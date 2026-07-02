@@ -19,6 +19,7 @@ import { PilotScanner, PilotPLL, toneIQ, getDataToneFreqs } from "./pilot";
 import { FramedBlockDecoder, BLOCK_TYPE } from "./framing";
 import { BlockProcessor } from "./blockProcessor";
 import { SquawkProcessor } from "./squawk";
+import { bch3116Decode } from "./ecc";
 import { debugLogger, STAGE, LOG_LEVEL } from "./debugger";
 import { TimingProfiler, BerTracker, ConstellationSampler, buildSnapshot } from "./diag";
 
@@ -81,6 +82,10 @@ export class Decoder {
   public framedDecoder: FramedBlockDecoder;
   public blockProcessor: BlockProcessor;
   public squawkProcessor: SquawkProcessor;
+
+  // BCH decode buffer: accumulate 4 demodulated bytes → BCH decode → 2 bytes → framedDecoder
+  private bchBuf: number[] = [];
+  private bchBufCount = 0;
 
   // Noise profiling
   private noiseFloor: [number, number, number, number] = [0, 0, 0, 0];
@@ -176,6 +181,8 @@ export class Decoder {
     this.blockProcessor.reset();
     this.squawkProcessor.reset();
     this.lastFrameIQ = [];
+    this.bchBuf = [];
+    this.bchBufCount = 0;
     this.timing.reset();
     this.berTracker.reset();
     this.constellation.reset();
@@ -436,19 +443,31 @@ export class Decoder {
         frameBits = (frameBits << 2) | (ampBit << 1) | phaseBit;
       }
 
-      // Feed the 8-bit frame pattern to the framed block decoder
-      this.framedDecoder.feedSymbol(frameBits, 8);
-      const totalBits = this.framedDecoder.totalBits;
-      this.lastStrongBitsCollected = totalBits;
+      // Feed the 8-bit frame pattern through BCH decode buffer,
+      // then to the framed block decoder
+      this.bchBuf.push(frameBits);
+      this.bchBufCount++;
+      this.lastStrongBitsCollected = this.framedDecoder.totalBits;
 
-      if (this.logging && totalBits <= 16) {
-        console.log(`[DEC] first data frames: totalBits=${totalBits} pat=${frameBits.toString(2).padStart(8,'0')} eng=${energies.map(e=>e.toExponential(2)).join(' ')} relI=${relI.map(v=>v.toFixed(4)).join(' ')}`);
+      // Every 4 symbols (32 bits = 4 BCH-encoded bytes), BCH decode to 2 bytes
+      if (this.bchBufCount >= 4) {
+        // Pack 4 demodulated bytes into BCH decode input
+        const bchInput = new Uint8Array(4);
+        for (let j = 0; j < 4; j++) bchInput[j] = this.bchBuf[j];
+        const decoded = bch3116Decode(bchInput);
+        this.bchBuf = [];
+        this.bchBufCount = 0;
+        this.framedDecoder.feedBytes(decoded.data);
       }
 
-      if (signalToNoise > 1.3) this.lastStrongBitsCollected = totalBits;
+      if (this.logging && this.framedDecoder.totalBits <= 16) {
+        console.log(`[DEC] first data frames: totalBits=${this.framedDecoder.totalBits} pat=${frameBits.toString(2).padStart(8,'0')} eng=${energies.map(e=>e.toExponential(2)).join(' ')} relI=${relI.map(v=>v.toFixed(4)).join(' ')}`);
+      }
 
-      if (this.framesSinceStrong >= 8 && totalBits >= 16) {
-        if (this.logging) console.log(`[DEC] end-of-signal after ${totalBits} bits (SNR=${signalToNoise.toFixed(1)})`);
+      if (signalToNoise > 1.3) this.lastStrongBitsCollected = this.framedDecoder.totalBits;
+
+      if (this.framesSinceStrong >= 8 && this.framedDecoder.totalBits >= 16) {
+        if (this.logging) console.log(`[DEC] end-of-signal after ${this.framedDecoder.totalBits} bits (SNR=${signalToNoise.toFixed(1)})`);
         this.inFrame = false;
         return;
       }
