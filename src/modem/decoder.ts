@@ -16,8 +16,11 @@
 
 import { ModemConfig, DEFAULT_CONFIG } from "./types";
 import { PilotScanner, PilotPLL, toneIQ, getDataToneFreqs } from "./pilot";
-import { FramedBlockDecoder } from "./framing";
+import { FramedBlockDecoder, BLOCK_TYPE } from "./framing";
 import { BlockProcessor } from "./blockProcessor";
+import { SquawkProcessor } from "./squawk";
+import { debugLogger, STAGE, LOG_LEVEL } from "./debugger";
+import { TimingProfiler, BerTracker, ConstellationSampler, buildSnapshot } from "./diag";
 
 export interface DecoderDebugInfo {
   peakAmp: number;
@@ -77,6 +80,7 @@ export class Decoder {
   // ── Framed block decoder (replaces old bitCollector) ──
   public framedDecoder: FramedBlockDecoder;
   public blockProcessor: BlockProcessor;
+  public squawkProcessor: SquawkProcessor;
 
   // Noise profiling
   private noiseFloor: [number, number, number, number] = [0, 0, 0, 0];
@@ -96,6 +100,14 @@ export class Decoder {
   /** Bypass noise profiling — pre-fills noise floor so decoder is ready instantly */
   public fastSync = false;
 
+  // ── Diagnostics (Phase C) ──
+  public timing = new TimingProfiler();
+  public berTracker = new BerTracker();
+  public constellation = new ConstellationSampler();
+
+  /** Last frame's tone I/Q values (for squawk processing) */
+  public lastFrameIQ: Array<{ i: number; q: number }> = [];
+
   /** Callback for complete file reception (from BlockProcessor) */
   onFrame: ((data: Uint8Array) => void) | null = null;
 
@@ -105,6 +117,7 @@ export class Decoder {
     this.scanner = new PilotScanner({ sampleRate: this.cfg.sampleRate });
 
     this.framedDecoder = new FramedBlockDecoder();
+    this.squawkProcessor = new SquawkProcessor();
     this.blockProcessor = new BlockProcessor({
       onFileComplete: (file) => {
         if (this.logging) {
@@ -115,14 +128,26 @@ export class Decoder {
         }
       },
       onPayloadProgress: (soFar, total) => {
-        // Progress is tracked via blockProcessor stats; no callback needed here
+        // Progress is tracked via blockProcessor stats
+      },
+      onSquawk: (squawkId, refI, refQ) => {
+        // Handled by framedDecoder.onBlock path below
       },
     });
 
     this.framedDecoder.onBlock = (event) => {
-      const summary = this.blockProcessor.processBlock(event.type, event.data);
-      if (this.logging && this.blockProcessor.stats.blocksReceived <= 5) {
-        console.log(`[BLK] ${summary}`);
+      if (event.type === BLOCK_TYPE.SQUAWK) {
+        // Capture current I/Q measurements for squawk processing
+        const measuredIQ = this.lastFrameIQ.map(iq => ({ i: iq.i, q: iq.q }));
+        const correction = this.squawkProcessor.processSquawk(event.data, measuredIQ);
+        if (correction && this.logging) {
+          console.log(`[SQWK] #${correction.squawkId}: drift=${correction.phaseCorrectionDeg.toFixed(1)}deg amp=${correction.ampCorrection.toFixed(3)}`);
+        }
+      } else {
+        const summary = this.blockProcessor.processBlock(event.type, event.data);
+        if (this.logging && this.blockProcessor.stats.blocksReceived <= 5) {
+          console.log(`[BLK] ${summary}`);
+        }
       }
     };
   }
@@ -149,6 +174,11 @@ export class Decoder {
     this.debugLog = [];
     this.framedDecoder.reset();
     this.blockProcessor.reset();
+    this.squawkProcessor.reset();
+    this.lastFrameIQ = [];
+    this.timing.reset();
+    this.berTracker.reset();
+    this.constellation.reset();
   }
 
   /** Feed one audio sample */
@@ -171,6 +201,12 @@ export class Decoder {
         this.pll = new PilotPLL(result.freq, 0, result.amplitude, {
           sampleRate: this.cfg.sampleRate,
         });
+        debugLogger.info(STAGE.PILOT_SCAN, {
+          freq: result.freq.toFixed(1),
+          amp: result.amplitude,
+          confidence: result.confidence,
+          samples: this.scanner['buf']?.length || 0,
+        }, `Pilot discovered: ${result.freq.toFixed(1)} Hz @ amp ${result.amplitude.toExponential(2)}`);
         if (this.logging) {
           console.log(`[PILOT] Discovered: ${result.freq.toFixed(1)} Hz @ amp ${result.amplitude.toExponential(2)} confidence=${result.confidence.toFixed(2)}`);
           console.log(`[PILOT] Tone freqs: ${this.toneFreqs.map(f => f.toFixed(1)).join(', ')}`);
@@ -207,6 +243,12 @@ export class Decoder {
         relQ[t] = rawIQs[t].q;
         energies[t] = Math.hypot(rawIQs[t].i, rawIQs[t].q);
       }
+    }
+
+    // Store raw I/Q for squawk processing
+    this.lastFrameIQ = [];
+    for (let t = 0; t < 4; t++) {
+      this.lastFrameIQ.push({ i: relI[t], q: relQ[t] });
     }
 
     const total = energies.reduce((a, b) => a + b, 0);
@@ -275,6 +317,21 @@ export class Decoder {
     }
 
     // ── Debug log ──
+    if (this.logging || debugLogger.getTotalEvents() % 10 === 0) {
+      // Log sync state at INFO level every ~10 frames
+      if (this.inFrame || strong) {
+        debugLogger.info(STAGE.SYNC_DETECT, {
+          consecutive: this.consecutiveSync,
+          in_frame: this.inFrame,
+          strong,
+          avg: avg.toExponential(2),
+          burst_thr: burstThresh.toExponential(2),
+          peak_ratio: energies.map(e => (total > 1e-12 ? (e / total) : 0).toFixed(3)).join('/'),
+          noise_frames: this.noiseFrames,
+          pilot_freq: this.pilotFreq.toFixed(1),
+        }, `SYNC ${strong ? 'STRONG' : 'weak'} consecutive=${this.consecutiveSync} avg=${avg.toExponential(2)}`);
+      }
+    }
     if (this.logging) {
       const thresholds: [number, number, number, number] = [0, 0, 0, 0];
       let bitPat = 0;

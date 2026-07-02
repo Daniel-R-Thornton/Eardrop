@@ -11,6 +11,8 @@
  */
 
 import { ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG } from "./types";
+import { encodeBlock, BLOCK_TYPE } from "./framing";
+import { encodeSquawkPayload } from "./squawk";
 
 enum Phase { kLeader, kSync, kData, kDone }
 
@@ -57,31 +59,68 @@ export class Encoder {
     const numTones = this.cfg.bitsPerFrame / 2;
     this.tonePhases = new Float32Array(numTones);
     this.bpskMul = new Float32Array(numTones);
-    // BPSK multiplier defaults to +1
     for (let t = 0; t < numTones; t++) this.bpskMul[t] = 1;
     this.bitPos = 0;
 
-    // Build bitstream: 2 bits per tone (amplitude + phase), 4 tones = 8 bits/symbol
+    // Build bitstream from framed blocks, with squawks interleaved
     this.bitstream = [];
-    for (const byte of data) {
-      // For now, still use Hamming(7,4) as placeholder — BCH will come in Phase D
-      // Each nibble (4 bits) → 8 encoded bits via Hamming(7,4)
-      const hiNib = (byte >> 4) & 0xf;
-      const loNib = byte & 0xf;
-      // Hamming encode each nibble: 4 data → 8 encoded bits
-      const hiEnc = this.hammingEncode(hiNib);
-      const loEnc = this.hammingEncode(loNib);
-      for (let b = 7; b >= 0; b--) this.bitstream.push((hiEnc >> b) & 1);
-      for (let b = 7; b >= 0; b--) this.bitstream.push((loEnc >> b) & 1);
+
+    // Wrapped blocks: payload data framed, squawks interleaved
+    const framedPayload = encodeBlock(BLOCK_TYPE.PAYLOAD, data);
+
+    // Emit initial squawk (Squawk 0 — calibration)
+    this.emitBlockBits(encodeBlock(BLOCK_TYPE.SQUAWK, encodeSquawkPayload(0)));
+
+    // Emit payload in chunks, with squawks between
+    const squawkInterval = this.cfg.squawkIntervalSymbols;
+    const bitsPerBlock = this.cfg.bitsPerFrame; // 8 bits/symbol
+    const blockBits = framedPayload.bytes.length * 8;
+    const maxBitsPerSegment = squawkInterval * bitsPerBlock;
+    let payloadBitPos = 0;
+    let squawkId = 0;
+
+    while (payloadBitPos < blockBits) {
+      const segmentBits = Math.min(maxBitsPerSegment, blockBits - payloadBitPos);
+      // Payload segment
+      for (let i = 0; i < segmentBits; i++) {
+        const byteIdx = Math.floor((payloadBitPos + i) / 8);
+        const bitIdx = 7 - ((payloadBitPos + i) % 8);
+        this.bitstream.push((framedPayload.bytes[byteIdx] >> bitIdx) & 1);
+      }
+      payloadBitPos += segmentBits;
+
+      // Emit squawk after this segment (unless we just finished)
+      if (payloadBitPos < blockBits) {
+        squawkId++;
+        this.emitBlockBits(encodeBlock(BLOCK_TYPE.SQUAWK, encodeSquawkPayload(squawkId)));
+      }
     }
 
+    // Emit final squawk
+    squawkId++;
+    this.emitBlockBits(encodeBlock(BLOCK_TYPE.SQUAWK, encodeSquawkPayload(squawkId)));
+
+    // Estimate total size and generate audio
     this.leaderSamps = Math.floor(this.cfg.sampleRate / 2 / this.sps) * this.sps;
-    const totalSamples = this.estimateTotalSamples(data.length);
+    const totalSamples = this.estimateTotalSamples2(this.bitstream.length);
     const full = new Float32Array(totalSamples);
     for (let i = 0; i < totalSamples; i++) {
       full[i] = this.generateSample();
     }
     return full;
+  }
+
+  /** Emit a framed block's bytes as ECC-encoded bits into the bitstream */
+  private emitBlockBits(block: { bytes: Uint8Array }): void {
+    // Hamming(7,4) encode each byte: 2 nibbles → 16 encoded bits
+    for (const byte of block.bytes) {
+      const hiNib = (byte >> 4) & 0xf;
+      const loNib = byte & 0xf;
+      const hiEnc = this.hammingEncode(hiNib);
+      const loEnc = this.hammingEncode(loNib);
+      for (let b = 7; b >= 0; b--) this.bitstream.push((hiEnc >> b) & 1);
+      for (let b = 7; b >= 0; b--) this.bitstream.push((loEnc >> b) & 1);
+    }
   }
 
   /** One-shot: encode and upsample to output sample rate */
@@ -92,13 +131,12 @@ export class Encoder {
 
   // ─── private ───────────────────────────────────────
 
-  private estimateTotalSamples(dataBytes: number): number {
-    const bits = dataBytes * 16; // Hamming(7,4): each nibble → 8 bits
-    const dataSymbols = Math.ceil(bits / this.cfg.bitsPerFrame);
+  private estimateTotalSamples2(bitstreamBits: number): number {
+    const dataSymbols = Math.ceil(bitstreamBits / this.cfg.bitsPerFrame);
     const dataSamples = dataSymbols * this.sps;
     const leaderSamples = this.leaderSamps || Math.floor(this.cfg.sampleRate / 2 / this.sps) * this.sps;
     const syncSamples = this.cfg.syncSymbols * this.sps;
-    return leaderSamples + syncSamples + dataSamples + this.sps * 6; // +6 padding
+    return leaderSamples + syncSamples + dataSamples + this.sps * 6;
   }
 
   private generateSample(): number {
