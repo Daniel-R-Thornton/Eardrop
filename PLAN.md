@@ -989,8 +989,49 @@ Putting it all together, the new transmission frame uses self-framing blocks thr
 40. **Update `index.html`** — add mount point, update debug panel structure
 41. **Update `app.ts`** — pipe decoder state to React, handle debug toggle, wire test harness
 42. **Acoustic path tuning** — tune PLL bandwidth, squawk interval, AGC response using channel simulator
-43. **Console logging** — comprehensive per-stage debug output via new debugger system
-42. **Console logging** — comprehensive per-stage debug output
+
+### Phase K — Documentation & Developer Guide
+
+43. **Write `docs/ARCHITECTURE.md`** — high-level system architecture:
+    - Signal flow diagram (bits → ECC → block framing → pilot+tones → audio → speaker → mic → FFT → PLL → I/Q → bits → block scan → ECC → file)
+    - Data flow through encoder, channel, decoder
+    - Module dependency graph
+44. **Write `docs/MODEM.md`** — deep modem specification:
+    - Pilot: configurable frequency, FFT discovery, PLL tracking, pilot-relative I/Q
+    - Tone encoding: 4 tones at pilotFreq + offsets, BPSK (amplitude + phase bits)
+    - Frame layout: leader → sync → framed blocks → done
+    - Block format: [SENTINEL 0xE79F][TYPE][LEN][DATA][CRC16]
+    - Block types: SQUAWK(0x01), CONFIG(0x02), DICT(0x03), PAYLOAD(0x04), EOF(0xFF)
+    - Squawk calibration: interval, reference data, correction computation
+    - ECC: BCH(31,16) codeword structure, interleaving
+45. **Write `docs/DEBUG.md`** — debug and diagnostics guide:
+    - Per-stage log events and their fields
+    - Compressed LLM output format specification
+    - Stage filter toggles and log levels
+    - How to interpret constellation I/Q scatter
+    - BER tracking and what it means
+46. **Write `docs/CHANNEL_SIM.md`** — channel simulator reference:
+    - All noise/impairment models and their config parameters
+    - How to run batch SNR sweeps
+    - Interpreting BER vs SNR curves
+47. **Write `docs/API.md`** — public API reference:
+    - `ModemConfig` fields and defaults
+    - `Encoder.encode()` / `Encoder.encodeToOutputRate()`
+    - `Decoder.feedSample()` / `Decoder` options
+    - `encodeBlock()` / `FramedBlockDecoder` / `BlockProcessor`
+    - `PilotScanner` / `PilotPLL`
+    - UI workers: `encoder.worker.ts`, `broadcast.worker.ts`
+    - Message protocol between main thread and workers
+48. **Update `README.md`** — project overview:
+    - New feature summary (pilot-relative, phase encoding, framing, ECC, dictionary)
+    - Quick start (dev server, self-test, acoustic test)
+    - Current limitations and known issues
+    - Link to all docs in `docs/`
+49. **Write `docs/LLM_PROMPT.md`** — guide for LLM analysis of debug output:
+    - How to prompt an LLM with compressed debug output
+    - Example: "Here's a debug dump from a noisy transmission. What's the bottleneck?"
+    - Example: "Compare these two BER sweeps — what does the difference in ECC correction rate tell us?"
+    - Field-by-field explanation of the compressed format
 
 ---
 
