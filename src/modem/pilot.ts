@@ -2,8 +2,9 @@
  * PilotScanner + PilotPLL — Pilot frequency discovery and phase tracking.
  *
  * Two-phase design:
- *   1. PilotScanner: During leader/initial listening, sweep candidate frequencies
- *      to find the dominant continuous tone. Returns discovered frequency + amplitude.
+ *   1. PilotScanner: Buffer ~0.5s of leader audio, run FFT with zero-padding
+ *      to 2048 samples (bin spacing ~1.56 Hz), find peak in 40-120 Hz range.
+ *      Parabolic interpolation around peak gives <0.1 Hz accuracy.
  *   2. PilotPLL: Second-order PLL locked to the discovered frequency. Tracks phase
  *      and amplitude continuously through the entire transmission.
  *
@@ -12,92 +13,135 @@
 
 import { TONE_OFFSETS } from "./types";
 
+// ─── FFT helpers (radix-2, in-place, power-of-2 only) ──
+
+/**
+ * Compute FFT magnitude spectrum for a real-valued input.
+ * Input is zero-padded to `fftSize` if shorter. Returns magnitude per bin.
+ * Only the first `fftSize/2` bins are valid (Nyquist).
+ */
+function fftMagnitude(samples: number[], fftSize: number): Float64Array {
+  const n = fftSize;
+  // Real and imag arrays, zero-filled
+  const real = new Float64Array(n);
+  const imag = new Float64Array(n);
+  for (let i = 0; i < Math.min(samples.length, n); i++) {
+    real[i] = samples[i];
+  }
+
+  // Bit-reversal permutation
+  const bits = Math.log2(n);
+  for (let i = 0; i < n; i++) {
+    let rev = 0;
+    for (let j = 0; j < bits; j++) rev = (rev << 1) | ((i >> j) & 1);
+    if (rev > i) {
+      [real[i], real[rev]] = [real[rev], real[i]];
+      [imag[i], imag[rev]] = [imag[rev], imag[i]];
+    }
+  }
+
+  // Cooley-Tukey radix-2
+  for (let len = 2; len <= n; len <<= 1) {
+    const angle = (-2 * Math.PI) / len;
+    const wlenR = Math.cos(angle);
+    const wlenI = Math.sin(angle);
+    for (let i = 0; i < n; i += len) {
+      let wR = 1, wI = 0;
+      const half = len >> 1;
+      for (let j = 0; j < half; j++) {
+        const uR = real[i + j];
+        const uI = imag[i + j];
+        const vR = real[i + j + half] * wR - imag[i + j + half] * wI;
+        const vI = real[i + j + half] * wI + imag[i + j + half] * wR;
+        real[i + j] = uR + vR;
+        imag[i + j] = uI + vI;
+        real[i + j + half] = uR - vR;
+        imag[i + j + half] = uI - vI;
+        const nwR = wR * wlenR - wI * wlenI;
+        const nwI = wR * wlenI + wI * wlenR;
+        wR = nwR;
+        wI = nwI;
+      }
+    }
+  }
+
+  // Magnitude for first half
+  const mag = new Float64Array(n >> 1);
+  for (let i = 0; i < mag.length; i++) {
+    mag[i] = Math.hypot(real[i], imag[i]);
+  }
+  return mag;
+}
+
+/**
+ * Parabolic interpolation around a peak bin for sub-bin frequency accuracy.
+ * Given magnitude at bins (peak-1, peak, peak+1), fit a parabola and
+ * return the fractional offset from the peak bin.
+ */
+function interpolatePeak(m0: number, m1: number, m2: number): number {
+  const denom = m0 - 2 * m1 + m2;
+  if (Math.abs(denom) < 1e-12) return 0;
+  return (m0 - m2) / (2 * denom);
+}
+
 // ─── PilotScanner ─────────────────────────────────────
 
 export interface PilotDiscovery {
   /** Discovered pilot frequency in Hz */
   freq: number;
-  /** Estimated pilot amplitude (for AGC normalization) */
+  /** Estimated pilot amplitude (magnitude at peak, normalized) */
   amplitude: number;
-  /** Confidence 0-1 (based on stability and SNR) */
+  /** Confidence 0-1 (based on signal-to-noise ratio in FFT) */
   confidence: number;
 }
 
 export interface PilotScannerConfig {
   /** Frequency range to scan (Hz) */
   scanRange: [number, number];
-  /** Step size between candidate frequencies (Hz) */
-  scanStep: number;
-  /** How many frames to accumulate before deciding */
-  scanDurationFrames: number;
-  /** Minimum energy ratio above noise floor to accept a candidate */
-  minSignalRatio: number;
-  /** Maximum amplitude variance across frames to accept (0-1) */
-  maxVariance: number;
   /** Sample rate */
   sampleRate: number;
-  /** Samples per frame (symbol window) */
-  sps: number;
+  /** FFT size (must be power of 2) — default 2048 for ~1.56 Hz bins */
+  fftSize: number;
+  /** Minimum number of samples to collect before running FFT */
+  minSamples: number;
+  /** Minimum peak-to-median ratio to accept a discovery */
+  minSignalRatio: number;
 }
 
 const DEFAULT_SCANNER_CONFIG: PilotScannerConfig = {
   scanRange: [40, 120],
-  scanStep: 5,
-  scanDurationFrames: 6,     // ~0.3s at 25 sym/s — enough for Goertzel on each candidate
-  minSignalRatio: 3.0,
-  maxVariance: 0.2,
   sampleRate: 3200,
-  sps: 128,
+  fftSize: 2048,
+  minSamples: 1024,  // ~0.32s at 3200 Hz — enough for a clean spectrum
+  minSignalRatio: 5.0,
 };
 
 export class PilotScanner {
   private cfg: PilotScannerConfig;
   private buf: number[] = [];
-  private frameCount = 0;
-  /** Per-frequency energy accumulators: freq → frame energies[] */
-  private candidates: Map<number, number[]> = new Map();
   private done = false;
   private result: PilotDiscovery | null = null;
 
   constructor(cfg: Partial<PilotScannerConfig> = {}) {
     this.cfg = { ...DEFAULT_SCANNER_CONFIG, ...cfg };
-    // Build candidate frequency list
-    const { scanRange, scanStep } = this.cfg;
-    for (let f = scanRange[0]; f <= scanRange[1]; f += scanStep) {
-      this.candidates.set(Math.round(f * 10) / 10, []);
-    }
   }
 
   /** Feed one audio sample. Returns null until discovery is complete. */
   feedSample(sample: number): PilotDiscovery | null {
     if (this.done) return this.result;
-
     this.buf.push(sample);
-    if (this.buf.length < this.cfg.sps) return null;
-
-    // We have one frame
-    const window = this.buf.slice(0, this.cfg.sps);
-    this.buf.splice(0, this.cfg.sps);
-    this.frameCount++;
-
-    // Compute energy at every candidate frequency
-    for (const [freq, energies] of this.candidates) {
-      const e = this.goertzel(window, freq);
-      energies.push(e);
-    }
-
-    if (this.frameCount >= this.cfg.scanDurationFrames) {
-      this.result = this.selectBest();
+    if (this.buf.length >= this.cfg.minSamples) {
+      this.runFft();
       this.done = true;
     }
     return null;
   }
 
-  /** Force discovery with whatever frames we have (call on time-out) */
+  /** Force discovery with whatever samples we have */
   forceDiscover(): PilotDiscovery | null {
     if (this.done) return this.result;
-    if (this.frameCount < 2) return null;
-    this.result = this.selectBest();
+    if (this.buf.length < 64) return null; // too few samples
+    this.runFft();
     this.done = true;
     return this.result;
   }
@@ -106,70 +150,60 @@ export class PilotScanner {
   getResult(): PilotDiscovery | null { return this.result; }
   reset() {
     this.buf = [];
-    this.frameCount = 0;
     this.done = false;
     this.result = null;
-    for (const [, energies] of this.candidates) energies.length = 0;
   }
 
-  // ─── private ───────────────────────────────────────
+  private runFft() {
+    const { scanRange, sampleRate, fftSize, minSignalRatio } = this.cfg;
 
-  /** Goertzel magnitude for a single frequency over the buffer */
-  private goertzel(samples: number[], targetFreq: number): number {
-    const n = samples.length;
-    if (n === 0) return 0;
-    const k = Math.round((targetFreq * n) / this.cfg.sampleRate);
-    const omega = (2 * Math.PI * k) / n;
-    const coeff = 2 * Math.cos(omega);
-    let s0 = 0, s1 = 0, s2 = 0;
-    for (let i = 0; i < n; i++) {
-      s0 = samples[i] + coeff * s1 - s2;
-      s2 = s1; s1 = s0;
-    }
-    const real = s1 - s2 * Math.cos(omega);
-    const imag = s2 * Math.sin(omega);
-    return Math.hypot(real, imag) / n;
-  }
+    // Zero-padded FFT
+    const mag = fftMagnitude(this.buf, fftSize);
+    const binWidth = sampleRate / fftSize;
 
-  private selectBest(): PilotDiscovery | null {
-    let bestFreq = 0;
-    let bestMean = 0;
-    let bestVariance = Infinity;
+    // Bin range for our scan
+    const binLo = Math.max(1, Math.floor(scanRange[0] / binWidth));
+    const binHi = Math.min(mag.length - 1, Math.ceil(scanRange[1] / binWidth));
 
-    for (const [freq, energies] of this.candidates) {
-      if (energies.length < 2) continue;
-      const mean = energies.reduce((a, b) => a + b, 0) / energies.length;
-      const variance = energies.reduce((a, b) => a + (b - mean) ** 2, 0) / energies.length;
-      const normalizedVariance = mean > 1e-12 ? Math.sqrt(variance) / mean : 1;
-
-      if (mean > bestMean && normalizedVariance < this.cfg.maxVariance) {
-        bestFreq = freq;
-        bestMean = mean;
-        bestVariance = normalizedVariance;
+    // Find the peak bin in the scan range
+    let peakBin = binLo;
+    let peakMag = mag[binLo];
+    for (let b = binLo + 1; b <= binHi; b++) {
+      if (mag[b] > peakMag) {
+        peakMag = mag[b];
+        peakBin = b;
       }
     }
 
-    if (bestFreq === 0) return null;
-
-    // Check signal ratio: best freq vs noise floor (median of all other candidates)
-    const allMeans: number[] = [];
-    for (const [freq, energies] of this.candidates) {
-      if (freq === bestFreq) continue;
-      allMeans.push(energies.reduce((a, b) => a + b, 0) / energies.length);
+    // Compute noise floor as median magnitude across the whole spectrum
+    // (excluding the scan range to avoid counting the pilot itself)
+    const allMags: number[] = [];
+    for (let b = 1; b < mag.length; b++) {
+      if (b < binLo - 2 || b > binHi + 2) {
+        allMags.push(mag[b]);
+      }
     }
-    allMeans.sort((a, b) => a - b);
-    const noiseMedian = allMeans[Math.floor(allMeans.length / 2)] || 1e-12;
-    const ratio = bestMean / Math.max(noiseMedian, 1e-14);
+    allMags.sort((a, b) => a - b);
+    const noiseMedian = allMags[Math.floor(allMags.length / 2)] || 1e-12;
 
-    if (ratio < this.cfg.minSignalRatio) return null;
+    const signalRatio = peakMag / Math.max(noiseMedian, 1e-14);
 
-    const confidence = Math.min(1, (ratio - this.cfg.minSignalRatio) / 10);
+    if (signalRatio < minSignalRatio) {
+      this.result = null;
+      return;
+    }
 
-    return {
-      freq: bestFreq,
-      amplitude: bestMean,
-      confidence,
-    };
+    // Parabolic interpolation for sub-bin accuracy
+    const m0 = peakBin > 0 ? mag[peakBin - 1] : 0;
+    const m1 = peakMag;
+    const m2 = peakBin < mag.length - 1 ? mag[peakBin + 1] : 0;
+    const offset = interpolatePeak(m0, m1, m2);
+
+    const freq = (peakBin + offset) * binWidth;
+    const amplitude = peakMag / this.buf.length; // normalize by sample count
+    const confidence = Math.min(1, (signalRatio - minSignalRatio) / 20);
+
+    this.result = { freq, amplitude, confidence };
   }
 }
 
@@ -200,7 +234,7 @@ const DEFAULT_PLL_CONFIG: PLLConfig = {
 export class PilotPLL {
   private cfg: PLLConfig;
 
-  /** Tracked pilot frequency (Hz) — set once on lock, can drift slightly */
+  /** Tracked pilot frequency (Hz) */
   private freq: number;
   /** Internal NCO phase accumulator (cycles, 0..1) */
   private phase: number;
@@ -209,7 +243,7 @@ export class PilotPLL {
   /** Smoothed amplitude estimate */
   private amplitude: number;
 
-  /** Reference sin/cos for the current sample — updated on each feedSample call */
+  /** Reference sin/cos for the current sample */
   private sinRef = 0;
   private cosRef = 1;
 
@@ -222,19 +256,15 @@ export class PilotPLL {
     this.updateRef();
   }
 
-  /**
-   * Feed one audio sample. The PLL updates its phase tracking and amplitude estimate.
-   * Call getPhase() / getAmplitude() / getSinRef() / getCosRef() afterward.
-   */
+  /** Feed one audio sample. PLL updates phase tracking and amplitude estimate. */
   update(sample: number): void {
-    // Simple phase detector: multiply input by our reference sin
-    // The DC component of (input * sinRef) is proportional to phase error
+    // Phase detector: multiply input by our reference sin
+    // DC component of (sample * sinRef) ∝ phase error
     const error = sample * this.sinRef;
 
     // Loop filter: proportional + integral
     const proportional = this.cfg.Kp * error;
     this.integrator += this.cfg.Ki * error;
-    // Clamp integrator to prevent windup
     this.integrator = Math.max(-0.5, Math.min(0.5, this.integrator));
 
     // Update phase
@@ -243,36 +273,25 @@ export class PilotPLL {
     if (this.phase >= 1.0) this.phase -= 1.0;
     if (this.phase < 0) this.phase += 1.0;
 
-    // Amplitude estimation: low-pass filter on squared envelope
-    // Use cosRef as the quadrature component for full amplitude measurement
+    // Amplitude: low-pass filter on envelope (I² + Q²)
     const i = sample * this.cosRef;
     const q = sample * this.sinRef;
     const instAmp = Math.hypot(i, q);
-    const alpha = 0.01; // slow tracking — rejects data modulation
+    const alpha = 0.01; // slow — rejects data modulation
     this.amplitude = this.amplitude * (1 - alpha) + instAmp * alpha;
 
     this.updateRef();
   }
 
-  /** Get current tracked pilot frequency (may drift from initial) */
   getFrequency(): number { return this.freq; }
-
-  /** Get current tracked pilot phase in cycles (0..1) */
   getPhase(): number { return this.phase; }
-
-  /** Get current tracked pilot amplitude (smoothed) */
   getAmplitude(): number { return this.amplitude; }
-
-  /** Get reference sin(2π * phase) for the current sample */
   getSinRef(): number { return this.sinRef; }
-
-  /** Get reference cos(2π * phase) for the current sample */
   getCosRef(): number { return this.cosRef; }
 
   /**
-   * Get pilot-relative I/Q for a given tone frequency.
-   * Given raw I/Q correlation values, rotate by the PLL's tracked phase
-   * to get pilot-relative coordinates.
+   * Rotate raw I/Q values by the PLL's tracked pilot phase.
+   * Returns pilot-relative coordinates.
    */
   rotateToPilotRef(rawI: number, rawQ: number): { i: number; q: number } {
     const cos = this.cosRef;
@@ -293,11 +312,10 @@ export class PilotPLL {
   }
 }
 
-// ─── Convenience: detect energy of a tone, return pilot-relative I/Q ───
+// ─── Convenience functions ─────────────────────────────
 
 /**
  * Compute raw I/Q correlation for a single frequency over a sample buffer.
- * Returns { i, q } where i = sin correlation, q = cos correlation.
  */
 export function toneIQ(
   samples: readonly number[],
