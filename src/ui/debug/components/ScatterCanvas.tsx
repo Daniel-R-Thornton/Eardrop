@@ -1,127 +1,108 @@
 /**
  * ScatterCanvas.tsx — I/Q constellation scatter plot for one tone.
- * Canvas-based, renders with devicePixelRatio for sharp output.
+ * Draws a grid, crosshair, and colored scatter points.
  */
 
-import React, { useRef, useEffect } from 'react';
+import React, { useEffect, useRef } from 'react';
 
 export interface ScatterPoint {
   i: number;
   q: number;
-  ampBit: number;
-  phaseBit: number;
+  bit: number; // 0 or 1
+  error?: boolean; // if true, highlight differently
 }
 
 interface Props {
   points: ScatterPoint[];
-  width?: number;
-  height?: number;
+  width: number;
+  height: number;
   toneLabel: string;
   color: string;
 }
 
-const ScatterCanvas: React.FC<Props> = ({
-  points,
-  width = 160,
-  height = 160,
-  toneLabel,
-  color,
-}) => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+export const ScatterCanvas: React.FC<Props> = ({ points, width, height, toneLabel, color }) => {
+  const ref = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
-    const canvas = canvasRef.current;
+    const canvas = ref.current;
     if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
 
-    const ctx = canvas.getContext('2d')!;
-    const cw = width * dpr;
-    const ch = height * dpr;
-    canvas.width = cw;
-    canvas.height = ch;
-    canvas.style.width = `${width}px`;
-    canvas.style.height = `${height}px`;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = width * dpr;
+    canvas.height = height * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    // Compute axis limits
-    let maxAbs = 0.5;
-    for (const p of points) {
-      maxAbs = Math.max(maxAbs, Math.abs(p.i), Math.abs(p.q));
-    }
-    // Round up to nearest 0.5
-    let limit = Math.ceil(maxAbs * 2) / 2;
-    if (limit < 0.5) limit = 0.5;
+    const cx = width / 2;
+    const cy = height / 2;
+    const maxDim = Math.min(width, height) / 2 - 20;
 
-    const pad = 20;
-    const plotW = width - pad * 2;
-    const plotH = height - pad * 2;
-    const midX = pad + plotW / 2;
-    const midY = pad + plotH / 2;
-    const scale = Math.min(plotW / 2, plotH / 2) / limit;
+    // Find extent for auto-scaling
+    let maxVal = 1;
+    for (const p of points) {
+      const absI = Math.abs(p.i);
+      const absQ = Math.abs(p.q);
+      if (absI > maxVal) maxVal = absI;
+      if (absQ > maxVal) maxVal = absQ;
+    }
+    maxVal = Math.max(maxVal, 0.01);
+    const scale = maxDim / maxVal;
 
     // Background
     ctx.fillStyle = '#0a0a14';
     ctx.fillRect(0, 0, width, height);
 
-    // Grid circles
-    ctx.strokeStyle = '#222';
+    // Grid
+    ctx.strokeStyle = '#1a1a28';
     ctx.lineWidth = 0.5;
-    for (let r = 0.25; r <= limit; r += 0.25) {
-      const radius = r * scale;
-      ctx.beginPath();
-      ctx.arc(midX, midY, radius, 0, Math.PI * 2);
-      ctx.stroke();
+    for (let i = -3; i <= 3; i++) {
+      const pos = cx + i * maxDim / 3;
+      ctx.beginPath(); ctx.moveTo(pos, 0); ctx.lineTo(pos, height); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, pos); ctx.lineTo(width, pos); ctx.stroke();
     }
 
-    // Crosshair axes
-    ctx.strokeStyle = '#444';
+    // Crosshair
+    ctx.strokeStyle = '#ff446644';
     ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(pad, midY);
-    ctx.lineTo(width - pad, midY);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(midX, pad);
-    ctx.lineTo(midX, height - pad);
-    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(width, cy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, height); ctx.stroke();
 
-    // Axis labels
+    // Label
     ctx.fillStyle = '#666';
-    ctx.font = '9px monospace';
-    ctx.fillText('I', width - pad + 4, midY + 4);
-    ctx.fillText('Q', midX + 4, pad - 4);
-
-    // Tone label
-    ctx.fillStyle = color;
-    ctx.font = 'bold 10px monospace';
-    ctx.fillText(toneLabel, pad + 4, pad + 12);
+    ctx.font = '10px monospace';
+    ctx.fillText(toneLabel, 4, 12);
 
     // Scatter points
     for (const p of points) {
-      const x = midX + p.i * scale;
-      const y = midY - p.q * scale; // Q axis inverted for display
-
-      if (p.ampBit === 1) {
-        ctx.fillStyle = color;
-        ctx.globalAlpha = 0.8;
-      } else {
-        ctx.fillStyle = '#555';
-        ctx.globalAlpha = 0.3;
-      }
+      const x = cx + p.i * scale;
+      const y = cy - p.q * scale; // Y inverted: +Q is up
+      if (x < 0 || x > width || y < 0 || y > height) continue;
 
       ctx.beginPath();
-      ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+      ctx.arc(x, y, 3, 0, 2 * Math.PI);
+
+      if (p.error) {
+        ctx.fillStyle = '#ff4444';
+      } else if (p.bit === 1) {
+        ctx.fillStyle = color;
+      } else {
+        ctx.fillStyle = '#555';
+      }
       ctx.fill();
+
+      // Border
+      ctx.strokeStyle = '#ffffff33';
+      ctx.lineWidth = 0.5;
+      ctx.stroke();
     }
-    ctx.globalAlpha = 1;
-  }, [points, width, height, toneLabel, color, dpr]);
 
-  return (
-    <canvas
-      ref={canvasRef}
-      style={{ display: 'block', background: '#0a0a14', borderRadius: 4 }}
-    />
-  );
+    // Axis labels
+    ctx.fillStyle = '#555';
+    ctx.font = '8px monospace';
+    ctx.fillText('I', width - 12, cy - 4);
+    ctx.fillText('Q', cx + 4, 10);
+  }, [points, width, height, toneLabel, color]);
+
+  return <canvas ref={ref} style={{ width, height, display: 'block' }} />;
 };
-
-export default ScatterCanvas;

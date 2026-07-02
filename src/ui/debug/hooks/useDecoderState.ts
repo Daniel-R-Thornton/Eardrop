@@ -1,86 +1,60 @@
 /**
- * useDecoderState.ts — React hook subscribing to decoder state updates.
+ * useDecoderState.ts — React hook that subscribes to decoder state updates
+ * from the broadcast worker via a shared event emitter or callback.
  *
- * app.ts can import the eventEmitter singleton and push state updates into it.
- * React components use useDecoderState() to get the latest snapshot.
+ * For now, this provides a simple interface that the app.ts can feed
+ * data into. In the future it will subscribe to a shared state bus.
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useEffect, useState } from 'react';
 
-// ─── Event Emitter ──────────────────────────────────
-
-type StateListener = (state: any) => void;
-
-class DecoderStateEmitter {
-  private listeners: Set<StateListener> = new Set();
-  private latestState: any = null;
-
-  /** Subscribe to state updates. Returns unsubscribe function. */
-  subscribe(listener: StateListener): () => void {
-    this.listeners.add(listener);
-    // Immediately deliver latest state if available
-    if (this.latestState !== null) {
-      try { listener(this.latestState); } catch { /* ignore */ }
-    }
-    return () => {
-      this.listeners.delete(listener);
-    };
-  }
-
-  /** Emit a new state snapshot to all subscribers */
-  emit(state: any): void {
-    this.latestState = state;
-    for (const listener of this.listeners) {
-      try { listener(state); } catch { /* ignore */ }
-    }
-  }
-
-  /** Get the latest state without subscribing */
-  getLatest(): any {
-    return this.latestState;
-  }
+export interface DecoderStateSnapshot {
+  inFrame: boolean;
+  bitsCollected: number;
+  consecutiveSync: number;
+  pilotFreq: number;
+  pilotAmplitude: number;
+  signalToNoise: number;
+  noiseFloor: [number, number, number, number];
+  energies: [number, number, number, number];
+  relI: [number, number, number, number];
+  relQ: [number, number, number, number];
+  blocksDecoded: number;
+  blocksCrcFailed: number;
 }
 
-/** Singleton emitter — import this from app.ts to push decoder state */
-export const decoderStateEmitter = new DecoderStateEmitter();
+const defaultState: DecoderStateSnapshot = {
+  inFrame: false,
+  bitsCollected: 0,
+  consecutiveSync: 0,
+  pilotFreq: 0,
+  pilotAmplitude: 0,
+  signalToNoise: 0,
+  noiseFloor: [0, 0, 0, 0],
+  energies: [0, 0, 0, 0],
+  relI: [0, 0, 0, 0],
+  relQ: [0, 0, 0, 0],
+  blocksDecoded: 0,
+  blocksCrcFailed: 0,
+};
 
-// ─── React Hook ─────────────────────────────────────
-
-/**
- * Subscribe to decoder state updates.
- * Returns the latest decoder snapshot (or null if none yet).
- */
-export function useDecoderState(): any {
-  const [state, setState] = useState<any>(decoderStateEmitter.getLatest());
+export function useDecoderState(): DecoderStateSnapshot {
+  const [state, setState] = useState<DecoderStateSnapshot>(defaultState);
 
   useEffect(() => {
-    return decoderStateEmitter.subscribe((newState: any) => {
-      setState(newState);
-    });
+    // In the future, subscribe to a shared event bus.
+    // For now, the app.ts will call setDecoderState() which
+    // will be wired to a global event.
+    const handler = (e: CustomEvent) => {
+      if (e.detail && e.detail.type === 'decoderState') {
+        setState(e.detail.snapshot);
+      }
+    };
+    window.addEventListener('eardrop-decoder-state' as any, handler as any);
+    return () => {
+      window.removeEventListener('eardrop-decoder-state' as any, handler as any);
+    };
   }, []);
 
   return state;
-}
-
-// ─── Convenience: update from broadcast worker message ──
-
-/**
- * Call this from app.ts when you receive a decoderState message from the worker.
- * It extracts the relevant fields and pushes them to all React subscribers.
- */
-export function pushDecoderState(msg: {
-  bitsCollected?: number;
-  hasData?: boolean;
-  debugInfo?: any;
-  recentLog?: any[];
-  rawBytes?: ArrayBuffer;
-}): void {
-  decoderStateEmitter.emit({
-    bitsCollected: msg.bitsCollected ?? 0,
-    hasData: msg.hasData ?? false,
-    debugInfo: msg.debugInfo ?? null,
-    recentLog: msg.recentLog ?? [],
-    rawBytes: msg.rawBytes ? new Uint8Array(msg.rawBytes) : null,
-    timestamp: performance.now(),
-  });
 }
