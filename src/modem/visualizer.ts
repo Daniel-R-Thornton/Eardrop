@@ -6,7 +6,9 @@
  */
 
 import { DSP } from "./dsp";
-import { TONES } from "./types";
+import { getDefaultToneFreqs, TONE_COLORS } from "./types";
+
+const TONES = getDefaultToneFreqs();
 
 const COLORS = ["#6c6cff", "#ff6b4a", "#5eead4", "#f472b6"];
 

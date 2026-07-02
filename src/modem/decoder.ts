@@ -1,16 +1,30 @@
 /**
- * Decoder — Ported from TapewormFS lib/ofdm/src/modem_decoder.cpp
+ * Decoder — Pilot-Relative Multi-Tone Modem
  *
- * Multi-tone energy detection decoder.
- * Uses Goertzel-style correlation on 4 frequencies.
- * Continuous pre-sync noise profiling for robust real-world operation.
+ * Two-phase pilot discovery:
+ *   1. PilotScanner: scans 40-120 Hz during leader to find the dominant tone
+ *   2. PilotPLL: second-order PLL locked to discovered frequency
+ *
+ * All tone measurements are pilot-relative:
+ *   - Raw I/Q at each data tone frequency
+ *   - Rotated by PLL's tracked pilot phase → pilot-relative I'/Q'
+ *   - Amplitude bit: |I' + jQ'| > pilotAmp * thresholdRatio
+ *   - Phase bit: sign(I')  (BPSK: right half-plane = 1, left = 0)
+ *
+ * Falls back to absolute-energy detection if pilot discovery fails.
  */
-import { ModemConfig, TONES, DEFAULT_CONFIG } from "./types";
+
+import { ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG } from "./types";
+import { PilotScanner, PilotPLL, toneIQ, getDataToneFreqs } from "./pilot";
 import { hammingDecode } from "../hamming";
 
 export interface DecoderDebugInfo {
-  /** Raw audio peak amplitude in this frame (0-1 range) */
   peakAmp: number;
+  /** Per-tone pilot-relative I' values */
+  relI: [number, number, number, number];
+  /** Per-tone pilot-relative Q' values */
+  relQ: [number, number, number, number];
+  /** Pilot-relative energy magnitude per tone */
   energies: [number, number, number, number];
   avg: number;
   noiseAvg: number;
@@ -20,24 +34,22 @@ export interface DecoderDebugInfo {
   bitsCollected: number;
   noiseFloor: [number, number, number, number];
   noiseMax: [number, number, number, number];
-  /** Per-tone thresholds after noise profiling */
   thresholds: [number, number, number, number];
-  /** Per-tone energy fraction of total frame energy (0-1) */
   ratios: [number, number, number, number];
-  /** Number of noise frames collected (ready when >= 30) */
   noiseFrames: number;
-  /** Bit pattern decoded this frame (4 bits, one per tone: 0=below thr, 1=above) */
+  /** 8-bit pattern: [amp0 phase0 amp1 phase1 amp2 phase2 amp3 phase3] */
   bitPattern: number;
-  /** End-detection SNR (avg / noiseFloor avg) */
   signalToNoise: number;
-  /** Burst threshold used for strong/weak decision */
   burstThreshold: number;
-  /** Frames since last strong detection */
   framesSinceStrong: number;
-  /** Frames since last exit from data mode */
   framesSinceExit: number;
-  /** Remaining sync symbols to skip */
   frameSkip: number;
+  /** Discovered pilot frequency (0 = not yet discovered) */
+  pilotFreq: number;
+  /** Tracked pilot amplitude (for AGC reference) */
+  pilotAmp: number;
+  /** Pilot confidence 0-1 */
+  pilotConfidence: number;
 }
 
 export class Decoder {
@@ -47,6 +59,15 @@ export class Decoder {
   // Buffer
   private buf: number[] = [];
 
+  // ── Pilot discovery ──
+  private scanner: PilotScanner;
+  private pll: PilotPLL | null = null;
+  private pilotDiscovered = false;
+  private pilotFreq = 0;
+  private pilotAmplitude = 0;
+  /** Absolute tone frequencies (computed from discovered pilot) */
+  private toneFreqs: [number, number, number, number] = [500, 700, 900, 1100];
+
   // State
   private inFrame = false;
   private consecutiveSync = 0;
@@ -54,33 +75,24 @@ export class Decoder {
   private bitCollector: number[] = [];
   private bitsCollected = 0;
 
-  // ── Noise profiling (per frequency band) ──
-  /** Running average noise floor */
+  // Noise profiling
   private noiseFloor: [number, number, number, number] = [0, 0, 0, 0];
-  /** Running max noise (decays slowly) — catches transient noise */
   private noiseMax: [number, number, number, number] = [0, 0, 0, 0];
-  /** How many noise frames we've sampled (pre-sync) */
   private noiseFrames = 0;
 
-  // Accumulated decoded frames
+  // Accumulated decoded bytes
   private decodedBytes: number[] = [];
 
-  // Timeout-based end detection
+  // End detection
   private framesSinceStrong = 0;
   private lastStrongBits = 0;
-  /** Frames elapsed since last exiting data mode — enforces settling period */
   private framesSinceExit = 0;
-  private dataFramesExecuted = 0;  // safety timeout — exit data mode after 150 frames (6s)
-  private expectedTotalBytes = 0;  // length-based exit — 0 = unlimited, >0 = auto-stop after N bytes
-  private totalBytesEmitted = 0;    // cumulative bytes emitted since entering data mode
-  /** Reference peak amplitude measured during sync — used for adaptive end detection */
-  private peakAmpRef = 0;
-  /** Per-tone peak energy measured during sync preambles — used for burst auto-calibration */
+  private dataFramesExecuted = 0;
+  private expectedTotalBytes = 0;
+  private totalBytesEmitted = 0;
   private syncPeak: [number, number, number, number] = [2e-10, 2e-10, 2e-10, 2e-10];
-  /** Calibration complete flag — set after first sync entry */
-  private calibrated = false;
 
-  // Debug log
+  // Debug
   public debugLog: DecoderDebugInfo[] = [];
   public logging = false;
   /** Bypass noise profiling — pre-fills noise floor so decoder is ready instantly */
@@ -91,10 +103,16 @@ export class Decoder {
   constructor(cfg: Partial<ModemConfig> = {}) {
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
     this.sps = this.cfg.sampleRate / this.cfg.symbolsPerSec;
+    this.scanner = new PilotScanner({ sampleRate: this.cfg.sampleRate, sps: this.sps });
   }
 
   reset() {
     this.buf = [];
+    this.scanner.reset();
+    this.pll = null;
+    this.pilotDiscovered = false;
+    this.pilotFreq = 0;
+    this.pilotAmplitude = 0;
     this.inFrame = false;
     this.consecutiveSync = 0;
     this.frameSkip = 0;
@@ -110,7 +128,7 @@ export class Decoder {
     this.framesSinceExit = 0;
     this.dataFramesExecuted = 0;
     this.expectedTotalBytes = 0;
-    this.peakAmpRef = 0;
+    this.pilotAmplitude = 0;
     this.debugLog = [];
   }
 
@@ -123,48 +141,88 @@ export class Decoder {
     const window = this.buf.slice(0, this.sps);
     this.buf.splice(0, this.sps);
 
-    // Energy at each tone using sin/cos correlation
-    const energies: [number, number, number, number] = [0, 0, 0, 0];
-    let total = 0;
-    for (let t = 0; t < 4; t++) {
-      energies[t] = this.detectEnergy(window, t);
-      total += energies[t];
+    // ── Pilot discovery (runs during leader / before data mode) ──
+    if (!this.pilotDiscovered && !this.inFrame) {
+      const result = this.scanner.feedSample(sample);
+      if (result) {
+        this.pilotDiscovered = true;
+        this.pilotFreq = result.freq;
+        this.pilotAmplitude = result.amplitude;
+        this.toneFreqs = getDataToneFreqs(result.freq);
+        this.pll = new PilotPLL(result.freq, 0, result.amplitude, {
+          sampleRate: this.cfg.sampleRate,
+        });
+        if (this.logging) {
+          console.log(`[PILOT] Discovered: ${result.freq.toFixed(1)} Hz @ amp ${result.amplitude.toExponential(2)} confidence=${result.confidence.toFixed(2)}`);
+          console.log(`[PILOT] Tone freqs: ${this.toneFreqs.map(f => f.toFixed(1)).join(', ')}`);
+        }
+      }
     }
 
+    // Feed every sample to the PLL (for continuous phase tracking)
+    if (this.pll) {
+      this.pll.update(sample);
+      this.pilotAmplitude = this.pll.getAmplitude();
+    }
+
+    // ── Compute pilot-relative I/Q for all 4 data tones ──
+    // Raw I/Q at each tone frequency
+    const rawIQs = this.toneFreqs.map(f => toneIQ(window, f, this.cfg.sampleRate));
+
+    // Rotate by pilot phase to get pilot-relative I'/Q'
+    const relI: [number, number, number, number] = [0, 0, 0, 0];
+    const relQ: [number, number, number, number] = [0, 0, 0, 0];
+    const energies: [number, number, number, number] = [0, 0, 0, 0];
+
+    if (this.pll) {
+      for (let t = 0; t < 4; t++) {
+        const rotated = this.pll.rotateToPilotRef(rawIQs[t].i, rawIQs[t].q);
+        relI[t] = rotated.i;
+        relQ[t] = rotated.q;
+        energies[t] = Math.hypot(rotated.i, rotated.q);
+      }
+    } else {
+      // Fallback: absolute energy (no pilot lock yet)
+      for (let t = 0; t < 4; t++) {
+        relI[t] = rawIQs[t].i;
+        relQ[t] = rawIQs[t].q;
+        energies[t] = Math.hypot(rawIQs[t].i, rawIQs[t].q);
+      }
+    }
+
+    const total = energies.reduce((a, b) => a + b, 0);
     const avg = total / 4;
     const noiseAvg =
       (this.noiseFloor[0] + this.noiseFloor[1] + this.noiseFloor[2] + this.noiseFloor[3]) / 4;
 
     // ── Sync / burst detection ──
-    // If we have a noise floor, require avg > noiseAvg * SYNC_MARGIN
-    // If noise floor is near zero (silence), use absolute threshold
-    // Acoustic path attenuates tone energies to ~1e-8–1e-6 vs 0.25 direct.
-    // Use relative check (2x noise floor) — this adapts to any noise level.
-    // Use auto-calibrated burst threshold based on measured sync peak
     const calibPeak = Math.max(...this.syncPeak);
-    // Calibration only tightens: whichever is lower (noise-based or peak-based).
     const burstThresh = Math.min(noiseAvg * 0.8, Math.max(calibPeak * 0.10, 2e-11));
-    // Sync preamble has ALL 4 tones ON simultaneously — room noise typically has
-    // one dominant frequency. Require all 4 tones above 12% of frame energy.
-    const allFourStrong = total > 1e-12
-      && (energies[0] / total) > 0.08
-      && (energies[1] / total) > 0.08
-      && (energies[2] / total) > 0.08
-      && (energies[3] / total) > 0.08;
+
+    // With pilot-relative detection, use the amplitudeThresholdRatio from config
+    // A tone is ON if its pilot-relative energy > pilotAmplitude * thresholdRatio
+    const ampThresh = this.pilotAmplitude * this.cfg.amplitudeThresholdRatio;
+
+    // Sync: all 4 tones should show strong pilot-relative energy
+    const allFourStrong = this.pll
+      ? (energies[0] > ampThresh * 0.5 &&
+         energies[1] > ampThresh * 0.5 &&
+         energies[2] > ampThresh * 0.5 &&
+         energies[3] > ampThresh * 0.5)
+      : (total > 1e-12 &&
+         (energies[0] / total) > 0.08 &&
+         (energies[1] / total) > 0.08 &&
+         (energies[2] / total) > 0.08 &&
+         (energies[3] / total) > 0.08);
+
     const isBurst = (avg > burstThresh) && allFourStrong;
 
-    // ── Noise profiling (pre-sync) ──
-    // Collect at least 25 noise samples (~1s) before trusting sync detection.
-    // Without forced profiling, the first room-noise frame exceeds the absolute
-    // floor and prevents the noise floor from ever being established.
-    // Once profiling complete, FREEZE the noise floor — do not update it during
-    // payload transmission. Signal energy corrupts the background reference.
+    // ── Noise profiling ──
     if (!this.inFrame) {
       this.framesSinceExit++;
       if (this.noiseFrames < 25) {
         this.noiseFrames++;
-
-        const alpha = this.noiseFrames < 25 ? (1 / this.noiseFrames) : 0.1;
+        const alpha = 1 / this.noiseFrames;
         for (let t = 0; t < 4; t++) {
           this.noiseFloor[t] = this.noiseFloor[t] * (1 - alpha) + energies[t] * alpha;
           if (energies[t] > this.noiseMax[t]) {
@@ -176,20 +234,14 @@ export class Decoder {
       }
     }
 
-    // ── Sync detection ──
+    // ── Sync tracking ──
     const strong = isBurst;
 
-    // Track per-tone peak: only update during sustained bursts (≥3 consecutive),
-    // so isolated room transients don't permanently poison the calibration.
-    // Decay toward noise floor when quiet frames resume.
     if (strong && !this.inFrame && this.consecutiveSync >= 3) {
       for (let t = 0; t < 4; t++) {
-        if (energies[t] > this.syncPeak[t]) {
-          this.syncPeak[t] = energies[t];
-        }
+        if (energies[t] > this.syncPeak[t]) this.syncPeak[t] = energies[t];
       }
     } else if (!strong && !this.inFrame) {
-      // Decay calibration peak toward noise max after 20 quiet frames
       const noiseRef = Math.max(...this.noiseMax) * 2;
       for (let t = 0; t < 4; t++) {
         this.syncPeak[t] = Math.max(this.syncPeak[t] * 0.95, noiseRef);
@@ -203,7 +255,7 @@ export class Decoder {
       if (!this.inFrame) this.frameSkip = 0;
     }
 
-    // Debug log
+    // ── Debug log ──
     if (this.logging) {
       const thresholds: [number, number, number, number] = [0, 0, 0, 0];
       let bitPat = 0;
@@ -213,10 +265,11 @@ export class Decoder {
       }
       const endNoiseAvg = (this.noiseFloor[0] + this.noiseFloor[1] + this.noiseFloor[2] + this.noiseFloor[3]) / 4;
       const snr = endNoiseAvg > 1e-12 ? avg / endNoiseAvg : 999;
-      const bThresh = Math.min(noiseAvg * 0.8, Math.max(Math.max(...this.syncPeak) * 0.10, 2e-11));
       const totalEDbg = energies[0] + energies[1] + energies[2] + energies[3];
       this.debugLog.push({
         peakAmp: Math.max(...window.map(Math.abs)),
+        relI: [...relI],
+        relQ: [...relQ],
         energies,
         avg,
         ratios: totalEDbg > 1e-12
@@ -233,20 +286,18 @@ export class Decoder {
         noiseFrames: this.noiseFrames,
         bitPattern: bitPat,
         signalToNoise: snr,
-        burstThreshold: bThresh,
+        burstThreshold: burstThresh,
         framesSinceStrong: this.framesSinceStrong,
         framesSinceExit: this.framesSinceExit,
         frameSkip: this.frameSkip,
+        pilotFreq: this.pilotFreq,
+        pilotAmp: this.pilotAmplitude,
+        pilotConfidence: this.pilotDiscovered ? 1 : 0,
       });
       if (this.debugLog.length > 200) this.debugLog.shift();
     }
 
-    // ── Enter data mode after sync detected ──
-    // Require 3 consecutive sync frames (matching the sync symbol count) to
-    // enter data mode. A single noisy frame shouldn't trigger it.
-    // Also require noise profiling to be complete (>=25 frames / ~1s).
-    // fastSync bypasses settling-period gate — enter on strong sync pattern
-    // Require 6 of 8 sync symbols (robust wake detection)
+    // ── Enter data mode ──
     const canEnter = this.fastSync
       ? (this.consecutiveSync >= 8 && this.noiseFrames >= 25)
       : (this.consecutiveSync >= 8 && this.noiseFrames >= 25 && (this.framesSinceExit >= 50 || this.consecutiveSync >= 10));
@@ -259,35 +310,28 @@ export class Decoder {
       this.totalBytesEmitted = 0;
       this.lastStrongBits = 0;
       this.framesSinceExit = 0;
-      this.peakAmpRef = 0;
-      // Skip remaining sync symbols. This frame (which triggered sync)
-      // is already consumed by detection and won't contribute to bitCollector.
-      this.frameSkip = Math.max(0, this.cfg.syncSymbols - this.consecutiveSync) + 2; // +2 guard symbols
-      // Round up to even — Hamming codewords span 2 symbols
+      this.frameSkip = Math.max(0, this.cfg.syncSymbols - this.consecutiveSync) + 2;
       if (this.frameSkip % 2 !== 0) this.frameSkip++;
       if (this.logging) {
         console.log("[DEC] SYNC DETECTED — entering data mode", {
+          pilotFreq: this.pilotFreq.toFixed(1),
+          pilotAmp: this.pilotAmplitude.toExponential(2),
+          toneFreqs: this.toneFreqs.map(f => f.toFixed(1)),
           noiseFrames: this.noiseFrames,
           consecutiveSync: this.consecutiveSync,
           frameSkip: this.frameSkip,
-          framesSinceExit: this.framesSinceExit,
           energies: energies.map(e => e.toExponential(2)),
-          avg: avg.toExponential(2),
-          noiseFloor: this.noiseFloor.map(n => n.toExponential(2)),
         });
       }
     }
 
-    // ── Decode bits during data frame ──
+    // ── Decode bits ──
     if (this.inFrame) {
       if (this.frameSkip > 0) {
         this.frameSkip--;
         return;
       }
 
-      // End detection: use tone energy SNR, not raw peak amplitude.
-      // Room noise can have high peakAmp but low tone energy — the modem
-      // signal is only present when tone energies exceed the noise floor.
       const endNoiseAvg = (this.noiseFloor[0] + this.noiseFloor[1] + this.noiseFloor[2] + this.noiseFloor[3]) / 4;
       const signalToNoise = avg / Math.max(endNoiseAvg, 1e-12);
 
@@ -297,37 +341,40 @@ export class Decoder {
         this.framesSinceStrong++;
       }
 
-      // Safety timeouts — prevent infinite noise collection
       this.dataFramesExecuted++;
       if (this.dataFramesExecuted > 150 || this.bitsCollected > 10240) {
-        // Too long in data mode — emit whatever we have and exit
-        if (DEBUG) console.log(`[DEC] data-mode timeout after ${this.dataFramesExecuted}frames / ${this.bitsCollected}bits`);
         this.emitFrame();
         this.inFrame = false;
         return;
       }
 
-      // ── Bit detection — per-tone SNR (compensates for frequency-response imbalance) ──
-      // Each tone is ON if its energy exceeds 4× its own noise floor.
-      // This handles speakers/mics with uneven response across the 4 tones.
+      // ── Pilot-relative bit detection ──
+      // For each tone: 2 bits = [amplitude, phase]
+      // amplitude: 1 if pilot-relative energy > threshold
+      // phase: 1 if relI > 0 (right half-plane), 0 if relI < 0 (left half-plane)
+      const ampThresh = this.pilotAmplitude * this.cfg.amplitudeThresholdRatio;
+
       let frameBits = 0;
       for (let t = 0; t < 4; t++) {
-        const bit = energies[t] > this.noiseFloor[t] * 4 ? 1 : 0;
-        frameBits = (frameBits << 1) | bit;
-        this.bitCollector.push(bit);
-        this.bitsCollected++;
-      }
-      if (this.logging && this.bitsCollected <= 16) {
-        console.log(`[DEC] first data frame: bits=${this.bitsCollected-4}-${this.bitsCollected-1} pat=${frameBits.toString(2).padStart(4,'0')} eng=${energies.map(e=>e.toExponential(2)).join(' ')}`);
+        // Amplitude bit: tone ON if energy > ampThresh
+        const ampBit = energies[t] > ampThresh ? 1 : 0;
+        // Phase bit: sign of relI (BPSK). When tone is OFF, phase is undefined — default 0.
+        const phaseBit = ampBit === 1 && relI[t] > 0 ? 1 : 0;
+
+        this.bitCollector.push(ampBit);
+        this.bitCollector.push(phaseBit);
+        this.bitsCollected += 2;
+        frameBits = (frameBits << 2) | (ampBit << 1) | phaseBit;
       }
 
-      // Track last known-good bit position for noise trimming
+      if (this.logging && this.bitsCollected <= 16) {
+        console.log(`[DEC] first data frame: bits=${this.bitsCollected-8}-${this.bitsCollected-1} pat=${frameBits.toString(2).padStart(8,'0')} eng=${energies.map(e=>e.toExponential(2)).join(' ')} relI=${relI.map(v=>v.toFixed(4)).join(' ')}`);
+      }
+
       if (signalToNoise > 1.3) this.lastStrongBits = this.bitsCollected;
 
-      // Exit after consecutive dead frames — trim noise bits collected during countdown
-      if (this.framesSinceStrong >= 8 && this.bitsCollected >= 4) {
+      if (this.framesSinceStrong >= 8 && this.bitsCollected >= 8) {
         if (this.logging) console.log(`[DEC] end-of-signal after ${this.bitsCollected} bits (SNR=${signalToNoise.toFixed(1)})`);
-        // Trim noise bits: keep only bits collected up to the last strong frame
         if (this.lastStrongBits > 0 && this.lastStrongBits < this.bitCollector.length) {
           this.bitCollector.length = this.lastStrongBits;
           this.bitsCollected = this.lastStrongBits;
@@ -339,36 +386,14 @@ export class Decoder {
     }
   }
 
-  /**
-   * Per-tone adaptive threshold.
-   * Uses running noise floor + a relative floor based on the strongest tone
-   * in this frame — works for both direct loopback (high energy) and acoustic
-   * (low energy) paths.
-   */
-  private bitThreshold(toneIdx: number, maxEnergy: number): number {
-    // Per-frame relative: threshold = 30% of strongest tone in this frame.
-    // Adapts automatically to any signal level — loopback or acoustic.
-    const relThresh = maxEnergy * 0.30;
-
-    // Absolute floor — never go below 1e-11 even in silence
-    const absFloor = 1e-11;
-
-    return Math.max(relThresh, absFloor);
-  }
-
   /** Set expected total byte count for length-based exit (0 = unlimited) */
   setExpectedTotal(n: number) { this.expectedTotalBytes = n; }
 
-  /** Check if any data has been decoded */
-  hasData(): boolean {
-    return this.decodedBytes.length > 0;
-  }
+  hasData(): boolean { return this.decodedBytes.length > 0; }
 
-  /** Flush remaining data and emit any pending frame */
   flush(): Uint8Array {
     let result = new Uint8Array(0);
-    if (this.inFrame && this.bitsCollected >= 4) {
-      // Trim noise bits collected after the last strong frame
+    if (this.inFrame && this.bitsCollected >= 8) {
       if (this.lastStrongBits > 0 && this.lastStrongBits < this.bitCollector.length) {
         this.bitCollector.length = this.lastStrongBits;
         this.bitsCollected = this.lastStrongBits;
@@ -376,7 +401,6 @@ export class Decoder {
       result = this.emitFrame();
       this.inFrame = false;
     }
-    // Also return any bytes accumulated from previous emitFrame calls
     const remaining = this.takeBytes();
     if (remaining.length > 0) {
       const combined = new Uint8Array(result.length + remaining.length);
@@ -387,45 +411,26 @@ export class Decoder {
     return result;
   }
 
-  /** Get all accumulated bytes */
   takeBytes(): Uint8Array {
     const bytes = new Uint8Array(this.decodedBytes);
     this.decodedBytes = [];
     return bytes;
   }
 
-  getProgress(): number {
-    return this.bitsCollected;
-  }
+  getProgress(): number { return this.bitsCollected; }
 
-  /** Current noise floor for each tone (for debug display) */
-  getNoiseFloor(): [number, number, number, number] {
-    return [...this.noiseFloor];
-  }
-
-  /** Current noise max for each tone (for debug display) */
-  getNoiseMax(): [number, number, number, number] {
-    return [...this.noiseMax];
-  }
+  getNoiseFloor(): [number, number, number, number] { return [...this.noiseFloor]; }
+  getNoiseMax(): [number, number, number, number] { return [...this.noiseMax]; }
+  getPilotFreq(): number { return this.pilotFreq; }
+  getPilotAmplitude(): number { return this.pilotAmplitude; }
 
   // ─── private ───────────────────────────────────────
 
-  private detectEnergy(samples: number[], toneIdx: number): number {
-    const freq = TONES[toneIdx];
-    let sinCorr = 0, cosCorr = 0;
-    const n = samples.length;
-    for (let i = 0; i < n; i++) {
-      const phase = 2 * Math.PI * freq * i / this.cfg.sampleRate;
-      sinCorr += samples[i] * Math.sin(phase);
-      cosCorr += samples[i] * Math.cos(phase);
-    }
-    return (sinCorr * sinCorr + cosCorr * cosCorr) / (n * n);
-  }
-
   private emitFrame() {
-    // Hamming(7,4) decode: group bits in 8-bit codewords, correct 1-bit errors.
-    // Leftover bits (<8) are kept in bitCollector for the next emitFrame call
-    // so every emitted byte is on a proper codeword boundary.
+    // Hamming(7,4) decode: group 8-bit pairs into codewords.
+    // Current bit layout: [amp0 phase0 amp1 phase1 amp2 phase2 amp3 phase3] × N symbols
+    // For Hamming(7,4), each 8-bit codeword = 1 nibble of data.
+    // We collect 8 bits at a time (2 symbols × 4 tones).
     let codeword = 0;
     let cwBits = 0;
     let nibbleBuf = 0;
@@ -443,7 +448,6 @@ export class Decoder {
           this.decodedBytes.push((nibbleBuf >> 4) & 0xff);
           this.totalBytesEmitted++;
           if (this.expectedTotalBytes > 0 && this.totalBytesEmitted >= this.expectedTotalBytes) {
-            if (DEBUG) console.log(`[DEC] length exit at ${this.totalBytesEmitted}B`);
             this.inFrame = false;
             break;
           }
@@ -454,7 +458,6 @@ export class Decoder {
         cwBits = 0;
       }
     }
-    // Keep leftover bits for next frame — don't pad/drop them
     this.bitCollector.splice(0, consumed);
     this.bitsCollected = this.bitCollector.length;
 

@@ -51,7 +51,7 @@ import { Decoder } from "../modem/decoder";
 import { AudioPlayer } from "../audio/player";
 import { AudioRecorder } from "../audio/recorder";
 import { Visualizer } from "../modem/visualizer";
-import { DEFAULT_CONFIG } from "../modem/types";
+import { DEFAULT_CONFIG, getDefaultToneFreqs, TONE_COLORS } from "../modem/types";
 import { enumerateDevices, populateSelect } from "../audio/devices";
 import { buildPacket, tryParsePreamble, verifyPayload, preambleSize } from "../protocol";
 
@@ -305,9 +305,8 @@ const debugMicLevelNum = document.getElementById("debugMicLevelNum")!;
 const debugToneRow = document.getElementById("debugToneRow")!;
 const debugDecodeSnr = document.getElementById("debugDecodeSnr")!;
 
-/** Tone frequencies used by the modem (from types.ts) */
-const TONES = [500, 700, 900, 1100] as const;
-const TONE_COLORS = ["#4a9eff", "#ff6b4a", "#5eead4", "#f472b6"];
+/** Tone frequencies used by the modem */
+const TONES = getDefaultToneFreqs();
 
 // ─── State ────────────────────────────────────────────
 let selectedFile: File | null = null;
