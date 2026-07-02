@@ -850,68 +850,147 @@ Putting it all together, the new transmission frame uses self-framing blocks thr
 
 1. **Add React dependencies**
 2. **Update `tsconfig.json`** — add `"jsx": "react-jsx"`
-3. **Enable pilot in encoder** — `pilotAmplitude: 0.125`
-4. **Build `PilotTracker`** — PLL-based pilot phase/amplitude tracking
-5. **Change decoder to pilot-relative** — use PilotTracker for all tone measurements
+3. **Enable pilot in encoder** — `pilotAmplitude: 0.125`  ✅ DONE
+4. **Build `PilotTracker`** — PLL-based pilot phase/amplitude tracking  ✅ DONE (now `pilot.ts`)
+5. **Change decoder to pilot-relative** — use PilotTracker for all tone measurements  ✅ DONE
 
-### Phase B — Squawk System
+### Phase B — Self-Framing Block Protocol
 
-6. **Build `squawk.ts`** — reference pattern generation + decoder processing
-7. **Add squawk injection to encoder** — fixed interval after every N data symbols
-8. **Add squawk processing to decoder** — recalibrate pilot lock, AGC, phase offset
-9. **Demonstrate squawk effect** — debug view shows correction values per squawk
+6. **Define block format** — sentinel (0xE79F), type, length, data, CRC in `types.ts`
+7. **Build `framing.ts`** — block encoder (wraps raw bytes in sentinel+type+len+crc) and bit-level sentinel scanner for decoder
+8. **Build `blockProcessor.ts`** — dispatches decoded blocks by type: config→preamble parser, payload→byte buffer, EOF→flush
+9. **Wire framing into decoder** — replace raw bit collector with FramedBlockDecoder state machine
+10. **Wire framing into encoder** — wrap every logical unit (config, payload chunk) in sentinel+type+len+CRC before ECC
 
-### Phase C — Self-Framing Block Protocol
+### Phase C — Comprehensive Debug & Diagnostics
 
-10. **Define block format** — sentinel (0xE79F), type, length, data, CRC in `types.ts`
-11. **Build `framing.ts`** — block encoder (wraps raw bytes in sentinel+type+len+crc) and block decoder (bit-level sentinel scanner, state machine) in decoder
-12. **Replace raw bit collector** — decoder no longer collects raw bits; instead feeds bits into `FramedBlockDecoder` state machine that emits typed blocks
-13. **Build `blockProcessor.ts`** — dispatches decoded blocks by type: squawk→PilotTracker, config→preamble parser, payload→byte buffer, EOF→flush
-14. **Encoder emits framed blocks** — encoder wraps every logical unit (config, dict, payload chunk) in sentinel+type+len+CRC before ECC encoding
+11. **Build `debugger.ts`** — centralized debug logging system:
+    - **Per-stage pipeline logging**: every encoder/decoder stage emits structured log events
+      - `PILOT_SCAN` — candidate freqs, magnitudes, noise floor, selected freq + confidence
+      - `PILOT_LOCK` — PLL frequency, phase, amplitude, loop filter state
+      - `SYNC_DETECT` — frame energies, consecutive count, burst threshold, all-four-strong check
+      - `BLOCK_SENTINEL` — sentinel match position, block type, length, CRC pass/fail
+      - `BLOCK_PROCESS` — block type dispatch, data length, handler result
+      - `FRAME_BITS` — per-tone relI, relQ, amplitude decision, phase decision, raw bit pattern (8 bits)
+      - `ECC_DECODE` — codeword bits, syndrome, corrected errors, final nibble
+      - `SQUAWK_CAL` — pre/post phase correction, amplitude correction, drift since last
+      - `END_DETECT` — SNR, frames-since-strong, bits trimmed, emit trigger
+    - **Ring buffer**: keeps last N events per stage (configurable, default 500)
+    - **Log levels**: `DEBUG`, `INFO`, `WARN`, `ERROR` — each stage has a minimum level
+    - **Filterable by stage**: e.g. `debugger.enable('SYNC_DETECT')` or `debugger.disable('FRAME_BITS')`
 
-### Phase D — Phase Encoding
+12. **Build `diag.ts`** — diagnostics tools:
+    - **State snapshot**: one-shot dump of full decoder state (all fields, all config, ring buffer tail)
+    - **Timing profiler**: per-stage wall-clock timing (min/max/avg over last N calls)
+    - **BER tracker**: running bit error count (expected vs received) per symbol, per byte, per block
+    - **Constellation sampler**: captures last N I/Q points per tone (for scatter plot data)
 
-15. **Add BPSK modulation to encoder** — 2 bits per tone (amplitude + phase)
-16. **Add phase detection to decoder** — extract phase bit from I/Q rotation
-17. **Update types** — `bitsPerFrame: 8`, squawk config
+13. **Build `compressForLLM.ts`** — compressed output formatter for LLM context:
+    ```
+    Input: Full debug ring buffer (500 events × 50 bytes = ~25KB raw)
+    Output: ~2-3KB structured summary:
+    [PILOT] freq=62.5Hz amp=0.121 conf=0.92 N=1024
+    [SYNC] frames=8/10 strong=t peak_ratio=0.31/0.08/0.16/0.21 burst_thr=2.1e-11
+    [BLK] 3/12 OK crc_fail=0 type_dist={01:2,02:1,04:9,FF:1}
+    [BER] raw=0.023 corr=0.004 total_bits=4096 err_raw=94 err_corr=16
+    [ECC] codewords=512 syndrome_fix=78/512 (15.2%) double_err=2/512 (0.4%)
+    [SQWK] n=4 avg_drift=0.8deg max_drift=2.1deg amp_recovery=0.97x
+    [PLL] phase_std=0.032 amp_std=0.004 lock_quality=0.97
+    ```
+    - Level-based compression:
+      - `brief`: 1 line per stage, key metrics only (~500 bytes)
+      - `normal`: 2-3 lines per stage, includes warnings and anomalies (~2KB)
+      - `verbose`: full ring buffer with filters applied (~5-10KB)
+    - Anomaly highlighting: any value exceeding configurable thresholds gets `⚠️` prefix
+    - Designed for direct paste into LLM context with zero explanation needed
 
-### Phase E — Error Correction
+14. **Wire debugger into all stages**:
+    - `PilotScanner` → `debugger.log('PILOT_SCAN', ...)`
+    - `PilotPLL` → `debugger.log('PILOT_LOCK', ...)`
+    - `Decoder.feedSample()` → `debugger.log('SYNC_DETECT', ...)` and `debugger.log('FRAME_BITS', ...)`
+    - `FramedBlockDecoder` → `debugger.log('BLOCK_SENTINEL', ...)`
+    - `BlockProcessor` → `debugger.log('BLOCK_PROCESS', ...)`
+    - `emitFrame()` → `debugger.log('ECC_DECODE', ...)`
+    - `SquawkProcessor` → `debugger.log('SQUAWK_CAL', ...)`
+    - End detection → `debugger.log('END_DETECT', ...)`
+15. **Wire diagnostics into UI**: "🛠 Debug" area gets:
+    - "📋 Dump State" button → copies full diagnostic snapshot to clipboard
+    - "🤖 Compress for LLM" button → copies compressed summary to clipboard
+    - Level selector: Brief / Normal / Verbose
+    - Stage filter toggles: which stages produce console output
+    - Live BER display in status bar
+16. **Document the compressed format** so LLM analysis prompts can reference the field layout
 
-18. **Build `ecc.ts`** — BCH(31,16) encoder/decoder + interleaver depth 8
-19. **Update encoder/decoder** to use new ECC
-20. **Update frame structure** — guard symbols aligned to codeword boundaries
+### Phase D — Squawk System
 
-### Phase F — Dictionary Compression
+17. **Build `squawk.ts`** — reference pattern generation + decoder processing
+18. **Add squawk injection to encoder** — framed blocks (Type=0x01) at fixed interval
+19. **Add squawk processing to decoder** — recalibrate pilot lock, AGC, phase offset via sentinel-guarded blocks
+20. **Wire squawk events** → `debugger.log('SQUAWK_CAL', ...)` (leveraging Phase C)
+21. **Demonstrate squawk effect** — debug view shows correction values per squawk
 
-21. **Build `dictionary_data.ts`** — static ASCII text dictionary tables
-22. **Build `dictionary.ts`** — compress/decompress functions, file-type detection, dictionary selection
-23. **Update encoder** — compress payload before wrapping in framed blocks
-24. **Update decoder** — decompress after block extraction + CRC verify
-25. **Add adaptive dictionary** — runtime scan + transmit in Type=0x03 blocks (lower priority)
+### Phase E — Robust Self-Test System (Channel Simulator)
 
-### Phase G — Noise & Robustness
+22. **Build `channel.ts`** — acoustic channel simulator:
+    - **AWGN** at configurable SNR (-10 to +40 dB)
+    - **Multi-path / echo**: configurable delay (0-50ms) + attenuation (0-100%)
+    - **Frequency offset** (Doppler): ±0.1-10 Hz shift
+    - **Amplitude modulation**: simulate volume drift (slow sine or ramp)
+    - **Phase noise**: random jitter per sample (configurable stddev)
+    - **Band-limiting**: low-pass filter at configurable cutoff (simulates speaker/mic FR)
+    - **Impulse noise**: random pops/clicks at configurable rate
+23. **Build `testHarness.ts`** — full pipeline test harness:
+    - **Clean mode**: encode → decode (no channel, tests basic pipeline integrity)
+    - **Simulated mode**: encode → channel.simulate(samples, options) → decode
+    - **Batch mode**: sweep SNR -10 to +40 dB, report BER per stage
+    - **All metrics pulled from debugger + diag** (leveraging Phase C ring buffer)
+24. **Wire test harness into UI**: "🧪 Self-Test" dropdown:
+    - "Clean Loopback" | "Noisy SNR=5dB" | "Noisy SNR=15dB"
+    - "Multi-path (20ms echo)" | "Doppler +3Hz"
+    - "Sweep SNR → BER plot" | "Full Stress (all effects)"
+25. **Self-test result display** — React panel:
+    - Pass/fail, BER (raw+corrected), pilot confidence, sync time
+    - Constellation scatter plot, bit error map, timing breakdown
+    - **Compressed LLM summary inline** (leveraging Phase C's compressForLLM)
 
-26. **Build `noise.ts`** — spectral subtractor, AGC based on pilot amplitude
-27. **Integrate noise canceller** into decoder pipeline
-28. **Adaptive fallback** — if high BER, drop to amplitude-only mode (4 bits/sym)
+### Phase F — Error Correction
 
-### Phase H — React Debug UI (Floating Windows)
+21. **Build `ecc.ts`** — BCH(31,16) encoder/decoder + interleaver depth 8
+22. **Wire ECC events** → `debugger.log('ECC_DECODE', ...)` (leveraging Phase C)
+23. **Update encoder/decoder** to use new ECC through framed blocks
+24. **Update frame structure** — guard symbols aligned to codeword boundaries
 
-29. **Build `FloatingWindow` React component** — draggable, resizable, closeable window shell (portaled, z-index managed, mouse-drag header, resize handle)
-30. **Create React mount** + root component with window manager
-31. **Build hooks** — `useDecoderState`, `useAudioStream`
-32. **Build canvas components** — `ScatterCanvas`, `SpectrumCanvas`
-33. **Build all panels as FloatingWindow children** — constellation, FFT, band breakdown, bit stream, decoder state, squawk history
-34. **Wire broadcast worker** to emit all debug data (including block decode status, sentinel scan state)
-35. **Wire debug toggle** — Ctrl+Shift+D opens the floating window manager (replacing old debug panel toggle, or alongside it)
+### Phase G — Dictionary Compression
 
-### Phase I — Polish & Integration
+25. **Build `dictionary_data.ts`** — static ASCII text dictionary tables
+26. **Build `dictionary.ts`** — compress/decompress functions, file-type detection, dictionary selection
+27. **Update encoder** — compress payload before wrapping in framed blocks
+28. **Update decoder** — decompress after block extraction + CRC verify
+29. **Add adaptive dictionary** — runtime scan + transmit in Type=0x03 blocks (lower priority)
 
-35. **Update `index.html`** — add mount point, update debug panel structure
-36. **Update `app.ts`** — pipe decoder state to React, handle debug toggle
-37. **Self-test update** — verify loopback with squawks, BCH, dictionary, framed blocks
-38. **Acoustic path tuning** — tune PLL bandwidth, squawk interval, AGC response
-39. **Console logging** — comprehensive per-stage debug output
+### Phase H — Noise Cancellation
+
+30. **Build `noise.ts`** — spectral subtractor, AGC based on pilot amplitude
+31. **Integrate noise canceller** into decoder pipeline (test via channel simulator in Phase E)
+32. **Adaptive fallback** — if high BER, drop to amplitude-only mode (4 bits/sym)
+
+### Phase I — React Debug UI (Floating Windows)
+
+33. **Build `FloatingWindow` React component** — draggable, resizable, closeable window shell (portaled, z-index managed, mouse-drag header, resize handle)
+34. **Create React mount** + root component with window manager
+35. **Build hooks** — `useDecoderState`, `useAudioStream`
+36. **Build canvas components** — `ScatterCanvas`, `SpectrumCanvas`
+37. **Build all panels as FloatingWindow children** — constellation, FFT, band breakdown, bit stream, decoder state, squawk history, self-test results, diagnostics log, LLM compress output
+38. **Wire broadcast worker** to emit all debug data (including block decode status, sentinel scan state, constellation I/Q)
+39. **Wire debug toggle** — Ctrl+Shift+D opens the floating window manager
+
+### Phase J — Polish & Integration
+
+40. **Update `index.html`** — add mount point, update debug panel structure
+41. **Update `app.ts`** — pipe decoder state to React, handle debug toggle, wire test harness
+42. **Acoustic path tuning** — tune PLL bandwidth, squawk interval, AGC response using channel simulator
+43. **Console logging** — comprehensive per-stage debug output via new debugger system
+42. **Console logging** — comprehensive per-stage debug output
 
 ---
 
