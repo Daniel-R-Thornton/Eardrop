@@ -14,9 +14,10 @@
  * Falls back to absolute-energy detection if pilot discovery fails.
  */
 
-import { ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG } from "./types";
+import { ModemConfig, DEFAULT_CONFIG } from "./types";
 import { PilotScanner, PilotPLL, toneIQ, getDataToneFreqs } from "./pilot";
-import { hammingDecode } from "../hamming";
+import { FramedBlockDecoder } from "./framing";
+import { BlockProcessor } from "./blockProcessor";
 
 export interface DecoderDebugInfo {
   peakAmp: number;
@@ -72,24 +73,21 @@ export class Decoder {
   private inFrame = false;
   private consecutiveSync = 0;
   private frameSkip = 0;
-  private bitCollector: number[] = [];
-  private bitsCollected = 0;
+
+  // ── Framed block decoder (replaces old bitCollector) ──
+  public framedDecoder: FramedBlockDecoder;
+  public blockProcessor: BlockProcessor;
 
   // Noise profiling
   private noiseFloor: [number, number, number, number] = [0, 0, 0, 0];
   private noiseMax: [number, number, number, number] = [0, 0, 0, 0];
   private noiseFrames = 0;
 
-  // Accumulated decoded bytes
-  private decodedBytes: number[] = [];
-
   // End detection
   private framesSinceStrong = 0;
-  private lastStrongBits = 0;
+  private lastStrongBitsCollected = 0;
   private framesSinceExit = 0;
   private dataFramesExecuted = 0;
-  private expectedTotalBytes = 0;
-  private totalBytesEmitted = 0;
   private syncPeak: [number, number, number, number] = [2e-10, 2e-10, 2e-10, 2e-10];
 
   // Debug
@@ -98,12 +96,35 @@ export class Decoder {
   /** Bypass noise profiling — pre-fills noise floor so decoder is ready instantly */
   public fastSync = false;
 
+  /** Callback for complete file reception (from BlockProcessor) */
   onFrame: ((data: Uint8Array) => void) | null = null;
 
   constructor(cfg: Partial<ModemConfig> = {}) {
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
     this.sps = this.cfg.sampleRate / this.cfg.symbolsPerSec;
-    this.scanner = new PilotScanner({ sampleRate: this.cfg.sampleRate, sps: this.sps });
+    this.scanner = new PilotScanner({ sampleRate: this.cfg.sampleRate });
+
+    this.framedDecoder = new FramedBlockDecoder();
+    this.blockProcessor = new BlockProcessor({
+      onFileComplete: (file) => {
+        if (this.logging) {
+          console.log(`[BLK] File complete: "${file.name}" ${file.data.length}B`);
+        }
+        if (this.onFrame) {
+          this.onFrame(file.data);
+        }
+      },
+      onPayloadProgress: (soFar, total) => {
+        // Progress is tracked via blockProcessor stats; no callback needed here
+      },
+    });
+
+    this.framedDecoder.onBlock = (event) => {
+      const summary = this.blockProcessor.processBlock(event.type, event.data);
+      if (this.logging && this.blockProcessor.stats.blocksReceived <= 5) {
+        console.log(`[BLK] ${summary}`);
+      }
+    };
   }
 
   reset() {
@@ -116,20 +137,18 @@ export class Decoder {
     this.inFrame = false;
     this.consecutiveSync = 0;
     this.frameSkip = 0;
-    this.bitCollector = [];
-    this.bitsCollected = 0;
     this.noiseFloor = [3e-10, 3e-10, 3e-10, 3e-10];
     this.noiseMax = [3e-10, 3e-10, 3e-10, 3e-10];
     this.noiseFrames = this.fastSync ? 25 : 0;
-    this.decodedBytes = [];
     this.framesSinceStrong = 0;
-    this.lastStrongBits = 0;
+    this.lastStrongBitsCollected = 0;
     this.syncPeak = [2e-10, 2e-10, 2e-10, 2e-10];
     this.framesSinceExit = 0;
     this.dataFramesExecuted = 0;
-    this.expectedTotalBytes = 0;
     this.pilotAmplitude = 0;
     this.debugLog = [];
+    this.framedDecoder.reset();
+    this.blockProcessor.reset();
   }
 
   /** Feed one audio sample */
@@ -266,6 +285,7 @@ export class Decoder {
       const endNoiseAvg = (this.noiseFloor[0] + this.noiseFloor[1] + this.noiseFloor[2] + this.noiseFloor[3]) / 4;
       const snr = endNoiseAvg > 1e-12 ? avg / endNoiseAvg : 999;
       const totalEDbg = energies[0] + energies[1] + energies[2] + energies[3];
+      const totalBits = this.framedDecoder.totalBits;
       this.debugLog.push({
         peakAmp: Math.max(...window.map(Math.abs)),
         relI: [...relI],
@@ -279,7 +299,7 @@ export class Decoder {
         strong,
         consecutiveSync: this.consecutiveSync,
         inFrame: this.inFrame,
-        bitsCollected: this.bitsCollected,
+        bitsCollected: totalBits,
         noiseFloor: [...this.noiseFloor],
         noiseMax: [...this.noiseMax],
         thresholds,
@@ -303,13 +323,12 @@ export class Decoder {
       : (this.consecutiveSync >= 8 && this.noiseFrames >= 25 && (this.framesSinceExit >= 50 || this.consecutiveSync >= 10));
     if (canEnter && !this.inFrame) {
       this.inFrame = true;
-      this.bitCollector = [];
-      this.bitsCollected = 0;
       this.framesSinceStrong = 0;
       this.dataFramesExecuted = 0;
-      this.totalBytesEmitted = 0;
-      this.lastStrongBits = 0;
+      this.lastStrongBitsCollected = 0;
       this.framesSinceExit = 0;
+      this.framedDecoder.reset();
+      this.blockProcessor.reset();
       this.frameSkip = Math.max(0, this.cfg.syncSymbols - this.consecutiveSync) + 2;
       if (this.frameSkip % 2 !== 0) this.frameSkip++;
       if (this.logging) {
@@ -342,8 +361,7 @@ export class Decoder {
       }
 
       this.dataFramesExecuted++;
-      if (this.dataFramesExecuted > 150 || this.bitsCollected > 10240) {
-        this.emitFrame();
+      if (this.dataFramesExecuted > 150 || this.framedDecoder.totalBits > 10240) {
         this.inFrame = false;
         return;
       }
@@ -356,30 +374,24 @@ export class Decoder {
 
       let frameBits = 0;
       for (let t = 0; t < 4; t++) {
-        // Amplitude bit: tone ON if energy > ampThresh
         const ampBit = energies[t] > ampThresh ? 1 : 0;
-        // Phase bit: sign of relI (BPSK). When tone is OFF, phase is undefined — default 0.
         const phaseBit = ampBit === 1 && relI[t] > 0 ? 1 : 0;
-
-        this.bitCollector.push(ampBit);
-        this.bitCollector.push(phaseBit);
-        this.bitsCollected += 2;
         frameBits = (frameBits << 2) | (ampBit << 1) | phaseBit;
       }
 
-      if (this.logging && this.bitsCollected <= 16) {
-        console.log(`[DEC] first data frame: bits=${this.bitsCollected-8}-${this.bitsCollected-1} pat=${frameBits.toString(2).padStart(8,'0')} eng=${energies.map(e=>e.toExponential(2)).join(' ')} relI=${relI.map(v=>v.toFixed(4)).join(' ')}`);
+      // Feed the 8-bit frame pattern to the framed block decoder
+      this.framedDecoder.feedSymbol(frameBits, 8);
+      const totalBits = this.framedDecoder.totalBits;
+      this.lastStrongBitsCollected = totalBits;
+
+      if (this.logging && totalBits <= 16) {
+        console.log(`[DEC] first data frames: totalBits=${totalBits} pat=${frameBits.toString(2).padStart(8,'0')} eng=${energies.map(e=>e.toExponential(2)).join(' ')} relI=${relI.map(v=>v.toFixed(4)).join(' ')}`);
       }
 
-      if (signalToNoise > 1.3) this.lastStrongBits = this.bitsCollected;
+      if (signalToNoise > 1.3) this.lastStrongBitsCollected = totalBits;
 
-      if (this.framesSinceStrong >= 8 && this.bitsCollected >= 8) {
-        if (this.logging) console.log(`[DEC] end-of-signal after ${this.bitsCollected} bits (SNR=${signalToNoise.toFixed(1)})`);
-        if (this.lastStrongBits > 0 && this.lastStrongBits < this.bitCollector.length) {
-          this.bitCollector.length = this.lastStrongBits;
-          this.bitsCollected = this.lastStrongBits;
-        }
-        this.emitFrame();
+      if (this.framesSinceStrong >= 8 && totalBits >= 16) {
+        if (this.logging) console.log(`[DEC] end-of-signal after ${totalBits} bits (SNR=${signalToNoise.toFixed(1)})`);
         this.inFrame = false;
         return;
       }
@@ -387,37 +399,29 @@ export class Decoder {
   }
 
   /** Set expected total byte count for length-based exit (0 = unlimited) */
-  setExpectedTotal(n: number) { this.expectedTotalBytes = n; }
+  setExpectedTotal(n: number) {
+    // Handled by BlockProcessor's Config block parsing
+  }
 
-  hasData(): boolean { return this.decodedBytes.length > 0; }
+  hasData(): boolean {
+    return this.blockProcessor.getProgress() !== null;
+  }
 
   flush(): Uint8Array {
-    let result = new Uint8Array(0);
-    if (this.inFrame && this.bitsCollected >= 8) {
-      if (this.lastStrongBits > 0 && this.lastStrongBits < this.bitCollector.length) {
-        this.bitCollector.length = this.lastStrongBits;
-        this.bitsCollected = this.lastStrongBits;
-      }
-      result = this.emitFrame();
-      this.inFrame = false;
-    }
-    const remaining = this.takeBytes();
-    if (remaining.length > 0) {
-      const combined = new Uint8Array(result.length + remaining.length);
-      combined.set(result, 0);
-      combined.set(remaining, result.length);
-      return combined;
-    }
-    return result;
+    // With framing, data is emitted via onFileComplete callback.
+    // flush() is a no-op for the framing path.
+    return new Uint8Array(0);
   }
 
   takeBytes(): Uint8Array {
-    const bytes = new Uint8Array(this.decodedBytes);
-    this.decodedBytes = [];
-    return bytes;
+    return new Uint8Array(0);
   }
 
-  getProgress(): number { return this.bitsCollected; }
+  getProgress(): number {
+    const prog = this.blockProcessor.getProgress();
+    if (prog) return prog.bytesSoFar;
+    return this.framedDecoder.totalBits;
+  }
 
   getNoiseFloor(): [number, number, number, number] { return [...this.noiseFloor]; }
   getNoiseMax(): [number, number, number, number] { return [...this.noiseMax]; }
@@ -426,44 +430,4 @@ export class Decoder {
 
   // ─── private ───────────────────────────────────────
 
-  private emitFrame() {
-    // Hamming(7,4) decode: group 8-bit pairs into codewords.
-    // Current bit layout: [amp0 phase0 amp1 phase1 amp2 phase2 amp3 phase3] × N symbols
-    // For Hamming(7,4), each 8-bit codeword = 1 nibble of data.
-    // We collect 8 bits at a time (2 symbols × 4 tones).
-    let codeword = 0;
-    let cwBits = 0;
-    let nibbleBuf = 0;
-    let nibbleBits = 0;
-    let consumed = 0;
-    for (const b of this.bitCollector) {
-      codeword = (codeword << 1) | (b & 1);
-      cwBits++;
-      consumed++;
-      if (cwBits >= 8) {
-        const nibble = hammingDecode(codeword);
-        nibbleBuf = (nibbleBuf << 4) | (nibble & 0xf);
-        nibbleBits += 4;
-        if (nibbleBits >= 8) {
-          this.decodedBytes.push((nibbleBuf >> 4) & 0xff);
-          this.totalBytesEmitted++;
-          if (this.expectedTotalBytes > 0 && this.totalBytesEmitted >= this.expectedTotalBytes) {
-            this.inFrame = false;
-            break;
-          }
-          nibbleBits -= 8;
-          nibbleBuf &= 0xf;
-        }
-        codeword = 0;
-        cwBits = 0;
-      }
-    }
-    this.bitCollector.splice(0, consumed);
-    this.bitsCollected = this.bitCollector.length;
-
-    const data = new Uint8Array(this.decodedBytes);
-    this.decodedBytes = [];
-    if (this.onFrame) this.onFrame(data);
-    return data;
-  }
 }
