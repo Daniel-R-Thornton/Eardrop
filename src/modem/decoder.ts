@@ -205,6 +205,7 @@ export class Decoder {
       this.scanner.learnNoise(sample, 1024);
     }
     this.samplesSeen++;
+    this.scanner.feedSampleRT(sample);
     this.buf.push(sample);
     if (this.buf.length < this.sps) return;
 

@@ -69,6 +69,9 @@ export class PilotScanner {
   private done = false;
   private result: PilotDiscovery | null = null;
   private lastFftAt = 0;
+  private scanCounter = 0;
+  /** Real-time ring buffer — captures EVERY sample directly, no frame delay */
+  private rtBuf: number[] = [];
   /** Noise floor spectrum — learned during silent first ~1s, subtracted to reject room hum */
   private noiseBuf: number[] = [];
   private noiseSpectrum: Float64Array | null = null;
@@ -99,17 +102,18 @@ export class PilotScanner {
 
   hasNoiseProfile(): boolean { return this.noiseLearned; }
 
+  /** Feed every sample in real time — called from decoder.feedSample BEFORE frame buffering */
+  feedSampleRT(sample: number): void {
+    this.rtBuf.push(sample);
+    if (this.rtBuf.length > 1024) this.rtBuf.shift();
+  }
+
   feedSample(sample: number): PilotDiscovery | null {
     if (this.done) return this.result;
-    this.buf.push(sample);
-    // Keep a sliding window of recent samples
-    if (this.buf.length > 2048) {
-      this.buf.splice(0, this.buf.length - 1024);
-    }
-    // Use Goertzel on the most recent ~512 samples at target frequency ± tolerance
-    if (this.buf.length >= 512 && this.buf.length >= this.lastFftAt + 256) {
-      this.lastFftAt = this.buf.length;
-      const win = this.buf.slice(-512);
+    this.scanCounter++;
+    // Scan every 4th call (~512 samples) using the RT ring buffer
+    if (this.scanCounter % 4 !== 0 || this.rtBuf.length < 512) return null;
+    const win = this.rtBuf.slice(-512);
       const { sampleRate, targetFreq, freqTolerance = 30, minSignalRatio } = this.cfg;
       console.warn(`[SCAN] Goertzel scan: ${win.length}samp target=${targetFreq}Hz`);
 
@@ -162,7 +166,8 @@ export class PilotScanner {
   getResult(): PilotDiscovery | null { return this.result; }
 
   reset() {
-    this.buf = []; this.done = false; this.result = null; this.lastFftAt = 0;
+    this.rtBuf = []; this.buf = []; this.done = false; this.result = null;
+    this.lastFftAt = 0; this.scanCounter = 0;
     this.noiseBuf = []; this.noiseSpectrum = null; this.noiseLearned = false;
   }
 }
