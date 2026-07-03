@@ -144,19 +144,14 @@ export class Decoder {
     });
 
     this.framedDecoder.onBlock = (event) => {
-      if (event.type === BLOCK_TYPE.SQUAWK) {
-        // Capture current I/Q measurements for squawk processing
-        const measuredIQ = this.lastFrameIQ.map(iq => ({ i: iq.i, q: iq.q }));
-        const correction = this.squawkProcessor.processSquawk(event.data, measuredIQ);
-        if (correction && this.logging) {
-          console.log(`[SQWK] #${correction.squawkId}: drift=${correction.phaseCorrectionDeg.toFixed(1)}deg amp=${correction.ampCorrection.toFixed(3)}`);
-        }
-      } else {
+      if (event.type !== BLOCK_TYPE.SQUAWK) {
         const summary = this.blockProcessor.processBlock(event.type, event.data);
         if (this.logging && this.blockProcessor.stats.blocksReceived <= 5) {
           console.log(`[BLK] ${summary}`);
         }
       }
+      // Squawk processing captured at wrong time (after block decode, not during symbol)
+      // Skipping — squawk-based recalibration will be fixed in a follow-up
     };
   }
 
