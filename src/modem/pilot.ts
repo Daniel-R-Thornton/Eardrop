@@ -83,7 +83,7 @@ export interface PilotScannerConfig {
 }
 
 const DEFAULT_SCANNER_CONFIG: PilotScannerConfig = {
-  scanRange: [30, 500],
+  scanRange: [30, 310],
   sampleRate: 3200,
   fftSize: 2048,
   minSamples: 1024,
