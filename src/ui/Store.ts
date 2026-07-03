@@ -50,6 +50,8 @@ export interface AppState {
   toneEnergies: number[];
   /** User-configurable pilot frequency */
   pilotFreqHz: number;
+  /** Acoustic sweep test results */
+  sweepResults: Array<{ freq: number; energy: number }> | null;
 }
 
 const defaultDecoder: DecoderInfo = {
@@ -78,6 +80,7 @@ const defaultState: AppState = {
   micLevel: -80,
   toneEnergies: [0, 0, 0, 0],
   pilotFreqHz: 237.5,
+  sweepResults: null,
 };
 
 // ─── Store ────────────────────────────────────────────

@@ -341,15 +341,96 @@ export function MainApp() {
 
           {/* ── DIAGNOSTICS + LLM COMPRESS ── */}
           <Section title="🧪 Diagnostics & LLM Output" color="#eab308">
-            <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
-              <button onClick={() => dispatch("eardrop-self-test")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#e0e0ee", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>🧪 Self-Test</button>
-              <button onClick={() => dispatch("eardrop-send-test")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#e0e0ee", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>📤 Send Test</button>
+            <div style={{ display: "flex", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
+              <button onClick={() => dispatch("eardrop-self-test")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#e0e0ee", cursor: "pointer", fontSize: 11, fontWeight: 600, minWidth: 80 }}>🧪 Self-Test</button>
+              <button onClick={() => dispatch("eardrop-send-test")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#e0e0ee", cursor: "pointer", fontSize: 11, fontWeight: 600, minWidth: 80 }}>📤 Send Test</button>
+              <button onClick={() => dispatch("eardrop-acoustic-sweep")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#f472b6", cursor: "pointer", fontSize: 11, fontWeight: 600, minWidth: 80 }}>🔊 Acoustic Sweep</button>
             </div>
             <div id="selfTestResult" style={{ fontSize: 10, color: "#7878a0", fontFamily: "monospace", minHeight: 14, marginBottom: 6 }} />
+
+            {/* Sweep results graph */}
+            <SweepGraph results={s.sweepResults} />
 
             <DebugOutput />
           </Section>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// SWEEP RESULTS GRAPH
+// ═══════════════════════════════════════════════════════
+
+function SweepGraph({ results }: { results: Array<{ freq: number; energy: number }> | null }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const c = ref.current;
+    if (!c || !results || results.length === 0) return;
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+
+    const w = c.width, h = c.height;
+    const pad = { t: 12, r: 8, b: 20, l: 36 };
+    const pw = w - pad.l - pad.r, ph = h - pad.t - pad.b;
+
+    ctx.fillStyle = "#07070e";
+    ctx.fillRect(0, 0, w, h);
+
+    const maxE = Math.max(...results.map(r => r.energy), 1e-12);
+    const minF = results[0].freq, maxF = results[results.length - 1].freq;
+
+    // Grid
+    ctx.strokeStyle = "#1a1a2a";
+    ctx.lineWidth = 0.5;
+    for (let i = 0; i <= 4; i++) {
+      const y = pad.t + (i / 4) * ph;
+      ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(w - pad.r, y); ctx.stroke();
+    }
+
+    // Y-axis labels (dB)
+    ctx.fillStyle = "#5858a0";
+    ctx.font = "8px monospace";
+    ctx.textAlign = "right";
+    for (let i = 0; i <= 4; i++) {
+      const db = (1 - i / 4) * 60 - 20; // -20 to -80 dB
+      ctx.fillText(`${db.toFixed(0)}dB`, pad.l - 2, pad.t + (i / 4) * ph + 3);
+    }
+
+    // Plot line
+    ctx.strokeStyle = "#f472b6";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < results.length; i++) {
+      const x = pad.l + ((results[i].freq - minF) / (maxF - minF)) * pw;
+      const db = results[i].energy > 1e-12 ? 20 * Math.log10(results[i].energy) : -80;
+      const y = pad.t + (1 - Math.min(1, Math.max(0, (db + 80) / 60))) * ph;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Axis labels
+    ctx.fillStyle = "#5858a0";
+    ctx.font = "8px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText("Frequency (Hz)", w / 2, h - 2);
+    // X-axis ticks (every 200 Hz)
+    for (let f = 200; f <= 1400; f += 200) {
+      const x = pad.l + ((f - minF) / (maxF - minF)) * pw;
+      ctx.fillText(`${f}`, x, h - pad.b + 10);
+    }
+  }, [results]);
+
+  if (!results || results.length === 0) return null;
+
+  return (
+    <div style={{ marginBottom: 6 }}>
+      <canvas ref={ref} width={400} height={110} style={{ width: "100%", height: 110, borderRadius: 4, background: "#07070e" }} />
+      <div style={{ fontSize: 9, color: "#5858a0", marginTop: 2, display: "flex", justifyContent: "space-between" }}>
+        <span>Peak: {(Math.max(...results.map(r => r.energy))).toExponential(2)}</span>
+        <span>Freqs: {results.length}</span>
       </div>
     </div>
   );

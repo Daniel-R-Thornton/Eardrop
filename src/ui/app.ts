@@ -276,6 +276,57 @@ window.addEventListener("eardrop-send-test", (async () => {
   }
 }) as EventListener);
 
+// Acoustic sweep
+window.addEventListener("eardrop-acoustic-sweep", (async () => {
+  setState({ sendStatus: { type: "info", msg: "🔊 Sweep — playing tones…" }, sweepResults: null });
+  if (!isListening) await startListening();
+  await new Promise(r => setTimeout(r, 300));
+
+  const modemRate = DEFAULT_CONFIG.sampleRate;
+  const outputRate = player.getSampleRate();
+  const sweepFreqs: number[] = [];
+  for (let f = 50; f <= 1550; f += 25) sweepFreqs.push(f);
+
+  const results: Array<{ freq: number; energy: number }> = [];
+  const toneSamples = Math.floor(modemRate * 0.15);
+  const measureDelay = 80;
+
+  for (let fi = 0; fi < sweepFreqs.length; fi++) {
+    const freq = sweepFreqs[fi];
+    const tone = new Float32Array(toneSamples);
+    for (let i = 0; i < toneSamples; i++) {
+      tone[i] = Math.sin(2 * Math.PI * freq * i / modemRate) * 0.8;
+    }
+    const playBuf = resampleAudio(tone, modemRate, outputRate);
+    const recvCount = recvSamples.length;
+    await player.play(playBuf, outputRate, selectedOutputId || undefined);
+    await new Promise(r => setTimeout(r, measureDelay));
+
+    const newSamples = recvSamples.slice(recvCount);
+    const measureLen = Math.min(256, newSamples.length);
+    if (measureLen >= 64) {
+      const buf = newSamples.slice(newSamples.length - measureLen);
+      results.push({ freq, energy: detectToneEnergy(buf, freq, modemRate) });
+    } else {
+      results.push({ freq, energy: 0 });
+    }
+    if (fi % 10 === 0) setState({ sendStatus: { type: "info", msg: `🔊 Sweep ${fi}/${sweepFreqs.length} — ${freq}Hz` } });
+  }
+  setState({ sweepResults: results, sendStatus: { type: "success", msg: `✅ Sweep done — ${results.length} freqs` } });
+}) as EventListener);
+
+function resampleAudio(input: Float32Array, inRate: number, outRate: number): Float32Array {
+  if (inRate === outRate) return input;
+  const ratio = inRate / outRate;
+  const out = new Float32Array(Math.ceil(input.length / ratio));
+  for (let i = 0; i < out.length; i++) {
+    const pos = i * ratio, idx = Math.floor(pos), frac = pos - idx;
+    const a = input[idx] ?? 0, b = input[Math.min(idx + 1, input.length - 1)] ?? 0;
+    out[i] = a + (b - a) * frac;
+  }
+  return out;
+}
+
 // ─── Receive ──────────────────────────────────────────
 
 let recorder: AudioRecorder | null = null;
