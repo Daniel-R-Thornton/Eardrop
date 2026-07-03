@@ -212,7 +212,10 @@ export class Decoder {
         this.pilotDiscovered = true;
         this.pilotFreq = result.freq;
         this.pilotAmplitude = result.amplitude;
-        this.toneFreqs = getDataToneFreqs(result.freq);
+        // Compute sample-rate correction from discovered vs expected pilot
+        // This handles hardware sample rate mismatches (e.g., 45600 vs 48000 Hz)
+        const correction = this.cfg.pilotFreqHz > 0 ? result.freq / this.cfg.pilotFreqHz : 1.0;
+        this.toneFreqs = getDataToneFreqs(this.cfg.pilotFreqHz).map(f => f * correction) as [number, number, number, number];
         this.pll = new PilotPLL(result.freq, 0, result.amplitude, {
           sampleRate: this.cfg.sampleRate,
         });
