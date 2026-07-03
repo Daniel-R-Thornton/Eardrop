@@ -200,7 +200,7 @@ export class Decoder {
   feedSample(sample: number) {
     // Learn noise spectrum during the first ~1s (before audio plays)
     if (!this.inFrame && this.noiseFrames < 25) {
-      this.scanner.learnNoise(sample, 3200);
+      this.scanner.learnNoise(sample, 1024);
     }
     this.buf.push(sample);
     if (this.buf.length < this.sps) return;

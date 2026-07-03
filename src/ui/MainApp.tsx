@@ -136,6 +136,12 @@ export function MainApp() {
               style={{ width: "100%", marginTop: 8, padding: "8px 16px", border: "none", borderRadius: 6, fontSize: 14, fontWeight: 600, cursor: "pointer", background: s.selectedFile ? "#6c6cff" : "#1e1e3a", color: s.selectedFile ? "#fff" : "#555" }}>
               {s.isSending ? "⏳ Sending…" : "📡 Send as Audio"}
             </button>
+            {s.isPlaying && (
+              <button onClick={() => dispatch("eardrop-stop-playback")}
+                style={{ width: "100%", marginTop: 4, padding: "6px 12px", border: "none", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: "pointer", background: "#ff4466", color: "#fff" }}>
+                ⏹ Stop Playback
+              </button>
+            )}
             {s.sendStatus && <StatusBadge {...s.sendStatus} />}
             {/* Self-test + Send Test buttons */}
             <div style={{ display: "flex", gap: 6, marginTop: 8 }}>

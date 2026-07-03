@@ -224,10 +224,12 @@ window.addEventListener("eardrop-send", (async () => {
     const outputRate = player.getSampleRate();
     const { samples: playSamples } = await encodeToOutputRateInWorker(packet, outputRate, cfg);
     setState({ sendStatus: { type: "info", msg: `Playing ${selectedFile.name}…` } });
-    await player.play(playSamples, outputRate, selectedOutputId || undefined);
-    setState({ isSending: false, sendStatus: { type: "success", msg: `✅ Sent ${selectedFile.name}` } });
+    setState({ isPlaying: true });
+    const cleanPlay = getState().musicalMode;
+    await player.play(playSamples, outputRate, selectedOutputId || undefined, cleanPlay);
+    setState({ isSending: false, isPlaying: false, sendStatus: { type: "success", msg: `✅ Sent ${selectedFile.name}` } });
   } catch (err: any) {
-    setState({ isSending: false, sendStatus: { type: "error", msg: `❌ ${err.message}` } });
+    setState({ isSending: false, isPlaying: false, sendStatus: { type: "error", msg: `❌ ${err.message}` } });
   }
 }) as EventListener);
 
@@ -269,11 +271,17 @@ window.addEventListener("eardrop-send-test", (async () => {
     const cfg: any = { pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz, musical: getState().musicalMode };
     const outputRate = player.getSampleRate();
     const { samples: playSamples } = await encodeToOutputRateInWorker(packet, outputRate, cfg);
-    await player.play(playSamples, outputRate, selectedOutputId || undefined);
+    await player.play(playSamples, outputRate, selectedOutputId || undefined, getState().musicalMode);
     setState({ sendStatus: { type: "success", msg: "✅ Test sent" } });
   } catch (err: any) {
     setState({ sendStatus: { type: "error", msg: `❌ ${err.message}` } });
   }
+}) as EventListener);
+
+// Stop playback
+window.addEventListener("eardrop-stop-playback", (() => {
+  player.stopPlayback();
+  setState({ isSending: false, isPlaying: false, sendStatus: { type: "info", msg: "⏹ Playback stopped" } });
 }) as EventListener);
 
 // Live threshold adjustment — forward to broadcast worker
@@ -313,7 +321,7 @@ window.addEventListener("eardrop-acoustic-sweep", (async () => {
     }
     const playBuf = resampleAudio(tone, modemRate, outputRate);
     const recvCount = recvSamples.length;
-    await player.play(playBuf, outputRate, selectedOutputId || undefined);
+    await player.play(playBuf, outputRate, selectedOutputId || undefined, getState().musicalMode);
     await new Promise(r => setTimeout(r, 50));
 
     const newSamples = recvSamples.slice(recvCount);

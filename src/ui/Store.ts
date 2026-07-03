@@ -37,6 +37,7 @@ export interface AppState {
   recvStatus: { type: string; msg: string } | null;
   isListening: boolean;
   isSending: boolean;
+  isPlaying: boolean;
   selectedFile: { name: string; size: number } | null;
   receivedFiles: Array<{ name: string; url: string; size: number }>;
   progress: number; // 0-100
@@ -74,6 +75,7 @@ const defaultState: AppState = {
   recvStatus: null,
   isListening: false,
   isSending: false,
+  isPlaying: false,
   selectedFile: null,
   receivedFiles: [],
   progress: 0,
