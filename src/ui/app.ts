@@ -498,6 +498,22 @@ async function startListening() {
       const energies = TONES.map(f => detectToneEnergy(buf, f, modemRate));
       setState({ micLevel: rmsDb, toneEnergies: energies });
 
+      // Main-thread FFT diagnostic (every 20 ticks = ~2s)
+      if (tickCount % 20 === 0 && buf.length >= 128) {
+        const ft: { freq: number; mag: number }[] = [];
+        for (let f = 0; f <= 500; f += 12.5) {
+          let si = 0, co = 0;
+          for (let i = 0; i < buf.length; i++) {
+            const ph = 2 * Math.PI * f * i / modemRate;
+            si += buf[i] * Math.sin(ph);
+            co += buf[i] * Math.cos(ph);
+          }
+          ft.push({ freq: f, mag: Math.hypot(si, co) / buf.length });
+        }
+        ft.sort((a, b) => b.mag - a.mag);
+        console.warn(`[FFT] Main top 5: ${ft.slice(0,5).map(b => `${b.freq.toFixed(1)}Hz=${b.mag.toExponential(2)}`).join(', ')}`);
+      }
+
       // Throttle waveform to ~2fps
       tickCount++;
       if (tickCount % 5 === 0) {
@@ -548,7 +564,7 @@ function showRxPayload(bytes: Uint8Array, fileName: string) {
 
 // ─── Tone Energy Detection ────────────────────────────
 
-const TONES = [675, 875, 1075, 1275];
+const TONES = [850, 1050, 1250, 1450];
 
 function detectToneEnergy(samples: number[], freq: number, sampleRate: number): number {
   let sinCorr = 0, cosCorr = 0;

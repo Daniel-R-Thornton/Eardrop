@@ -75,6 +75,7 @@ export class Decoder {
   private toneFreqs: [number, number, number, number] = [500, 700, 900, 1100];
   /** Frame counter for phase tracking: each frame adds PI to pilot-relative phase (offset * 128/3200 = 0.5 cycles = PI for all tones) */
   private dataFrameCount = 0;
+  private samplesSeen = 0;
 
   // State
   private inFrame = false;
@@ -130,7 +131,7 @@ export class Decoder {
     this.scanner = new PilotScanner({
       sampleRate: this.cfg.sampleRate,
       targetFreq: this.cfg.pilotFreqHz,
-      freqTolerance: 50,
+      freqTolerance: 30,
     });
 
     this.framedDecoder = new FramedBlockDecoder();
@@ -184,6 +185,7 @@ export class Decoder {
     this.dataFramesExecuted = 0;
     this.pilotAmplitude = 0;
     this.dataFrameCount = 0;
+    this.samplesSeen = 0;
     this.debugLog = [];
     this.framedDecoder.reset();
     this.blockProcessor.reset();
@@ -198,10 +200,11 @@ export class Decoder {
 
   /** Feed one audio sample */
   feedSample(sample: number) {
-    // Learn noise spectrum during the first ~1s (before audio plays)
-    if (!this.inFrame && this.noiseFrames < 25) {
+    // Learn noise spectrum on samples 1024-2048 (skip initial silence, let mic warm up)
+    if (!this.scanner.hasNoiseProfile() && this.samplesSeen >= 1024) {
       this.scanner.learnNoise(sample, 1024);
     }
+    this.samplesSeen++;
     this.buf.push(sample);
     if (this.buf.length < this.sps) return;
 

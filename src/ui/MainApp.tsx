@@ -10,7 +10,7 @@ import { debugLogger, STAGE } from "../modem/debugger";
 import { compressForLLM, type CompressLevel } from "../modem/compressForLLM";
 
 const TONE_COLORS = ["#4a9eff", "#ff6b4a", "#5eead4", "#f472b6"];
-const TONE_FREQS = [675, 875, 1075, 1275];
+const TONE_FREQS = [850, 1050, 1250, 1450];
 
 // ─── Helpers ──────────────────────────────────────────
 
@@ -359,9 +359,10 @@ export function MainApp() {
             </div>
           </Section>
 
-          {/* ── WAVEFORM ── */}
-          <Section title="〰 Waveform" color="#6c6cff">
+          {/* ── WAVEFORM + FFT WATERFALL ── */}
+          <Section title="〰 Spectrum" color="#6c6cff">
             <WaveformCanvas samples={s.debugSamples} />
+            <FftView samples={s.debugSamples} />
           </Section>
 
           {/* ── BLOCK LOG + DECODER TEXT LOG ── */}
@@ -621,4 +622,95 @@ function WaveformCanvas({ samples }: { samples: Float32Array | null }) {
     ctx.fillText(`${(peak * 1e3).toFixed(1)}mV`, 4, 11);
   }, [samples]);
   return <canvas ref={ref} width={400} height={70} style={{ width: "100%", height: 70, borderRadius: 4, background: "#07070e" }} />;
+}
+
+function FftView({ samples }: { samples: Float32Array | null }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  const histRef = useRef<Uint8ClampedArray[]>([]);
+
+  useEffect(() => {
+    const c = ref.current;
+    if (!c || !samples || samples.length < 128) return;
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+    const w = c.width, h = c.height;
+    const fftSize = 512;
+    const binCount = fftSize / 2;
+
+    // Compute FFT magnitude from sample buffer
+    const n = Math.min(samples.length, fftSize);
+    const real = new Float64Array(fftSize);
+    const imag = new Float64Array(fftSize);
+    for (let i = 0; i < n; i++) real[i] = samples[samples.length - n + i];
+
+    // Simple DFT at key frequency bins (0-1600 Hz in ~25 Hz steps)
+    const bins: number[] = [];
+    const binFreqs: number[] = [];
+    const sampleRate = 3200;
+    for (let f = 0; f <= 1550; f += 25) {
+      let sumSin = 0, sumCos = 0;
+      for (let i = 0; i < n; i++) {
+        const phase = 2 * Math.PI * f * i / sampleRate;
+        sumSin += samples[samples.length - n + i] * Math.sin(phase);
+        sumCos += samples[samples.length - n + i] * Math.cos(phase);
+      }
+      const mag = Math.hypot(sumSin, sumCos) / n;
+      binFreqs.push(f);
+      bins.push(mag);
+    }
+    const maxMag = Math.max(...bins, 1e-12);
+
+    // Shift history and add new frame
+    const hist = histRef.current;
+    hist.push(new Uint8ClampedArray(bins.map(m => Math.min(255, (m / maxMag) * 255))));
+    if (hist.length > h) hist.shift();
+
+    // Draw waterfall (scroll upward)
+    const imgData = ctx.createImageData(bins.length, h);
+    for (let y = 0; y < hist.length; y++) {
+      const row = hist[y];
+      for (let x = 0; x < row.length && x < bins.length; x++) {
+        const v = row[x];
+        const i = (y * bins.length + x) * 4;
+        // Hot colormap: black → red → yellow → white
+        if (v < 64) {
+          imgData.data[i] = v * 4; imgData.data[i+1] = 0; imgData.data[i+2] = 0;
+        } else if (v < 128) {
+          imgData.data[i] = 255; imgData.data[i+1] = (v - 64) * 4; imgData.data[i+2] = 0;
+        } else {
+          imgData.data[i] = 255; imgData.data[i+1] = 255; imgData.data[i+2] = (v - 128) * 4;
+        }
+        imgData.data[i+3] = 255;
+      }
+    }
+    // Fill remaining rows (above hist) with black
+    for (let y = hist.length; y < h; y++) {
+      for (let x = 0; x < bins.length; x++) {
+        const i = (y * bins.length + x) * 4;
+        imgData.data[i] = 0; imgData.data[i+1] = 0; imgData.data[i+2] = 0; imgData.data[i+3] = 255;
+      }
+    }
+
+    ctx.putImageData(imgData, 0, 0);
+
+    // Overlay frequency labels
+    ctx.fillStyle = "#484870";
+    ctx.font = "8px monospace";
+    for (let f = 0; f <= 1500; f += 250) {
+      const x = (f / 1550) * w;
+      ctx.fillText(`${f}Hz`, x + 2, 10);
+    }
+    // Mark pilot frequency
+    const px = (237.5 / 1550) * w;
+    ctx.strokeStyle = "#6c6cff";
+    ctx.lineWidth = 0.5;
+    ctx.setLineDash([2, 2]);
+    ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, h); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#6c6cff";
+    ctx.font = "7px monospace";
+    ctx.fillText("237Hz", px - 12, h - 4);
+  }, [samples]);
+
+  return <canvas ref={ref} width={512} height={120} style={{ width: "100%", height: 120, borderRadius: 4, background: "#07070e", marginTop: 2 }} />;
 }

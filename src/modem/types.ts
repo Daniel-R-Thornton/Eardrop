@@ -96,7 +96,7 @@ export const DEFAULT_CONFIG: ModemConfig = {
   bitsPerFrame: 8,
 
   pilotEnabled: true,
-  pilotFreqHz: 237.5,
+  pilotFreqHz: 412.5,
   musical: false,
   pilotAmplitude: 0.4,
 

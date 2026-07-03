@@ -87,7 +87,7 @@ const defaultState: AppState = {
   rxPayload: null,
   micLevel: -80,
   toneEnergies: [0, 0, 0, 0],
-  pilotFreqHz: 237.5,
+  pilotFreqHz: 412.5,
   musicalMode: false,
   ampThresholdRatio: 0.3,
   syncStrongMultiplier: 0.5,

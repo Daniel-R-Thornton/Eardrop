@@ -61,6 +61,8 @@ const DEFAULT_SCANNER_CONFIG: PilotScannerConfig = {
   minSignalRatio: 5.0,
 };
 
+const DEFAULT_TOLERANCE = 25; // Hz — wide enough for sample-rate shift (~5%), tight enough to reject room noise 47 Hz away
+
 export class PilotScanner {
   private cfg: PilotScannerConfig;
   private buf: number[] = [];
@@ -91,7 +93,7 @@ export class PilotScanner {
       const peaks: { freq: number; mag: number }[] = [];
       for (let b = lo; b <= hi; b++) peaks.push({ freq: b * bw, mag: mag[b] });
       peaks.sort((a, b) => b.mag - a.mag);
-      console.log(`[SCAN] Noise floor learned (${targetSamples}samp). Top: ${peaks.slice(0,5).map(p => `${p.freq.toFixed(1)}Hz=${p.mag.toExponential(2)}`).join(', ')}`);
+      console.warn(`[SCAN] Noise floor learned (${targetSamples}samp). Top: ${peaks.slice(0,5).map(p => `${p.freq.toFixed(1)}Hz=${p.mag.toExponential(2)}`).join(', ')}`);
     }
   }
 
@@ -100,16 +102,20 @@ export class PilotScanner {
   feedSample(sample: number): PilotDiscovery | null {
     if (this.done) return this.result;
     this.buf.push(sample);
+    // Keep only the most recent 4096 samples (sliding window — ~1.3s)
+    if (this.buf.length > 4096) {
+      this.buf.splice(0, this.buf.length - 2048);
+    }
     if (this.buf.length >= this.cfg.minSamples && this.buf.length >= this.lastFftAt + 512) {
       this.lastFftAt = this.buf.length;
-      console.log(`[SCAN] FFT run: ${this.buf.length}samp noise=${this.noiseLearned}`);
+      console.warn(`[SCAN] FFT run: ${this.buf.length}samp noise=${this.noiseLearned}`);
       this.runFft();
       if (this.result) {
-        console.log(`[SCAN] PILOT LOCKED: ${this.result.freq} Hz @ amp ${this.result.amplitude.toExponential(2)}`);
+        console.warn(`[SCAN] PILOT LOCKED: ${this.result.freq} Hz @ amp ${this.result.amplitude.toExponential(2)}`);
         this.done = true;
         return this.result;
       } else {
-        console.log(`[SCAN] No valid pilot yet (buf=${this.buf.length})`);
+        console.warn(`[SCAN] No valid pilot yet (buf=${this.buf.length})`);
       }
     }
     return null;
@@ -132,7 +138,8 @@ export class PilotScanner {
 
   private runFft() {
     const { scanRange, sampleRate, fftSize, minSignalRatio, targetFreq, freqTolerance = 50 } = this.cfg;
-    let mag = fftMagnitude(this.buf, fftSize);
+    const rawMag = fftMagnitude(this.buf, fftSize);
+    let mag = rawMag;
 
     // Subtract learned noise spectrum to suppress room hum
     if (this.noiseSpectrum) {
@@ -140,8 +147,9 @@ export class PilotScanner {
       for (let i = 0; i < mag.length; i++) {
         sub[i] = Math.max(0, mag[i] - this.noiseSpectrum[i]);
       }
+      const binMax = Math.round(400 / (sampleRate / fftSize));
+      console.warn(`[SCAN] Noise-subtracted: noise@365Hz=${this.noiseSpectrum[Math.round(365/sampleRate*fftSize)]?.toExponential(2)} rawFFT=${rawMag[Math.round(365/sampleRate*fftSize)]?.toExponential(2)} after=${sub[Math.round(365/sampleRate*fftSize)]?.toExponential(2)}`);
       mag = sub;
-      console.log(`[SCAN] Noise-subtracted FFT`);
     }
     const binWidth = sampleRate / fftSize;
     const binLo = Math.max(1, Math.floor(scanRange[0] / binWidth));
@@ -168,7 +176,7 @@ export class PilotScanner {
       topBins.push({ bin: b, freq: b * binWidth, mag: mag[b] });
     }
     topBins.sort((a, b) => b.mag - a.mag);
-    console.log(`[SCAN] Top 5 bins: ${topBins.slice(0, 5).map(p => `${p.freq.toFixed(1)}Hz=${p.mag.toExponential(2)}`).join(', ')}`);
+    console.warn(`[SCAN] Top 5 bins: ${topBins.slice(0, 5).map(p => `${p.freq.toFixed(1)}Hz=${p.mag.toExponential(2)}`).join(', ')}`);
 
     const allMags: number[] = [];
     for (let b = 1; b < mag.length; b++) {
@@ -177,10 +185,10 @@ export class PilotScanner {
     allMags.sort((a, b) => a - b);
     const noiseMedian = allMags[Math.floor(allMags.length / 2)] || 1e-12;
     const signalRatio = peakMag / Math.max(noiseMedian, 1e-14);
-    console.log(`[SCAN] Peak: ${(peakBin * binWidth).toFixed(1)}Hz mag=${peakMag.toExponential(2)} noiseMedian=${noiseMedian.toExponential(2)} ratio=${signalRatio.toFixed(1)}`);
+    console.warn(`[SCAN] Peak: ${(peakBin * binWidth).toFixed(1)}Hz mag=${peakMag.toExponential(2)} noiseMedian=${noiseMedian.toExponential(2)} ratio=${signalRatio.toFixed(1)}`);
 
     if (signalRatio < minSignalRatio) {
-      console.log(`[SCAN] Rejected: signalRatio ${signalRatio.toFixed(1)} < ${minSignalRatio}`);
+      console.warn(`[SCAN] Rejected: signalRatio ${signalRatio.toFixed(1)} < ${minSignalRatio}`);
       return;
     }
 
@@ -193,12 +201,12 @@ export class PilotScanner {
     const confidence = Math.min(1, (signalRatio - minSignalRatio) / 20);
 
     if (targetFreq && Math.abs(freq - targetFreq) > freqTolerance) {
-      console.log(`[SCAN] Rejected: ${freq}Hz is ${Math.abs(freq - targetFreq).toFixed(1)}Hz from target ${targetFreq}Hz (tolerance ${freqTolerance}Hz)`);
-      console.log(`[SCAN]   Top 5: ${topBins.slice(0, 5).map(p => `${p.freq.toFixed(1)}Hz`).join(', ')}`);
+      console.warn(`[SCAN] Rejected: ${freq}Hz is ${Math.abs(freq - targetFreq).toFixed(1)}Hz from target ${targetFreq}Hz (tolerance ${freqTolerance}Hz)`);
+      console.warn(`[SCAN]   Top 5: ${topBins.slice(0, 5).map(p => `${p.freq.toFixed(1)}Hz`).join(', ')}`);
       this.result = null;
       return;
     }
-    console.log(`[SCAN] ACCEPTED: ${freq}Hz amp=${amplitude.toExponential(2)} confidence=${confidence.toFixed(2)}`);
+    console.warn(`[SCAN] ACCEPTED: ${freq}Hz amp=${amplitude.toExponential(2)} confidence=${confidence.toFixed(2)}`);
     this.result = { freq, amplitude, confidence };
   }
 }
