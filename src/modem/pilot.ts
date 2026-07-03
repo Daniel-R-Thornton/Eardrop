@@ -38,13 +38,13 @@ export interface PilotDiscovery { freq: number; amplitude: number; confidence: n
 
 export interface PilotScannerConfig {
   scanRange: [number, number]; sampleRate: number; fftSize: number;
-  minSamples: number; minSignalRatio: number;
+  minSamples: number; minSignalRatio: number; minAmplitude?: number;
   targetFreq?: number; freqTolerance?: number;
 }
 
 const DEFAULT_SCANNER_CONFIG: PilotScannerConfig = {
   scanRange: [30, 500], sampleRate: 3200, fftSize: 2048,
-  minSamples: 1024, minSignalRatio: 3.0,
+  minSamples: 1024, minSignalRatio: 5.0, minAmplitude: 0.005,
 };
 
 export class PilotScanner {
@@ -77,12 +77,10 @@ export class PilotScanner {
   }
 
   feedSample(_sample: number): PilotDiscovery | null {
-    if (this.done) return this.result;
     this.scanCount++;
-    if (this.scanCount % 4 !== 0 || this.rtBuf.length < 512) return null;
+    if (this.scanCount % 4 !== 0 || this.rtBuf.length < 512) return this.result;
     const win = this.rtBuf.slice(-512);
-    const { sampleRate, targetFreq, freqTolerance = 30, minSignalRatio } = this.cfg;
-    console.warn(`[SCAN] Goertzel: ${win.length}samp target=${targetFreq}Hz`);
+    const { sampleRate, targetFreq, freqTolerance = 30, minSignalRatio, minAmplitude } = this.cfg;
 
     // Scan target ± tolerance at 2 Hz resolution
     let bestF = 0, bestM = 0;
@@ -106,13 +104,12 @@ export class PilotScanner {
     const ratio = bestM / Math.max(median, 1e-14);
     console.warn(`[SCAN] Top 5: ${top5} | Peak: ${bestF}Hz ratio=${ratio.toFixed(1)}`);
 
-    if (ratio >= minSignalRatio && targetFreq && Math.abs(bestF - targetFreq) <= freqTolerance) {
-      this.result = { freq: bestF, amplitude: bestM, confidence: Math.min(1, (ratio - minSignalRatio) / 20) };
-      console.warn(`[SCAN] PILOT LOCKED: ${bestF}Hz amp=${bestM.toExponential(2)}`);
+    if (ratio >= (minSignalRatio || 5) && bestM >= (minAmplitude || 0.005) && targetFreq && Math.abs(bestF - targetFreq) <= freqTolerance) {
+      this.result = { freq: bestF, amplitude: bestM, confidence: Math.min(1, (ratio - (minSignalRatio || 5)) / 20) };
       this.done = true;
-      return this.result;
+      console.warn(`[SCAN] PILOT LOCKED: ${bestF}Hz amp=${bestM.toExponential(2)}`);
     }
-    return null;
+    return this.result;
   }
 
   forceDiscover(): PilotDiscovery | null { return this.result; }
