@@ -85,9 +85,9 @@ export class AudioRecorder {
     const constraints: MediaStreamConstraints = {
       audio: {
         ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
+        echoCancellation: { exact: false },
+        noiseSuppression: { exact: false },
+        autoGainControl: { exact: false },
       },
     };
     this.stream = await navigator.mediaDevices.getUserMedia(constraints);
