@@ -1,78 +1,47 @@
 /**
  * PilotScanner + PilotPLL — Pilot frequency discovery and phase tracking.
- *
- * Two-phase design:
- *   1. PilotScanner: Buffer ~0.5s of leader audio, run FFT with zero-padding
- *      to 2048 samples (bin spacing ~1.56 Hz), find the strongest peak
- *      in the scan range. That peak IS the pilot — tones are relative to it.
- *      Parabolic interpolation around peak gives <0.1 Hz accuracy.
- *   2. PilotPLL: Second-order PLL locked to the discovered frequency. Tracks phase
- *      and amplitude continuously through the entire transmission.
  */
-
 import { TONE_OFFSETS } from "./types";
-
-// ─── FFT helpers ──────────────────────────────────────
 
 function fftMagnitude(samples: number[], fftSize: number): Float64Array {
   const n = fftSize;
   const real = new Float64Array(n);
   const imag = new Float64Array(n);
-  for (let i = 0; i < Math.min(samples.length, n); i++) {
-    real[i] = samples[i];
-  }
+  for (let i = 0; i < Math.min(samples.length, n); i++) real[i] = samples[i];
   const bits = Math.log2(n);
   for (let i = 0; i < n; i++) {
     let rev = 0;
     for (let j = 0; j < bits; j++) rev = (rev << 1) | ((i >> j) & 1);
-    if (rev > i) {
-      [real[i], real[rev]] = [real[rev], real[i]];
-      [imag[i], imag[rev]] = [imag[rev], imag[i]];
-    }
+    if (rev > i) { [real[i], real[rev]] = [real[rev], real[i]]; [imag[i], imag[rev]] = [imag[rev], imag[i]]; }
   }
   for (let len = 2; len <= n; len <<= 1) {
     const angle = (-2 * Math.PI) / len;
-    const wlenR = Math.cos(angle);
-    const wlenI = Math.sin(angle);
+    const wlenR = Math.cos(angle), wlenI = Math.sin(angle);
     for (let i = 0; i < n; i += len) {
       let wR = 1, wI = 0;
       const half = len >> 1;
       for (let j = 0; j < half; j++) {
-        const uR = real[i + j];
-        const uI = imag[i + j];
+        const uR = real[i + j], uI = imag[i + j];
         const vR = real[i + j + half] * wR - imag[i + j + half] * wI;
         const vI = real[i + j + half] * wI + imag[i + j + half] * wR;
-        real[i + j] = uR + vR;
-        imag[i + j] = uI + vI;
-        real[i + j + half] = uR - vR;
-        imag[i + j + half] = uI - vI;
-        const nwR = wR * wlenR - wI * wlenI;
-        const nwI = wR * wlenI + wI * wlenR;
-        wR = nwR;
-        wI = nwI;
+        real[i + j] = uR + vR; imag[i + j] = uI + vI;
+        real[i + j + half] = uR - vR; imag[i + j + half] = uI - vI;
+        const nwR = wR * wlenR - wI * wlenI, nwI = wR * wlenI + wI * wlenR;
+        wR = nwR; wI = nwI;
       }
     }
   }
   const mag = new Float64Array(n >> 1);
-  for (let i = 0; i < mag.length; i++) {
-    mag[i] = Math.hypot(real[i], imag[i]);
-  }
+  for (let i = 0; i < mag.length; i++) mag[i] = Math.hypot(real[i], imag[i]);
   return mag;
 }
 
 function interpolatePeak(m0: number, m1: number, m2: number): number {
   const denom = m0 - 2 * m1 + m2;
-  if (Math.abs(denom) < 1e-12) return 0;
-  return (m0 - m2) / (2 * denom);
+  return Math.abs(denom) < 1e-12 ? 0 : (m0 - m2) / (2 * denom);
 }
 
-// ─── PilotScanner ─────────────────────────────────────
-
-export interface PilotDiscovery {
-  freq: number;
-  amplitude: number;
-  confidence: number;
-}
+export interface PilotDiscovery { freq: number; amplitude: number; confidence: number; }
 
 export interface PilotScannerConfig {
   scanRange: [number, number];
@@ -80,10 +49,12 @@ export interface PilotScannerConfig {
   fftSize: number;
   minSamples: number;
   minSignalRatio: number;
+  targetFreq?: number;
+  freqTolerance?: number;
 }
 
 const DEFAULT_SCANNER_CONFIG: PilotScannerConfig = {
-  scanRange: [30, 310],
+  scanRange: [30, 500],
   sampleRate: 3200,
   fftSize: 2048,
   minSamples: 1024,
@@ -95,7 +66,6 @@ export class PilotScanner {
   private buf: number[] = [];
   private done = false;
   private result: PilotDiscovery | null = null;
-  /** Track last FFT run sample count to avoid re-running on every sample */
   private lastFftAt = 0;
 
   constructor(cfg: Partial<PilotScannerConfig> = {}) {
@@ -105,14 +75,16 @@ export class PilotScanner {
   feedSample(sample: number): PilotDiscovery | null {
     if (this.done) return this.result;
     this.buf.push(sample);
-    // Run FFT periodically — never give up, audio might start late
-    // Run at minSamples, then every ~512 samples after that if no result yet
     if (this.buf.length >= this.cfg.minSamples && this.buf.length >= this.lastFftAt + 512) {
       this.lastFftAt = this.buf.length;
+      console.log(`[SCAN] FFT run: ${this.buf.length} samples accumulated`);
       this.runFft();
       if (this.result) {
+        console.log(`[SCAN] PILOT LOCKED: ${this.result.freq} Hz @ amp ${this.result.amplitude.toExponential(2)}`);
         this.done = true;
         return this.result;
+      } else {
+        console.log(`[SCAN] No valid pilot found yet (buffer=${this.buf.length})`);
       }
     }
     return null;
@@ -129,24 +101,38 @@ export class PilotScanner {
   getResult(): PilotDiscovery | null { return this.result; }
 
   reset() {
-    this.buf = [];
-    this.done = false;
-    this.result = null;
-    this.lastFftAt = 0;
+    this.buf = []; this.done = false; this.result = null; this.lastFftAt = 0;
   }
 
   private runFft() {
-    const { scanRange, sampleRate, fftSize, minSignalRatio } = this.cfg;
+    const { scanRange, sampleRate, fftSize, minSignalRatio, targetFreq, freqTolerance = 50 } = this.cfg;
     const mag = fftMagnitude(this.buf, fftSize);
     const binWidth = sampleRate / fftSize;
     const binLo = Math.max(1, Math.floor(scanRange[0] / binWidth));
     const binHi = Math.min(mag.length - 1, Math.ceil(scanRange[1] / binWidth));
 
-    let peakBin = binLo;
-    let peakMag = mag[binLo];
+    // Find top 3 peaks for diagnostics
+    interface Peak { bin: number; mag: number; freq: number; }
+    const peaks: Peak[] = [];
+    for (let b = binLo; b <= binHi; b++) {
+      // Local maximum check
+      if ((b === binLo || mag[b] > mag[b - 1]) && (b === binHi || mag[b] > mag[b + 1] || mag[b] >= mag[b - 1])) {
+        continue; // simple approach — just find the global max
+      }
+    }
+    // Actually just find the top value
+    let peakBin = binLo, peakMag = mag[binLo];
     for (let b = binLo + 1; b <= binHi; b++) {
       if (mag[b] > peakMag) { peakMag = mag[b]; peakBin = b; }
     }
+
+    // Log top 5 magnitude bins for debugging
+    const topBins: { bin: number; freq: number; mag: number }[] = [];
+    for (let b = binLo; b <= binHi; b++) {
+      topBins.push({ bin: b, freq: b * binWidth, mag: mag[b] });
+    }
+    topBins.sort((a, b) => b.mag - a.mag);
+    console.log(`[SCAN] Top 5 bins: ${topBins.slice(0, 5).map(p => `${p.freq.toFixed(1)}Hz=${p.mag.toExponential(2)}`).join(', ')}`);
 
     const allMags: number[] = [];
     for (let b = 1; b < mag.length; b++) {
@@ -155,8 +141,10 @@ export class PilotScanner {
     allMags.sort((a, b) => a - b);
     const noiseMedian = allMags[Math.floor(allMags.length / 2)] || 1e-12;
     const signalRatio = peakMag / Math.max(noiseMedian, 1e-14);
+    console.log(`[SCAN] Peak: ${(peakBin * binWidth).toFixed(1)}Hz mag=${peakMag.toExponential(2)} noiseMedian=${noiseMedian.toExponential(2)} ratio=${signalRatio.toFixed(1)}`);
+
     if (signalRatio < minSignalRatio) {
-      this.result = null;
+      console.log(`[SCAN] Rejected: signalRatio ${signalRatio.toFixed(1)} < ${minSignalRatio}`);
       return;
     }
 
@@ -168,40 +156,29 @@ export class PilotScanner {
     const amplitude = peakMag / this.buf.length;
     const confidence = Math.min(1, (signalRatio - minSignalRatio) / 20);
 
+    if (targetFreq && Math.abs(freq - targetFreq) > freqTolerance) {
+      console.log(`[SCAN] Rejected: ${freq}Hz is ${Math.abs(freq - targetFreq).toFixed(1)}Hz from target ${targetFreq}Hz (tolerance ${freqTolerance}Hz)`);
+      console.log(`[SCAN]   Top 5: ${topBins.slice(0, 5).map(p => `${p.freq.toFixed(1)}Hz`).join(', ')}`);
+      this.result = null;
+      return;
+    }
+    console.log(`[SCAN] ACCEPTED: ${freq}Hz amp=${amplitude.toExponential(2)} confidence=${confidence.toFixed(2)}`);
     this.result = { freq, amplitude, confidence };
   }
 }
 
-// ─── PilotPLL ─────────────────────────────────────────
-
-export interface PLLConfig {
-  Kp: number;
-  Ki: number;
-  sampleRate: number;
-}
-
-const DEFAULT_PLL_CONFIG: PLLConfig = {
-  Kp: 0.1,
-  Ki: 0.01,
-  sampleRate: 3200,
-};
+export interface PLLConfig { Kp: number; Ki: number; sampleRate: number; }
+const DEFAULT_PLL_CONFIG: PLLConfig = { Kp: 0.1, Ki: 0.01, sampleRate: 3200 };
 
 export class PilotPLL {
-  private cfg: PLLConfig;
-  private freq: number;
-  private phase: number;
-  private integrator: number;
-  private amplitude: number;
-  private sinRef = 0;
-  private cosRef = 1;
+  private cfg: PLLConfig; private freq: number; private phase: number;
+  private integrator: number; private amplitude: number;
+  private sinRef = 0; private cosRef = 1;
 
   constructor(freq: number, initialPhase: number, initialAmplitude: number, cfg?: Partial<PLLConfig>) {
     this.cfg = { ...DEFAULT_PLL_CONFIG, ...cfg };
-    this.freq = freq;
-    this.phase = initialPhase;
-    this.integrator = 0;
-    this.amplitude = initialAmplitude;
-    this.updateRef();
+    this.freq = freq; this.phase = initialPhase; this.integrator = 0;
+    this.amplitude = initialAmplitude; this.updateRef();
   }
 
   update(sample: number): void {
@@ -209,15 +186,11 @@ export class PilotPLL {
     const proportional = this.cfg.Kp * error;
     this.integrator += this.cfg.Ki * error;
     this.integrator = Math.max(-0.5, Math.min(0.5, this.integrator));
-    const freqDelta = proportional + this.integrator;
-    this.phase += this.freq / this.cfg.sampleRate + freqDelta;
+    this.phase += this.freq / this.cfg.sampleRate + proportional + this.integrator;
     if (this.phase >= 1.0) this.phase -= 1.0;
     if (this.phase < 0) this.phase += 1.0;
-    const i = sample * this.cosRef;
-    const q = sample * this.sinRef;
-    const instAmp = Math.hypot(i, q);
-    const alpha = 0.01;
-    this.amplitude = this.amplitude * (1 - alpha) + instAmp * alpha;
+    const i = sample * this.cosRef, q = sample * this.sinRef;
+    this.amplitude = this.amplitude * 0.99 + Math.hypot(i, q) * 0.01;
     this.updateRef();
   }
 
@@ -228,39 +201,27 @@ export class PilotPLL {
   getCosRef(): number { return this.cosRef; }
 
   rotateToPilotRef(rawI: number, rawQ: number): { i: number; q: number } {
-    return {
-      i: rawI * this.cosRef + rawQ * this.sinRef,
-      q: -rawI * this.sinRef + rawQ * this.cosRef,
-    };
+    return { i: rawI * this.cosRef + rawQ * this.sinRef, q: -rawI * this.sinRef + rawQ * this.cosRef };
   }
-
   setFrequency(f: number) { this.freq = f; }
-
   private updateRef() {
     const theta = 2 * Math.PI * this.phase;
-    this.sinRef = Math.sin(theta);
-    this.cosRef = Math.cos(theta);
+    this.sinRef = Math.sin(theta); this.cosRef = Math.cos(theta);
   }
 }
 
-// ─── Convenience functions ─────────────────────────────
-
 export function toneIQ(samples: readonly number[], toneFreq: number, sampleRate: number): { i: number; q: number } {
-  let i = 0, q = 0;
-  const n = samples.length;
+  let i = 0, q = 0; const n = samples.length;
   for (let idx = 0; idx < n; idx++) {
     const phase = 2 * Math.PI * toneFreq * idx / sampleRate;
-    i += samples[idx] * Math.sin(phase);
-    q += samples[idx] * Math.cos(phase);
+    i += samples[idx] * Math.sin(phase); q += samples[idx] * Math.cos(phase);
   }
   return { i: i / n, q: q / n };
 }
 
 export function getDataToneFreqs(pilotFreqHz: number): [number, number, number, number] {
   return [
-    pilotFreqHz + TONE_OFFSETS[0],
-    pilotFreqHz + TONE_OFFSETS[1],
-    pilotFreqHz + TONE_OFFSETS[2],
-    pilotFreqHz + TONE_OFFSETS[3],
+    pilotFreqHz + TONE_OFFSETS[0], pilotFreqHz + TONE_OFFSETS[1],
+    pilotFreqHz + TONE_OFFSETS[2], pilotFreqHz + TONE_OFFSETS[3],
   ] as [number, number, number, number];
 }
