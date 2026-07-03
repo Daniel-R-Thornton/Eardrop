@@ -362,24 +362,41 @@ export function MainApp() {
 function DebugOutput() {
   const [level, setLevel] = useState<CompressLevel>("normal");
   const [output, setOutput] = useState("");
+  const [clipMsg, setClipMsg] = useState("");
+
+  const copy = async (text: string) => {
+    setOutput(text);
+    if (!text) { setClipMsg("⚠ buffer empty"); setTimeout(() => setClipMsg(""), 2000); return; }
+    try {
+      await navigator.clipboard.writeText(text);
+      setClipMsg("✓ copied");
+    } catch {
+      // Fallback: select text manually
+      setClipMsg("✗ copy failed — select text below");
+    }
+    setTimeout(() => setClipMsg(""), 2500);
+  };
 
   const genCompress = () => {
-    const text = compressForLLM(debugLogger, { level });
-    setOutput(text);
-    navigator.clipboard.writeText(text).catch(() => {});
+    const total = debugLogger.getTotalEvents();
+    if (total === 0) { setClipMsg("⚠ no events yet — run a test or listen"); setTimeout(() => setClipMsg(""), 3000); return; }
+    copy(compressForLLM(debugLogger, { level }));
   };
 
   const genSnapshot = () => {
+    if (debugLogger.getTotalEvents() === 0) { setClipMsg("⚠ no events yet"); setTimeout(() => setClipMsg(""), 2000); return; }
     const events = debugLogger.getAllEvents();
-    const text = events.map(e => `[${e.stage}] ${e.summary}`).join("\n");
-    setOutput(text);
-    navigator.clipboard.writeText(text).catch(() => {});
+    copy(events.map(e => `[${e.stage}] ${e.summary}`).join("\n"));
   };
 
   const clearLog = () => {
     debugLogger.clear();
     setOutput("");
+    setClipMsg("cleared");
+    setTimeout(() => setClipMsg(""), 1500);
   };
+
+  const totalEvents = debugLogger.getTotalEvents();
 
   return (
     <div>
@@ -393,12 +410,13 @@ function DebugOutput() {
         <button onClick={genCompress} style={{ padding: "3px 8px", border: "1px solid #2a2a4e", borderRadius: 4, background: "#16162a", color: "#eab308", cursor: "pointer", fontSize: 10 }}>🤖 Compress for LLM</button>
         <button onClick={genSnapshot} style={{ padding: "3px 8px", border: "1px solid #2a2a4e", borderRadius: 4, background: "#16162a", color: "#a78bfa", cursor: "pointer", fontSize: 10 }}>📋 Dump State</button>
         <button onClick={clearLog} style={{ padding: "3px 8px", border: "1px solid #2a2a4e", borderRadius: 4, background: "#16162a", color: "#7878a0", cursor: "pointer", fontSize: 10 }}>🗑 Clear</button>
+        {clipMsg && <span style={{ fontSize: 9, color: clipMsg.includes("✓") ? "#44cc88" : clipMsg.includes("⚠") ? "#eab308" : "#ef4444", lineHeight: "24px" }}>{clipMsg}</span>}
       </div>
       <pre style={{ margin: 0, padding: "4px 6px", background: "#07070e", border: "1px solid #1e1e3a", borderRadius: 4, fontSize: 9, color: "#a8a8c8", fontFamily: "monospace", whiteSpace: "pre-wrap", wordBreak: "break-all", maxHeight: 120, overflow: "auto", lineHeight: 1.3 }}>
-        {output || (debugLogger.getTotalEvents() > 0 ? `${debugLogger.getTotalEvents()} events in ring buffer…` : "Run a test to collect debug data, then click Compress for LLM")}
+        {output || (totalEvents > 0 ? `${totalEvents} events in ring buffer — click Compress or Dump` : "Run a test or listen for signal to collect debug data, then click Compress for LLM")}
       </pre>
       <div style={{ marginTop: 4, fontSize: 9, color: "#484870", fontFamily: "monospace" }}>
-        Events: {debugLogger.getTotalEvents()} | Stages: {Object.values(STAGE).length} | Copied to clipboard on click
+        Events: {totalEvents} | Stages: {Object.values(STAGE).length} | {clipMsg || "generates structured LLM-ready output"}
       </div>
     </div>
   );

@@ -234,6 +234,32 @@ export class DebugLogger {
     this.totalEvents = 0;
   }
 
+  private drainCursor = 0;
+
+  /** Return all new events since last drain, resetting cursor.
+   *  Used to ship events from a worker thread to the main thread. */
+  drain(): LogEvent[] {
+    const all = this.globalBuffer;
+    const events = all.slice(this.drainCursor);
+    this.drainCursor = all.length;
+    return events;
+  }
+
+  /** Ingest events from another source (e.g. a worker thread).
+   *  Replays them through the local buffer with original timestamps preserved. */
+  ingest(events: LogEvent[]): void {
+    for (const event of events) {
+      this.totalEvents++;
+      const buf = this.buffers.get(event.stage);
+      if (buf) {
+        buf.push(event);
+        if (buf.length > this.cfg.ringBufferSize) buf.shift();
+      }
+      this.globalBuffer.push(event);
+      if (this.globalBuffer.length > this.globalMax) this.globalBuffer.shift();
+    }
+  }
+
   /** Total events logged */
   getTotalEvents(): number { return this.totalEvents; }
 

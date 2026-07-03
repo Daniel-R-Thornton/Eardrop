@@ -12,6 +12,7 @@
 
 import "../style.css";
 import { setState, getState } from "./Store";
+import { debugLogger } from "../modem/debugger";
 import { Encoder } from "../modem/encoder";
 import { Decoder } from "../modem/decoder";
 import { AudioPlayer } from "../audio/player";
@@ -141,6 +142,11 @@ broadcastWorker.onmessage = (e) => {
           recvStatus = { type: "success", msg: "✅ Ready — listening" };
         }
         setState({ recvStatus });
+      }
+
+      // Ingest debug events from the worker thread's debugLogger
+      if (msg.debugEvents && Array.isArray(msg.debugEvents)) {
+        debugLogger.ingest(msg.debugEvents);
       }
 
       if (msg.rawBytes) {

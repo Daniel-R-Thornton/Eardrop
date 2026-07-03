@@ -4,6 +4,7 @@
 
 import { Decoder } from "../modem/decoder";
 import { DEFAULT_CONFIG, type ModemConfig } from "../modem/types";
+import { debugLogger } from "../modem/debugger";
 
 // Verbose debug flag – set false to silence logs for agentic AI contexts.
 const DEBUG = false;
@@ -75,6 +76,9 @@ self.onmessage = (e: MessageEvent) => {
           }
         }
 
+        // Drain debug events from this worker's debugLogger to ship to main thread
+        const debugEvents = debugLogger.drain();
+
         self.postMessage({
           type: "decoderState",
           bitsCollected: decoder.getProgress(),
@@ -82,6 +86,7 @@ self.onmessage = (e: MessageEvent) => {
           debugInfo: last ?? null,
           recentLog,
           rawBytes: new Uint8Array(rawAccum).buffer as ArrayBuffer,
+          debugEvents,
         });
       }, 200);
 
