@@ -278,53 +278,41 @@ window.addEventListener("eardrop-send-test", (async () => {
 
 // Acoustic sweep
 window.addEventListener("eardrop-acoustic-sweep", (async () => {
-  setState({ sendStatus: { type: "info", msg: "🔊 Sweep — playing tones…" }, sweepResults: null });
-
-  // Test 1: check mic is receiving data
-  console.log("[SWEEP] mic samples before start:", recvSamples.length);
+  setState({ sendStatus: { type: "info", msg: "🔊 Sweep starting…" }, sweepResults: null });
   if (!isListening) await startListening();
-  console.log("[SWEEP] mic samples after startListening:", recvSamples.length);
-  await new Promise(r => setTimeout(r, 500));
-  console.log("[SWEEP] mic samples after 500ms settle:", recvSamples.length);
+  await new Promise(r => setTimeout(r, 300));
 
-  // Test 2: play a single tone and measure
   const modemRate = DEFAULT_CONFIG.sampleRate;
   const outputRate = player.getSampleRate();
-  const testFreq = 500;
-  const toneSamples = Math.floor(modemRate * 0.2);
-  const tone = new Float32Array(toneSamples);
-  for (let i = 0; i < toneSamples; i++) {
-    tone[i] = Math.sin(2 * Math.PI * testFreq * i / modemRate) * 0.8;
-  }
+  const sweepFreqs: number[] = [];
+  for (let f = 100; f <= 1500; f += 50) sweepFreqs.push(f);
 
-  console.log("[SWEEP] playing 500Hz tone, samples:", toneSamples);
-  const beforePlay = recvSamples.length;
-  const playBuf = resampleAudio(tone, modemRate, outputRate);
-  console.log("[SWEEP] resampled to", playBuf.length, "samples at", outputRate, "Hz");
-  let sumSqPlay = 0;
-  for (const s of playBuf) sumSqPlay += s * s;
-  console.log("[SWEEP] play RMS:", Math.sqrt(sumSqPlay / playBuf.length), "peak:", Math.max(...playBuf.map(Math.abs)));
-  await player.play(playBuf, outputRate, selectedOutputId || undefined);
-  console.log("[SWEEP] play done, recvSamples before:", beforePlay, "after:", recvSamples.length);
-  await new Promise(r => setTimeout(r, 100));
-  console.log("[SWEEP] after 100ms more:", recvSamples.length);
+  const results: Array<{ freq: number; energy: number }> = [];
+  const toneSamples = Math.floor(modemRate * 0.12);
 
-  const testSamples = recvSamples.slice(beforePlay);
-  console.log("[SWEEP] new samples received:", testSamples.length);
-  if (testSamples.length > 64) {
-    const e = detectToneEnergy(testSamples.slice(-256), testFreq, modemRate);
-    console.log("[SWEEP] energy at 500Hz:", e);
-    // Also check energy at other freqs to see if anything is coming through
-    for (const f of [250, 500, 750, 1000]) {
-      console.log(`[SWEEP] energy at ${f}Hz:`, detectToneEnergy(testSamples.slice(-256), f, modemRate));
+  for (let fi = 0; fi < sweepFreqs.length; fi++) {
+    const freq = sweepFreqs[fi];
+    const tone = new Float32Array(toneSamples);
+    for (let i = 0; i < toneSamples; i++) {
+      tone[i] = Math.sin(2 * Math.PI * freq * i / modemRate) * 0.8;
     }
-    // RMS of the samples
-    let sumSq = 0;
-    for (const s of testSamples) sumSq += s * s;
-    console.log("[SWEEP] RMS:", Math.sqrt(sumSq / testSamples.length));
-  }
+    const playBuf = resampleAudio(tone, modemRate, outputRate);
+    const recvCount = recvSamples.length;
+    await player.play(playBuf, outputRate, selectedOutputId || undefined);
+    await new Promise(r => setTimeout(r, 50));
 
-  setState({ sendStatus: { type: "error", msg: "❌ Sweep failed — check console for diagnostics" } });
+    const newSamples = recvSamples.slice(recvCount);
+    if (newSamples.length >= 64) {
+      const buf = newSamples.slice(-Math.min(256, newSamples.length));
+      results.push({ freq, energy: detectToneEnergy(buf, freq, modemRate) });
+    } else {
+      results.push({ freq, energy: 0 });
+    }
+    if (fi % 5 === 0 || fi === sweepFreqs.length - 1) {
+      setState({ sweepResults: [...results], sendStatus: { type: "info", msg: `🔊 Sweep: ${fi + 1}/${sweepFreqs.length} (${freq}Hz)` } });
+    }
+  }
+  setState({ sweepResults: results, sendStatus: { type: "success", msg: `✅ Sweep done — ${results.length} frequencies` } });
 }) as EventListener);
 
 function resampleAudio(input: Float32Array, inRate: number, outRate: number): Float32Array {

@@ -32,9 +32,9 @@ export class AudioPlayer {
       const source = ctx.createBufferSource();
       source.buffer = buffer;
       // Boost gain for acoustic path (speaker→air→mic loses ~40-60dB)
-      // 3× gain for acoustic path
+      // 8× gain — hard-clips at [-1,1], fundamental frequency preserved
       const gain = ctx.createGain();
-      gain.gain.value = 3.0;
+      gain.gain.value = 8.0;
       source.connect(gain);
       gain.connect(ctx.destination);
       source.start(0);
