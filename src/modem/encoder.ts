@@ -41,6 +41,9 @@ export class Encoder {
   private wobblePhase = 0;
   private readonly WOBBLE_RATE = 8; // Hz
   private readonly WOBBLE_DEPTH = 0.3; // ±30%
+  // Correlated noise floor — same PRNG seed as decoder, keeps mic gate open, cancelled at decoder
+  private noiseState = 12345;
+  private readonly NOISE_AMP = 0.015;
 
   constructor(cfg: Partial<ModemConfig> = {}) {
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
@@ -231,11 +234,15 @@ export class Encoder {
         return 0;
     }
 
+    // Correlated noise — same deterministic sequence as decoder, keeps mic gate open
+    this.noiseState = (this.noiseState * 1664525 + 1013904223) & 0x7FFFFFFF;
+    const noise = ((this.noiseState >>> 0) / 2147483648 - 1) * this.NOISE_AMP;
+
     // Amplitude wobble to prevent microphone noise gate from suppressing stationary tones
     this.wobblePhase += this.WOBBLE_RATE / sampleRate;
     if (this.wobblePhase >= 1.0) this.wobblePhase -= 1.0;
     const wobble = 1.0 - this.WOBBLE_DEPTH * 0.5 + this.WOBBLE_DEPTH * 0.5 * Math.sin(2 * Math.PI * this.wobblePhase);
-    return output * wobble;
+    return output * wobble + noise;
   }
 
   private advancePhase() {
