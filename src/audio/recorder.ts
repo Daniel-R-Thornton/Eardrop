@@ -43,10 +43,19 @@ export class AudioRecorder {
   private running = false;
   private onSample: SampleCallback | null = null;
   private downsampler: ReturnType<typeof createDownsampler> | null = null;
+  /** Calibrated mic rate — may differ from ctx.sampleRate */
+  private calibratedMicRate = 0;
 
   /** Optionally accept a shared AudioContext. If omitted, creates its own. */
   constructor(ctx?: AudioContext) {
     this.ctx = ctx ?? new AudioContext();
+    this.calibratedMicRate = this.ctx.sampleRate;
+  }
+
+  /** Set a calibration factor for the mic sample rate (frequency offset detected via sweep) */
+  setCalibration(factor: number) {
+    this.calibratedMicRate = Math.round(this.ctx.sampleRate * factor);
+    console.log(`[Recorder] mic rate calibrated: ${this.ctx.sampleRate} × ${factor} = ${this.calibratedMicRate} Hz`);
   }
 
   get isRunning() { return this.running; }
@@ -84,7 +93,8 @@ export class AudioRecorder {
     this.stream = await navigator.mediaDevices.getUserMedia(constraints);
     console.log("[Recorder] stream active:", this.stream.active);
 
-    const micRate = this.ctx.sampleRate;
+    const micRate = this.calibratedMicRate || this.ctx.sampleRate;
+    console.log(`[Recorder] using mic rate: ${micRate} Hz (ctx says ${this.ctx.sampleRate})`);
     this.source = this.ctx.createMediaStreamSource(this.stream);
     this.onSample = onSample;
     this.downsampler = createDownsampler(micRate, modemRate, onSample);

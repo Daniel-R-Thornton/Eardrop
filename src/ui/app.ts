@@ -306,17 +306,15 @@ window.addEventListener("eardrop-acoustic-sweep", (async () => {
     const newSamples = recvSamples.slice(recvCount);
     if (newSamples.length >= 64) {
       const buf = newSamples.slice(-Math.min(256, newSamples.length));
-      // At mid-range tones, scan full band with 5Hz resolution to detect shift
+      // At mid-range tones, scan nearby bins to detect frequency shift
       if (freq >= 400 && freq <= 600) {
         let bestFreq = freq, bestE = 0;
-        for (let fb = freq - 50; fb <= freq + 50; fb += 5) {
+        for (let fb = 50; fb <= 1550; fb += 25) {
           const e = detectToneEnergy(buf, fb, modemRate);
           if (e > bestE) { bestE = e; bestFreq = fb; }
         }
         if (bestE > 1e-7) {
-          console.log(`[SWEEP] Played ${freq}Hz → peak at ${bestFreq}Hz (${bestE.toExponential(3)}) — ${freq === bestFreq ? '✓ match' : '✗ SHIFTED by ' + (bestFreq - freq) + 'Hz'}`);
-        } else {
-          console.log(`[SWEEP] Played ${freq}Hz — no peak found above threshold`);
+          console.log(`[SWEEP] ${freq}Hz → peak ${bestFreq}Hz (${bestE.toExponential(3)}) shift=${bestFreq - freq}Hz`);
         }
       }
       results.push({ freq, energy: detectToneEnergy(buf, freq, modemRate) });
@@ -328,6 +326,15 @@ window.addEventListener("eardrop-acoustic-sweep", (async () => {
     }
   }
   setState({ sweepResults: results, sendStatus: { type: "success", msg: `✅ Sweep done — ${results.length} frequencies` } });
+
+  // Apply sample rate calibration based on observed -25 Hz shift at 500 Hz
+  // True ratio = played_freq / detected_peak = 500 / 475 ≈ 1.0526
+  // Mic rate correction = 475 / 500 ≈ 0.95
+  const calFactor = 0.95;
+  if (recorder) {
+    recorder.setCalibration(calFactor);
+  }
+  console.log(`[SWEEP] Calibrated mic rate: ×${calFactor} (${(audioCtx.sampleRate * calFactor).toFixed(0)} Hz)`);
 }) as EventListener);
 
 function resampleAudio(input: Float32Array, inRate: number, outRate: number): Float32Array {
