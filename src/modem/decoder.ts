@@ -312,23 +312,17 @@ export class Decoder {
     // A tone is ON if its pilot-relative energy > pilotAmplitude * thresholdRatio
     const ampThresh = this.pilotAmplitude * this.liveAmpThresholdRatio;
 
-    // Sync: all 4 tones should show strong pilot-relative energy
-    const allFourStrong = this.pll
-      ? (energies[0] > ampThresh * this.liveSyncStrongMultiplier &&
-         energies[1] > ampThresh * this.liveSyncStrongMultiplier &&
-         energies[2] > ampThresh * this.liveSyncStrongMultiplier &&
-         energies[3] > ampThresh * this.liveSyncStrongMultiplier)
-      : (total > 1e-12 &&
-         (energies[0] / total) > 0.08 &&
-         (energies[1] / total) > 0.08 &&
-         (energies[2] / total) > 0.08 &&
-         (energies[3] / total) > 0.08);
-
-    const isBurst = (avg > burstThresh) && allFourStrong;
+    // Sync: at least 1 strong tone + total energy above noise
+    // (4-tone mod not feasible — speaker roll-off kills tones above 1 kHz)
+    const anyToneStrong = this.pll
+      ? Math.max(...energies) > ampThresh * this.liveSyncStrongMultiplier
+      : total > 1e-12 && Math.max(...energies) / total > 0.08;
+    const totalAboveNoise = total > this.noiseFloor.reduce((a,b)=>a+b,0) * 10;
+    const isBurst = (avg > burstThresh) && anyToneStrong && totalAboveNoise;
 
     // ── Post-pilot trace logging ──
     if (this.pilotDiscovered && !this.inFrame) {
-      console.warn(`[DEC_TRACE] pilotAmp=${this.pilotAmplitude.toExponential(2)} thresh=${ampThresh.toExponential(2)} avg=${avg.toExponential(2)} e=[${energies.map(e=>e.toExponential(2)).join(',')}] all4=${allFourStrong} burst=${(avg>burstThresh)} cons=${this.consecutiveSync} nf=${this.noiseFrames} fse=${this.framesSinceExit} pilotFreq=${this.pilotFreq.toFixed(1)}`);
+      console.warn(`[DEC_TRACE] pilotAmp=${this.pilotAmplitude.toExponential(2)} thresh=${ampThresh.toExponential(2)} avg=${avg.toExponential(2)} e=[${energies.map(e=>e.toExponential(2)).join(',')}] any=${anyToneStrong} totAbove=${totalAboveNoise} cons=${this.consecutiveSync} nf=${this.noiseFrames} fse=${this.framesSinceExit} pilotFreq=${this.pilotFreq.toFixed(1)}`);
     }
 
     // ── Noise profiling ──
@@ -431,7 +425,7 @@ export class Decoder {
     }
 
     // ── Enter data mode ──
-    // Two paths: sync-based (allFourStrong) or pilot-based (strong pilot + energy present)
+    // Two paths: sync-based (anyToneStrong + totalAboveNoise) or pilot-based (strong pilot + energy present)
     const syncPath = this.consecutiveSync >= 8 && this.noiseFrames >= 25;
     const pilotPath = this.pilotDiscovered && this.noiseFrames >= 25 &&
       this.pilotAmplitude > 0.02 && total > this.noiseFloor.reduce((a,b)=>a+b,0) * 20;
