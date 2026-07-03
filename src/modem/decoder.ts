@@ -127,11 +127,7 @@ export class Decoder {
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
     this.sps = this.cfg.sampleRate / this.cfg.symbolsPerSec;
     this.liveAmpThresholdRatio = this.cfg.amplitudeThresholdRatio;
-    this.scanner = new PilotScanner({
-      sampleRate: this.cfg.sampleRate,
-      targetFreq: this.cfg.pilotFreqHz,
-      freqTolerance: 80,
-    });
+    this.scanner = new PilotScanner({ sampleRate: this.cfg.sampleRate });
 
     this.framedDecoder = new FramedBlockDecoder();
     this.squawkProcessor = new SquawkProcessor();
@@ -217,15 +213,8 @@ export class Decoder {
         this.pilotDiscovered = true;
         this.pilotFreq = result.freq;
         this.pilotAmplitude = result.amplitude;
-        // Compute sample-rate correction from discovered vs expected pilot
-        // This handles hardware sample rate mismatches (e.g., 45600 vs 48000 Hz)
-        const correction = this.cfg.pilotFreqHz > 0 ? result.freq / this.cfg.pilotFreqHz : 1.0;
-        // Use discovered pilot freq; if correction is extreme (e.g. pilot 0), fall back to nominal
-        if (correction > 0.1 && correction < 10) {
-          this.toneFreqs = getDataToneFreqs(this.cfg.pilotFreqHz).map(f => f * correction) as [number, number, number, number];
-        } else {
-          this.toneFreqs = getDataToneFreqs(result.freq);
-        }
+        // The found peak IS the pilot. Tones are at pilot + TONE_OFFSETS.
+        this.toneFreqs = getDataToneFreqs(result.freq);
         this.pll = new PilotPLL(result.freq, 0, result.amplitude, {
           sampleRate: this.cfg.sampleRate,
         });
