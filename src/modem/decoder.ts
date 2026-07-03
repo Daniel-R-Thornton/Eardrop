@@ -226,7 +226,12 @@ export class Decoder {
         this.pilotFreq = result.freq;
         this.pilotAmplitude = result.amplitude;
         // The found peak IS the pilot. Tones are at pilot + TONE_OFFSETS.
-        this.toneFreqs = getDataToneFreqs(result.freq, !!this.cfg.musical);
+        // IMPORTANT: sample-rate mismatch scales ALL frequencies by the same factor.
+        // We must apply the correction factor (discovered/nominal) to the NOMINAL tone
+        // frequencies, not just add raw offsets to the (already-shifted) pilot.
+        const correction = result.freq / this.cfg.pilotFreqHz;
+        const nominalTones = getDataToneFreqs(this.cfg.pilotFreqHz, !!this.cfg.musical);
+        this.toneFreqs = nominalTones.map(f => f * correction) as [number, number, number, number];
         this.pll = new PilotPLL(result.freq, 0, result.amplitude, {
           sampleRate: this.cfg.sampleRate,
         });
@@ -237,8 +242,9 @@ export class Decoder {
           samples: this.scanner.isDone() ? 1024 : 0,
         }, `Pilot discovered: ${result.freq.toFixed(1)} Hz @ amp ${result.amplitude.toExponential(2)}`);
         if (this.logging) {
-          console.log(`[PILOT] Discovered: ${result.freq.toFixed(1)} Hz @ amp ${result.amplitude.toExponential(2)} confidence=${result.confidence.toFixed(2)}`);
-          console.log(`[PILOT] Tone freqs: ${this.toneFreqs.map(f => f.toFixed(1)).join(', ')}`);
+          console.warn(`[PILOT] Discovered: ${result.freq.toFixed(1)} Hz @ amp ${result.amplitude.toExponential(2)} confidence=${result.confidence.toFixed(2)} correction=${correction.toFixed(4)}`);
+          console.warn(`[PILOT] Old tone freqs (no correction): ${getDataToneFreqs(result.freq, !!this.cfg.musical).map(f => f.toFixed(1)).join(', ')}`);
+          console.warn(`[PILOT] New tone freqs (with correction): ${this.toneFreqs.map(f => f.toFixed(1)).join(', ')}`);
         }
       }
     }
@@ -319,6 +325,11 @@ export class Decoder {
          (energies[3] / total) > 0.08);
 
     const isBurst = (avg > burstThresh) && allFourStrong;
+
+    // ── Post-pilot trace logging ──
+    if (this.pilotDiscovered && !this.inFrame) {
+      console.warn(`[DEC_TRACE] pilotAmp=${this.pilotAmplitude.toExponential(2)} thresh=${ampThresh.toExponential(2)} avg=${avg.toExponential(2)} e=[${energies.map(e=>e.toExponential(2)).join(',')}] all4=${allFourStrong} burst=${(avg>burstThresh)} cons=${this.consecutiveSync} nf=${this.noiseFrames} fse=${this.framesSinceExit} pilotFreq=${this.pilotFreq.toFixed(1)}`);
+    }
 
     // ── Noise profiling ──
     if (!this.inFrame) {
@@ -449,6 +460,7 @@ export class Decoder {
     // ── Decode bits ──
     if (this.inFrame) {
       if (this.frameSkip > 0) {
+        console.warn(`[DEC_TRACE] frameSkip=${this.frameSkip}`);
         this.frameSkip--;
         return;
       }
