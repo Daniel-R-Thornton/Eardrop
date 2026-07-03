@@ -7,134 +7,16 @@
   <link rel="icon" href="data:," />
 </head>
 <body>
-  <div id="app">
-    <header>
-      <h1>🦻 Eardrop</h1>
-      <p class="subtitle">File transfer over audio — speaker to mic, no network needed</p>
-    </header>
+  <div id="root"></div>
 
-    <main>
-      <section class="card send-card">
-        <h2>📤 Send</h2>
-        <div class="drop-zone" id="dropZone">
-          <p>Drop a file here or <label for="fileInput" class="link">browse</label></p>
-          <input type="file" id="fileInput" hidden />
-          <div id="fileInfo" class="file-info hidden"></div>
-        </div>
-        <button id="sendBtn" class="btn primary" disabled>Send as Audio</button>
-        <div id="sendStatus" class="status hidden"></div>
-      </section>
-
-      <section class="card receive-card">
-        <h2>📥 Receive</h2>
-        <p class="hint">Place speaker of sender near mic. Click record when transfer starts.</p>
-        <button id="recordBtn" class="btn danger">🎙 Start Listening</button>
-        <div id="recvStatus" class="status hidden"></div>
-        <div id="recvProgress" class="progress hidden">
-          <div class="progress-bar"><div id="recvBar" class="progress-fill"></div></div>
-          <span id="recvBits">0</span> bits received
-        </div>
-        <div id="downloadArea" class="hidden"></div>
-      </section>
-
-      <section class="card devices-card">
-        <details>
-          <summary class="devices-summary">🎛 Audio Devices</summary>
-          <div class="devices-grid">
-            <div class="device-field">
-              <label for="inputSelect">Input (mic)</label>
-              <select id="inputSelect"><option value="">Default</option></select>
-            </div>
-            <div class="device-field">
-              <label for="outputSelect">Output (speaker)</label>
-              <select id="outputSelect"><option value="">Default</option></select>
-            </div>
-          </div>
-          <button id="refreshDevices" class="btn-small">🔄 Refresh</button>
-        </details>
-      </section>
-    </main>
-
-    <footer>
-      <p>Based on the OFDM modem from <a href="https://github.com/daniel/TapewormFS">TapewormFS</a></p>
-    </footer>
+  <!-- Hidden device selectors (app.ts reads these) -->
+  <div id="device-selectors" style="display:none">
+    <select id="inputSelect"><option value="">Default</option></select>
+    <select id="outputSelect"><option value="">Default</option></select>
+    <button id="refreshDevices"></button>
+    <input type="checkbox" id="fastSyncCb" checked />
   </div>
 
-  <div id="debugBadge" class="debug-badge hidden">🛠</div>
-
-  <!-- React Debug Panel (Ctrl+Shift+D) — floating windows -->
-  <div id="react-debug"></div>
-
-  <!-- Debug Panel (Ctrl+Shift+D) — floating window -->
-  <div id="debugPanel" class="debug-panel hidden">
-    <div class="debug-header" id="debugHeader">
-      <span>🛠 Debug View</span>
-      <div class="debug-header-btns">
-        <button id="debugMinimize" class="debug-icon-btn">─</button>
-        <button id="debugClose" class="debug-icon-btn">✕</button>
-      </div>
-    </div>
-    <div class="debug-body">
-      <div class="debug-grid">
-        <div class="debug-cell">
-          <div class="debug-label">Waveform</div>
-          <canvas id="dbgWaveform"></canvas>
-        </div>
-        <div class="debug-cell">
-          <div class="debug-label">Spectrogram</div>
-          <canvas id="dbgSpectrogram"></canvas>
-        </div>
-        <div class="debug-cell">
-          <div class="debug-label">Tone Energy</div>
-          <canvas id="dbgToneEnergy"></canvas>
-        </div>
-        <div class="debug-cell">
-          <div class="debug-label">Split Carriers</div>
-          <canvas id="dbgSplitCarriers"></canvas>
-        </div>
-      </div>
-      <div class="debug-stats" id="debugStats">Waiting for signal...</div>
-      <div class="debug-levels" id="debugLevels">
-        <div class="debug-levels-row">
-          <span class="debug-level-label">Mic Level</span>
-          <div class="debug-meter-track"><div class="debug-meter-fill" id="debugMicMeter"></div></div>
-          <span class="debug-level-num" id="debugMicLevelNum">— dB</span>
-        </div>
-        <div class="debug-levels-tones" id="debugToneBars">
-          <span class="debug-level-label">Tone Energy</span>
-          <div class="debug-tone-row" id="debugToneRow"></div>
-        </div>
-        <div class="debug-levels-row">
-          <span class="debug-level-label">Decode SNR</span>
-          <span class="debug-level-num" id="debugDecodeSnr">—</span>
-        </div>
-      </div>
-      <div class="debug-toolbar">
-        <button id="selfTestBtn" class="btn-small">🧪 Loopback Self-Test</button>
-        <button id="sendTestBtn" class="btn-small">📤 Send Test (hello.txt)</button>
-        <button id="debugToggleBtn" class="btn-small">Debug: Off</button>
-        <label class="debug-check"><input type="checkbox" id="fastSyncCb"> Fast Sync</label>
-        <span id="selfTestResult" class="self-test-result"></span>
-      </div>
-      <div class="debug-decoder-log">
-        <div class="debug-label">Decoder State</div>
-        <pre id="decoderState">waiting...</pre>
-      </div>
-      <div class="debug-payload-panel">
-        <div class="debug-payload-section">
-          <div class="debug-label">📤 TX Payload</div>
-          <pre id="dbgTxPayload" class="debug-payload-pre">(none sent yet)</pre>
-        </div>
-        <div class="debug-payload-section">
-          <div class="debug-label">📥 RX Payload</div>
-          <pre id="dbgRxPayload" class="debug-payload-pre">(none received yet)</pre>
-        </div>
-      </div>
-    </div>
-    <div class="debug-resize-handle" id="debugResizeHandle"></div>
-  </div>
-
-  <div id="react-debug"></div>
-  <script type="module" src="/src/ui/app.ts"></script>
+  <script type="module" src="/src/ui/main.tsx"></script>
 </body>
 </html>
