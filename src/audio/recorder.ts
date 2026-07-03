@@ -74,7 +74,12 @@ export class AudioRecorder {
 
     // Get mic permission
     const constraints: MediaStreamConstraints = {
-      audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+      audio: {
+        ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
     };
     this.stream = await navigator.mediaDevices.getUserMedia(constraints);
     console.log("[Recorder] stream active:", this.stream.active);
