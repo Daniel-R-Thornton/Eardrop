@@ -547,6 +547,20 @@ async function startListening() {
         }
         ft.sort((a, b) => b.mag - a.mag);
         console.warn(`[FFT] Main top 5: ${ft.slice(0,5).map(b => `${b.freq.toFixed(1)}Hz=${b.mag.toExponential(2)}`).join(', ')}`);
+
+        // Also scan the data tone range (500-1500 Hz) to see what the speaker reproduces
+        const ftHi: { freq: number; mag: number }[] = [];
+        for (let f = 500; f <= 1500; f += 25) {
+          let si = 0, co = 0;
+          for (let i = 0; i < buf.length; i++) {
+            const ph = 2 * Math.PI * f * i / modemRate;
+            si += buf[i] * Math.sin(ph);
+            co += buf[i] * Math.cos(ph);
+          }
+          ftHi.push({ freq: f, mag: Math.hypot(si, co) / buf.length });
+        }
+        ftHi.sort((a, b) => b.mag - a.mag);
+        console.warn(`[FFT] High top 8: ${ftHi.slice(0,8).map(b => `${b.freq.toFixed(1)}Hz=${b.mag.toExponential(2)}`).join(', ')}`);
       }
 
       // Throttle waveform to ~2fps

@@ -110,8 +110,8 @@ export class Decoder {
   public fastSync = false;
 
   /** Live-adjustable thresholds (set via UI sliders) */
-  public liveAmpThresholdRatio = 0.3;
-  public liveSyncStrongMultiplier = 0.5;
+  public liveAmpThresholdRatio = 0.12;
+  public liveSyncStrongMultiplier = 0.3;
 
   // ── Diagnostics (Phase C) ──
   public timing = new TimingProfiler();
@@ -431,9 +431,13 @@ export class Decoder {
     }
 
     // ── Enter data mode ──
+    // Two paths: sync-based (allFourStrong) or pilot-based (strong pilot + energy present)
+    const syncPath = this.consecutiveSync >= 8 && this.noiseFrames >= 25;
+    const pilotPath = this.pilotDiscovered && this.noiseFrames >= 25 &&
+      this.pilotAmplitude > 0.02 && total > this.noiseFloor.reduce((a,b)=>a+b,0) * 20;
     const canEnter = this.fastSync
       ? (this.consecutiveSync >= 8 && this.noiseFrames >= 25)
-      : (this.consecutiveSync >= 8 && this.noiseFrames >= 25 && (this.framesSinceExit >= 50 || this.consecutiveSync >= 10));
+      : (syncPath && (this.framesSinceExit >= 50 || this.consecutiveSync >= 10)) || pilotPath;
     if (canEnter && !this.inFrame) {
       this.inFrame = true;
       this.framesSinceStrong = 0;
