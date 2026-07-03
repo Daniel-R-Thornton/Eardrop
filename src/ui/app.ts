@@ -292,11 +292,15 @@ window.addEventListener("eardrop-acoustic-sweep", (async () => {
   const results: Array<{ freq: number; energy: number }> = [];
   const toneSamples = Math.floor(modemRate * 0.12);
 
-  for (let fi = 0; fi < sweepFreqs.length; fi++) {
-    const freq = sweepFreqs[fi];
+  // Play two tones at once (dual-tone sweep covers 2 freqs per step)
+  for (let fi = 0; fi < sweepFreqs.length; fi += 2) {
+    const freqA = sweepFreqs[fi];
+    const freqB = fi + 1 < sweepFreqs.length ? sweepFreqs[fi + 1] : 0;
     const tone = new Float32Array(toneSamples);
     for (let i = 0; i < toneSamples; i++) {
-      tone[i] = Math.sin(2 * Math.PI * freq * i / modemRate) * 0.8;
+      let s = Math.sin(2 * Math.PI * freqA * i / modemRate) * 0.4;
+      if (freqB) s += Math.sin(2 * Math.PI * freqB * i / modemRate) * 0.4;
+      tone[i] = s;
     }
     const playBuf = resampleAudio(tone, modemRate, outputRate);
     const recvCount = recvSamples.length;
@@ -306,23 +310,28 @@ window.addEventListener("eardrop-acoustic-sweep", (async () => {
     const newSamples = recvSamples.slice(recvCount);
     if (newSamples.length >= 64) {
       const buf = newSamples.slice(-Math.min(256, newSamples.length));
-      // At mid-range tones, scan nearby bins to detect frequency shift
-      if (freq >= 400 && freq <= 600) {
-        let bestFreq = freq, bestE = 0;
-        for (let fb = 50; fb <= 1550; fb += 25) {
-          const e = detectToneEnergy(buf, fb, modemRate);
-          if (e > bestE) { bestE = e; bestFreq = fb; }
-        }
-        if (bestE > 1e-7) {
-          console.log(`[SWEEP] ${freq}Hz → peak ${bestFreq}Hz (${bestE.toExponential(3)}) shift=${bestFreq - freq}Hz`);
+      // Measure energy at both played frequencies
+      const eA = detectToneEnergy(buf, freqA, modemRate);
+      results.push({ freq: freqA, energy: eA });
+      if (freqB) {
+        const eB = detectToneEnergy(buf, freqB, modemRate);
+        results.push({ freq: freqB, energy: eB });
+        // Full-band scan around second (mid-range) tone to check shift
+        if (freqB >= 400 && freqB <= 600) {
+          let bestFreq = freqB, bestE = 0;
+          for (let fb = 50; fb <= 1550; fb += 25) {
+            const e = detectToneEnergy(buf, fb, modemRate);
+            if (e > bestE) { bestE = e; bestFreq = fb; }
+          }
+          if (bestE > 1e-7) console.log(`[SWEEP] dual: ${freqA}/${freqB}Hz → peaks at ${bestFreq}Hz (${bestE.toExponential(3)})`);
         }
       }
-      results.push({ freq, energy: detectToneEnergy(buf, freq, modemRate) });
     } else {
-      results.push({ freq, energy: 0 });
+      if (freqB) { results.push({ freq: freqA, energy: 0 }, { freq: freqB, energy: 0 }); }
+      else { results.push({ freq: freqA, energy: 0 }); }
     }
-    if (fi % 5 === 0 || fi === sweepFreqs.length - 1) {
-      setState({ sweepResults: [...results], sendStatus: { type: "info", msg: `🔊 Sweep: ${fi + 1}/${sweepFreqs.length} (${freq}Hz)` } });
+    if (fi % 10 === 0 || fi >= sweepFreqs.length - 2) {
+      setState({ sweepResults: [...results], sendStatus: { type: "info", msg: `🔊 Sweep: ${fi / 2 + 1}/${Math.ceil(sweepFreqs.length / 2)} (${freqA}/${freqB || '—'}Hz)` } });
     }
   }
   setState({ sweepResults: results, sendStatus: { type: "success", msg: `✅ Sweep done — ${results.length} frequencies` } });
