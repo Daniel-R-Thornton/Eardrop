@@ -31,7 +31,12 @@ export class AudioPlayer {
 
       const source = ctx.createBufferSource();
       source.buffer = buffer;
-      source.connect(ctx.destination);
+      // Boost gain for acoustic path (speaker→air→mic loses ~40-60dB)
+      // 3× gain for acoustic path — browser clips at [-1,1] but preserves zero crossings
+      const gain = ctx.createGain();
+      gain.gain.value = 3.0;
+      source.connect(gain);
+      gain.connect(ctx.destination);
       source.start(0);
       source.onended = () => resolve();
     });
