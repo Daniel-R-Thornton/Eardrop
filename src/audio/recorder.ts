@@ -45,6 +45,8 @@ export class AudioRecorder {
   private downsampler: ReturnType<typeof createDownsampler> | null = null;
   /** Calibrated mic rate — may differ from ctx.sampleRate */
   private calibratedMicRate = 0;
+  private pending: Float32Array | null = null;
+  private modemFrameSamples: number = 0;
 
   /** Optionally accept a shared AudioContext. If omitted, creates its own. */
   constructor(ctx?: AudioContext) {
@@ -62,6 +64,9 @@ export class AudioRecorder {
 
   async start(modemRate: number, onSample: SampleCallback, deviceId?: string): Promise<void> {
     if (this.running) return;
+    // Reset buffer and frame size for a fresh start
+    this.pending = null;
+    this.modemFrameSamples = 0;
 
     console.log("[Recorder] start");
 
