@@ -304,6 +304,15 @@ window.addEventListener("eardrop-acoustic-sweep", (async () => {
     const newSamples = recvSamples.slice(recvCount);
     if (newSamples.length >= 64) {
       const buf = newSamples.slice(-Math.min(256, newSamples.length));
+      // For first tone, scan nearby bins to detect sample rate mismatch
+      if (fi === 0) {
+        console.log(`[SWEEP] First tone ${freq}Hz: scanning nearby bins…`);
+        for (let fb = freq - 100; fb <= freq + 100; fb += 10) {
+          const e = detectToneEnergy(buf, fb, modemRate);
+          if (e > 1e-7) console.log(`  [SWEEP]   ${fb}Hz: ${e.toExponential(3)}`);
+        }
+        console.log(`[SWEEP] RMS of first chunk:`, Math.sqrt(buf.reduce((a,s) => a + s*s, 0) / buf.length));
+      }
       results.push({ freq, energy: detectToneEnergy(buf, freq, modemRate) });
     } else {
       results.push({ freq, energy: 0 });
