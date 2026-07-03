@@ -234,7 +234,7 @@ export class Decoder {
           freq: result.freq.toFixed(1),
           amp: result.amplitude,
           confidence: result.confidence,
-          samples: this.scanner['buf']?.length || 0,
+          samples: this.scanner.isDone() ? 1024 : 0,
         }, `Pilot discovered: ${result.freq.toFixed(1)} Hz @ amp ${result.amplitude.toExponential(2)}`);
         if (this.logging) {
           console.log(`[PILOT] Discovered: ${result.freq.toFixed(1)} Hz @ amp ${result.amplitude.toExponential(2)} confidence=${result.confidence.toFixed(2)}`);
