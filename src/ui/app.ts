@@ -222,6 +222,30 @@ window.addEventListener("eardrop-toggle-debug", ((e: CustomEvent) => {
   // The React side already toggles the state
 }) as EventListener);
 
+// Self-test
+window.addEventListener("eardrop-self-test", (async () => {
+  await runSelfTest();
+}) as EventListener);
+
+// Send test (hello.txt)
+window.addEventListener("eardrop-send-test", (async () => {
+  await refreshDeviceList();
+  if (!isListening) await startListening();
+  const text = "Hello World\n";
+  const raw = new TextEncoder().encode(text);
+  const packet = buildPacket("hello.txt", raw);
+  showTxPayload(raw, "hello.txt");
+  setState({ sendStatus: { type: "info", msg: "📤 Sending test…" } });
+  try {
+    const outputRate = player.getSampleRate();
+    const { samples: playSamples } = await encodeToOutputRateInWorker(packet, outputRate);
+    await player.play(playSamples, outputRate, selectedOutputId || undefined);
+    setState({ sendStatus: { type: "success", msg: "✅ Test sent" } });
+  } catch (err: any) {
+    setState({ sendStatus: { type: "error", msg: `❌ ${err.message}` } });
+  }
+}) as EventListener);
+
 // ─── Receive ──────────────────────────────────────────
 
 let recorder: AudioRecorder | null = null;
@@ -429,7 +453,7 @@ async function runSelfTest() {
   });
 }
 
-// Expose self-test globally for the debug panel button
+// Expose self-test for event wiring
 (window as any).runSelfTest = runSelfTest;
 
 // ─── Init ─────────────────────────────────────────────
