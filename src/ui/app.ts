@@ -285,6 +285,7 @@ window.addEventListener("eardrop-acoustic-sweep", (async () => {
   const modemRate = DEFAULT_CONFIG.sampleRate;
   const outputRate = player.getSampleRate();
   console.log("[SWEEP] audioCtx.sampleRate=", audioCtx.sampleRate, "outputRate=", outputRate, "modemRate=", modemRate);
+  console.log("[SWEEP] recvSamples count in last second:", recvSamples.length - Math.max(0, recvSamples.length - 3500));
   const sweepFreqs: number[] = [];
   for (let f = 100; f <= 1500; f += 50) sweepFreqs.push(f);
 
@@ -305,10 +306,10 @@ window.addEventListener("eardrop-acoustic-sweep", (async () => {
     const newSamples = recvSamples.slice(recvCount);
     if (newSamples.length >= 64) {
       const buf = newSamples.slice(-Math.min(256, newSamples.length));
-      // At mid-range tones, scan full band to detect if frequency shifted
+      // At mid-range tones, scan full band with 5Hz resolution to detect shift
       if (freq >= 400 && freq <= 600) {
         let bestFreq = freq, bestE = 0;
-        for (let fb = 50; fb <= 1550; fb += 25) {
+        for (let fb = freq - 50; fb <= freq + 50; fb += 5) {
           const e = detectToneEnergy(buf, fb, modemRate);
           if (e > bestE) { bestE = e; bestFreq = fb; }
         }
