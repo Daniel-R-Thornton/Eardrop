@@ -285,11 +285,12 @@ window.addEventListener("eardrop-acoustic-sweep", (async () => {
   const modemRate = DEFAULT_CONFIG.sampleRate;
   const outputRate = player.getSampleRate();
   const sweepFreqs: number[] = [];
-  for (let f = 50; f <= 1550; f += 25) sweepFreqs.push(f);
+  for (let f = 100; f <= 1500; f += 50) sweepFreqs.push(f);
 
   const results: Array<{ freq: number; energy: number }> = [];
-  const toneSamples = Math.floor(modemRate * 0.15);
-  const measureDelay = 80;
+  const toneSamples = Math.floor(modemRate * 0.1);
+
+  setState({ sendStatus: { type: "info", msg: `🔊 Sweep: 0/${sweepFreqs.length} (${sweepFreqs[0]}Hz)` } });
 
   for (let fi = 0; fi < sweepFreqs.length; fi++) {
     const freq = sweepFreqs[fi];
@@ -300,17 +301,19 @@ window.addEventListener("eardrop-acoustic-sweep", (async () => {
     const playBuf = resampleAudio(tone, modemRate, outputRate);
     const recvCount = recvSamples.length;
     await player.play(playBuf, outputRate, selectedOutputId || undefined);
-    await new Promise(r => setTimeout(r, measureDelay));
+    await new Promise(r => setTimeout(r, 50));
 
     const newSamples = recvSamples.slice(recvCount);
-    const measureLen = Math.min(256, newSamples.length);
-    if (measureLen >= 64) {
-      const buf = newSamples.slice(newSamples.length - measureLen);
+    if (newSamples.length >= 64) {
+      const buf = newSamples.slice(-Math.min(256, newSamples.length));
       results.push({ freq, energy: detectToneEnergy(buf, freq, modemRate) });
     } else {
       results.push({ freq, energy: 0 });
     }
-    if (fi % 10 === 0) setState({ sendStatus: { type: "info", msg: `🔊 Sweep ${fi}/${sweepFreqs.length} — ${freq}Hz` } });
+    // Live-update every 5 frequencies so graph appears progressively
+    if (fi % 5 === 0 || fi === sweepFreqs.length - 1) {
+      setState({ sweepResults: [...results], sendStatus: { type: "info", msg: `🔊 Sweep: ${fi + 1}/${sweepFreqs.length} (${freq}Hz)` } });
+    }
   }
   setState({ sweepResults: results, sendStatus: { type: "success", msg: `✅ Sweep done — ${results.length} freqs` } });
 }) as EventListener);
