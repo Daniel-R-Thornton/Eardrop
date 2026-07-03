@@ -598,16 +598,27 @@ function WaveformCanvas({ samples }: { samples: Float32Array | null }) {
     const ctx = c.getContext("2d");
     if (!ctx) return;
     const w = c.width, h = c.height, cy = h / 2, len = Math.min(samples.length, 1024), step = samples.length / len;
+    // Find peak for auto-scaling
+    let peak = 1e-12;
+    for (let i = 0; i < len; i++) {
+      const v = Math.abs(samples[Math.floor(i * step)]);
+      if (v > peak) peak = v;
+    }
+    const scale = Math.max(peak * 1.5, 0.001); // at least show something
     ctx.fillStyle = "#07070e";
     ctx.fillRect(0, 0, w, h);
     ctx.strokeStyle = "#6c6cff";
     ctx.lineWidth = 0.8;
     ctx.beginPath();
-    for (let i = 0; i < len; i++) { const x = (i / len) * w, y = cy - samples[Math.floor(i * step)] * (h / 2 - 4); i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
+    for (let i = 0; i < len; i++) {
+      const x = (i / len) * w;
+      const y = cy - (samples[Math.floor(i * step)] / scale) * (h / 2 - 4);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
     ctx.stroke();
     ctx.fillStyle = "#484870";
     ctx.font = "9px monospace";
-    ctx.fillText("Waveform", 4, 11);
+    ctx.fillText(`${(peak * 1e3).toFixed(1)}mV`, 4, 11);
   }, [samples]);
   return <canvas ref={ref} width={400} height={70} style={{ width: "100%", height: 70, borderRadius: 4, background: "#07070e" }} />;
 }
