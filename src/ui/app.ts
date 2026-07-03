@@ -284,6 +284,7 @@ window.addEventListener("eardrop-acoustic-sweep", (async () => {
 
   const modemRate = DEFAULT_CONFIG.sampleRate;
   const outputRate = player.getSampleRate();
+  console.log("[SWEEP] audioCtx.sampleRate=", audioCtx.sampleRate, "outputRate=", outputRate, "modemRate=", modemRate);
   const sweepFreqs: number[] = [];
   for (let f = 100; f <= 1500; f += 50) sweepFreqs.push(f);
 
@@ -304,14 +305,18 @@ window.addEventListener("eardrop-acoustic-sweep", (async () => {
     const newSamples = recvSamples.slice(recvCount);
     if (newSamples.length >= 64) {
       const buf = newSamples.slice(-Math.min(256, newSamples.length));
-      // For first tone, scan nearby bins to detect sample rate mismatch
-      if (fi === 0) {
-        console.log(`[SWEEP] First tone ${freq}Hz: scanning nearby bins…`);
-        for (let fb = freq - 100; fb <= freq + 100; fb += 10) {
+      // At mid-range tones, scan full band to detect if frequency shifted
+      if (freq >= 400 && freq <= 600) {
+        let bestFreq = freq, bestE = 0;
+        for (let fb = 50; fb <= 1550; fb += 25) {
           const e = detectToneEnergy(buf, fb, modemRate);
-          if (e > 1e-7) console.log(`  [SWEEP]   ${fb}Hz: ${e.toExponential(3)}`);
+          if (e > bestE) { bestE = e; bestFreq = fb; }
         }
-        console.log(`[SWEEP] RMS of first chunk:`, Math.sqrt(buf.reduce((a,s) => a + s*s, 0) / buf.length));
+        if (bestE > 1e-7) {
+          console.log(`[SWEEP] Played ${freq}Hz → peak at ${bestFreq}Hz (${bestE.toExponential(3)}) — ${freq === bestFreq ? '✓ match' : '✗ SHIFTED by ' + (bestFreq - freq) + 'Hz'}`);
+        } else {
+          console.log(`[SWEEP] Played ${freq}Hz — no peak found above threshold`);
+        }
       }
       results.push({ freq, energy: detectToneEnergy(buf, freq, modemRate) });
     } else {
