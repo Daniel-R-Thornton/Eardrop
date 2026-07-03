@@ -125,6 +125,8 @@ export class PilotScanner {
   private buf: number[] = [];
   private done = false;
   private result: PilotDiscovery | null = null;
+  private lastRawResult: PilotDiscovery | null = null;
+  private fftRuns = 0;
 
   constructor(cfg: Partial<PilotScannerConfig> = {}) {
     this.cfg = { ...DEFAULT_SCANNER_CONFIG, ...cfg };
@@ -143,9 +145,15 @@ export class PilotScanner {
       this.done = true;
       return this.result;
     }
-    // If we've accumulated a lot of samples without success, force the last result (even null)
+    // If we've accumulated a lot of samples without success, accept whatever we found
     if (this.buf.length >= this.cfg.minSamples * 4) {
+      this.runFft();
+      // If still rejected by targetFreq, accept the last raw result anyway
+      if (!this.result && this.lastRawResult && this.lastRawResult.confidence > 0) {
+        this.result = this.lastRawResult;
+      }
       this.done = true;
+      return this.result;
     }
     return null;
   }
@@ -213,15 +221,19 @@ export class PilotScanner {
 
     const freq = (peakBin + offset) * binWidth;
     const roundedFreq = Math.round(freq * 10) / 10;
+    const amplitude = peakMag / this.buf.length;
+    const confidence = Math.min(1, (signalRatio - minSignalRatio) / 20);
+
+    // Store raw result always (used as fallback when targetFreq rejects)
+    if (signalRatio >= minSignalRatio) {
+      this.lastRawResult = { freq: roundedFreq, amplitude, confidence };
+    }
 
     // Reject if we have a target frequency hint and this is too far from it
     if (targetFreq && Math.abs(roundedFreq - targetFreq) > freqTolerance) {
       this.result = null;
       return;
     }
-
-    const amplitude = peakMag / this.buf.length;
-    const confidence = Math.min(1, (signalRatio - minSignalRatio) / 20);
 
     this.result = { freq: roundedFreq, amplitude, confidence };
   }
