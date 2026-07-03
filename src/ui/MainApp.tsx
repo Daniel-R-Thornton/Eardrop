@@ -6,6 +6,8 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useStore, setState } from "./Store";
 import { ToneMeter } from "./components/ToneMeter";
+import { debugLogger, STAGE } from "../modem/debugger";
+import { compressForLLM, type CompressLevel } from "../modem/compressForLLM";
 
 const TONE_COLORS = ["#4a9eff", "#ff6b4a", "#5eead4", "#f472b6"];
 const TONE_FREQS = [675, 875, 1075, 1275];
@@ -337,15 +339,66 @@ export function MainApp() {
             )}
           </Section>
 
-          {/* ── SELF-TEST RESULT ── */}
-          <Section title="🧪 Diagnostics" color="#eab308">
+          {/* ── DIAGNOSTICS + LLM COMPRESS ── */}
+          <Section title="🧪 Diagnostics & LLM Output" color="#eab308">
             <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
-              <button onClick={() => dispatch("eardrop-self-test")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#e0e0ee", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>🧪 Loopback Self-Test</button>
-              <button onClick={() => dispatch("eardrop-send-test")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#e0e0ee", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>📤 Send Test (hello.txt)</button>
+              <button onClick={() => dispatch("eardrop-self-test")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#e0e0ee", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>🧪 Self-Test</button>
+              <button onClick={() => dispatch("eardrop-send-test")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#e0e0ee", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>📤 Send Test</button>
             </div>
-            <div id="selfTestResult" style={{ fontSize: 10, color: "#7878a0", fontFamily: "monospace", minHeight: 14 }} />
+            <div id="selfTestResult" style={{ fontSize: 10, color: "#7878a0", fontFamily: "monospace", minHeight: 14, marginBottom: 6 }} />
+
+            <DebugOutput />
           </Section>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// DEBUG OUTPUT COMPONENT
+// ═══════════════════════════════════════════════════════
+
+function DebugOutput() {
+  const [level, setLevel] = useState<CompressLevel>("normal");
+  const [output, setOutput] = useState("");
+
+  const genCompress = () => {
+    const text = compressForLLM(debugLogger, { level });
+    setOutput(text);
+    navigator.clipboard.writeText(text).catch(() => {});
+  };
+
+  const genSnapshot = () => {
+    const events = debugLogger.getAllEvents();
+    const text = events.map(e => `[${e.stage}] ${e.summary}`).join("\n");
+    setOutput(text);
+    navigator.clipboard.writeText(text).catch(() => {});
+  };
+
+  const clearLog = () => {
+    debugLogger.clear();
+    setOutput("");
+  };
+
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 4, marginBottom: 4, flexWrap: "wrap" }}>
+        <select value={level} onChange={e => setLevel(e.target.value as CompressLevel)}
+          style={{ background: "#0a0a12", color: "#e0e0ee", border: "1px solid #2a2a4e", borderRadius: 4, padding: "2px 4px", fontSize: 10 }}>
+          <option value="brief">Brief</option>
+          <option value="normal">Normal</option>
+          <option value="verbose">Verbose</option>
+        </select>
+        <button onClick={genCompress} style={{ padding: "3px 8px", border: "1px solid #2a2a4e", borderRadius: 4, background: "#16162a", color: "#eab308", cursor: "pointer", fontSize: 10 }}>🤖 Compress for LLM</button>
+        <button onClick={genSnapshot} style={{ padding: "3px 8px", border: "1px solid #2a2a4e", borderRadius: 4, background: "#16162a", color: "#a78bfa", cursor: "pointer", fontSize: 10 }}>📋 Dump State</button>
+        <button onClick={clearLog} style={{ padding: "3px 8px", border: "1px solid #2a2a4e", borderRadius: 4, background: "#16162a", color: "#7878a0", cursor: "pointer", fontSize: 10 }}>🗑 Clear</button>
+      </div>
+      <pre style={{ margin: 0, padding: "4px 6px", background: "#07070e", border: "1px solid #1e1e3a", borderRadius: 4, fontSize: 9, color: "#a8a8c8", fontFamily: "monospace", whiteSpace: "pre-wrap", wordBreak: "break-all", maxHeight: 120, overflow: "auto", lineHeight: 1.3 }}>
+        {output || (debugLogger.getTotalEvents() > 0 ? `${debugLogger.getTotalEvents()} events in ring buffer…` : "Run a test to collect debug data, then click Compress for LLM")}
+      </pre>
+      <div style={{ marginTop: 4, fontSize: 9, color: "#484870", fontFamily: "monospace" }}>
+        Events: {debugLogger.getTotalEvents()} | Stages: {Object.values(STAGE).length} | Copied to clipboard on click
       </div>
     </div>
   );
