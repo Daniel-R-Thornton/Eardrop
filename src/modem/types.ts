@@ -56,14 +56,17 @@ export interface ModemConfig {
   payloadBlockSymbols: number;
 }
 
-/** Tone frequency offsets from pilot (standard mode).  Default pilot 237.5+437.5=675, etc. */
+/** Tone frequency offsets from pilot (standard mode).  Speaker-safe musical frequencies below 800 Hz.
+ *  Nominal tones: 475, 525, 625, 775 Hz — near B4, C5, D#5/Eb5, G5.
+ *  All are integer-cycle multiples (f/25): 19, 21, 25, 31 cycles at 3200 Hz.
+ */
 export const TONE_OFFSETS: [number, number, number, number] = [
-  437.5, 637.5, 837.5, 1037.5,
+  62.5, 112.5, 212.5, 362.5,
 ] as const;
 
-/** Musical mode offsets — C5, E5, G5, C6 intervals from pilot (using 25 Hz bins for frame alignment) */
+/** Musical mode offsets — playable intervals from pilot */
 export const MUSICAL_OFFSETS: [number, number, number, number] = [
-  300, 425, 550, 775,  // pilot+300≈C5, +425≈E5, +550≈G5, +775≈C6 (nearest 25Hz bins)
+  87.5, 162.5, 287.5, 487.5,  // 500, 575, 700, 900 Hz — B4, D5, F5, A5
 ] as const;
 
 /** Get offsets based on musical mode */
