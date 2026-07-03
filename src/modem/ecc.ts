@@ -74,27 +74,54 @@ function gfInv(a: number): number {
 
 // ─── Precomputed Generator Polynomial Coefficients ───
 
-// g(x) = (x+α)(x+α²)(x+α³)...(x+α⁶) for t=3 error correction
-// g(x) = x⁶ + g₅x⁵ + g₄x⁴ + g₃x³ + g₂x² + g₁x + g₀
-// These are the GF(2^5) coefficients
+// BCH(31,16) generator polynomial: g(x) = m₁(x) · m₃(x) · m₅(x)
+// where m_i(x) is the minimal polynomial of αⁱ over GF(2).
+// Degree = 15 (binary coefficients), roots: α¹, α², α³, α⁴, α⁵, α⁶
+//
+// Cyclotomic cosets:
+//   C₁ = {1, 2, 4, 8, 16}  → m₁(x)
+//   C₃ = {3, 6, 12, 24, 17} → m₃(x)
+//   C₅ = {5, 10, 20, 9, 18} → m₅(x)
 const GENERATOR: number[] = (() => {
   ensureGfTables();
-  // Start with g(x) = 1
-  let gen = [1]; // GF(2^5) coefficients
-  for (let i = 1; i <= 6; i++) {
-    // Multiply by (x + α^i)
-    const alpha = gfExp![(i * 1) % (GF_SIZE - 1)];
-    // Multiply current polynomial by (x + α^i)
-    const newGen = new Array(gen.length + 1).fill(0);
-    for (let j = 0; j < gen.length; j++) {
-      // Shift by 1 (multiply by x)
-      newGen[j + 1] ^= gen[j];
-      // Multiply by α^i
-      newGen[j] ^= gfMulVal(gen[j], alpha);
+
+  // Build a minimal polynomial from its set of conjugate roots.
+  // Returns binary coefficients (0 or 1) indexed by power of x.
+  function minPoly(roots: number[]): number[] {
+    // Start with polynomial = 1
+    let p = [1];
+    for (const r of roots) {
+      const a = gfExp![r % (GF_SIZE - 1)];
+      const next = new Array(p.length + 1).fill(0);
+      for (let j = 0; j < p.length; j++) {
+        // Multiply by (x + a): shift + scale
+        next[j + 1] ^= p[j];
+        next[j] ^= gfMulVal(p[j], a);
+      }
+      p = next;
     }
-    gen = newGen;
+    // Minimal polynomial over GF(2) has binary coefficients;
+    // the full GF(2⁵) product naturally yields 0/1 values.
+    // Mask as a safety measure.
+    return p.map(c => c & 1);
   }
-  return gen;
+
+  // Binary polynomial multiplication
+  function mulPoly(a: number[], b: number[]): number[] {
+    const r = new Array(a.length + b.length - 1).fill(0);
+    for (let i = 0; i < a.length; i++) {
+      for (let j = 0; j < b.length; j++) {
+        r[i + j] ^= (a[i] & b[j]);
+      }
+    }
+    return r;
+  }
+
+  const m1 = minPoly([1, 2, 4, 8, 16]);
+  const m3 = minPoly([3, 6, 12, 24, 17]);
+  const m5 = minPoly([5, 10, 20, 9, 18]);
+
+  return mulPoly(mulPoly(m1, m3), m5);
 })();
 
 // ─── Syndrome Calculation ────────────────────────────
@@ -188,7 +215,8 @@ function chienSearch(lambda: number[]): number[] {
       pow = gfMulVal(pow, alpha);
     }
     if (val === 0) {
-      errors.push(n - 1 - i); // position from LSB
+      // Λ(αⁱ) = 0  ⇒  αⁱ = α^(-pos)  ⇒  pos = (n - i) mod n
+      errors.push((n - i) % n);
     }
   }
 
@@ -238,23 +266,24 @@ function encodeCodeword(input16: number): Uint8Array {
     codeword[30 - i] = (input16 >> i) & 1;
   }
 
-  // Compute parity by polynomial division
-  // Remainder of x^15 * m(x) / g(x)
-  const msgPoly = codeword.slice(15); // data part (x^15 * m(x))
-  // Synthetic division
-  const remainder = [...msgPoly];
-  for (let i = 0; i < 16; i++) {
-    if (remainder[i] !== 0) {
+  // Compute parity: remainder of x^15 * m(x) / g(x)
+  // g(x) has binary coefficients, GENERATOR[i] = coefficient of xⁱ
+  // Synthetic (binary) polynomial long division over a 31-bit workspace
+  const work = [...codeword]; // 31 elements, indices 0..30 = x⁰..x³⁰
+  for (let i = 30; i >= 15; i--) {
+    if (work[i] !== 0) {
+      // Subtract g(x) · x^(i-15)  ⟹  XOR generator coefficients starting at (i-15)
       for (let j = 0; j < GENERATOR.length; j++) {
-        remainder[i + j] ^= gfMulVal(remainder[i], GENERATOR[j]);
+        if (GENERATOR[j]) {
+          work[i - 15 + j] ^= 1;
+        }
       }
-      remainder[i] = 0;
     }
   }
 
-  // Place remainder in low 15 positions
+  // work[0..14] now holds the remainder → place in low 15 codeword positions
   for (let i = 0; i < 15; i++) {
-    codeword[14 - i] = i < remainder.length ? remainder[remainder.length - 1 - i] : 0;
+    codeword[i] = work[i];
   }
 
   // Pack into 4 bytes (31 bits MSB-aligned in 4 bytes = 32 bits, discard bit 31)
@@ -314,12 +343,13 @@ function decodeCodeword(encoded4: Uint8Array): { data: number; errors: number } 
     return { data, errors: foundErrors };
   }
 
-  // Too many errors or no solution — return uncorrected data
+  // No valid error pattern found or too many errors — uncorrectable
   let data = 0;
   for (let i = 0; i < 16; i++) {
     if (codeword[30 - i]) data |= (1 << i);
   }
-  return { data, errors: -foundErrors }; // negative = uncorrectable
+  // Use -1 for uncorrectable (syndrome ≠ 0 but no valid ≤3-error pattern)
+  return { data, errors: -1 };
 }
 
 // ─── Block-Level API ─────────────────────────────────

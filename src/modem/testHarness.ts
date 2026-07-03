@@ -240,11 +240,11 @@ export class TestHarness {
     allFrameBytes.set(payloadBlock.bytes, configBlock.bytes.length);
     allFrameBytes.set(eofBlock.bytes, configBlock.bytes.length + payloadBlock.bytes.length);
 
-    // Encode
+    // Encode — use encodeFramedBlocks since allFrameBytes is already framed
     this.timing.begin('encode');
     let audio: Float32Array;
     try {
-      audio = this.encoder.encode(allFrameBytes);
+      audio = this.encoder.encodeFramedBlocks(allFrameBytes);
     } catch (err: any) {
       return {
         name,
@@ -315,7 +315,7 @@ export class TestHarness {
       }
       dataMatch = byteErrors === 0 && decodedData.length === testData.length;
     } else {
-      byteErrors = testData.length; // no data = all bytes wrong
+      byteErrors = testData.length;
     }
 
     const metrics: PassFailMetrics = {

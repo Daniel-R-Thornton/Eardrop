@@ -133,6 +133,7 @@ export class PilotScanner {
     if (this.buf.length >= this.cfg.minSamples) {
       this.runFft();
       this.done = true;
+      return this.result;
     }
     return null;
   }
@@ -200,10 +201,11 @@ export class PilotScanner {
     const offset = interpolatePeak(m0, m1, m2);
 
     const freq = (peakBin + offset) * binWidth;
-    const amplitude = peakMag / this.buf.length; // normalize by sample count
+    const roundedFreq = Math.round(freq * 10) / 10; // round to 0.1 Hz
+    const amplitude = peakMag / this.buf.length;
     const confidence = Math.min(1, (signalRatio - minSignalRatio) / 20);
 
-    this.result = { freq, amplitude, confidence };
+    this.result = { freq: roundedFreq, amplitude, confidence };
   }
 }
 

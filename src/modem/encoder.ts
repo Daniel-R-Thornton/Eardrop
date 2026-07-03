@@ -53,6 +53,49 @@ export class Encoder {
 
   /** Encode raw bytes → float32 audio samples [-1, 1] */
   encode(data: Uint8Array): Float32Array {
+    this.resetState();
+    this.bitstream = [];
+    const framedPayload = encodeBlock(BLOCK_TYPE.PAYLOAD, data);
+    this.buildBitstream(framedPayload.bytes);
+    return this.generateAudioInternal();
+  }
+
+  /** Encode pre-framed block bytes → audio (no extra framing layer) */
+  encodeFramedBlocks(blockBytes: Uint8Array): Float32Array {
+    this.resetState();
+    this.bitstream = [];
+    this.buildBitstream(blockBytes);
+    return this.generateAudioInternal();
+  }
+
+  /** Build bitstream: initial squawk → data segments → final squawk */
+  private buildBitstream(dataBytes: Uint8Array): void {
+    // Emit initial squawk
+    this.emitBlockBits(encodeBlock(BLOCK_TYPE.SQUAWK, encodeSquawkPayload(0)).bytes);
+
+    // Emit data in segments with squawks between
+    // No segment splitting — all data sent in one contiguous block
+    const bytesPerSegment = Infinity;
+    let bytePos = 0;
+    let squawkId = 0;
+
+    while (bytePos < dataBytes.length) {
+      const len = Math.min(bytesPerSegment, dataBytes.length - bytePos);
+      this.emitBlockBits(dataBytes.slice(bytePos, bytePos + len));
+      bytePos += len;
+
+      if (bytePos < dataBytes.length) {
+        squawkId++;
+        this.emitBlockBits(encodeBlock(BLOCK_TYPE.SQUAWK, encodeSquawkPayload(squawkId)).bytes);
+      }
+    }
+
+    // Final squawk
+    squawkId++;
+    this.emitBlockBits(encodeBlock(BLOCK_TYPE.SQUAWK, encodeSquawkPayload(squawkId)).bytes);
+  }
+
+  private resetState(): void {
     this.phase = Phase.kLeader;
     this.samplesInPhase = 0;
     this.pilotPhase = 0;
@@ -61,65 +104,25 @@ export class Encoder {
     this.bpskMul = new Float32Array(numTones);
     for (let t = 0; t < numTones; t++) this.bpskMul[t] = 1;
     this.bitPos = 0;
-
-    // Build bitstream from framed blocks, with squawks interleaved
     this.bitstream = [];
-
-    // Wrapped blocks: payload data framed, squawks interleaved
-    const framedPayload = encodeBlock(BLOCK_TYPE.PAYLOAD, data);
-
-    // Emit initial squawk (Squawk 0 — calibration)
-    this.emitBlockBits(encodeBlock(BLOCK_TYPE.SQUAWK, encodeSquawkPayload(0)));
-
-    // Emit payload in chunks, with squawks between
-    const squawkInterval = this.cfg.squawkIntervalSymbols;
-    const bitsPerBlock = this.cfg.bitsPerFrame; // 8 bits/symbol
-    const blockBits = framedPayload.bytes.length * 8;
-    const maxBitsPerSegment = squawkInterval * bitsPerBlock;
-    let payloadBitPos = 0;
-    let squawkId = 0;
-
-    while (payloadBitPos < blockBits) {
-      const segmentBits = Math.min(maxBitsPerSegment, blockBits - payloadBitPos);
-      // Payload segment
-      for (let i = 0; i < segmentBits; i++) {
-        const byteIdx = Math.floor((payloadBitPos + i) / 8);
-        const bitIdx = 7 - ((payloadBitPos + i) % 8);
-        this.bitstream.push((framedPayload.bytes[byteIdx] >> bitIdx) & 1);
-      }
-      payloadBitPos += segmentBits;
-
-      // Emit squawk after this segment (unless we just finished)
-      if (payloadBitPos < blockBits) {
-        squawkId++;
-        this.emitBlockBits(encodeBlock(BLOCK_TYPE.SQUAWK, encodeSquawkPayload(squawkId)));
-      }
-    }
-
-    // Emit final squawk
-    squawkId++;
-    this.emitBlockBits(encodeBlock(BLOCK_TYPE.SQUAWK, encodeSquawkPayload(squawkId)));
-
-    // Estimate total size and generate audio
-    this.leaderSamps = Math.floor(this.cfg.sampleRate / 2 / this.sps) * this.sps;
-    const totalSamples = this.estimateTotalSamples2(this.bitstream.length);
-    const full = new Float32Array(totalSamples);
-    for (let i = 0; i < totalSamples; i++) {
-      full[i] = this.generateSample();
-    }
-    return full;
   }
 
-  /** Emit a framed block's bytes as ECC-encoded bits into the bitstream */
-  private emitBlockBits(block: { bytes: Uint8Array }): void {
-    // Hamming(7,4) encode each byte: 2 nibbles → 16 encoded bits
-    for (const byte of block.bytes) {
-      const hiNib = (byte >> 4) & 0xf;
-      const loNib = byte & 0xf;
-      const hiEnc = this.hammingEncode(hiNib);
-      const loEnc = this.hammingEncode(loNib);
-      for (let b = 7; b >= 0; b--) this.bitstream.push((hiEnc >> b) & 1);
-      for (let b = 7; b >= 0; b--) this.bitstream.push((loEnc >> b) & 1);
+  /** Emit raw bytes -> bits in [amp0,amp1,amp2,amp3] format (4 data bits/symbol)
+   *  Each input byte is split into two 4-bit nibbles, each becomes one frame.
+   *  The frame byte format [a0,0,a1,0,a2,0,a3,0] is reconstructed by the encoder's
+   *  BPSK modulation (phase bits always 0 for reliability). */
+  private emitBlockBits(data: Uint8Array): void {
+    for (const byte of data) {
+      const hi = (byte >> 4) & 0x0F;
+      const lo = byte & 0x0F;
+      // High nibble: 4 amp bits for tones 0-3
+      for (let b = 3; b >= 0; b--) {
+        this.bitstream.push((hi >> b) & 1);
+      }
+      // Low nibble: 4 amp bits for next frame
+      for (let b = 3; b >= 0; b--) {
+        this.bitstream.push((lo >> b) & 1);
+      }
     }
   }
 
@@ -131,8 +134,20 @@ export class Encoder {
 
   // ─── private ───────────────────────────────────────
 
+  /** Generate audio from prepared bitstream */
+  private generateAudioInternal(): Float32Array {
+    this.leaderSamps = Math.floor(this.cfg.sampleRate / 2 / this.sps) * this.sps;
+    const totalSamples = this.estimateTotalSamples2(this.bitstream.length);
+    const out = new Float32Array(totalSamples);
+    for (let i = 0; i < totalSamples; i++) {
+      out[i] = this.generateSample();
+    }
+    return out;
+  }
+
   private estimateTotalSamples2(bitstreamBits: number): number {
-    const dataSymbols = Math.ceil(bitstreamBits / this.cfg.bitsPerFrame);
+    // 4 data bits per symbol (amp bits only; phase bits always 0)
+    const dataSymbols = Math.ceil(bitstreamBits / 4);
     const dataSamples = dataSymbols * this.sps;
     const leaderSamples = this.leaderSamps || Math.floor(this.cfg.sampleRate / 2 / this.sps) * this.sps;
     const syncSamples = this.cfg.syncSymbols * this.sps;
@@ -181,18 +196,14 @@ export class Encoder {
         }
 
         if (this.samplesInPhase === 0) {
-          // Start of new symbol — set BPSK multipliers for this symbol
-          // bitstream layout: [amp0, phase0, amp1, phase1, amp2, phase2, amp3, phase3]
+          // 8-bit frame: [a0,0,a1,0,a2,0,a3,0] — phase bits always 0
+          // bitstream has 4 bits per symbol, packed as [amp0,amp1,amp2,amp3]
           for (let t = 0; t < numTones; t++) {
-            const ampBit = (this.bitPos + t * 2) < this.bitstream.length
-              ? this.bitstream[this.bitPos + t * 2] : 0;
-            const phaseBit = (this.bitPos + t * 2 + 1) < this.bitstream.length
-              ? this.bitstream[this.bitPos + t * 2 + 1] : 0;
-            // BPSK: phaseBit=0 → +1 (0°), phaseBit=1 → -1 (180°)
-            this.bpskMul[t] = phaseBit === 0 ? 1 : -1;
-            // If ampBit=0, also set bpskMul to 0 (tone OFF)
-            if (ampBit === 0) this.bpskMul[t] = 0;
+            const ampBit = (this.bitPos + t) < this.bitstream.length
+              ? this.bitstream[this.bitPos + t] : 0;
+            this.bpskMul[t] = ampBit === 0 ? 0 : 1;
           }
+
         }
 
         // Generate this sample
@@ -205,7 +216,7 @@ export class Encoder {
         this.samplesInPhase++;
         if (this.samplesInPhase >= this.sps) {
           this.samplesInPhase = 0;
-          this.bitPos += this.cfg.bitsPerFrame;
+          this.bitPos += 4; // 4 bits per symbol (phase bits are always 0)
         }
         break;
       }
@@ -221,26 +232,6 @@ export class Encoder {
   private advancePhase() {
     this.phase = (this.phase + 1) as Phase;
     this.samplesInPhase = 0;
-  }
-
-  /** Hamming(7,4) encode — placeholder until BCH is implemented */
-  private hammingEncode(nibble: number): number {
-    const d0 = (nibble >> 3) & 1;
-    const d1 = (nibble >> 2) & 1;
-    const d2 = (nibble >> 1) & 1;
-    const d3 = (nibble >> 0) & 1;
-    const p0 = d0 ^ d1 ^ d3;
-    const p1 = d0 ^ d2 ^ d3;
-    const p2 = d1 ^ d2 ^ d3;
-    let out = 0;
-    out |= (p0 << 7);
-    out |= (p1 << 6);
-    out |= (d0 << 5);
-    out |= (p2 << 4);
-    out |= (d1 << 3);
-    out |= (d2 << 2);
-    out |= (d3 << 1);
-    return out;
   }
 
   /** Simple linear resample */

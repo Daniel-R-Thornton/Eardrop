@@ -27,7 +27,7 @@ export const BLOCK_TYPE = {
 
 export type BlockType = (typeof BLOCK_TYPE)[keyof typeof BLOCK_TYPE];
 
-export const SENTINEL = 0xE79F;
+export const SENTINEL = 0x8888;
 export const SENTINEL_BYTES = 2;
 export const BLOCK_HEADER_BYTES = 5;   // type(1) + len(2) + sentinel(2)
 export const BLOCK_FOOTER_BYTES = 2;   // crc(2)

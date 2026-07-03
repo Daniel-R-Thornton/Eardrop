@@ -34,7 +34,7 @@ export interface ModemConfig {
   // ── Sync / framing ──
   /** Number of sync symbols in the sync burst */
   syncSymbols: number;
-  /** 16-bit sentinel pattern for self-framing blocks */
+  /** 16-bit sentinel pattern (all OFF-tone phase bits = 0 to match decoder convention) */
   sentinel: number;
 
   // ── Squawk calibration ──
@@ -91,7 +91,7 @@ export const DEFAULT_CONFIG: ModemConfig = {
 
   syncSymbols: 10,
 
-  sentinel: 0xE79F,
+  sentinel: 0x8888,  // block format: 0x88 high nibble 0x8 → amp bits [1,0,0,0] → frame 0x80
 
   squawkIntervalSymbols: 32,
   squawkSymbols: 8,
