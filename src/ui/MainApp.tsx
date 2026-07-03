@@ -74,6 +74,11 @@ function Section({ title, children, color = "#6c6cff" }: { title: string; childr
 export function MainApp() {
   const s = useStore(x => x); // full state
 
+  // Refresh device pickers after React mounts the DOM
+  useEffect(() => {
+    (window as any).eardropRefreshDevices?.();
+  }, []);
+
   // ── Event dispatchers to app.ts ──
 
   const dispatch = (type: string, detail?: any) => window.dispatchEvent(new CustomEvent(type, { detail }));

@@ -155,12 +155,23 @@ broadcastWorker.onmessage = (e) => {
   }
 };
 
-// ─── DOM refs (minimal — only device selectors and audio) ──
+// ─── DOM refs (acquired lazily — React creates these) ──
+let inputSelect: HTMLSelectElement | null = null;
+let outputSelect: HTMLSelectElement | null = null;
+let refreshBtn: HTMLButtonElement | null = null;
+let fastSyncCb: HTMLInputElement | null = null;
 
-const inputSelect = document.getElementById("inputSelect") as HTMLSelectElement;
-const outputSelect = document.getElementById("outputSelect") as HTMLSelectElement;
-const refreshBtn = document.getElementById("refreshDevices") as HTMLButtonElement;
-const fastSyncCb = document.getElementById("fastSyncCb") as HTMLInputElement;
+function getDeviceRefs() {
+  if (!inputSelect) {
+    inputSelect = document.getElementById("inputSelect") as HTMLSelectElement;
+    outputSelect = document.getElementById("outputSelect") as HTMLSelectElement;
+    refreshBtn = document.getElementById("refreshDevices") as HTMLButtonElement;
+    fastSyncCb = document.getElementById("fastSyncCb") as HTMLInputElement;
+    refreshBtn?.addEventListener("click", refreshDeviceList);
+    inputSelect.addEventListener("change", () => { selectedInputId = inputSelect!.value; });
+    outputSelect.addEventListener("change", () => { selectedOutputId = outputSelect!.value; });
+  }
+}
 
 // ─── State ────────────────────────────────────────────
 
@@ -173,6 +184,8 @@ const player = new AudioPlayer(audioCtx);
 // ─── Device Enumeration ───────────────────────────────
 
 async function refreshDeviceList() {
+  getDeviceRefs();
+  if (!inputSelect || !outputSelect) return;
   try {
     const { inputs, outputs } = await enumerateDevices();
     populateSelect(inputSelect, inputs, "");
@@ -180,13 +193,8 @@ async function refreshDeviceList() {
   } catch { /* silent */ }
 }
 
-refreshBtn?.addEventListener("click", refreshDeviceList);
-// Wait for React to mount device selects before populating
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", () => setTimeout(refreshDeviceList, 100));
-} else {
-  setTimeout(refreshDeviceList, 100);
-}
+// React calls this after mount
+(window as any).eardropRefreshDevices = refreshDeviceList;
 
 // ─── Custom Events from React ─────────────────────────
 
@@ -261,8 +269,7 @@ let isListening = false;
 let selectedInputId = "";
 let selectedOutputId = "";
 
-inputSelect?.addEventListener("change", () => { selectedInputId = inputSelect.value; });
-outputSelect?.addEventListener("change", () => { selectedOutputId = outputSelect.value; });
+// Device change listeners are set up in getDeviceRefs()
 
 function recvBuf(existing: Uint8Array[], chunk: Uint8Array) {
   existing.push(chunk);
