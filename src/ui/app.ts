@@ -322,7 +322,6 @@ window.addEventListener("eardrop-acoustic-sweep", (async () => {
   }
 
   setState({ sendStatus: { type: "error", msg: "❌ Sweep failed — check console for diagnostics" } });
-  setState({ sweepResults: results, sendStatus: { type: "success", msg: `✅ Sweep done — ${results.length} freqs` } });
 }) as EventListener);
 
 function resampleAudio(input: Float32Array, inRate: number, outRate: number): Float32Array {
