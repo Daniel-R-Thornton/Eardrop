@@ -396,6 +396,7 @@ export function MainApp() {
               <button onClick={() => dispatch("eardrop-self-test")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#e0e0ee", cursor: "pointer", fontSize: 11, fontWeight: 600, minWidth: 80 }}>🧪 Self-Test</button>
               <button onClick={() => dispatch("eardrop-send-test")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#e0e0ee", cursor: "pointer", fontSize: 11, fontWeight: 600, minWidth: 80 }}>📤 Send Test</button>
               <button onClick={() => dispatch("eardrop-acoustic-sweep")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#f472b6", cursor: "pointer", fontSize: 11, fontWeight: 600, minWidth: 80 }}>🔊 Acoustic Sweep</button>
+              <button onClick={() => dispatch("eardrop-download-wav")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#44cc88", cursor: "pointer", fontSize: 11, fontWeight: 600, minWidth: 80 }}>⬇ Download WAV</button>
             </div>
             <div id="selfTestResult" style={{ fontSize: 10, color: "#7878a0", fontFamily: "monospace", minHeight: 14, marginBottom: 6 }} />
 

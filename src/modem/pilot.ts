@@ -102,29 +102,59 @@ export class PilotScanner {
   feedSample(sample: number): PilotDiscovery | null {
     if (this.done) return this.result;
     this.buf.push(sample);
-    // Keep only the most recent 4096 samples (sliding window — ~1.3s)
-    if (this.buf.length > 4096) {
-      this.buf.splice(0, this.buf.length - 2048);
+    // Keep a sliding window of recent samples
+    if (this.buf.length > 2048) {
+      this.buf.splice(0, this.buf.length - 1024);
     }
-    if (this.buf.length >= this.cfg.minSamples && this.buf.length >= this.lastFftAt + 512) {
+    // Use Goertzel on the most recent ~512 samples at target frequency ± tolerance
+    if (this.buf.length >= 512 && this.buf.length >= this.lastFftAt + 256) {
       this.lastFftAt = this.buf.length;
-      console.warn(`[SCAN] FFT run: ${this.buf.length}samp noise=${this.noiseLearned}`);
-      this.runFft();
-      if (this.result) {
-        console.warn(`[SCAN] PILOT LOCKED: ${this.result.freq} Hz @ amp ${this.result.amplitude.toExponential(2)}`);
+      const win = this.buf.slice(-512);
+      const { sampleRate, targetFreq, freqTolerance = 30, minSignalRatio } = this.cfg;
+      console.warn(`[SCAN] Goertzel scan: ${win.length}samp target=${targetFreq}Hz`);
+
+      // Scan target ± tolerance at 5 Hz resolution using Goertzel on recent samples
+      let bestFreq = 0, bestMag = 0;
+      const results: { f: number; m: number }[] = [];
+      const startF = Math.max(30, (targetFreq || 400) - freqTolerance);
+      const endF = Math.min(1550, (targetFreq || 400) + freqTolerance);
+      for (let f = startF; f <= endF; f += 2) {
+        let si = 0, co = 0;
+        for (let i = 0; i < win.length; i++) {
+          const ph = 2 * Math.PI * f * i / sampleRate;
+          si += win[i] * Math.sin(ph);
+          co += win[i] * Math.cos(ph);
+        }
+        const mag = Math.hypot(si, co) / win.length;
+        results.push({ f, m: mag });
+        if (mag > bestMag) { bestMag = mag; bestFreq = f; }
+      }
+      results.sort((a, b) => b.m - a.m);
+      console.warn(`[SCAN] Goertzel top 5: ${results.slice(0, 5).map(r => `${r.f}Hz=${r.m.toExponential(2)}`).join(', ')}`);
+
+      // Check if best peak is above noise floor
+      const allMags = results.map(r => r.m).sort((a, b) => a - b);
+      const median = allMags[Math.floor(allMags.length / 2)] || 1e-12;
+      const ratio = bestMag / Math.max(median, 1e-14);
+      console.warn(`[SCAN] Peak: ${bestFreq}Hz mag=${bestMag.toExponential(2)} median=${median.toExponential(2)} ratio=${ratio.toFixed(1)}`);
+
+      if (ratio >= (minSignalRatio || 5) && targetFreq && Math.abs(bestFreq - targetFreq) <= freqTolerance) {
+        const amplitude = bestMag;
+        const confidence = Math.min(1, (ratio - (minSignalRatio || 5)) / 20);
+        this.result = { freq: bestFreq, amplitude, confidence };
+        console.warn(`[SCAN] PILOT LOCKED: ${bestFreq} Hz @ amp ${amplitude.toExponential(2)}`);
         this.done = true;
         return this.result;
-      } else {
-        console.warn(`[SCAN] No valid pilot yet (buf=${this.buf.length})`);
+      } else if (ratio < (minSignalRatio || 5)) {
+        console.warn(`[SCAN] Rejected: ratio ${ratio.toFixed(1)} < ${minSignalRatio || 5}`);
+      } else if (targetFreq && Math.abs(bestFreq - targetFreq) > freqTolerance) {
+        console.warn(`[SCAN] Rejected: ${bestFreq}Hz is ${Math.abs(bestFreq - targetFreq).toFixed(1)}Hz from target ${targetFreq}Hz`);
       }
     }
     return null;
   }
 
   forceDiscover(): PilotDiscovery | null {
-    if (this.buf.length < 64) return null;
-    this.runFft();
-    this.done = true;
     return this.result;
   }
 
@@ -134,80 +164,6 @@ export class PilotScanner {
   reset() {
     this.buf = []; this.done = false; this.result = null; this.lastFftAt = 0;
     this.noiseBuf = []; this.noiseSpectrum = null; this.noiseLearned = false;
-  }
-
-  private runFft() {
-    const { scanRange, sampleRate, fftSize, minSignalRatio, targetFreq, freqTolerance = 50 } = this.cfg;
-    const rawMag = fftMagnitude(this.buf, fftSize);
-    let mag = rawMag;
-
-    // Subtract learned noise spectrum to suppress room hum
-    if (this.noiseSpectrum) {
-      const sub = new Float64Array(mag.length);
-      for (let i = 0; i < mag.length; i++) {
-        sub[i] = Math.max(0, mag[i] - this.noiseSpectrum[i]);
-      }
-      const binMax = Math.round(400 / (sampleRate / fftSize));
-      console.warn(`[SCAN] Noise-subtracted: noise@365Hz=${this.noiseSpectrum[Math.round(365/sampleRate*fftSize)]?.toExponential(2)} rawFFT=${rawMag[Math.round(365/sampleRate*fftSize)]?.toExponential(2)} after=${sub[Math.round(365/sampleRate*fftSize)]?.toExponential(2)}`);
-      mag = sub;
-    }
-    const binWidth = sampleRate / fftSize;
-    const binLo = Math.max(1, Math.floor(scanRange[0] / binWidth));
-    const binHi = Math.min(mag.length - 1, Math.ceil(scanRange[1] / binWidth));
-
-    // Find top 3 peaks for diagnostics
-    interface Peak { bin: number; mag: number; freq: number; }
-    const peaks: Peak[] = [];
-    for (let b = binLo; b <= binHi; b++) {
-      // Local maximum check
-      if ((b === binLo || mag[b] > mag[b - 1]) && (b === binHi || mag[b] > mag[b + 1] || mag[b] >= mag[b - 1])) {
-        continue; // simple approach — just find the global max
-      }
-    }
-    // Actually just find the top value
-    let peakBin = binLo, peakMag = mag[binLo];
-    for (let b = binLo + 1; b <= binHi; b++) {
-      if (mag[b] > peakMag) { peakMag = mag[b]; peakBin = b; }
-    }
-
-    // Log top 5 magnitude bins for debugging
-    const topBins: { bin: number; freq: number; mag: number }[] = [];
-    for (let b = binLo; b <= binHi; b++) {
-      topBins.push({ bin: b, freq: b * binWidth, mag: mag[b] });
-    }
-    topBins.sort((a, b) => b.mag - a.mag);
-    console.warn(`[SCAN] Top 5 bins: ${topBins.slice(0, 5).map(p => `${p.freq.toFixed(1)}Hz=${p.mag.toExponential(2)}`).join(', ')}`);
-
-    const allMags: number[] = [];
-    for (let b = 1; b < mag.length; b++) {
-      if (b < binLo - 2 || b > binHi + 2) allMags.push(mag[b]);
-    }
-    allMags.sort((a, b) => a - b);
-    const noiseMedian = allMags[Math.floor(allMags.length / 2)] || 1e-12;
-    const signalRatio = peakMag / Math.max(noiseMedian, 1e-14);
-    console.warn(`[SCAN] Peak: ${(peakBin * binWidth).toFixed(1)}Hz mag=${peakMag.toExponential(2)} noiseMedian=${noiseMedian.toExponential(2)} ratio=${signalRatio.toFixed(1)}`);
-
-    if (signalRatio < minSignalRatio) {
-      console.warn(`[SCAN] Rejected: signalRatio ${signalRatio.toFixed(1)} < ${minSignalRatio}`);
-      return;
-    }
-
-    const m0 = peakBin > 0 ? mag[peakBin - 1] : 0;
-    const m1 = peakMag;
-    const m2 = peakBin < mag.length - 1 ? mag[peakBin + 1] : 0;
-    const offset = interpolatePeak(m0, m1, m2);
-    const freq = Math.round((peakBin + offset) * binWidth * 10) / 10;
-    const amplitude = peakMag / this.buf.length;
-    const confidence = Math.min(1, (signalRatio - minSignalRatio) / 20);
-
-    if (targetFreq && Math.abs(freq - targetFreq) > freqTolerance) {
-      console.warn(`[SCAN] Rejected: ${freq}Hz is ${Math.abs(freq - targetFreq).toFixed(1)}Hz from target ${targetFreq}Hz (tolerance ${freqTolerance}Hz)`);
-      console.warn(`[SCAN]   Top 5: ${topBins.slice(0, 5).map(p => `${p.freq.toFixed(1)}Hz`).join(', ')}`);
-      this.result = null;
-      return;
-    }
-    console.warn(`[SCAN] ACCEPTED: ${freq}Hz amp=${amplitude.toExponential(2)} confidence=${confidence.toFixed(2)}`);
-    this.result = { freq, amplitude, confidence };
   }
 }
 

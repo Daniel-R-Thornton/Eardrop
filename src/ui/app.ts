@@ -284,6 +284,41 @@ window.addEventListener("eardrop-stop-playback", (() => {
   setState({ isSending: false, isPlaying: false, sendStatus: { type: "info", msg: "⏹ Playback stopped" } });
 }) as EventListener);
 
+// Download recorded samples as WAV file
+window.addEventListener("eardrop-download-wav", (() => {
+  const samples = recvSamples;
+  if (samples.length < 128) {
+    setState({ sendStatus: { type: "error", msg: "⚠ No audio recorded — listen first" } });
+    return;
+  }
+  const sr = 3200;
+  const n = samples.length;
+  const dataLen = n * 2;
+  const buf = new ArrayBuffer(44 + dataLen);
+  const v = new DataView(buf);
+  const w = (o: number, s: number) => v.setUint32(o, s, true);
+  const w16 = (o: number, s: number) => v.setUint16(o, s, true);
+  v.setUint8(0, 0x52); v.setUint8(1, 0x49); v.setUint8(2, 0x46); v.setUint8(3, 0x46);
+  w(4, 36 + dataLen);
+  v.setUint8(8, 0x57); v.setUint8(9, 0x41); v.setUint8(10, 0x56); v.setUint8(11, 0x45);
+  v.setUint8(12, 0x66); v.setUint8(13, 0x6D); v.setUint8(14, 0x74); v.setUint8(15, 0x20);
+  w(16, 16); w16(20, 1); w16(22, 1); w(24, sr); w(28, sr * 2); w16(32, 2); w16(34, 16);
+  v.setUint8(36, 0x64); v.setUint8(37, 0x61); v.setUint8(38, 0x74); v.setUint8(39, 0x61);
+  w(40, dataLen);
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(44 + i * 2, s * 32767, true);
+  }
+  const blob = new Blob([buf], { type: "audio/wav" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `eardrop_${Date.now()}.wav`;
+  a.click();
+  URL.revokeObjectURL(url);
+  setState({ sendStatus: { type: "success", msg: `✅ Downloaded ${(dataLen / 1024).toFixed(0)}KB WAV` } });
+}) as EventListener);
+
 // Live threshold adjustment — forward to broadcast worker
 window.addEventListener("eardrop-thresholds", ((e: CustomEvent) => {
   broadcastWorker.postMessage({
