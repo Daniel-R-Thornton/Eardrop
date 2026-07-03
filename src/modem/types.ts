@@ -83,10 +83,10 @@ export const DEFAULT_CONFIG: ModemConfig = {
   bitsPerFrame: 8,
 
   pilotEnabled: true,
-  pilotFreqHz: 62.5,
-  pilotAmplitude: 0.125,
+  pilotFreqHz: 237.5,
+  pilotAmplitude: 0.15,
 
-  dataToneAmplitude: 0.2,
+  dataToneAmplitude: 0.25,
   amplitudeThresholdRatio: 0.3,
 
   syncSymbols: 10,

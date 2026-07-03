@@ -109,7 +109,7 @@ export interface PilotScannerConfig {
 }
 
 const DEFAULT_SCANNER_CONFIG: PilotScannerConfig = {
-  scanRange: [40, 120],
+  scanRange: [30, 400],
   sampleRate: 3200,
   fftSize: 2048,
   minSamples: 1024,  // ~0.32s at 3200 Hz — enough for a clean spectrum

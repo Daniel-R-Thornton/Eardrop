@@ -8,7 +8,7 @@ import { useStore, setState } from "./Store";
 import { ToneMeter } from "./components/ToneMeter";
 
 const TONE_COLORS = ["#4a9eff", "#ff6b4a", "#5eead4", "#f472b6"];
-const TONE_FREQS = [500, 700, 900, 1100];
+const TONE_FREQS = [675, 875, 1075, 1275];
 
 // ─── Helpers ──────────────────────────────────────────
 

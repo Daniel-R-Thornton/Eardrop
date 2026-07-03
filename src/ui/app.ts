@@ -429,7 +429,7 @@ function showRxPayload(bytes: Uint8Array, fileName: string) {
 
 // ─── Tone Energy Detection ────────────────────────────
 
-const TONES = [500, 700, 900, 1100];
+const TONES = [675, 875, 1075, 1275];
 
 function detectToneEnergy(samples: number[], freq: number, sampleRate: number): number {
   let sinCorr = 0, cosCorr = 0;
