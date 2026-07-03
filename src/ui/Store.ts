@@ -50,6 +50,10 @@ export interface AppState {
   toneEnergies: number[];
   /** User-configurable pilot frequency */
   pilotFreqHz: number;
+  /** User-configurable amplitude threshold ratio (lower = more sensitive) */
+  ampThresholdRatio: number;
+  /** Sync all-four-strong multiplier (lower = easier sync) */
+  syncStrongMultiplier: number;
   /** Acoustic sweep test results */
   sweepResults: Array<{ freq: number; energy: number }> | null;
 }
@@ -80,6 +84,8 @@ const defaultState: AppState = {
   micLevel: -80,
   toneEnergies: [0, 0, 0, 0],
   pilotFreqHz: 237.5,
+  ampThresholdRatio: 0.3,
+  syncStrongMultiplier: 0.5,
   sweepResults: null,
 };
 

@@ -216,6 +216,44 @@ export function MainApp() {
                 Tones: {[437.5,637.5,837.5,1037.5].map(o => (s.pilotFreqHz + o).toFixed(0)).join(", ")} Hz
               </div>
             </div>
+
+            <div style={{ marginBottom: 6 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+                <label style={{ fontSize: 10, color: "#5858a0" }}>Amp Threshold</label>
+                <span style={{ fontSize: 10, fontFamily: "monospace", color: "#eab308" }}>{s.ampThresholdRatio.toFixed(2)}</span>
+              </div>
+              <input type="range" min="0.05" max="0.5" step="0.05" value={s.ampThresholdRatio}
+                onChange={e => {
+                  const v = parseFloat(e.target.value);
+                  setState({ ampThresholdRatio: v });
+                  window.dispatchEvent(new CustomEvent("eardrop-thresholds", { detail: { ampRatio: v, syncMul: s.syncStrongMultiplier } }));
+                }}
+                style={{ width: "100%", accentColor: "#eab308" }}
+              />
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 8, color: "#484870" }}>
+                <span>0.05 (sensitive)</span>
+                <span>0.30 (default)</span>
+              </div>
+            </div>
+
+            <div style={{ marginBottom: 6 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+                <label style={{ fontSize: 10, color: "#5858a0" }}>Sync Strong Threshold</label>
+                <span style={{ fontSize: 10, fontFamily: "monospace", color: "#eab308" }}>{s.syncStrongMultiplier.toFixed(2)}</span>
+              </div>
+              <input type="range" min="0.1" max="1.0" step="0.1" value={s.syncStrongMultiplier}
+                onChange={e => {
+                  const v = parseFloat(e.target.value);
+                  setState({ syncStrongMultiplier: v });
+                  window.dispatchEvent(new CustomEvent("eardrop-thresholds", { detail: { ampRatio: s.ampThresholdRatio, syncMul: v } }));
+                }}
+                style={{ width: "100%", accentColor: "#eab308" }}
+              />
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 8, color: "#484870" }}>
+                <span>0.1 (easy)</span>
+                <span>0.5 (default)</span>
+              </div>
+            </div>
           </Section>
 
           {/* ── DEVICES ── */}

@@ -108,6 +108,10 @@ export class Decoder {
   /** Bypass noise profiling — pre-fills noise floor so decoder is ready instantly */
   public fastSync = false;
 
+  /** Live-adjustable thresholds (set via UI sliders) */
+  public liveAmpThresholdRatio = 0.3;
+  public liveSyncStrongMultiplier = 0.5;
+
   // ── Diagnostics (Phase C) ──
   public timing = new TimingProfiler();
   public berTracker = new BerTracker();
@@ -122,6 +126,7 @@ export class Decoder {
   constructor(cfg: Partial<ModemConfig> = {}) {
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
     this.sps = this.cfg.sampleRate / this.cfg.symbolsPerSec;
+    this.liveAmpThresholdRatio = this.cfg.amplitudeThresholdRatio;
     this.scanner = new PilotScanner({
       sampleRate: this.cfg.sampleRate,
       targetFreq: this.cfg.pilotFreqHz,
@@ -293,14 +298,14 @@ export class Decoder {
 
     // With pilot-relative detection, use the amplitudeThresholdRatio from config
     // A tone is ON if its pilot-relative energy > pilotAmplitude * thresholdRatio
-    const ampThresh = this.pilotAmplitude * this.cfg.amplitudeThresholdRatio;
+    const ampThresh = this.pilotAmplitude * this.liveAmpThresholdRatio;
 
     // Sync: all 4 tones should show strong pilot-relative energy
     const allFourStrong = this.pll
-      ? (energies[0] > ampThresh * 0.5 &&
-         energies[1] > ampThresh * 0.5 &&
-         energies[2] > ampThresh * 0.5 &&
-         energies[3] > ampThresh * 0.5)
+      ? (energies[0] > ampThresh * this.liveSyncStrongMultiplier &&
+         energies[1] > ampThresh * this.liveSyncStrongMultiplier &&
+         energies[2] > ampThresh * this.liveSyncStrongMultiplier &&
+         energies[3] > ampThresh * this.liveSyncStrongMultiplier)
       : (total > 1e-12 &&
          (energies[0] / total) > 0.08 &&
          (energies[1] / total) > 0.08 &&
@@ -461,7 +466,7 @@ export class Decoder {
       // Packed: [amp0, phase0, amp1, phase1, amp2, phase2, amp3, phase3]
       // Amplitude: energy > pilotAmp * thresholdRatio → 1, else 0
       // Phase: relI > 0 → 0 (right half-plane), relI < 0 → 1 (left half-plane)
-      const ampThresh = this.pilotAmplitude * this.cfg.amplitudeThresholdRatio;
+      const ampThresh = this.pilotAmplitude * this.liveAmpThresholdRatio;
 
       let frameBits = 0;
       // Pack: [a0,0,a1,0,a2,0,a3,0] — phase bits always 0 (encoder sends 0° BPSK)

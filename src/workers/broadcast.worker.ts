@@ -99,6 +99,14 @@ self.onmessage = (e: MessageEvent) => {
       break;
     }
 
+    case "updateThresholds": {
+      if (decoder) {
+        if (msg.ampRatio !== undefined) decoder.liveAmpThresholdRatio = msg.ampRatio;
+        if (msg.syncMul !== undefined) decoder.liveSyncStrongMultiplier = msg.syncMul;
+      }
+      break;
+    }
+
     case "feedSample": {
       if (!decoder) return;
       decoder.feedSample(msg.sample);

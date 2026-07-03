@@ -276,6 +276,15 @@ window.addEventListener("eardrop-send-test", (async () => {
   }
 }) as EventListener);
 
+// Live threshold adjustment — forward to broadcast worker
+window.addEventListener("eardrop-thresholds", ((e: CustomEvent) => {
+  broadcastWorker.postMessage({
+    type: "updateThresholds",
+    ampRatio: e.detail.ampRatio,
+    syncMul: e.detail.syncMul,
+  });
+}) as EventListener);
+
 // Acoustic sweep
 window.addEventListener("eardrop-acoustic-sweep", (async () => {
   setState({ sendStatus: { type: "info", msg: "🔊 Sweep starting…" }, sweepResults: null });
