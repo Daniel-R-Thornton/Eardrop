@@ -95,6 +95,8 @@ export class PilotScanner {
   private buf: number[] = [];
   private done = false;
   private result: PilotDiscovery | null = null;
+  /** Track last FFT run sample count to avoid re-running on every sample */
+  private lastFftAt = 0;
 
   constructor(cfg: Partial<PilotScannerConfig> = {}) {
     this.cfg = { ...DEFAULT_SCANNER_CONFIG, ...cfg };
@@ -103,18 +105,15 @@ export class PilotScanner {
   feedSample(sample: number): PilotDiscovery | null {
     if (this.done) return this.result;
     this.buf.push(sample);
-    if (this.buf.length >= this.cfg.minSamples && !this.result) {
+    // Run FFT periodically — never give up, audio might start late
+    // Run at minSamples, then every ~512 samples after that if no result yet
+    if (this.buf.length >= this.cfg.minSamples && this.buf.length >= this.lastFftAt + 512) {
+      this.lastFftAt = this.buf.length;
       this.runFft();
       if (this.result) {
         this.done = true;
         return this.result;
       }
-    }
-    if (this.buf.length >= this.cfg.minSamples * 4) {
-      // Final attempt — run FFT one more time
-      if (!this.result) this.runFft();
-      this.done = true;
-      return this.result;
     }
     return null;
   }
@@ -133,6 +132,7 @@ export class PilotScanner {
     this.buf = [];
     this.done = false;
     this.result = null;
+    this.lastFftAt = 0;
   }
 
   private runFft() {
