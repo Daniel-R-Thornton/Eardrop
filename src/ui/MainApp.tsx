@@ -277,6 +277,12 @@ export function MainApp() {
               <label style={{ fontSize: 10, color: "#5858a0", display: "flex", alignItems: "center", gap: 4 }}>
                 <input type="checkbox" id="fastSyncCb" defaultChecked /> Fast Sync
               </label>
+              <label style={{ fontSize: 10, color: "#5858a0", display: "flex", alignItems: "center", gap: 4 }}>
+                <input type="checkbox" checked={s.musicalMode} onChange={e => {
+                  const v = e.target.checked;
+                  setState({ musicalMode: v });
+                }} /> 🎵 Musical
+              </label>
             </div>
           </Section>
         </div>

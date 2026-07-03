@@ -10,7 +10,7 @@
  * the pilot's tracked phase at the decoder).
  */
 
-import { ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG } from "./types";
+import { ModemConfig, TONE_OFFSETS, MUSICAL_OFFSETS, DEFAULT_CONFIG } from "./types";
 import { encodeBlock, BLOCK_TYPE } from "./framing";
 import { encodeSquawkPayload } from "./squawk";
 
@@ -50,9 +50,10 @@ export class Encoder {
     this.sps = this.cfg.sampleRate / this.cfg.symbolsPerSec;
 
     // Compute absolute tone frequencies from pilot + offsets
+    const offsets = this.cfg.musical ? MUSICAL_OFFSETS : TONE_OFFSETS;
     this.toneFreqs = new Float32Array(this.cfg.bitsPerFrame / 2);
     for (let t = 0; t < this.toneFreqs.length; t++) {
-      this.toneFreqs[t] = this.cfg.pilotFreqHz + TONE_OFFSETS[t];
+      this.toneFreqs[t] = this.cfg.pilotFreqHz + offsets[t];
     }
   }
 

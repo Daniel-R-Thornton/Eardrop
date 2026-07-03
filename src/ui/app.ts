@@ -220,7 +220,7 @@ window.addEventListener("eardrop-send", (async () => {
     const packet = buildPacket(selectedFile.name, raw);
     showTxPayload(raw, selectedFile.name);
 
-    const cfg = { pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz };
+    const cfg: any = { pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz, musical: getState().musicalMode };
     const outputRate = player.getSampleRate();
     const { samples: playSamples } = await encodeToOutputRateInWorker(packet, outputRate, cfg);
     setState({ sendStatus: { type: "info", msg: `Playing ${selectedFile.name}…` } });
@@ -266,7 +266,7 @@ window.addEventListener("eardrop-send-test", (async () => {
   showTxPayload(raw, "hello.txt");
   setState({ sendStatus: { type: "info", msg: "📤 Sending test…" } });
   try {
-    const cfg = { pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz };
+    const cfg: any = { pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz, musical: getState().musicalMode };
     const outputRate = player.getSampleRate();
     const { samples: playSamples } = await encodeToOutputRateInWorker(packet, outputRate, cfg);
     await player.play(playSamples, outputRate, selectedOutputId || undefined);
@@ -455,7 +455,8 @@ async function startListening() {
     wasInFrame = false;
     setState({ isListening: true, recvStatus: { type: "info", msg: "🔊 Noise profiling…" }, progress: 0 });
 
-    broadcastWorker.postMessage({ type: "startListening", config: DEFAULT_CONFIG, fastSync: fastSyncCb?.checked ?? false });
+    const listenCfg = { ...DEFAULT_CONFIG, musical: getState().musicalMode };
+    broadcastWorker.postMessage({ type: "startListening", config: listenCfg, fastSync: fastSyncCb?.checked ?? false });
     recorder = new AudioRecorder(audioCtx);
     const modemRate = DEFAULT_CONFIG.sampleRate;
 

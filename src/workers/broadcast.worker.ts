@@ -6,8 +6,7 @@ import { Decoder } from "../modem/decoder";
 import { DEFAULT_CONFIG, type ModemConfig } from "../modem/types";
 import { debugLogger } from "../modem/debugger";
 
-// Verbose debug flag – set false to silence logs for agentic AI contexts.
-const DEBUG = false;
+const DEBUG = true;
 if (!DEBUG) {
   // Override console methods to no-op.
   console.log = function() {};

@@ -67,24 +67,49 @@ export class PilotScanner {
   private done = false;
   private result: PilotDiscovery | null = null;
   private lastFftAt = 0;
+  /** Noise floor spectrum — learned during silent first ~1s, subtracted to reject room hum */
+  private noiseBuf: number[] = [];
+  private noiseSpectrum: Float64Array | null = null;
+  private noiseLearned = false;
 
   constructor(cfg: Partial<PilotScannerConfig> = {}) {
     this.cfg = { ...DEFAULT_SCANNER_CONFIG, ...cfg };
   }
+
+  /** Feed samples during the silent noise-profiling phase */
+  learnNoise(sample: number, targetSamples: number): void {
+    if (this.noiseLearned) return;
+    this.noiseBuf.push(sample);
+    if (this.noiseBuf.length >= targetSamples) {
+      const mag = fftMagnitude(this.noiseBuf, this.cfg.fftSize);
+      this.noiseSpectrum = mag;
+      this.noiseLearned = true;
+      // Log top noise peaks
+      const bw = this.cfg.sampleRate / this.cfg.fftSize;
+      const lo = Math.max(1, Math.floor(this.cfg.scanRange[0] / bw));
+      const hi = Math.min(mag.length - 1, Math.ceil(this.cfg.scanRange[1] / bw));
+      const peaks: { freq: number; mag: number }[] = [];
+      for (let b = lo; b <= hi; b++) peaks.push({ freq: b * bw, mag: mag[b] });
+      peaks.sort((a, b) => b.mag - a.mag);
+      console.log(`[SCAN] Noise floor learned (${targetSamples}samp). Top: ${peaks.slice(0,5).map(p => `${p.freq.toFixed(1)}Hz=${p.mag.toExponential(2)}`).join(', ')}`);
+    }
+  }
+
+  hasNoiseProfile(): boolean { return this.noiseLearned; }
 
   feedSample(sample: number): PilotDiscovery | null {
     if (this.done) return this.result;
     this.buf.push(sample);
     if (this.buf.length >= this.cfg.minSamples && this.buf.length >= this.lastFftAt + 512) {
       this.lastFftAt = this.buf.length;
-      console.log(`[SCAN] FFT run: ${this.buf.length} samples accumulated`);
+      console.log(`[SCAN] FFT run: ${this.buf.length}samp noise=${this.noiseLearned}`);
       this.runFft();
       if (this.result) {
         console.log(`[SCAN] PILOT LOCKED: ${this.result.freq} Hz @ amp ${this.result.amplitude.toExponential(2)}`);
         this.done = true;
         return this.result;
       } else {
-        console.log(`[SCAN] No valid pilot found yet (buffer=${this.buf.length})`);
+        console.log(`[SCAN] No valid pilot yet (buf=${this.buf.length})`);
       }
     }
     return null;
@@ -102,11 +127,22 @@ export class PilotScanner {
 
   reset() {
     this.buf = []; this.done = false; this.result = null; this.lastFftAt = 0;
+    this.noiseBuf = []; this.noiseSpectrum = null; this.noiseLearned = false;
   }
 
   private runFft() {
     const { scanRange, sampleRate, fftSize, minSignalRatio, targetFreq, freqTolerance = 50 } = this.cfg;
-    const mag = fftMagnitude(this.buf, fftSize);
+    let mag = fftMagnitude(this.buf, fftSize);
+
+    // Subtract learned noise spectrum to suppress room hum
+    if (this.noiseSpectrum) {
+      const sub = new Float64Array(mag.length);
+      for (let i = 0; i < mag.length; i++) {
+        sub[i] = Math.max(0, mag[i] - this.noiseSpectrum[i]);
+      }
+      mag = sub;
+      console.log(`[SCAN] Noise-subtracted FFT`);
+    }
     const binWidth = sampleRate / fftSize;
     const binLo = Math.max(1, Math.floor(scanRange[0] / binWidth));
     const binHi = Math.min(mag.length - 1, Math.ceil(scanRange[1] / binWidth));
@@ -219,9 +255,12 @@ export function toneIQ(samples: readonly number[], toneFreq: number, sampleRate:
   return { i: i / n, q: q / n };
 }
 
-export function getDataToneFreqs(pilotFreqHz: number): [number, number, number, number] {
+export function getDataToneFreqs(pilotFreqHz: number, musical = false): [number, number, number, number] {
+  const offs = musical
+    ? [300, 425, 550, 775]
+    : [TONE_OFFSETS[0], TONE_OFFSETS[1], TONE_OFFSETS[2], TONE_OFFSETS[3]];
   return [
-    pilotFreqHz + TONE_OFFSETS[0], pilotFreqHz + TONE_OFFSETS[1],
-    pilotFreqHz + TONE_OFFSETS[2], pilotFreqHz + TONE_OFFSETS[3],
+    pilotFreqHz + offs[0], pilotFreqHz + offs[1],
+    pilotFreqHz + offs[2], pilotFreqHz + offs[3],
   ] as [number, number, number, number];
 }

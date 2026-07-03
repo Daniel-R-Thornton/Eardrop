@@ -20,8 +20,10 @@ export interface ModemConfig {
   // ── Pilot ──
   /** Whether the pilot tone is enabled */
   pilotEnabled: boolean;
-  /** Pilot frequency in Hz (configurable — default 62.5) */
+  /** Pilot frequency in Hz (configurable — default 237.5) */
   pilotFreqHz: number;
+  /** Musical mode — use pleasant note intervals for data tones */
+  musical: boolean;
   /** Pilot amplitude (0.125 = leaves headroom for 4 data tones at 0.2 each) */
   pilotAmplitude: number;
 
@@ -54,24 +56,35 @@ export interface ModemConfig {
   payloadBlockSymbols: number;
 }
 
-/** Tone frequency offsets from pilot.  Default pilot 62.5+437.5=500, etc. */
+/** Tone frequency offsets from pilot (standard mode).  Default pilot 237.5+437.5=675, etc. */
 export const TONE_OFFSETS: [number, number, number, number] = [
   437.5, 637.5, 837.5, 1037.5,
 ] as const;
 
+/** Musical mode offsets — C5, E5, G5, C6 intervals from pilot (using 25 Hz bins for frame alignment) */
+export const MUSICAL_OFFSETS: [number, number, number, number] = [
+  300, 425, 550, 775,  // pilot+300≈C5, +425≈E5, +550≈G5, +775≈C6 (nearest 25Hz bins)
+] as const;
+
+/** Get offsets based on musical mode */
+export function getOffsets(musical: boolean): [number, number, number, number] {
+  return musical ? MUSICAL_OFFSETS : TONE_OFFSETS;
+}
+
 /** Compute absolute tone frequencies for a given pilot frequency */
-export function getToneFreqs(pilotFreqHz: number): [number, number, number, number] {
+export function getToneFreqs(pilotFreqHz: number, musical = false): [number, number, number, number] {
+  const offs = getOffsets(musical);
   return [
-    pilotFreqHz + TONE_OFFSETS[0],
-    pilotFreqHz + TONE_OFFSETS[1],
-    pilotFreqHz + TONE_OFFSETS[2],
-    pilotFreqHz + TONE_OFFSETS[3],
+    pilotFreqHz + offs[0],
+    pilotFreqHz + offs[1],
+    pilotFreqHz + offs[2],
+    pilotFreqHz + offs[3],
   ];
 }
 
 /** Get default tone frequencies (using DEFAULT_CONFIG pilot freq) */
-export function getDefaultToneFreqs(): [number, number, number, number] {
-  return getToneFreqs(DEFAULT_CONFIG.pilotFreqHz);
+export function getDefaultToneFreqs(musical = false): [number, number, number, number] {
+  return getToneFreqs(DEFAULT_CONFIG.pilotFreqHz, musical);
 }
 
 /** Tone colors for debug display (one per tone index) */
@@ -84,6 +97,7 @@ export const DEFAULT_CONFIG: ModemConfig = {
 
   pilotEnabled: true,
   pilotFreqHz: 237.5,
+  musical: false,
   pilotAmplitude: 0.4,
 
   dataToneAmplitude: 0.5,

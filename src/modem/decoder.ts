@@ -127,7 +127,11 @@ export class Decoder {
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
     this.sps = this.cfg.sampleRate / this.cfg.symbolsPerSec;
     this.liveAmpThresholdRatio = this.cfg.amplitudeThresholdRatio;
-    this.scanner = new PilotScanner({ sampleRate: this.cfg.sampleRate });
+    this.scanner = new PilotScanner({
+      sampleRate: this.cfg.sampleRate,
+      targetFreq: this.cfg.pilotFreqHz,
+      freqTolerance: 50,
+    });
 
     this.framedDecoder = new FramedBlockDecoder();
     this.squawkProcessor = new SquawkProcessor();
@@ -194,6 +198,10 @@ export class Decoder {
 
   /** Feed one audio sample */
   feedSample(sample: number) {
+    // Learn noise spectrum during the first ~1s (before audio plays)
+    if (!this.inFrame && this.noiseFrames < 25) {
+      this.scanner.learnNoise(sample, 3200);
+    }
     this.buf.push(sample);
     if (this.buf.length < this.sps) return;
 
@@ -214,7 +222,7 @@ export class Decoder {
         this.pilotFreq = result.freq;
         this.pilotAmplitude = result.amplitude;
         // The found peak IS the pilot. Tones are at pilot + TONE_OFFSETS.
-        this.toneFreqs = getDataToneFreqs(result.freq);
+        this.toneFreqs = getDataToneFreqs(result.freq, !!this.cfg.musical);
         this.pll = new PilotPLL(result.freq, 0, result.amplitude, {
           sampleRate: this.cfg.sampleRate,
         });

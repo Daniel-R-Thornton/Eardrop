@@ -50,6 +50,8 @@ export interface AppState {
   toneEnergies: number[];
   /** User-configurable pilot frequency */
   pilotFreqHz: number;
+  /** Musical mode — use nice note intervals for data tones */
+  musicalMode: boolean;
   /** User-configurable amplitude threshold ratio (lower = more sensitive) */
   ampThresholdRatio: number;
   /** Sync all-four-strong multiplier (lower = easier sync) */
@@ -84,6 +86,7 @@ const defaultState: AppState = {
   micLevel: -80,
   toneEnergies: [0, 0, 0, 0],
   pilotFreqHz: 237.5,
+  musicalMode: false,
   ampThresholdRatio: 0.3,
   syncStrongMultiplier: 0.5,
   sweepResults: null,
