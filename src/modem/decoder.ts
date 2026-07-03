@@ -122,7 +122,11 @@ export class Decoder {
   constructor(cfg: Partial<ModemConfig> = {}) {
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
     this.sps = this.cfg.sampleRate / this.cfg.symbolsPerSec;
-    this.scanner = new PilotScanner({ sampleRate: this.cfg.sampleRate });
+    this.scanner = new PilotScanner({
+      sampleRate: this.cfg.sampleRate,
+      targetFreq: this.cfg.pilotFreqHz,
+      freqTolerance: 30,
+    });
 
     this.framedDecoder = new FramedBlockDecoder();
     this.squawkProcessor = new SquawkProcessor();

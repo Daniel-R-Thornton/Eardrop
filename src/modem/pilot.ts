@@ -106,13 +106,17 @@ export interface PilotScannerConfig {
   minSamples: number;
   /** Minimum peak-to-median ratio to accept a discovery */
   minSignalRatio: number;
+  /** Expected pilot frequency hint (0 = accept any). If set, reject discoveries farther than freqTolerance */
+  targetFreq?: number;
+  /** How far from targetFreq a discovery can be and still be accepted */
+  freqTolerance?: number;
 }
 
 const DEFAULT_SCANNER_CONFIG: PilotScannerConfig = {
-  scanRange: [100, 500],
+  scanRange: [30, 500],
   sampleRate: 3200,
   fftSize: 2048,
-  minSamples: 1024,  // ~0.32s at 3200 Hz — enough for a clean spectrum
+  minSamples: 1024,
   minSignalRatio: 6.0,
 };
 
@@ -156,7 +160,7 @@ export class PilotScanner {
   }
 
   private runFft() {
-    const { scanRange, sampleRate, fftSize, minSignalRatio } = this.cfg;
+    const { scanRange, sampleRate, fftSize, minSignalRatio, targetFreq, freqTolerance = 15 } = this.cfg;
 
     // Zero-padded FFT
     const mag = fftMagnitude(this.buf, fftSize);
@@ -201,7 +205,14 @@ export class PilotScanner {
     const offset = interpolatePeak(m0, m1, m2);
 
     const freq = (peakBin + offset) * binWidth;
-    const roundedFreq = Math.round(freq * 10) / 10; // round to 0.1 Hz
+    const roundedFreq = Math.round(freq * 10) / 10;
+
+    // Reject if we have a target frequency hint and this is too far from it
+    if (targetFreq && Math.abs(roundedFreq - targetFreq) > freqTolerance) {
+      this.result = null;
+      return;
+    }
+
     const amplitude = peakMag / this.buf.length;
     const confidence = Math.min(1, (signalRatio - minSignalRatio) / 20);
 
