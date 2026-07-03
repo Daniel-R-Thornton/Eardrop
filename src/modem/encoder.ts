@@ -37,6 +37,10 @@ export class Encoder {
 
   // Tone frequencies (computed from pilotFreq + offsets)
   private toneFreqs: Float32Array = new Float32Array(0);
+  // Anti-noise-gate: slow amplitude wobble (8 Hz, ±30%) so tones aren't mistaken for stationary hum
+  private wobblePhase = 0;
+  private readonly WOBBLE_RATE = 8; // Hz
+  private readonly WOBBLE_DEPTH = 0.3; // ±30%
 
   constructor(cfg: Partial<ModemConfig> = {}) {
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
@@ -105,6 +109,7 @@ export class Encoder {
     for (let t = 0; t < numTones; t++) this.bpskMul[t] = 1;
     this.bitPos = 0;
     this.bitstream = [];
+    this.wobblePhase = 0;
   }
 
   /** Emit raw bytes -> bits in [amp0,amp1,amp2,amp3] format (4 data bits/symbol)
@@ -226,7 +231,11 @@ export class Encoder {
         return 0;
     }
 
-    return output;
+    // Amplitude wobble to prevent microphone noise gate from suppressing stationary tones
+    this.wobblePhase += this.WOBBLE_RATE / sampleRate;
+    if (this.wobblePhase >= 1.0) this.wobblePhase -= 1.0;
+    const wobble = 1.0 - this.WOBBLE_DEPTH * 0.5 + this.WOBBLE_DEPTH * 0.5 * Math.sin(2 * Math.PI * this.wobblePhase);
+    return output * wobble;
   }
 
   private advancePhase() {
