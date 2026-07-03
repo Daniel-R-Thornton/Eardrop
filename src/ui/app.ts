@@ -301,6 +301,9 @@ window.addEventListener("eardrop-acoustic-sweep", (async () => {
   const beforePlay = recvSamples.length;
   const playBuf = resampleAudio(tone, modemRate, outputRate);
   console.log("[SWEEP] resampled to", playBuf.length, "samples at", outputRate, "Hz");
+  let sumSqPlay = 0;
+  for (const s of playBuf) sumSqPlay += s * s;
+  console.log("[SWEEP] play RMS:", Math.sqrt(sumSqPlay / playBuf.length), "peak:", Math.max(...playBuf.map(Math.abs)));
   await player.play(playBuf, outputRate, selectedOutputId || undefined);
   console.log("[SWEEP] play done, recvSamples before:", beforePlay, "after:", recvSamples.length);
   await new Promise(r => setTimeout(r, 100));
