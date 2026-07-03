@@ -21,8 +21,14 @@ export class AudioPlayer {
 
     // Set output device if supported and specified
     if (deviceId && typeof (ctx as any).setSinkId === "function") {
-      try { await (ctx as any).setSinkId(deviceId); }
-      catch { /* fallback to default */ }
+      try {
+        await (ctx as any).setSinkId(deviceId);
+        console.log("[Player] output device set to:", deviceId);
+      } catch (e) {
+        console.warn("[Player] setSinkId failed:", e);
+      }
+    } else {
+      console.log("[Player] default output (deviceId=", deviceId, ")");
     }
 
     return new Promise((resolve) => {
