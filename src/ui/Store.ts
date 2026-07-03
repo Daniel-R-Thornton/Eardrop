@@ -48,6 +48,8 @@ export interface AppState {
   rxPayload: { name: string; bytes: string } | null;
   micLevel: number; // dB
   toneEnergies: number[];
+  /** User-configurable pilot frequency */
+  pilotFreqHz: number;
 }
 
 const defaultDecoder: DecoderInfo = {
@@ -75,6 +77,7 @@ const defaultState: AppState = {
   rxPayload: null,
   micLevel: -80,
   toneEnergies: [0, 0, 0, 0],
+  pilotFreqHz: 237.5,
 };
 
 // ─── Store ────────────────────────────────────────────

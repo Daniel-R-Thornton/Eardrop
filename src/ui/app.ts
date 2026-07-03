@@ -214,8 +214,9 @@ window.addEventListener("eardrop-send", (async () => {
     const packet = buildPacket(selectedFile.name, raw);
     showTxPayload(raw, selectedFile.name);
 
+    const cfg = { pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz };
     const outputRate = player.getSampleRate();
-    const { samples: playSamples } = await encodeToOutputRateInWorker(packet, outputRate);
+    const { samples: playSamples } = await encodeToOutputRateInWorker(packet, outputRate, cfg);
     setState({ sendStatus: { type: "info", msg: `Playing ${selectedFile.name}…` } });
     await player.play(playSamples, outputRate, selectedOutputId || undefined);
     setState({ isSending: false, sendStatus: { type: "success", msg: `✅ Sent ${selectedFile.name}` } });
@@ -230,10 +231,19 @@ window.addEventListener("eardrop-record", (async () => {
   await startListening();
 }) as EventListener);
 
-// Debug toggle
+// Debug toggle — enable/disable verbose console logging
 window.addEventListener("eardrop-toggle-debug", ((e: CustomEvent) => {
-  // The React side already toggles the state
+  DEBUG = e.detail?.visible ?? !DEBUG;
+  if (DEBUG) {
+    console.log = _origLog;
+    console.log("🦻 Debug logging ON");
+  } else {
+    console.log = function() {};
+  }
 }) as EventListener);
+
+// Expose DEBUG state so broadcast worker can pick it up
+(window as any).eardropDebugEnabled = () => DEBUG;
 
 // Self-test
 window.addEventListener("eardrop-self-test", (async () => {
@@ -250,8 +260,9 @@ window.addEventListener("eardrop-send-test", (async () => {
   showTxPayload(raw, "hello.txt");
   setState({ sendStatus: { type: "info", msg: "📤 Sending test…" } });
   try {
+    const cfg = { pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz };
     const outputRate = player.getSampleRate();
-    const { samples: playSamples } = await encodeToOutputRateInWorker(packet, outputRate);
+    const { samples: playSamples } = await encodeToOutputRateInWorker(packet, outputRate, cfg);
     await player.play(playSamples, outputRate, selectedOutputId || undefined);
     setState({ sendStatus: { type: "success", msg: "✅ Test sent" } });
   } catch (err: any) {

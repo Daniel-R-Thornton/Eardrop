@@ -185,6 +185,32 @@ export function MainApp() {
             )}
           </Section>
 
+          {/* ── MODEM CONFIG ── */}
+          <Section title="⚙️ Modem Config" color="#eab308">
+            <div style={{ marginBottom: 8 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
+                <label style={{ fontSize: 10, color: "#5858a0" }}>Pilot Frequency</label>
+                <span style={{ fontSize: 11, fontFamily: "monospace", color: "#eab308" }}>{s.pilotFreqHz.toFixed(1)} Hz</span>
+              </div>
+              <input type="range" min="25" max="400" step="12.5" value={s.pilotFreqHz}
+                onChange={e => {
+                  const v = parseFloat(e.target.value);
+                  setState({ pilotFreqHz: v });
+                  window.dispatchEvent(new CustomEvent("eardrop-pilot-freq", { detail: { freq: v } }));
+                }}
+                style={{ width: "100%", accentColor: "#eab308" }}
+              />
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "#484870" }}>
+                <span>25 Hz</span>
+                <span>200 Hz</span>
+                <span>400 Hz</span>
+              </div>
+              <div style={{ marginTop: 4, fontSize: 9, color: "#5858a0" }}>
+                Tones: {[437.5,637.5,837.5,1037.5].map(o => (s.pilotFreqHz + o).toFixed(0)).join(", ")} Hz
+              </div>
+            </div>
+          </Section>
+
           {/* ── DEVICES ── */}
           <Section title="🎛 Audio Devices" color="#7878a0">
             <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
