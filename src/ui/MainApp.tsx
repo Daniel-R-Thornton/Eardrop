@@ -192,18 +192,23 @@ export function MainApp() {
                 <label style={{ fontSize: 10, color: "#5858a0" }}>Pilot Frequency</label>
                 <span style={{ fontSize: 11, fontFamily: "monospace", color: "#eab308" }}>{s.pilotFreqHz.toFixed(1)} Hz</span>
               </div>
-              <input type="range" min="25" max="400" step="12.5" value={s.pilotFreqHz}
+              <input type="range" min="37.5" max="537.5" step="25" value={s.pilotFreqHz}
                 onChange={e => {
-                  const v = parseFloat(e.target.value);
+                  // Snap to N*25 + 12.5 for clean frame alignment
+                  const raw = parseFloat(e.target.value);
+                  const v = Math.round((raw - 12.5) / 25) * 25 + 12.5;
                   setState({ pilotFreqHz: v });
                   window.dispatchEvent(new CustomEvent("eardrop-pilot-freq", { detail: { freq: v } }));
                 }}
                 style={{ width: "100%", accentColor: "#eab308" }}
               />
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "#484870" }}>
-                <span>25 Hz</span>
-                <span>200 Hz</span>
-                <span>400 Hz</span>
+                <span>37.5 Hz</span>
+                <span>287.5 Hz</span>
+                <span>537.5 Hz</span>
+              </div>
+              <div style={{ marginTop: 2, fontSize: 9, color: "#484870" }}>
+                Tone range: {(s.pilotFreqHz + 437.5).toFixed(0)}–{(s.pilotFreqHz + 1037.5).toFixed(0)} Hz (max {(s.pilotFreqHz + 1037.5) < 1600 ? '✓' : '✗'})
               </div>
               <div style={{ marginTop: 4, fontSize: 9, color: "#5858a0" }}>
                 Tones: {[437.5,637.5,837.5,1037.5].map(o => (s.pilotFreqHz + o).toFixed(0)).join(", ")} Hz

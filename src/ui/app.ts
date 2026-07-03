@@ -276,6 +276,7 @@ let recorder: AudioRecorder | null = null;
 let recvTimer: number | null = null;
 let micWatchdog: ReturnType<typeof setTimeout> | null = null;
 let recvSamples: number[] = [];
+let tickCount = 0;
 let isListening = false;
 let selectedInputId = "";
 let selectedOutputId = "";
@@ -349,6 +350,7 @@ async function startListening() {
   try {
     isListening = true;
     recvSamples = [];
+    tickCount = 0;
     decodedAccumulated = [];
     totalDecoded = 0;
     parsedPreamble = null;
@@ -387,14 +389,14 @@ async function startListening() {
       for (const s of buf) sumSq += s * s;
       const rms = Math.sqrt(sumSq / buf.length);
       const rmsDb = rms > 0.0001 ? 20 * Math.log10(rms) : -80;
-      setState({ micLevel: rmsDb });
-
-      // Tone energies
       const energies = TONES.map(f => detectToneEnergy(buf, f, modemRate));
-      setState({ toneEnergies: energies });
+      setState({ micLevel: rmsDb, toneEnergies: energies });
 
-      // Update debug samples
-      setState({ debugSamples: new Float32Array(recvSamples) });
+      // Throttle waveform to ~2fps
+      tickCount++;
+      if (tickCount % 5 === 0) {
+        setState({ debugSamples: new Float32Array(recvSamples) });
+      }
     }, 100);
   } catch (err: any) {
     isListening = false;
