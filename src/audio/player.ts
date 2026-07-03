@@ -32,17 +32,18 @@ export class AudioPlayer {
     }
 
     return new Promise((resolve) => {
-      const buffer = ctx.createBuffer(1, samples.length, sampleRate);
-      buffer.getChannelData(0).set(samples);
+      // Pre-amplify samples directly in buffer (6×, hard-clip at ±1)
+      const buf = new Float32Array(samples.length);
+      for (let i = 0; i < samples.length; i++) {
+        const s = samples[i] * 6.0;
+        buf[i] = s > 1.0 ? 1.0 : s < -1.0 ? -1.0 : s;
+      }
+      const buffer = ctx.createBuffer(1, buf.length, sampleRate);
+      buffer.getChannelData(0).set(buf);
 
       const source = ctx.createBufferSource();
       source.buffer = buffer;
-      // Boost gain for acoustic path (speaker→air→mic loses ~40-60dB)
-      // 8× gain — hard-clips at [-1,1], fundamental frequency preserved
-      const gain = ctx.createGain();
-      gain.gain.value = 8.0;
-      source.connect(gain);
-      gain.connect(ctx.destination);
+      source.connect(ctx.destination);
       source.start(0);
       source.onended = () => resolve();
     });
