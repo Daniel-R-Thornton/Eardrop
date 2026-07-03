@@ -181,7 +181,12 @@ async function refreshDeviceList() {
 }
 
 refreshBtn?.addEventListener("click", refreshDeviceList);
-refreshDeviceList();
+// Wait for React to mount device selects before populating
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", () => setTimeout(refreshDeviceList, 100));
+} else {
+  setTimeout(refreshDeviceList, 100);
+}
 
 // ─── Custom Events from React ─────────────────────────
 
@@ -434,21 +439,44 @@ function detectToneEnergy(samples: number[], freq: number, sampleRate: number): 
 
 async function runSelfTest() {
   const testData = new Uint8Array([0x48, 0x65, 0x6C, 0x6C, 0x6F]);
-  const packet = buildPacket("self-test.txt", testData);
   setState({ sendStatus: { type: "info", msg: "🧪 Running self-test…" } });
 
-  const { samples } = await encodeInWorker(packet);
+  // Encode the raw test data directly (no preamble) for a clean modem test
+  const encoder = new Encoder(DEFAULT_CONFIG);
+  const samples = encoder.encode(testData);
+
   const testDecoder = new Decoder(DEFAULT_CONFIG);
+  const results: Uint8Array[] = [];
   testDecoder.fastSync = true;
+  testDecoder.onFrame = (data: Uint8Array) => { results.push(data); };
   testDecoder.reset();
   for (const s of samples) testDecoder.feedSample(s);
-  const decoded = testDecoder.flush();
-  const match = decoded.length === packet.length && decoded.every((b, i) => b === packet[i]);
+
+  // Wait a tick for async block processing
+  await new Promise(r => setTimeout(r, 50));
+
+  const blocksOk = testDecoder.framedDecoder.blocksDecoded;
+  const crcFail = testDecoder.framedDecoder.blocksCrcFailed;
+  const decoded = results.length > 0 ? results[0] : null;
+  let passed = false;
+  let len = 0;
+  if (decoded) {
+    len = decoded.length;
+    passed = len === testData.length;
+    for (let i = 0; passed && i < len; i++) {
+      if (decoded[i] !== testData[i]) passed = false;
+    }
+  }
+
+  // Update self-test result in the DOM
+  const el = document.getElementById("selfTestResult");
+  if (el) {
+    el.textContent = passed
+      ? `✅ PASS: ${len}B roundtrip (${blocksOk} blocks, ${crcFail} CRC fail)`
+      : `❌ FAIL: got ${len}B exp ${testData.length}B (${blocksOk} blk, ${crcFail} CRC)`;
+  }
   setState({
-    sendStatus: {
-      type: match ? "success" : "error",
-      msg: match ? `✅ PASS: ${decoded.length}B roundtrip` : `❌ FAIL: got ${decoded.length}B expected ${packet.length}B`,
-    },
+    sendStatus: { type: passed ? "success" : "error", msg: passed ? "✅ Self-test PASS" : "❌ Self-test FAIL" },
     debugSamples: samples,
   });
 }
