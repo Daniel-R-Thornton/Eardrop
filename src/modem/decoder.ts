@@ -192,15 +192,8 @@ export class Decoder {
   }
 
   /** Feed one audio sample */
-  /** Correlated noise cancellation — same PRNG as encoder, seed 12345 */
-  private noiseState = 12345;
-  private readonly NOISE_AMP = 0.015;
-
   feedSample(sample: number) {
-    // Cancel the encoder's correlated noise floor before buffering
-    this.noiseState = (this.noiseState * 1664525 + 1013904223) & 0x7FFFFFFF;
-    const noise = ((this.noiseState >>> 0) / 2147483648 - 1) * this.NOISE_AMP;
-    this.buf.push(sample - noise);
+    this.buf.push(sample);
     if (this.buf.length < this.sps) return;
 
     // Grab one symbol window (128 samples)
