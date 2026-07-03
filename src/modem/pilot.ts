@@ -134,18 +134,25 @@ export class PilotScanner {
   feedSample(sample: number): PilotDiscovery | null {
     if (this.done) return this.result;
     this.buf.push(sample);
-    if (this.buf.length >= this.cfg.minSamples) {
+    // Run FFT when we have enough samples; retry periodically if rejected
+    if (this.buf.length >= this.cfg.minSamples && !this.result) {
       this.runFft();
+    }
+    // Only mark done if we got a valid result (may be rejected by targetFreq)
+    if (this.result) {
       this.done = true;
       return this.result;
+    }
+    // If we've accumulated a lot of samples without success, force the last result (even null)
+    if (this.buf.length >= this.cfg.minSamples * 4) {
+      this.done = true;
     }
     return null;
   }
 
   /** Force discovery with whatever samples we have */
   forceDiscover(): PilotDiscovery | null {
-    if (this.done) return this.result;
-    if (this.buf.length < 64) return null; // too few samples
+    if (this.buf.length < 64) return null;
     this.runFft();
     this.done = true;
     return this.result;
