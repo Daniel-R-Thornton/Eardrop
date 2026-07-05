@@ -376,7 +376,7 @@ export class Decoder {
           peak_ratio: energies.map(e => (total > 1e-12 ? (e / total) : 0).toFixed(3)).join('/'),
           noise_frames: this.noiseFrames,
           pilot_freq: this.pilotFreq.toFixed(1),
-        }, `SYNC ${strong ? 'STRONG' : 'weak'} consecutive=${this.consecutiveSync} avg=${avg.toExponential(2)}`);
+        }, `SYNC ${strong ? 'STRONG' : 'weak'} consecutive=${this.consecutiveSync} avg=${avg.toExponential(2)} nf=${this.noiseFrames} fse=${this.framesSinceExit}`);
       }
     }
     if (this.logging) {
@@ -429,6 +429,10 @@ export class Decoder {
     const syncPath = this.consecutiveSync >= 8 && this.noiseFrames >= 25;
     const pilotPath = this.pilotDiscovered && this.noiseFrames >= 25 &&
       this.pilotAmplitude > 0.02 && total > this.noiseFloor.reduce((a,b)=>a+b,0) * 20;
+    // Debug: log enter-data-mode conditions every 50 frames
+    if ((this.samplesSeen / this.sps | 0) % 50 === 0 && !this.inFrame) {
+      console.warn(`[CAN_ENTER] cons=${this.consecutiveSync} nf=${this.noiseFrames} fse=${this.framesSinceExit} pilot=${this.pilotDiscovered} pilotAmp=${this.pilotAmplitude.toExponential(2)} total=${total.toExponential(2)} noiseFloorSum=${this.noiseFloor.reduce((a,b)=>a+b,0).toExponential(2)}`);
+    }
     const canEnter = this.fastSync
       ? (this.consecutiveSync >= 8 && this.noiseFrames >= 25)
       : (syncPath && (this.framesSinceExit >= 50 || this.consecutiveSync >= 10)) || pilotPath;
