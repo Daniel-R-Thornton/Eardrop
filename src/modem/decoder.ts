@@ -317,7 +317,7 @@ export class Decoder {
     const anyToneStrong = this.pll
       ? Math.max(...energies) > ampThresh * this.liveSyncStrongMultiplier
       : total > 1e-12 && Math.max(...energies) / total > 0.08;
-    const totalAboveNoise = total > this.noiseFloor.reduce((a,b)=>a+b,0) * 10;
+    const totalAboveNoise = total > Math.max(this.noiseFloor.reduce((a,b)=>a+b,0) * 10, 0.01);
     const isBurst = (avg > burstThresh) && anyToneStrong && totalAboveNoise;
 
     // ── Post-pilot trace logging ──
@@ -428,7 +428,7 @@ export class Decoder {
     // Two paths: sync-based (anyToneStrong + totalAboveNoise) or pilot-based (strong pilot + energy present)
     const syncPath = this.consecutiveSync >= 8 && this.noiseFrames >= 25;
     const pilotPath = this.pilotDiscovered && this.noiseFrames >= 25 &&
-      this.pilotAmplitude > 0.02 && total > this.noiseFloor.reduce((a,b)=>a+b,0) * 20;
+      this.pilotAmplitude > 0.02 && total > Math.max(this.noiseFloor.reduce((a,b)=>a+b,0) * 20, 0.02);
     // Debug: log enter-data-mode conditions every 50 frames
     if ((this.samplesSeen / this.sps | 0) % 50 === 0 && !this.inFrame) {
       console.warn(`[CAN_ENTER] cons=${this.consecutiveSync} nf=${this.noiseFrames} fse=${this.framesSinceExit} pilot=${this.pilotDiscovered} pilotAmp=${this.pilotAmplitude.toExponential(2)} total=${total.toExponential(2)} noiseFloorSum=${this.noiseFloor.reduce((a,b)=>a+b,0).toExponential(2)}`);
