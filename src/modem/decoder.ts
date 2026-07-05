@@ -110,7 +110,7 @@ export class Decoder {
   public fastSync = false;
 
   /** Live-adjustable thresholds (set via UI sliders) */
-  public liveAmpThresholdRatio = 0.12;
+  public liveAmpThresholdRatio = 0.04;
   public liveSyncStrongMultiplier = 0.3;
 
   // ── Diagnostics (Phase C) ──
@@ -177,7 +177,7 @@ export class Decoder {
     this.frameSkip = 0;
     this.noiseFloor = [3e-10, 3e-10, 3e-10, 3e-10];
     this.noiseMax = [3e-10, 3e-10, 3e-10, 3e-10];
-    this.noiseFrames = 0;
+    this.noiseFrames = this.fastSync ? 25 : 0;
     this.framesSinceStrong = 0;
     this.lastStrongBitsCollected = 0;
     this.syncPeak = [2e-10, 2e-10, 2e-10, 2e-10];
