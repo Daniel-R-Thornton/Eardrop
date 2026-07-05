@@ -507,7 +507,11 @@ export class Decoder {
         const lo = ((this.bchBuf[1] >> 7) & 1) << 3 | ((this.bchBuf[1] >> 5) & 1) << 2 |
                    ((this.bchBuf[1] >> 3) & 1) << 1 | ((this.bchBuf[1] >> 1) & 1);
         const blockByte = (hi << 4) | lo;
-        this.framedDecoder.feedBytes(new Uint8Array([blockByte]));
+      // One-shot debug: log first 8 bytes decoded in data mode
+      if (this.framedDecoder.totalBits <= 64) {
+        console.warn(`[DEC_BYTE] byte=0x${blockByte.toString(16).padStart(2,'0')} hi=${hi} lo=${lo} bits=${this.framedDecoder.totalBits} energies=${energies.map(e=>e.toExponential(2)).join(',')}`);
+      }
+      this.framedDecoder.feedBytes(new Uint8Array([blockByte]));
         this.bchBuf = [];
         this.bchBufCount = 0;
       }
