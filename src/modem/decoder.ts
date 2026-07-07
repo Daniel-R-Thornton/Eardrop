@@ -238,40 +238,28 @@ export class Decoder {
     const window = this.buf.slice(0, this.sps);
     this.buf.splice(0, this.sps);
 
-    // ── Pilot discovery (runs during leader / before data mode) ──
-    if (!this.pilotDiscovered && !this.inFrame) {
-      // Feed ALL 128 samples in this window to the scanner, not just one
-      let result: import("./pilot").PilotDiscovery | null = null;
-      for (const s of window) {
-        result = this.scanner.feedSample(s);
-        if (result) break;
+    // ── Pilot discovery — use configured frequency directly ──
+    // The scanner is unreliable in real-world acoustics (rate mismatch, room modes).
+    // Use the user-configured pilot frequency and let the PLL fine-tune phase.
+    if (!this.pilotDiscovered && !this.inFrame && this.noiseFrames >= 20) {
+      this.pilotDiscovered = true;
+      this.pilotFreq = this.cfg.pilotFreqHz;
+      this.pilotAmplitude = 0.05; // initial estimate, PLL converges
+      const nominalTones = getDataToneFreqs(this.cfg.pilotFreqHz, !!this.cfg.musical);
+      this.toneFreqs = nominalTones;
+      this.pll = new PilotPLL(this.cfg.pilotFreqHz, 0, 0.05, {
+        sampleRate: this.cfg.sampleRate,
+      });
+      debugLogger.info(STAGE.PILOT_SCAN, {
+        freq: this.cfg.pilotFreqHz.toFixed(1),
+        amp: 'config',
+        confidence: 1,
+        samples: 0,
+      }, `Pilot set: ${this.cfg.pilotFreqHz} Hz (config)`);
+      if (this.logging) {
+        console.warn(`[PILOT] Using config freq: ${this.cfg.pilotFreqHz} Hz, tones: ${this.toneFreqs.map(f => f.toFixed(0)).join(',')} Hz`);
       }
-      if (result) {
-        this.pilotDiscovered = true;
-        this.pilotFreq = result.freq;
-        this.pilotAmplitude = result.amplitude;
-        // The found peak IS the pilot. Tones are at pilot + TONE_OFFSETS.
-        // IMPORTANT: sample-rate mismatch scales ALL frequencies by the same factor.
-        // We must apply the correction factor (discovered/nominal) to the NOMINAL tone
-        // frequencies, not just add raw offsets to the (already-shifted) pilot.
-        const correction = result.freq / this.cfg.pilotFreqHz;
-        const nominalTones = getDataToneFreqs(this.cfg.pilotFreqHz, !!this.cfg.musical);
-        this.toneFreqs = nominalTones.map(f => f * correction) as [number, number, number, number];
-        this.pll = new PilotPLL(result.freq, 0, result.amplitude, {
-          sampleRate: this.cfg.sampleRate,
-        });
-        debugLogger.info(STAGE.PILOT_SCAN, {
-          freq: result.freq.toFixed(1),
-          amp: result.amplitude,
-          confidence: result.confidence,
-          samples: this.scanner.isDone() ? 1024 : 0,
-        }, `Pilot discovered: ${result.freq.toFixed(1)} Hz @ amp ${result.amplitude.toExponential(2)}`);
-        if (this.logging) {
-          console.warn(`[PILOT] Discovered: ${result.freq.toFixed(1)} Hz @ amp ${result.amplitude.toExponential(2)} confidence=${result.confidence.toFixed(2)} correction=${correction.toFixed(4)}`);
-          console.warn(`[PILOT] Old tone freqs (no correction): ${getDataToneFreqs(result.freq, !!this.cfg.musical).map(f => f.toFixed(1)).join(', ')}`);
-          console.warn(`[PILOT] New tone freqs (with correction): ${this.toneFreqs.map(f => f.toFixed(1)).join(', ')}`);
-        }
-      }
+    }
     }
 
     // Feed every sample to the PLL (for continuous phase tracking)
@@ -317,12 +305,10 @@ export class Decoder {
     // A tone is ON if its pilot-relative energy > pilotAmplitude * thresholdRatio
     const ampThresh = this.pilotAmplitude * this.liveAmpThresholdRatio;
 
-    // Sync: at least 1 strong tone + total energy above noise
-    // (4-tone mod not feasible — speaker roll-off kills tones above 1 kHz)
-    const anyToneStrong = this.pll
-      ? Math.max(...energies) > ampThresh * this.liveSyncStrongMultiplier
-      : total > 1e-12 && Math.max(...energies) / total > 0.08;
-    const totalAboveNoise = total > 0.005;
+    // Sync: at least 1 strong tone + total energy above noise floor
+    // Use absolute threshold for real-world weak signals (mic pickup varies)
+    const anyToneStrong = Math.max(...energies) > 0.002; // ~10x above typical noise floor
+    const totalAboveNoise = total > 0.0005;
     const isBurst = (avg > burstThresh) && anyToneStrong && totalAboveNoise;
 
     // ── Post-pilot trace logging ──
@@ -458,7 +444,7 @@ export class Decoder {
       console.warn(`[CAN_ENTER] cons=${this.consecutiveSync} nf=${this.noiseFrames} fse=${this.framesSinceExit} pilot=${this.pilotDiscovered} pilotAmp=${this.pilotAmplitude.toExponential(2)} total=${total.toExponential(2)} noiseFloorSum=${this.noiseFloor.reduce((a,b)=>a+b,0).toExponential(2)}`);
     }
     const canEnter = this.fastSync
-      ? (this.pilotDiscovered && this.consecutiveSync >= 12 && this.noiseFrames >= 25)
+      ? (this.pilotDiscovered && this.consecutiveSync >= 6 && this.noiseFrames >= 25)
       : (syncPath && (this.framesSinceExit >= 50 || this.consecutiveSync >= 10)) || pilotPath;
     if (canEnter && !this.inFrame) {
       this.inFrame = true;
@@ -468,8 +454,8 @@ export class Decoder {
       this.framesSinceExit = 0;
       this.framedDecoder.reset();
       this.blockProcessor.reset();
-      // Entered at end of leader (cons=12). Skip all 10 sync symbols.
-      this.frameSkip = this.cfg.syncSymbols;
+      // Skip remaining sync frames to land on first data symbol
+      this.frameSkip = Math.max(0, this.cfg.syncSymbols - this.consecutiveSync + 1);
       if (this.logging) {
         console.log("[DEC] SYNC DETECTED — entering data mode", {
           pilotFreq: this.pilotFreq.toFixed(1),
