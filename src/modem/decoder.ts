@@ -445,7 +445,7 @@ export class Decoder {
     }
     const canEnter = this.fastSync
       ? (this.pilotDiscovered && this.consecutiveSync >= 6 && this.noiseFrames >= 25)
-      : (syncPath && (this.framesSinceExit >= 50 || this.consecutiveSync >= 10)) || pilotPath;
+      : (syncPath && (this.framesSinceExit >= 50 || this.consecutiveSync >= 10));
     if (canEnter && !this.inFrame) {
       this.inFrame = true;
       this.framesSinceStrong = 0;
