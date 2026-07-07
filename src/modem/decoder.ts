@@ -260,7 +260,6 @@ export class Decoder {
         console.warn(`[PILOT] Using config freq: ${this.cfg.pilotFreqHz} Hz, tones: ${this.toneFreqs.map(f => f.toFixed(0)).join(',')} Hz`);
       }
     }
-    }
 
     // Feed every sample to the PLL (for continuous phase tracking)
     if (this.pll) {
