@@ -7,6 +7,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useStore, setState } from "./Store";
 import { ToneMeter } from "./components/ToneMeter";
 import { BitAnalyzer } from "./components/BitAnalyzer";
+import { debugLogger, STAGE } from "../modem/debugger";
 
 const TONE_COLORS = ["#4a9eff", "#ff6b4a", "#5eead4", "#f472b6"];
 const TONE_FREQS = [850, 1050, 1250, 1450];
@@ -384,6 +385,50 @@ export function MainApp() {
                 <div style={{ fontSize: 10, color: "#4b5563", fontFamily: "SF Mono, ui-monospace, monospace" }}>
                   Noise: {debug.noiseFloor.map(n => n.toExponential(1)).join(" | ")}
                 </div>
+
+                {/* Frame trace log */}
+                {s.debugTrace && s.debugTrace.length > 0 && (
+                  <div style={{ marginTop: 10 }}>
+                    <div style={{ fontSize: 11, color: "#6b7280", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                      Frame Trace ({s.debugTrace.length})
+                    </div>
+                    <div style={{
+                      maxHeight: 180, overflow: "auto",
+                      background: "rgba(0,0,0,0.4)", borderRadius: 6,
+                      border: "1px solid rgba(255,255,255,0.05)",
+                      fontFamily: "SF Mono, ui-monospace, monospace", fontSize: 10,
+                    }}>
+                      {s.debugTrace.slice(-40).map((entry, i) => (
+                        <div key={i} style={{
+                          display: "flex", gap: 8, padding: "2px 8px",
+                          borderBottom: "1px solid rgba(255,255,255,0.03)",
+                          alignItems: "center",
+                        }}>
+                          <span style={{ color: "#4b5563", minWidth: 32 }}>#{entry.sym}</span>
+                          <span style={{ color: "#e5e7eb", minWidth: 70 }}>
+                            {entry.bits.map((b, ti) => (
+                              <span key={ti} style={{ color: b ? "#f87171" : "#818cf8" }}>{b}</span>
+                            ))}
+                          </span>
+                          <span style={{ color: "#6b7280", minWidth: 40 }}>0x{entry.frameHex}</span>
+                          <span style={{
+                            color: "#6b7280", flex: 1, textAlign: "right",
+                            fontSize: 9,
+                          }}>
+                            I=[{entry.rawI.map(v => v.toFixed(3)).join(",")}]
+                          </span>
+                          {entry.blockEvent && (
+                            <span style={{
+                              color: "#34d399", fontSize: 9, fontWeight: 600,
+                              background: "rgba(52,211,153,0.15)",
+                              padding: "1px 6px", borderRadius: 3,
+                            }}>{entry.blockEvent}</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </>
             )}
           </Card>

@@ -61,6 +61,8 @@ export interface AppState {
   sweepResults: Array<{ freq: number; energy: number }> | null;
   /** Active tones: 2 or 4 */
   toneCount: number;
+  /** Debug trace log — raw per-frame BPSK data */
+  debugTrace: Array<{ sym: number; rawI: number[]; bits: number[]; frameHex: string; blockEvent?: string }>;
 }
 
 const defaultDecoder: DecoderInfo = {
@@ -95,6 +97,7 @@ const defaultState: AppState = {
   syncStrongMultiplier: 0.5,
   sweepResults: null,
   toneCount: 4,
+  debugTrace: [],
 };
 
 // ─── Store ────────────────────────────────────────────

@@ -83,6 +83,7 @@ self.onmessage = (e: MessageEvent) => {
           bitsCollected: decoder.getProgress(),
           hasData: decoder.hasData(),
           debugInfo: last ?? null,
+          debugTrace: decoder.debugTrace.slice(-50),
           recentLog,
           rawBytes: new Uint8Array(rawAccum).buffer as ArrayBuffer,
           debugEvents,

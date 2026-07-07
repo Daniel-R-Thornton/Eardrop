@@ -131,6 +131,11 @@ broadcastWorker.onmessage = (e) => {
         };
         setState({ debug });
 
+        // Debug trace from decoder
+        if (msg.debugTrace && Array.isArray(msg.debugTrace)) {
+          setState({ debugTrace: msg.debugTrace });
+        }
+
         // Update recv status from decoder state
         const nf = d.noiseFrames ?? 0;
         let recvStatus: { type: string; msg: string };

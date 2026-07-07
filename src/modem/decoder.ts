@@ -100,6 +100,9 @@ export class Decoder {
   private calPhaseCount: [number, number, number, number] = [0, 0, 0, 0];
   private calDone = false;
 
+  /** Debug trace — per-frame BPSK analysis exported to UI */
+  public debugTrace: Array<{ sym: number; rawI: number[]; bits: number[]; frameHex: string; blockEvent?: string }> = [];
+
   // Noise profiling
   private noiseFloor: [number, number, number, number] = [0, 0, 0, 0];
   private noiseMax: [number, number, number, number] = [0, 0, 0, 0];
@@ -164,14 +167,20 @@ export class Decoder {
     });
 
     this.framedDecoder.onBlock = (event) => {
+      const typeNames: Record<number, string> = { 1: 'SQWK', 2: 'CONF', 3: 'DICT', 4: 'PAYD', 255: 'EOF' };
+      const evtStr = `${typeNames[event.type] || '?'} ${event.data.length}B`;
+      // Push to trace
+      if (this.debugTrace.length < 200) {
+        const last = this.debugTrace[this.debugTrace.length - 1];
+        if (last) last.blockEvent = evtStr;
+        else this.debugTrace.push({ sym: 0, rawI: [0,0,0,0], bits: [0,0,0,0], frameHex: '00', blockEvent: evtStr });
+      }
       if (event.type !== BLOCK_TYPE.SQUAWK) {
         const summary = this.blockProcessor.processBlock(event.type, event.data);
         if (this.logging && this.blockProcessor.stats.blocksReceived <= 5) {
           console.log(`[BLK] ${summary}`);
         }
       }
-      // Squawk processing captured at wrong time (after block decode, not during symbol)
-      // Skipping — squawk-based recalibration will be fixed in a follow-up
     };
   }
 
@@ -208,6 +217,7 @@ export class Decoder {
     this.calPhaseCount = [0, 0, 0, 0];
     this.calDone = false;
     this.prevPhase = [];
+    this.debugTrace = [];
     this.timing.reset();
     this.berTracker.reset();
     this.constellation.reset();
@@ -501,11 +511,17 @@ export class Decoder {
       // Frame byte: [p0, 1, p1, 1, p2, 1, p3, 1] where p_t = BPSK phase bit
 
       let frameBits = 0;
+      const dbgBits: number[] = [];
       for (let t = 0; t < 4; t++) {
         const correctedI = this.calPhaseFlip[t] < 0 ? -relI[t] : relI[t];
         const bit = t < this.cfg.toneCount ? (correctedI < 0 ? 1 : 0) : 0;
+        dbgBits.push(bit);
         frameBits |= (bit) << (7 - t * 2);
         frameBits |= (1) << (6 - t * 2);
+      }
+      // Console-log first 16 data frames for devtools debugging
+      if (this.dataFramesExecuted <= 16) {
+        console.warn(`[BPSK] frm=${this.dataFramesExecuted} sym=${Math.floor(this.samplesSeen/this.sps)} bits=${dbgBits.join('')} hex=0x${frameBits.toString(16).padStart(2,'0')} I=[${relI.map(v=>v.toFixed(3)).join(',')}] flip=[${this.calPhaseFlip.join(',')}]`);
       }
 
       // Pack frame bytes into block bytes.
@@ -536,6 +552,19 @@ export class Decoder {
         this.framedDecoder.feedBytes(new Uint8Array([blockByte]));
         this.bchBuf = [];
         this.bchBufCount = 0;
+
+        // Push debug trace (keep last 200 entries)
+        if (this.debugTrace.length < 200) {
+          this.debugTrace.push({
+            sym: Math.floor(this.samplesSeen / this.sps),
+            rawI: [relI[0], relI[1], relI[2], relI[3]],
+            bits: [
+              (frameBits >> 7) & 1, (frameBits >> 5) & 1,
+              (frameBits >> 3) & 1, (frameBits >> 1) & 1,
+            ],
+            frameHex: frameBits.toString(16).padStart(2, '0'),
+          });
+        }
       }
 
       if (this.logging && this.framedDecoder.totalBits <= 16) {
