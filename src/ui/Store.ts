@@ -59,6 +59,8 @@ export interface AppState {
   syncStrongMultiplier: number;
   /** Acoustic sweep test results */
   sweepResults: Array<{ freq: number; energy: number }> | null;
+  /** Active tones: 2 or 4 */
+  toneCount: number;
 }
 
 const defaultDecoder: DecoderInfo = {
@@ -92,6 +94,7 @@ const defaultState: AppState = {
   ampThresholdRatio: 0.3,
   syncStrongMultiplier: 0.5,
   sweepResults: null,
+  toneCount: 4,
 };
 
 // ─── Store ────────────────────────────────────────────

@@ -6,6 +6,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useStore, setState } from "./Store";
 import { ToneMeter } from "./components/ToneMeter";
+import { BitAnalyzer } from "./components/BitAnalyzer";
 import { debugLogger, STAGE } from "../modem/debugger";
 import { compressForLLM, type CompressLevel } from "../modem/compressForLLM";
 
@@ -143,18 +144,6 @@ export function MainApp() {
               </button>
             )}
             {s.sendStatus && <StatusBadge {...s.sendStatus} />}
-            {/* Self-test + Send Test buttons */}
-            <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
-              <button onClick={() => dispatch("eardrop-self-test")} style={{ flex: 1, padding: "5px 8px", border: "1px solid #1e1e3a", borderRadius: 5, background: "#16162a", color: "#7878a0", cursor: "pointer", fontSize: 11 }}>🧪 Self-Test</button>
-              <button onClick={() => dispatch("eardrop-send-test")} style={{ flex: 1, padding: "5px 8px", border: "1px solid #1e1e3a", borderRadius: 5, background: "#16162a", color: "#7878a0", cursor: "pointer", fontSize: 11 }}>📤 Send Test</button>
-            </div>
-            {/* TX Payload */}
-            {s.txPayload && (
-              <div style={{ marginTop: 8, background: "#07070e", borderRadius: 5, border: "1px solid #1e1e3a", overflow: "hidden" }}>
-                <div style={{ fontSize: 10, color: "#5858a0", padding: "2px 6px", background: "#11111e", borderBottom: "1px solid #1e1e3a" }}>📤 TX: {s.txPayload.name}</div>
-                <pre style={{ margin: 0, padding: "4px 6px", fontSize: 10, color: "#5858a0", whiteSpace: "pre-wrap", wordBreak: "break-all", fontFamily: "monospace", maxHeight: 60, overflow: "auto", lineHeight: 1.3 }}>{s.txPayload.bytes}</pre>
-              </div>
-            )}
           </Section>
 
           {/* ── RECEIVE ── */}
@@ -289,6 +278,19 @@ export function MainApp() {
                   setState({ musicalMode: v });
                 }} /> 🎵 Musical
               </label>
+              <label style={{ fontSize: 10, color: "#5858a0", display: "flex", alignItems: "center", gap: 4 }}>
+                <select
+                  value={s.toneCount}
+                  onChange={e => {
+                    const v = parseInt(e.target.value);
+                    setState({ toneCount: v });
+                  }}
+                  style={{ background: "#0a0a12", color: "#e0e0ee", border: "1px solid #1e1e3a", borderRadius: 3, padding: "1px 3px", fontSize: 10 }}
+                >
+                  <option value={2}>2 tones</option>
+                  <option value={4}>4 tones</option>
+                </select>
+              </label>
             </div>
           </Section>
         </div>
@@ -341,6 +343,12 @@ export function MainApp() {
                     </span>
                   </div>
                 ))}
+
+                {/* Bit analyzer table */}
+                <div style={{ marginTop: 8 }}>
+                  <div style={{ fontSize: 10, color: "#5858a0", marginBottom: 4 }}>Bit Analyzer</div>
+                  <BitAnalyzer debug={debug} />
+                </div>
 
                 {/* Noise floor */}
                 <div style={{ marginTop: 6, fontSize: 9, color: "#484870", fontFamily: "monospace" }}>
