@@ -8,6 +8,7 @@ import { useStore, setState } from "./Store";
 import { ToneMeter } from "./components/ToneMeter";
 import { BitAnalyzer } from "./components/BitAnalyzer";
 import { WaveformScope } from "./components/WaveformScope";
+import { SpectrumAnalyzer } from "./components/SpectrumAnalyzer";
 import { debugLogger, STAGE } from "../modem/debugger";
 
 const TONE_COLORS = ["#4a9eff", "#ff6b4a", "#5eead4", "#f472b6"];
@@ -298,7 +299,15 @@ export function MainApp() {
             {/* Symbol Rate */}
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
               <span style={{ fontSize: 12, color: "#6b7280" }}>Symbol Rate</span>
-              <span style={{ fontSize: 12, fontFamily: "SF Mono, ui-monospace, monospace", color: "#f59e0b" }}>{s.symbolsPerSec} sym/s · {s.symbolsPerSec * s.toneCount} bit/s</span>
+              <select value={s.symbolsPerSec} onChange={e => setState({ symbolsPerSec: parseInt(e.target.value) })}
+                style={{ background: "rgba(255,255,255,0.04)", color: "#e5e7eb", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 5, padding: "3px 8px", fontSize: 12 }}>
+                <option value={10}>10 sym/s</option>
+                <option value={25}>25 sym/s</option>
+                <option value={50}>50 sym/s</option>
+              </select>
+            </div>
+            <div style={{ fontSize: 10, color: "#4b5563", marginTop: -4, marginBottom: 8 }}>
+              {s.symbolsPerSec * s.toneCount} bit/s
             </div>
 
             {/* Pilot Freq */}
@@ -457,8 +466,11 @@ export function MainApp() {
         </div>
       </div>
 
-      {/* ═══ FULL-WIDTH WAVEFORM ═══ */}
-      <div style={{ marginTop: 16 }}>
+      {/* ═══ FULL-WIDTH: Spectrum + Waveform ═══ */}
+      <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "1fr 1fr", gap: GAP }}>
+        <Card title="Spectrum — FFT + Waterfall" accent="#818cf8">
+          <SpectrumAnalyzer spectrum={s.fftSpectrum} rawPeak={s.rawPeak} noiseFloorDb={s.noiseFloorDb} sampleRate={3200} />
+        </Card>
         <Card title="Waveform — RX (blue) / TX (orange)" accent="#6c6cff">
           <WaveformScope rxSamples={s.debugSamples} txSamples={s.txSamples} sampleRate={3200} />
         </Card>

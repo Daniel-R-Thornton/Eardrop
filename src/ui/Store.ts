@@ -64,6 +64,12 @@ export interface AppState {
   toneCount: number;
   /** Symbols per second (baud rate) */
   symbolsPerSec: number;
+  /** FFT spectrum data for waterfall display */
+  fftSpectrum: Float32Array | null;
+  /** Raw mic peak (0-1) for VU meter */
+  rawPeak: number;
+  /** Noise floor estimate for VU reference */
+  noiseFloorDb: number;
   /** Debug trace log — raw per-frame BPSK data */
   debugTrace: Array<{ sym: number; rawI: number[]; bits: number[]; frameHex: string; blockEvent?: string }>;
 }
@@ -102,6 +108,9 @@ const defaultState: AppState = {
   sweepResults: null,
   toneCount: 4,
   symbolsPerSec: 25,
+  fftSpectrum: null,
+  rawPeak: 0,
+  noiseFloorDb: -80,
   debugTrace: [],
 };
 

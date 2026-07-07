@@ -537,43 +537,31 @@ async function startListening() {
       const rms = Math.sqrt(sumSq / buf.length);
       const rmsDb = rms > 0.0001 ? 20 * Math.log10(rms) : -80;
       const energies = TONES.map(f => detectToneEnergy(buf, f, modemRate));
-      setState({ micLevel: rmsDb, toneEnergies: energies });
-
-      // Main-thread FFT diagnostic (every 20 ticks = ~2s)
-      if (tickCount % 20 === 0 && buf.length >= 128) {
-        const ft: { freq: number; mag: number }[] = [];
-        for (let f = 0; f <= 500; f += 12.5) {
-          let si = 0, co = 0;
-          for (let i = 0; i < buf.length; i++) {
-            const ph = 2 * Math.PI * f * i / modemRate;
-            si += buf[i] * Math.sin(ph);
-            co += buf[i] * Math.cos(ph);
-          }
-          ft.push({ freq: f, mag: Math.hypot(si, co) / buf.length });
+      // FFT spectrum (every tick, 100ms)
+      const ftBins = 64;
+      const spectrum = new Float32Array(ftBins);
+      for (let bin = 0; bin < ftBins; bin++) {
+        const f = (bin / ftBins) * 1600; // 0-1600 Hz
+        let si = 0, co = 0;
+        for (let i = 0; i < buf.length; i++) {
+          const ph = 2 * Math.PI * f * i / modemRate;
+          si += buf[i] * Math.sin(ph);
+          co += buf[i] * Math.cos(ph);
         }
-        ft.sort((a, b) => b.mag - a.mag);
-        console.warn(`[FFT] Main top 5: ${ft.slice(0,5).map(b => `${b.freq.toFixed(1)}Hz=${b.mag.toExponential(2)}`).join(', ')}`);
-
-        // Also scan the data tone range (500-1500 Hz) to see what the speaker reproduces
-        const ftHi: { freq: number; mag: number }[] = [];
-        for (let f = 500; f <= 1500; f += 25) {
-          let si = 0, co = 0;
-          for (let i = 0; i < buf.length; i++) {
-            const ph = 2 * Math.PI * f * i / modemRate;
-            si += buf[i] * Math.sin(ph);
-            co += buf[i] * Math.cos(ph);
-          }
-          ftHi.push({ freq: f, mag: Math.hypot(si, co) / buf.length });
-        }
-        ftHi.sort((a, b) => b.mag - a.mag);
-        console.warn(`[FFT] High top 8: ${ftHi.slice(0,8).map(b => `${b.freq.toFixed(1)}Hz=${b.mag.toExponential(2)}`).join(', ')}`);
+        spectrum[bin] = Math.hypot(si, co) / buf.length;
       }
 
-      // Throttle waveform to ~2fps
+      // Raw peak and VU
+      const rawMin = Math.min(...buf);
+      const rawMax = Math.max(...buf);
+      const rawPeak = Math.max(Math.abs(rawMin), Math.abs(rawMax));
+      const noiseFloorDb = rmsDb < -50 ? rmsDb : 20 * Math.log10(Math.max(rms, 1e-6));
+
+      setState({ micLevel: rmsDb, rawPeak, toneEnergies: energies, fftSpectrum: spectrum, noiseFloorDb });
+
+      // Waveform and debug samples every tick
       tickCount++;
-      if (tickCount % 5 === 0) {
-        setState({ debugSamples: new Float32Array(recvSamples) });
-      }
+      setState({ debugSamples: new Float32Array(recvSamples.slice(-1024)) });
     }, 100);
   } catch (err: any) {
     isListening = false;
