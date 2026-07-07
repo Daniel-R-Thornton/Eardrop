@@ -1,25 +1,64 @@
 /* Eardrop — Clean design system */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* ── Dark theme (default) ── */
+:root, [data-theme="dark"] {
+  --bg: #05050f;
+  --surface: #0d0d1a;
+  --surface2: rgba(255,255,255,0.02);
+  --border: rgba(255,255,255,0.06);
+  --border2: rgba(255,255,255,0.1);
+  --text: #e5e7eb;
+  --text-muted: #6b7280;
+  --text-dim: #4b5563;
+  --input-bg: rgba(255,255,255,0.04);
+  --canvas-bg: rgba(0,0,0,0.4);
+}
+
+/* ── Light theme ── */
+[data-theme="light"] {
+  --bg: #f8f9fa;
+  --surface: #ffffff;
+  --surface2: rgba(0,0,0,0.02);
+  --border: rgba(0,0,0,0.08);
+  --border2: rgba(0,0,0,0.12);
+  --text: #1a1a2e;
+  --text-muted: #6b7280;
+  --text-dim: #9ca3af;
+  --input-bg: rgba(0,0,0,0.04);
+  --canvas-bg: rgba(0,0,0,0.06);
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, system-ui, sans-serif;
-  background: #05050f;
-  color: #e5e7eb;
+  background: var(--bg);
+  color: var(--text);
   min-height: 100vh;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+  transition: background 0.2s, color 0.2s;
 }
 
 /* Scrollbar */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
+::-webkit-scrollbar-thumb { background: rgba(128,128,128,0.2); border-radius: 3px; }
 
 /* Range inputs */
-input[type="range"] { -webkit-appearance: none; height: 4px; border-radius: 2px; outline: none; }
+input[type="range"] { -webkit-appearance: none; height: 4px; border-radius: 2px; outline: none; background: var(--border); }
 input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: currentColor; cursor: pointer; }
 
 /* Button transitions */
 button { transition: all 0.15s ease; }
 button:hover:not(:disabled) { opacity: 0.85; }
 button:active:not(:disabled) { transform: scale(0.97); }
+
+/* Theme toggle */
+.theme-toggle {
+  width: 36px; height: 36px; border-radius: 50%;
+  border: 1px solid var(--border2); background: var(--surface);
+  color: var(--text-muted); font-size: 16px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.2s; flex-shrink: 0;
+}
+.theme-toggle:hover { border-color: var(--text-muted); color: var(--text); }

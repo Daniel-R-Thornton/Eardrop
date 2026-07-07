@@ -74,6 +74,8 @@ export interface AppState {
   debugTrace: Array<{ sym: number; rawI: number[]; bits: number[]; frameHex: string; blockEvent?: string }>;
   /** Diagnostic messages from last receive cycle */
   diagMessages: string[];
+  /** Theme: 'dark' | 'light' */
+  theme: 'dark' | 'light';
 }
 
 const defaultDecoder: DecoderInfo = {
@@ -115,6 +117,7 @@ const defaultState: AppState = {
   noiseFloorDb: -80,
   debugTrace: [],
   diagMessages: [],
+  theme: 'dark',
 };
 
 // ─── Store ────────────────────────────────────────────

@@ -44,15 +44,15 @@ function Card({ title, accent = "#6c6cff", children, style }: {
 }) {
   return (
     <div style={{
-      background: "#0d0d1a", borderRadius: 12,
-      border: "1px solid rgba(255,255,255,0.06)",
+      background: "var(--surface)", borderRadius: 12,
+      border: "1px solid var(--border)",
       overflow: "hidden",
       ...style,
     }}>
       {title && (
         <div style={{
           padding: "10px 16px", fontSize: 13, fontWeight: 600,
-          color: accent, borderBottom: "1px solid rgba(255,255,255,0.05)",
+          color: accent, borderBottom: "1px solid var(--border)",
           textTransform: "uppercase", letterSpacing: "0.05em",
         }}>{title}</div>
       )}
@@ -191,10 +191,11 @@ export function MainApp() {
   const snrColor = !debug ? "#6b7280" : debug.signalToNoise > 10 ? "#34d399" : debug.signalToNoise > 3 ? "#f59e0b" : "#f87171";
 
   return (
-    <div style={{
+    <div data-theme={s.theme} style={{
       maxWidth: 1100, margin: "0 auto", padding: "20px 16px",
       fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Roboto, sans-serif",
-      color: "#e5e7eb", background: "#05050f", minHeight: "100vh",
+      color: "var(--text)", background: "var(--bg)", minHeight: "100vh",
+      transition: "background 0.2s, color 0.2s",
     }}>
 
       {/* ═══ HEADER ═══ */}
@@ -207,6 +208,10 @@ export function MainApp() {
           }}>Eardrop</h1>
           <p style={{ color: "#6b7280", fontSize: 14, marginTop: 2 }}>File transfer over audio · speaker → mic</p>
         </div>
+        <button onClick={() => setState({ theme: s.theme === 'dark' ? 'light' : 'dark' })}
+          className="theme-toggle" title="Toggle theme">
+          {s.theme === 'dark' ? '☀' : '🌙'}
+        </button>
       </div>
 
       {/* ═══ TWO-COLUMN LAYOUT ═══ */}
@@ -516,11 +521,11 @@ export function MainApp() {
   );
 }
 
-const statBg: React.CSSProperties = { background: "rgba(255,255,255,0.02)", padding: "10px 12px" };
+const statBg: React.CSSProperties = { background: "var(--surface2)", padding: "10px 12px" };
 
 const btnSmall: React.CSSProperties = {
   flex: "1 1 auto", minWidth: 90,
-  padding: "8px 12px", border: "1px solid rgba(255,255,255,0.1)",
-  borderRadius: 6, background: "rgba(255,255,255,0.04)",
-  color: "#e5e7eb", cursor: "pointer", fontSize: 12, fontWeight: 500,
+  padding: "8px 12px", border: "1px solid var(--border2)",
+  borderRadius: 6, background: "var(--input-bg)",
+  color: "var(--text)", cursor: "pointer", fontSize: 12, fontWeight: 500,
 };
