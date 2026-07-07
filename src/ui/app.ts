@@ -675,8 +675,8 @@ async function runSelfTest() {
 
   const blocksOk = decoder.framedDecoder.blocksDecoded;
   const crcFail = decoder.framedDecoder.blocksCrcFailed;
-  const dataMatch = decoded && decoded.length === testData.length &&
-    testData.every((b, i) => decoded![i] === b);
+  const dataMatch = !!(decoded && (decoded as Uint8Array).length === testData.length &&
+    testData.every((b, i) => (decoded as Uint8Array)[i] === b));
   const passed = blocksOk > 0 && crcFail === 0 && !!dataMatch;
 
   const el = document.getElementById("selfTestResult");
