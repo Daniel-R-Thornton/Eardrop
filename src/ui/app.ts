@@ -139,7 +139,7 @@ broadcastWorker.onmessage = (e) => {
           const nf = d.noiseFloor || [0,0,0,0];
           const eng = d.energies || [0,0,0,0];
           const maxE = Math.max(...eng, 1e-12);
-          const avgNf = nf.reduce((a,b)=>a+b,0) / 4;
+          const avgNf = nf.reduce((a: number,b: number) => a + b, 0) / 4;
 
           msgs.push(`End: ${d.bitsCollected} bits decoded`);
 
