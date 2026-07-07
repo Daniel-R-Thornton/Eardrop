@@ -204,14 +204,14 @@ export class Encoder {
         }
 
         if (this.samplesInPhase === 0) {
-          // 8-bit frame: [a0,0,a1,0,a2,0,a3,0] — phase bits always 0
-          // bitstream has 4 bits per symbol, packed as [amp0,amp1,amp2,amp3]
+          // BPSK: active tones always ON, data in 0°/180° phase
+          const active = Math.min(numTones, this.cfg.toneCount || 4);
           for (let t = 0; t < numTones; t++) {
-            const ampBit = (this.bitPos + t) < this.bitstream.length
+            const bit = t < active && (this.bitPos + t) < this.bitstream.length
               ? this.bitstream[this.bitPos + t] : 0;
-            this.bpskMul[t] = ampBit === 0 ? 0 : 1;
+            this.bpskMul[t] = t < active ? (bit === 0 ? 1 : -1) : 0;
           }
-
+          this.bitPos += active;
         }
 
         // Generate this sample

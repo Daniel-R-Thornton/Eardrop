@@ -274,38 +274,18 @@ export class Decoder {
     // Raw I/Q at each tone frequency
     const rawIQs = this.toneFreqs.map(f => toneIQ(window, f, this.cfg.sampleRate));
 
-    // Rotate by pilot phase to get pilot-relative I'/Q'
+    // Use raw I/Q directly — the toneIQ reference sin starts at 0, encoder
+    // advances one sample ahead (sin(ω*(n+1))), giving a constant ω phase offset
+    // per tone. For 0° BPSK: raw.i = A/2*cos(ω) > 0. For 180°: raw.i < 0.
+    // No rotation needed — just use raw I component for BPSK decision.
     const relI: [number, number, number, number] = [0, 0, 0, 0];
     const relQ: [number, number, number, number] = [0, 0, 0, 0];
     const energies: [number, number, number, number] = [0, 0, 0, 0];
 
-    // Pilot-relative phase detection.
-    // The encoder increments phase by freq/rate before the first sample of
-    // each frame, creating a one-sample offset. Combined with the toneIQ
-    // correlation midpoint (sps/2), the rotation angle for tone t is:
-    //   θ_rot[t] = 2π * f_t * (sps/2 + 1) / sampleRate
-    // This is CONSTANT per tone because f_t * sps / rate is an integer.
-    // No per-frame parity correction is needed — the rotation is frame-invariant.
-    if (this.pll) {
-      for (let t = 0; t < 4; t++) {
-        const raw = rawIQs[t];
-        // Constant rotation for this tone (mod 2π to avoid float precision loss)
-        const cycles = this.toneFreqs[t] * (this.sps / 2 + 1) / this.cfg.sampleRate;
-        const theta = 2 * Math.PI * (cycles - Math.floor(cycles));
-        const cos = Math.cos(theta);
-        const sin = Math.sin(theta);
-        relI[t] = raw.i * cos + raw.q * sin;
-        relQ[t] = -raw.i * sin + raw.q * cos;
-        // DEBUG: also store raw (pre-rotation) energy
-        energies[t] = Math.hypot(raw.i, raw.q);
-      }
-    } else {
-      // Fallback: absolute energy (no pilot lock yet)
-      for (let t = 0; t < 4; t++) {
-        relI[t] = rawIQs[t].i;
-        relQ[t] = rawIQs[t].q;
-        energies[t] = Math.hypot(rawIQs[t].i, rawIQs[t].q);
-      }
+    for (let t = 0; t < 4; t++) {
+      relI[t] = rawIQs[t].i;
+      relQ[t] = rawIQs[t].q;
+      energies[t] = Math.hypot(rawIQs[t].i, rawIQs[t].q);
     }
 
     // Store raw I/Q for squawk processing
@@ -468,7 +448,7 @@ export class Decoder {
       console.warn(`[CAN_ENTER] cons=${this.consecutiveSync} nf=${this.noiseFrames} fse=${this.framesSinceExit} pilot=${this.pilotDiscovered} pilotAmp=${this.pilotAmplitude.toExponential(2)} total=${total.toExponential(2)} noiseFloorSum=${this.noiseFloor.reduce((a,b)=>a+b,0).toExponential(2)}`);
     }
     const canEnter = this.fastSync
-      ? (this.consecutiveSync >= 8 && this.noiseFrames >= 25)
+      ? (this.pilotDiscovered && this.consecutiveSync >= 12 && this.noiseFrames >= 25)
       : (syncPath && (this.framesSinceExit >= 50 || this.consecutiveSync >= 10)) || pilotPath;
     if (canEnter && !this.inFrame) {
       this.inFrame = true;
@@ -478,8 +458,8 @@ export class Decoder {
       this.framesSinceExit = 0;
       this.framedDecoder.reset();
       this.blockProcessor.reset();
-      // Skip remaining sync frames (includes the entry frame itself)
-      this.frameSkip = Math.max(0, this.cfg.syncSymbols - this.consecutiveSync) + (this.cfg.toneCount * 4);
+      // Entered at end of leader (cons=12). Skip all 10 sync symbols.
+      this.frameSkip = this.cfg.syncSymbols;
       if (this.logging) {
         console.log("[DEC] SYNC DETECTED — entering data mode", {
           pilotFreq: this.pilotFreq.toFixed(1),
