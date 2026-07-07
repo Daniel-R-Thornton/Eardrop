@@ -410,11 +410,6 @@ export function MainApp() {
             </div>
           </Card>
 
-          {/* Waveform */}
-          <Card title="Waveform" accent="#6c6cff">
-            <WaveformScope rxSamples={s.debugSamples} txSamples={s.txSamples} sampleRate={3200} />
-          </Card>
-
           {/* Actions */}
           <Card title="Actions" accent="#f59e0b">
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
@@ -425,6 +420,13 @@ export function MainApp() {
             <div id="selfTestResult" style={{ fontSize: 11, color: "#6b7280", fontFamily: "SF Mono, ui-monospace, monospace", marginTop: 6, minHeight: 16 }} />
           </Card>
         </div>
+      </div>
+
+      {/* ═══ FULL-WIDTH WAVEFORM ═══ */}
+      <div style={{ marginTop: 16 }}>
+        <Card title="Waveform — RX (blue) / TX (orange)" accent="#6c6cff">
+          <WaveformScope rxSamples={s.debugSamples} txSamples={s.txSamples} sampleRate={3200} />
+        </Card>
       </div>
     </div>
   );

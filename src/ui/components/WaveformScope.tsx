@@ -152,15 +152,15 @@ export function WaveformScope({ rxSamples, txSamples, sampleRate = 3200 }: Props
     }}>
       <canvas
         ref={canvasRef}
-        width={800}
-        height={180}
+        width={1200}
+        height={400}
         onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
         style={{
-          width: "100%", height: 180, cursor: dragging ? "grabbing" : "grab",
+          width: "100%", height: 400, cursor: dragging ? "grabbing" : "grab",
           display: "block",
         }}
       />
