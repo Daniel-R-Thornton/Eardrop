@@ -1,17 +1,16 @@
 /**
- * MainApp.tsx — Full-featured Eardrop UI.
- * Includes send/receive, comprehensive debug dashboard, test buttons, device config.
+ * MainApp.tsx — Eardrop UI with comprehensive debug dashboard.
+ * Apple-inspired design: clean cards, tight typography, visible debug.
  */
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useStore, setState } from "./Store";
 import { ToneMeter } from "./components/ToneMeter";
 import { BitAnalyzer } from "./components/BitAnalyzer";
-import { debugLogger, STAGE } from "../modem/debugger";
-import { compressForLLM, type CompressLevel } from "../modem/compressForLLM";
 
 const TONE_COLORS = ["#4a9eff", "#ff6b4a", "#5eead4", "#f472b6"];
 const TONE_FREQS = [850, 1050, 1250, 1450];
+const GAP = 12;
 
 // ─── Helpers ──────────────────────────────────────────
 
@@ -20,53 +19,145 @@ function formatSize(b: number): string {
   return `${(b / 1024).toFixed(1)} KB`;
 }
 
-function formatPayloadHex(bytes: Uint8Array, max = 96): string {
-  const slice = bytes.slice(0, max);
-  const lines: string[] = [];
-  for (let i = 0; i < slice.length; i += 16) {
-    const h = Array.from(slice.slice(i, i + 16)).map(b => b.toString(16).padStart(2, "0")).join(" ");
-    const a = Array.from(slice.slice(i, i + 16)).map(b => (b >= 0x20 && b <= 0x7e ? String.fromCharCode(b) : ".")).join("");
-    lines.push(`${h.padEnd(48)}  ${a}`);
-  }
-  if (bytes.length > max) lines.push(`… ${bytes.length - max} more bytes`);
-  return lines.join("\n");
-}
-
-// ─── Status Badge ─────────────────────────────────────
-
 function StatusBadge({ type, msg }: { type: string; msg: string }) {
   const c: Record<string, { bg: string; fg: string }> = {
     info: { bg: "rgba(108,108,255,0.15)", fg: "#6c6cff" },
-    success: { bg: "rgba(68,204,136,0.15)", fg: "#44cc88" },
-    error: { bg: "rgba(255,68,102,0.15)", fg: "#ff4466" },
+    success: { bg: "rgba(52,211,153,0.15)", fg: "#34d399" },
+    error: { bg: "rgba(248,113,113,0.15)", fg: "#f87171" },
   };
   const s = c[type] || c.info;
-  return <div style={{ marginTop: 6, padding: "5px 10px", borderRadius: 6, fontSize: 12, background: s.bg, color: s.fg }}>{msg}</div>;
-}
-
-// ─── Meter Bar ────────────────────────────────────────
-
-function MeterBar({ val, peak, color, label, decimals = 1 }: { val: number; peak: number; color: string; label: string; decimals?: number }) {
-  const pct = Math.min(100, (val / Math.max(peak || 1e-12, 1e-12)) * 100);
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
-      <span style={{ fontSize: 10, color: "#888", minWidth: 70, textAlign: "right", flexShrink: 0 }}>{label}</span>
-      <div style={{ flex: 1, height: 8, background: "#12121e", borderRadius: 4, overflow: "hidden" }}>
-        <div style={{ width: `${pct}%`, height: "100%", background: color, borderRadius: 4, transition: "width 40ms linear" }} />
-      </div>
-      <span style={{ fontSize: 10, fontFamily: "monospace", color, minWidth: 55, textAlign: "right", flexShrink: 0 }}>{val.toFixed(decimals)}</span>
+    <div style={{ marginTop: 6, padding: "6px 12px", borderRadius: 8, fontSize: 13, background: s.bg, color: s.fg, fontWeight: 500 }}>
+      {msg}
     </div>
   );
 }
 
-// ─── Section Wrapper ──────────────────────────────────
+// ─── Card ─────────────────────────────────────────────
 
-function Section({ title, children, color = "#6c6cff" }: { title: string; children: React.ReactNode; color?: string }) {
+function Card({ title, accent = "#6c6cff", children, style }: {
+  title?: string; accent?: string; children: React.ReactNode; style?: React.CSSProperties
+}) {
   return (
-    <div style={{ background: "#11111e", border: "1px solid #1e1e3a", borderRadius: 10, overflow: "hidden" }}>
-      <div style={{ padding: "6px 12px", background: "#16162a", borderBottom: "1px solid #1e1e3a", fontWeight: 600, fontSize: 13, color }}>{title}</div>
-      <div style={{ padding: 10 }}>{children}</div>
+    <div style={{
+      background: "#0d0d1a", borderRadius: 12,
+      border: "1px solid rgba(255,255,255,0.06)",
+      overflow: "hidden",
+      ...style,
+    }}>
+      {title && (
+        <div style={{
+          padding: "10px 16px", fontSize: 13, fontWeight: 600,
+          color: accent, borderBottom: "1px solid rgba(255,255,255,0.05)",
+          textTransform: "uppercase", letterSpacing: "0.05em",
+        }}>{title}</div>
+      )}
+      <div style={{ padding: title ? "14px 16px" : "16px" }}>{children}</div>
     </div>
+  );
+}
+
+// ─── Stat Grid Item ───────────────────────────────────
+
+function Stat({ label, value, color = "#e0e0ee" }: { label: string; value: string; color?: string }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      <span style={{ fontSize: 10, color: "#6b7280", textTransform: "uppercase", letterSpacing: "0.05em" }}>{label}</span>
+      <span style={{ fontSize: 15, fontWeight: 600, fontFamily: "SF Mono, ui-monospace, monospace", color }}>{value}</span>
+    </div>
+  );
+}
+
+// ─── Meter Bar ────────────────────────────────────────
+
+function MeterBar({ val, peak, color, label }: { val: number; peak: number; color: string; label: string }) {
+  const pct = Math.min(100, Math.max(0, (val / Math.max(peak || 1e-12, 1e-6)) * 100));
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+      <span style={{ fontSize: 11, color: "#6b7280", minWidth: 55, textAlign: "right" }}>{label}</span>
+      <div style={{ flex: 1, height: 6, background: "rgba(255,255,255,0.04)", borderRadius: 3, overflow: "hidden" }}>
+        <div style={{ width: `${pct}%`, height: "100%", background: color, borderRadius: 3, transition: "width 80ms linear" }} />
+      </div>
+      <span style={{ fontSize: 11, fontFamily: "SF Mono, ui-monospace, monospace", color, minWidth: 50, textAlign: "right" }}>{val.toFixed(1)}</span>
+    </div>
+  );
+}
+
+// ─── Constellation Dot ────────────────────────────────
+
+function ConstellationCanvas({ tone, iVal, qVal, color, label }: {
+  tone: number; iVal: number; qVal: number; color: string; label: string
+}) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  const size = 70;
+
+  useEffect(() => {
+    const c = ref.current;
+    if (!c) return;
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+    const w = c.width, h = c.height;
+    const cx = w / 2, cy = h / 2, scale = w / 3;
+
+    ctx.fillStyle = "rgba(0,0,0,0.3)";
+    ctx.fillRect(0, 0, w, h);
+
+    // Axes
+    ctx.strokeStyle = "rgba(255,255,255,0.08)";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(w, cy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, h); ctx.stroke();
+
+    // Dot
+    const x = cx + iVal * scale;
+    const y = cy - qVal * scale;
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.3)";
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.stroke();
+  }, [iVal, qVal, color]);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
+      <canvas ref={ref} width={size} height={size} style={{ borderRadius: 6, background: "rgba(0,0,0,0.3)" }} />
+      <span style={{ fontSize: 9, color, fontFamily: "SF Mono, ui-monospace, monospace" }}>{label}</span>
+    </div>
+  );
+}
+
+// ─── Waveform Canvas ──────────────────────────────────
+
+function WaveformCanvas({ samples }: { samples: Float32Array | null }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const c = ref.current;
+    if (!c || !samples) return;
+    const ctx = c.getContext("2d");
+    if (!ctx) return;
+    const w = c.width, h = c.height;
+    ctx.fillStyle = "rgba(0,0,0,0.3)";
+    ctx.fillRect(0, 0, w, h);
+
+    const step = Math.max(1, Math.floor(samples.length / w));
+    ctx.strokeStyle = "#6c6cff";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i < w; i++) {
+      const idx = Math.min(i * step, samples.length - 1);
+      const y = h / 2 - samples[idx] * h / 3;
+      i === 0 ? ctx.moveTo(i, y) : ctx.lineTo(i, y);
+    }
+    ctx.stroke();
+  }, [samples]);
+
+  if (!samples) return null;
+  return (
+    <canvas ref={ref} width={400} height={60} style={{
+      width: "100%", height: 60, borderRadius: 6,
+      background: "rgba(0,0,0,0.3)",
+    }} />
   );
 }
 
@@ -75,16 +166,15 @@ function Section({ title, children, color = "#6c6cff" }: { title: string; childr
 // ═══════════════════════════════════════════════════════
 
 export function MainApp() {
-  const s = useStore(x => x); // full state
+  const s = useStore(x => x);
+  const debug = s.debug;
 
-  // Refresh device pickers after React mounts the DOM
   useEffect(() => {
     (window as any).eardropRefreshDevices?.();
   }, []);
 
-  // ── Event dispatchers to app.ts ──
-
-  const dispatch = (type: string, detail?: any) => window.dispatchEvent(new CustomEvent(type, { detail }));
+  const dispatch = (type: string, detail?: any) =>
+    window.dispatchEvent(new CustomEvent(type, { detail }));
 
   const handleFile = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
@@ -98,124 +188,137 @@ export function MainApp() {
     if (f) { setState({ selectedFile: { name: f.name, size: f.size } }); dispatch("eardrop-file", { file: f }); }
   }, []);
 
-  // ── Debug ──
-
-  const debug = s.debug;
-  const snrColor = !debug ? "#666" : debug.signalToNoise > 10 ? "#44cc88" : debug.signalToNoise > 3 ? "#eab308" : "#ef4444";
+  const snrColor = !debug ? "#6b7280" : debug.signalToNoise > 10 ? "#34d399" : debug.signalToNoise > 3 ? "#f59e0b" : "#f87171";
 
   return (
-    <div style={{ maxWidth: 1000, margin: "0 auto", padding: "16px 12px", fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif", color: "#e0e0ee", background: "#0a0a12", minHeight: "100vh" }}>
+    <div style={{
+      maxWidth: 1100, margin: "0 auto", padding: "20px 16px",
+      fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Roboto, sans-serif",
+      color: "#e5e7eb", background: "#05050f", minHeight: "100vh",
+    }}>
 
       {/* ═══ HEADER ═══ */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20 }}>
         <div>
-          <h1 style={{ fontSize: 28, fontWeight: 700, margin: 0, background: "linear-gradient(135deg,#6c6cff,#a78bfa)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>Eardrop</h1>
-          <p style={{ color: "#7878a0", fontSize: 13, marginTop: 2 }}>File transfer over audio — speaker to mic</p>
+          <h1 style={{
+            fontSize: 32, fontWeight: 700, margin: 0, letterSpacing: "-0.03em",
+            background: "linear-gradient(135deg, #818cf8, #c084fc)", WebkitBackgroundClip: "text",
+            WebkitTextFillColor: "transparent",
+          }}>Eardrop</h1>
+          <p style={{ color: "#6b7280", fontSize: 14, marginTop: 2 }}>File transfer over audio · speaker → mic</p>
         </div>
-        <button onClick={() => { const v = !s.debugVisible; setState({ debugVisible: v }); dispatch("eardrop-toggle-debug", { visible: v }); }}
-          style={{ width: 36, height: 36, borderRadius: "50%", border: "1px solid #2a2a4e", background: "#11111e", color: "#7878a0", fontSize: 16, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}
-          title="Toggle debug (Ctrl+Shift+D)">{s.debugVisible ? "✕" : "🛠"}</button>
       </div>
 
       {/* ═══ TWO-COLUMN LAYOUT ═══ */}
-      <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) minmax(0,1fr)", gap: 12, alignItems: "start" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: GAP, alignItems: "start" }}>
 
-        {/* ═══ LEFT COLUMN ═══ */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {/* ── LEFT: Send, Receive, Config ── */}
+        <div style={{ display: "flex", flexDirection: "column", gap: GAP }}>
 
-          {/* ── SEND ── */}
-          <Section title="📤 Send">
-            <div onDragOver={e => { e.preventDefault(); e.currentTarget.style.borderColor = "#6c6cff"; }}
-              onDragLeave={e => e.currentTarget.style.borderColor = "#2a2a4e"}
+          {/* Send */}
+          <Card title="Send" accent="#818cf8">
+            <div
+              onDragOver={e => { e.preventDefault(); e.currentTarget.style.borderColor = "#818cf8"; }}
+              onDragLeave={e => e.currentTarget.style.borderColor = "rgba(255,255,255,0.1)"}
               onDrop={handleDrop}
               onClick={() => document.getElementById("fi")?.click()}
-              style={{ border: "2px dashed #2a2a4e", borderRadius: 6, padding: "14px 10px", textAlign: "center", cursor: "pointer", fontSize: 13, color: s.selectedFile ? "#e0e0ee" : "#7878a0", transition: "border-color .2s" }}>
+              style={{
+                border: "2px dashed rgba(255,255,255,0.1)", borderRadius: 8,
+                padding: "16px", textAlign: "center", cursor: "pointer",
+                fontSize: 14, color: s.selectedFile ? "#e5e7eb" : "#6b7280",
+                transition: "border-color .2s",
+              }}>
               {s.selectedFile ? `${s.selectedFile.name} (${formatSize(s.selectedFile.size)})` : "Drop a file or click to browse"}
               <input id="fi" type="file" hidden onChange={handleFile} />
             </div>
-            <button disabled={!s.selectedFile || s.isSending} onClick={() => dispatch("eardrop-send")}
-              style={{ width: "100%", marginTop: 8, padding: "8px 16px", border: "none", borderRadius: 6, fontSize: 14, fontWeight: 600, cursor: "pointer", background: s.selectedFile ? "#6c6cff" : "#1e1e3a", color: s.selectedFile ? "#fff" : "#555" }}>
-              {s.isSending ? "⏳ Sending…" : "📡 Send as Audio"}
+            <button
+              disabled={!s.selectedFile || s.isSending}
+              onClick={() => dispatch("eardrop-send")}
+              style={{
+                width: "100%", marginTop: 10, padding: "10px 0", border: "none", borderRadius: 8,
+                fontSize: 15, fontWeight: 600, cursor: "pointer",
+                background: s.selectedFile ? "#818cf8" : "rgba(255,255,255,0.06)",
+                color: s.selectedFile ? "#fff" : "#4b5563",
+                transition: "all .15s",
+              }}>
+              {s.isSending ? "Sending…" : "Send as Audio"}
             </button>
             {s.isPlaying && (
               <button onClick={() => dispatch("eardrop-stop-playback")}
-                style={{ width: "100%", marginTop: 4, padding: "6px 12px", border: "none", borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: "pointer", background: "#ff4466", color: "#fff" }}>
-                ⏹ Stop Playback
+                style={{ width: "100%", marginTop: 6, padding: "8px 0", border: "none", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer", background: "#f87171", color: "#fff" }}>
+                Stop Playback
               </button>
             )}
             {s.sendStatus && <StatusBadge {...s.sendStatus} />}
-          </Section>
+          </Card>
 
-          {/* ── RECEIVE ── */}
-          <Section title="📥 Receive">
-            <p style={{ color: "#7878a0", fontSize: 12, marginBottom: 8 }}>Place sender speaker near mic.</p>
+          {/* Receive */}
+          <Card title="Receive" accent="#34d399">
+            <p style={{ color: "#6b7280", fontSize: 13, marginBottom: 10 }}>Place sender speaker near mic.</p>
             <button onClick={() => dispatch("eardrop-record")}
-              style={{ width: "100%", padding: "8px 16px", border: "none", borderRadius: 6, fontSize: 14, fontWeight: 600, cursor: "pointer", background: s.isListening ? "#ff4466" : "#6c6cff", color: "#fff" }}>
-              {s.isListening ? "⏹ Stop Listening" : "🎙 Start Listening"}
+              style={{
+                width: "100%", padding: "10px 0", border: "none", borderRadius: 8,
+                fontSize: 15, fontWeight: 600, cursor: "pointer",
+                background: s.isListening ? "#f87171" : "#34d399",
+                color: "#fff", transition: "all .15s",
+              }}>
+              {s.isListening ? "Stop Listening" : "Start Listening"}
             </button>
             {s.recvStatus && <StatusBadge {...s.recvStatus} />}
             {s.progress > 0 && (
-              <div style={{ marginTop: 8 }}>
-                <div style={{ height: 4, background: "#1e1e3a", borderRadius: 2, overflow: "hidden" }}>
-                  <div style={{ width: `${Math.min(s.progress, 100)}%`, height: "100%", background: "#6c6cff", borderRadius: 2, transition: "width .3s" }} />
+              <div style={{ marginTop: 10 }}>
+                <div style={{ height: 4, background: "rgba(255,255,255,0.06)", borderRadius: 2, overflow: "hidden" }}>
+                  <div style={{ width: `${Math.min(s.progress, 100)}%`, height: "100%", background: "#34d399", borderRadius: 2, transition: "width .3s" }} />
                 </div>
-                <span style={{ fontSize: 11, color: "#7878a0", marginTop: 2 }}>{s.progress}%</span>
+                <span style={{ fontSize: 12, color: "#6b7280", marginTop: 3, display: "block" }}>{s.progress}%</span>
               </div>
             )}
-            {/* Downloads */}
             {s.receivedFiles.length > 0 && (
-              <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
-                <div style={{ fontSize: 12, color: "#7878a0" }}>📥 {s.receivedFiles.length} file(s)</div>
+              <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6 }}>
                 {s.receivedFiles.map((f, i) => (
-                  <a key={i} href={f.url} download={f.name} style={{ padding: "4px 10px", background: "#44cc88", color: "#000", borderRadius: 5, textDecoration: "none", fontWeight: 600, fontSize: 12 }}>⬇ {f.name} ({formatSize(f.size)})</a>
+                  <a key={i} href={f.url} download={f.name}
+                    style={{ padding: "6px 12px", background: "#34d399", color: "#000", borderRadius: 6, textDecoration: "none", fontWeight: 600, fontSize: 13 }}>
+                    {f.name} ({formatSize(f.size)})
+                  </a>
                 ))}
-                <button onClick={() => { s.receivedFiles.forEach(f => URL.revokeObjectURL(f.url)); setState({ receivedFiles: [] }); }}
-                  style={{ alignSelf: "flex-start", padding: "2px 8px", border: "1px solid #1e1e3a", borderRadius: 4, background: "#16162a", color: "#7878a0", cursor: "pointer", fontSize: 10 }}>🗑 Clear</button>
               </div>
             )}
-            {/* RX Payload */}
-            {s.rxPayload && (
-              <div style={{ marginTop: 8, background: "#07070e", borderRadius: 5, border: "1px solid #1e1e3a", overflow: "hidden" }}>
-                <div style={{ fontSize: 10, color: "#44cc88", padding: "2px 6px", background: "#11111e", borderBottom: "1px solid #1e1e3a" }}>📥 RX: {s.rxPayload.name}</div>
-                <pre style={{ margin: 0, padding: "4px 6px", fontSize: 10, color: "#44cc88", whiteSpace: "pre-wrap", wordBreak: "break-all", fontFamily: "monospace", maxHeight: 60, overflow: "auto", lineHeight: 1.3 }}>{s.rxPayload.bytes}</pre>
-              </div>
-            )}
-          </Section>
+          </Card>
 
-          {/* ── MODEM CONFIG ── */}
-          <Section title="⚙️ Modem Config" color="#eab308">
+          {/* Config */}
+          <Card title="Config" accent="#f59e0b">
+            {/* Tone Count */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <span style={{ fontSize: 12, color: "#6b7280" }}>Active Tones</span>
+              <select value={s.toneCount} onChange={e => setState({ toneCount: parseInt(e.target.value) })}
+                style={{ background: "rgba(255,255,255,0.04)", color: "#e5e7eb", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 5, padding: "3px 8px", fontSize: 12 }}>
+                <option value={2}>2 tones</option>
+                <option value={4}>4 tones</option>
+              </select>
+            </div>
+
+            {/* Pilot Freq */}
             <div style={{ marginBottom: 8 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 2 }}>
-                <label style={{ fontSize: 10, color: "#5858a0" }}>Pilot Frequency</label>
-                <span style={{ fontSize: 11, fontFamily: "monospace", color: "#eab308" }}>{s.pilotFreqHz.toFixed(1)} Hz</span>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                <span style={{ fontSize: 12, color: "#6b7280" }}>Pilot Freq</span>
+                <span style={{ fontSize: 12, fontFamily: "SF Mono, ui-monospace, monospace", color: "#f59e0b" }}>{s.pilotFreqHz.toFixed(1)} Hz</span>
               </div>
               <input type="range" min="37.5" max="537.5" step="25" value={s.pilotFreqHz}
                 onChange={e => {
-                  // Snap to N*25 + 12.5 for clean frame alignment
                   const raw = parseFloat(e.target.value);
                   const v = Math.round((raw - 12.5) / 25) * 25 + 12.5;
                   setState({ pilotFreqHz: v });
                   window.dispatchEvent(new CustomEvent("eardrop-pilot-freq", { detail: { freq: v } }));
                 }}
-                style={{ width: "100%", accentColor: "#eab308" }}
+                style={{ width: "100%", accentColor: "#f59e0b" }}
               />
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, color: "#484870" }}>
-                <span>37.5 Hz</span>
-                <span>287.5 Hz</span>
-                <span>537.5 Hz</span>
-              </div>
-              <div style={{ marginTop: 2, fontSize: 9, color: "#484870" }}>
-                Tone range: {(s.pilotFreqHz + 437.5).toFixed(0)}–{(s.pilotFreqHz + 1037.5).toFixed(0)} Hz (max {(s.pilotFreqHz + 1037.5) < 1600 ? '✓' : '✗'})
-              </div>
-              <div style={{ marginTop: 4, fontSize: 9, color: "#5858a0" }}>
-                Tones: {[437.5,637.5,837.5,1037.5].map(o => (s.pilotFreqHz + o).toFixed(0)).join(", ")} Hz
-              </div>
             </div>
 
-            <div style={{ marginBottom: 6 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
-                <label style={{ fontSize: 10, color: "#5858a0" }}>Amp Threshold</label>
-                <span style={{ fontSize: 10, fontFamily: "monospace", color: "#eab308" }}>{s.ampThresholdRatio.toFixed(2)}</span>
+            {/* Amp Threshold */}
+            <div style={{ marginBottom: 8 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                <span style={{ fontSize: 12, color: "#6b7280" }}>Amp Threshold</span>
+                <span style={{ fontSize: 12, fontFamily: "SF Mono, ui-monospace, monospace", color: "#f59e0b" }}>{s.ampThresholdRatio.toFixed(2)}</span>
               </div>
               <input type="range" min="0.05" max="0.5" step="0.05" value={s.ampThresholdRatio}
                 onChange={e => {
@@ -223,503 +326,102 @@ export function MainApp() {
                   setState({ ampThresholdRatio: v });
                   window.dispatchEvent(new CustomEvent("eardrop-thresholds", { detail: { ampRatio: v, syncMul: s.syncStrongMultiplier } }));
                 }}
-                style={{ width: "100%", accentColor: "#eab308" }}
+                style={{ width: "100%", accentColor: "#f59e0b" }}
               />
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 8, color: "#484870" }}>
-                <span>0.05 (sensitive)</span>
-                <span>0.30 (default)</span>
-              </div>
             </div>
 
-            <div style={{ marginBottom: 6 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
-                <label style={{ fontSize: 10, color: "#5858a0" }}>Sync Strong Threshold</label>
-                <span style={{ fontSize: 10, fontFamily: "monospace", color: "#eab308" }}>{s.syncStrongMultiplier.toFixed(2)}</span>
-              </div>
-              <input type="range" min="0.1" max="1.0" step="0.1" value={s.syncStrongMultiplier}
-                onChange={e => {
-                  const v = parseFloat(e.target.value);
-                  setState({ syncStrongMultiplier: v });
-                  window.dispatchEvent(new CustomEvent("eardrop-thresholds", { detail: { ampRatio: s.ampThresholdRatio, syncMul: v } }));
-                }}
-                style={{ width: "100%", accentColor: "#eab308" }}
-              />
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 8, color: "#484870" }}>
-                <span>0.1 (easy)</span>
-                <span>0.5 (default)</span>
-              </div>
+            {/* Audio Devices */}
+            <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+              <select id="inputSelect" style={{ flex: 1, background: "rgba(255,255,255,0.04)", color: "#e5e7eb", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 5, padding: "4px 6px", fontSize: 11 }}>
+                <option value="">Default Mic</option>
+              </select>
+              <select id="outputSelect" style={{ flex: 1, background: "rgba(255,255,255,0.04)", color: "#e5e7eb", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 5, padding: "4px 6px", fontSize: 11 }}>
+                <option value="">Default Speaker</option>
+              </select>
+              <button id="refreshDevices" style={{ padding: "4px 8px", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 5, background: "rgba(255,255,255,0.04)", color: "#6b7280", cursor: "pointer", fontSize: 11 }}>↻</button>
             </div>
-          </Section>
-
-          {/* ── DEVICES ── */}
-          <Section title="🎛 Audio Devices" color="#7878a0">
-            <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
-              <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 2 }}>
-                <label style={{ fontSize: 10, color: "#5858a0" }}>Input (mic)</label>
-                <select id="inputSelect" style={{ background: "#0a0a12", color: "#e0e0ee", border: "1px solid #1e1e3a", borderRadius: 4, padding: "3px 4px", fontSize: 11 }}>
-                  <option value="">Default</option>
-                </select>
-              </div>
-              <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 2 }}>
-                <label style={{ fontSize: 10, color: "#5858a0" }}>Output (speaker)</label>
-                <select id="outputSelect" style={{ background: "#0a0a12", color: "#e0e0ee", border: "1px solid #1e1e3a", borderRadius: 4, padding: "3px 4px", fontSize: 11 }}>
-                  <option value="">Default</option>
-                </select>
-              </div>
-            </div>
-            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              <button id="refreshDevices" style={{ padding: "3px 10px", border: "1px solid #1e1e3a", borderRadius: 4, background: "#16162a", color: "#7878a0", cursor: "pointer", fontSize: 10 }}>🔄 Refresh</button>
-              <label style={{ fontSize: 10, color: "#5858a0", display: "flex", alignItems: "center", gap: 4 }}>
-                <input type="checkbox" id="fastSyncCb" defaultChecked /> Fast Sync
-              </label>
-              <label style={{ fontSize: 10, color: "#5858a0", display: "flex", alignItems: "center", gap: 4 }}>
-                <input type="checkbox" checked={s.musicalMode} onChange={e => {
-                  const v = e.target.checked;
-                  setState({ musicalMode: v });
-                }} /> 🎵 Musical
-              </label>
-              <label style={{ fontSize: 10, color: "#5858a0", display: "flex", alignItems: "center", gap: 4 }}>
-                <select
-                  value={s.toneCount}
-                  onChange={e => {
-                    const v = parseInt(e.target.value);
-                    setState({ toneCount: v });
-                  }}
-                  style={{ background: "#0a0a12", color: "#e0e0ee", border: "1px solid #1e1e3a", borderRadius: 3, padding: "1px 3px", fontSize: 10 }}
-                >
-                  <option value={2}>2 tones</option>
-                  <option value={4}>4 tones</option>
-                </select>
-              </label>
-            </div>
-          </Section>
+          </Card>
         </div>
 
-        {/* ═══ RIGHT COLUMN ═══ */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {/* ── RIGHT: Debug Dashboard ── */}
+        <div style={{ display: "flex", flexDirection: "column", gap: GAP }}>
 
-          {/* ── MIC LEVEL + TONE ENERGY ── */}
-          <Section title="🎤 Mic & Tones">
-            <MeterBar val={s.micLevel} peak={0} color={s.micLevel > -30 ? "#44cc88" : s.micLevel > -50 ? "#eab308" : "#666"} label="Level" decimals={1} />
-            <div style={{ marginTop: 4 }}>
-              <span style={{ fontSize: 10, color: "#5858a0" }}>Tone Energy</span>
-              <ToneMeter energies={s.toneEnergies} freqs={TONE_FREQS} colors={TONE_COLORS} />
-            </div>
-          </Section>
-
-          {/* ── DECODER STATE ── */}
-          <Section title="📡 Decoder State">
+          {/* Decoder State */}
+          <Card title="Decoder State" accent="#818cf8">
             {!debug ? (
-              <div style={{ padding: "8px 0", color: "#5858a0", fontSize: 12 }}>Listening for signal…</div>
+              <div style={{ padding: "12px 0", color: "#6b7280", fontSize: 13, textAlign: "center" }}>
+                Listening for signal…
+              </div>
             ) : (
               <>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "1px", background: "#1e1e3a", borderRadius: 4, overflow: "hidden", marginBottom: 6 }}>
-                  {[
-                    ["Status", debug.inFrame ? "DATA" : debug.noiseFrames < 25 ? "Profiling" : "Listening", debug.inFrame ? "#44cc88" : "#eab308"],
-                    ["Sync", `${debug.consecutiveSync}`, "#6c6cff"],
-                    ["SNR", `${debug.signalToNoise.toFixed(1)} dB`, snrColor],
-                    ["Pilot", `${debug.pilotFreq.toFixed(1)} Hz`, "#6c6cff"],
-                    ["Bits", `${debug.bitsCollected}`, "#e0e0ee"],
-                    ["Blocks", `${debug.blocksDecoded} OK${debug.blocksCrcFailed > 0 ? ` / ${debug.blocksCrcFailed} FAIL` : ""}`, debug.blocksCrcFailed > 0 ? "#ef4444" : "#44cc88"],
-                  ].map(([l, v, c], i) => (
-                    <div key={i} style={{ background: "#11111e", padding: "5px 6px", display: "flex", flexDirection: "column", gap: 1 }}>
-                      <span style={{ fontSize: 9, color: "#5858a0", textTransform: "uppercase", letterSpacing: "0.04em" }}>{l}</span>
-                      <span style={{ fontSize: 13, fontWeight: 600, fontFamily: "monospace", color: c }}>{v}</span>
-                    </div>
+                {/* Stats grid */}
+                <div style={{
+                  display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "1px",
+                  background: "rgba(255,255,255,0.05)", borderRadius: 6, overflow: "hidden", marginBottom: 10,
+                }}>
+                  <div style={statBg}><Stat label="Status" value={debug.inFrame ? "DATA" : debug.noiseFrames < 25 ? "Profiling" : "Listening"} color={debug.inFrame ? "#34d399" : "#f59e0b"} /></div>
+                  <div style={statBg}><Stat label="Sync" value={`${debug.consecutiveSync}`} color="#818cf8" /></div>
+                  <div style={statBg}><Stat label="SNR" value={`${debug.signalToNoise.toFixed(1)} dB`} color={snrColor} /></div>
+                  <div style={statBg}><Stat label="Pilot" value={`${debug.pilotFreq.toFixed(1)} Hz`} color="#818cf8" /></div>
+                  <div style={statBg}><Stat label="Bits" value={`${debug.bitsCollected}`} color="#e5e7eb" /></div>
+                  <div style={statBg}><Stat label="Blocks" value={`${debug.blocksDecoded}/${debug.blocksCrcFailed > 0 ? "⚠️" : "✓"}`} color={debug.blocksCrcFailed > 0 ? "#f87171" : "#34d399"} /></div>
+                </div>
+
+                {/* Per-tone energies */}
+                <div style={{ marginBottom: 10 }}>
+                  {[0, 1, 2, 3].map(t => (
+                    <MeterBar key={t} val={debug.energies[t]} peak={Math.max(...debug.energies, 0.1)} color={TONE_COLORS[t]} label={`${TONE_FREQS[t]}Hz`} />
                   ))}
                 </div>
 
-                {/* Per-tone */}
-                <div style={{ fontSize: 10, color: "#5858a0", marginBottom: 4 }}>Tones</div>
-                {[0, 1, 2, 3].map(t => (
-                  <div key={t} style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 1, fontSize: 10, fontFamily: "monospace" }}>
-                    <span style={{ color: TONE_COLORS[t], minWidth: 50, textAlign: "right" }}>{TONE_FREQS[t]}Hz</span>
-                    <div style={{ flex: 1, height: 5, background: "#12121e", borderRadius: 2, overflow: "hidden" }}>
-                      <div style={{ width: `${Math.min(100, (debug.energies[t] / Math.max(...debug.energies, 0.1)) * 100)}%`, height: "100%", background: TONE_COLORS[t], borderRadius: 2, transition: "width 40ms linear" }} />
-                    </div>
-                    <span style={{ color: "#7878a0", minWidth: 70 }}>I={debug.relI[t].toFixed(2)}</span>
-                    <span style={{ color: debug.relI[t] > 0 ? "#44cc88" : debug.relI[t] < 0 ? "#ff6b4a" : "#444" }}>
-                      {debug.relI[t] > 0 ? "▶" : debug.relI[t] < 0 ? "◀" : "○"}
-                    </span>
-                  </div>
-                ))}
-
-                {/* Bit analyzer table */}
-                <div style={{ marginTop: 8 }}>
-                  <div style={{ fontSize: 10, color: "#5858a0", marginBottom: 4 }}>Bit Analyzer</div>
+                {/* Bit Analyzer */}
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ fontSize: 11, color: "#6b7280", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>Bit Analyzer</div>
                   <BitAnalyzer debug={debug} />
                 </div>
 
                 {/* Noise floor */}
-                <div style={{ marginTop: 6, fontSize: 9, color: "#484870", fontFamily: "monospace" }}>
+                <div style={{ fontSize: 10, color: "#4b5563", fontFamily: "SF Mono, ui-monospace, monospace" }}>
                   Noise: {debug.noiseFloor.map(n => n.toExponential(1)).join(" | ")}
                 </div>
               </>
             )}
-          </Section>
+          </Card>
 
-          {/* ── CONSTELLATION ── */}
-          <Section title="🎯 Constellation (I/Q)" color="#a78bfa">
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 2 }}>
+          {/* Constellation */}
+          <Card title="Constellation" accent="#c084fc">
+            <div style={{ display: "flex", justifyContent: "space-around" }}>
               {[0, 1, 2, 3].map(t => (
-                <ConstellationCanvas key={t} tone={t} iVal={debug?.relI[t] ?? 0} qVal={debug?.relQ[t] ?? 0} color={TONE_COLORS[t]} label={`${TONE_FREQS[t]}Hz`} />
+                <ConstellationCanvas key={t} tone={t} iVal={debug?.relI[t] ?? 0} qVal={debug?.relQ[t] ?? 0} color={TONE_COLORS[t]} label={`T${t}`} />
               ))}
             </div>
-          </Section>
+          </Card>
 
-          {/* ── WAVEFORM + FFT WATERFALL ── */}
-          <Section title="〰 Spectrum" color="#6c6cff">
+          {/* Waveform */}
+          <Card title="Waveform" accent="#6c6cff">
             <WaveformCanvas samples={s.debugSamples} />
-            <FftView samples={s.debugSamples} />
-          </Section>
+          </Card>
 
-          {/* ── BLOCK LOG + DECODER TEXT LOG ── */}
-          <Section title="📋 Activity Log" color="#7878a0">
-            <div style={{ maxHeight: 120, overflow: "auto", fontSize: 10, fontFamily: "monospace", lineHeight: 1.5 }}>
-              {s.blockLog.length === 0 ? (
-                <span style={{ color: "#484870" }}>No blocks decoded yet.</span>
-              ) : (
-                s.blockLog.slice(-12).map((e, i) => (
-                  <div key={i} style={{ display: "flex", gap: 8 }}>
-                    <span style={{ color: e.type === "SQUAWK" ? "#5eead4" : e.type === "CONFIG" ? "#4a9eff" : e.type === "PAYLOAD" ? "#eab308" : e.type === "EOF" ? "#44cc88" : "#888" }}>
-                      {e.type.padEnd(10)}
-                    </span>
-                    <span style={{ color: "#7878a0" }}>{e.len}B</span>
-                  </div>
-                ))
-              )}
+          {/* Actions */}
+          <Card title="Actions" accent="#f59e0b">
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              <button onClick={() => dispatch("eardrop-self-test")} style={btnSmall}>Self-Test</button>
+              <button onClick={() => dispatch("eardrop-send-test")} style={btnSmall}>Send Test</button>
+              <button onClick={() => dispatch("eardrop-download-wav")} style={btnSmall}>Download WAV</button>
             </div>
-            {/* Raw decoder log */}
-            {debug && (
-              <div style={{ marginTop: 6, padding: "4px 6px", background: "#07070e", borderRadius: 4, border: "1px solid #1e1e3a", maxHeight: 50, overflow: "auto", fontSize: 9, color: "#484870", fontFamily: "monospace", lineHeight: 1.4, whiteSpace: "pre-wrap" }}>
-                {`pilot=${debug.pilotFreq.toFixed(1)}Hz amp=${debug.pilotAmplitude.toExponential(2)} snr=${debug.signalToNoise.toFixed(1)}dB bits=${debug.bitsCollected}`}
-                {debug.energies && `\neng=[${debug.energies.map((e: number) => e.toExponential(2)).join(",")}]`}
-              </div>
-            )}
-          </Section>
-
-          {/* ── DIAGNOSTICS + LLM COMPRESS ── */}
-          <Section title="🧪 Diagnostics & LLM Output" color="#eab308">
-            <div style={{ display: "flex", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
-              <button onClick={() => dispatch("eardrop-self-test")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#e0e0ee", cursor: "pointer", fontSize: 11, fontWeight: 600, minWidth: 80 }}>🧪 Self-Test</button>
-              <button onClick={() => dispatch("eardrop-send-test")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#e0e0ee", cursor: "pointer", fontSize: 11, fontWeight: 600, minWidth: 80 }}>📤 Send Test</button>
-              <button onClick={() => dispatch("eardrop-acoustic-sweep")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#f472b6", cursor: "pointer", fontSize: 11, fontWeight: 600, minWidth: 80 }}>🔊 Acoustic Sweep</button>
-              <button onClick={() => dispatch("eardrop-download-wav")} style={{ flex: 1, padding: "6px 10px", border: "1px solid #2a2a4e", borderRadius: 5, background: "#16162a", color: "#44cc88", cursor: "pointer", fontSize: 11, fontWeight: 600, minWidth: 80 }}>⬇ Download WAV</button>
-            </div>
-            <div id="selfTestResult" style={{ fontSize: 10, color: "#7878a0", fontFamily: "monospace", minHeight: 14, marginBottom: 6 }} />
-
-            {/* Sweep results graph */}
-            <SweepGraph results={s.sweepResults} />
-
-            <DebugOutput />
-          </Section>
+            <div id="selfTestResult" style={{ fontSize: 11, color: "#6b7280", fontFamily: "SF Mono, ui-monospace, monospace", marginTop: 6, minHeight: 16 }} />
+          </Card>
         </div>
       </div>
     </div>
   );
 }
 
-// ═══════════════════════════════════════════════════════
-// SWEEP RESULTS GRAPH
-// ═══════════════════════════════════════════════════════
+const statBg: React.CSSProperties = { background: "rgba(255,255,255,0.02)", padding: "10px 12px" };
 
-function SweepGraph({ results }: { results: Array<{ freq: number; energy: number }> | null }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    const c = ref.current;
-    if (!c || !results || results.length === 0) return;
-    const ctx = c.getContext("2d");
-    if (!ctx) return;
-
-    const w = c.width, h = c.height;
-    const pad = { t: 12, r: 8, b: 20, l: 36 };
-    const pw = w - pad.l - pad.r, ph = h - pad.t - pad.b;
-
-    ctx.fillStyle = "#07070e";
-    ctx.fillRect(0, 0, w, h);
-
-    const maxE = Math.max(...results.map(r => r.energy), 1e-12);
-    const minF = results[0].freq, maxF = results[results.length - 1].freq;
-
-    // Grid
-    ctx.strokeStyle = "#1a1a2a";
-    ctx.lineWidth = 0.5;
-    for (let i = 0; i <= 4; i++) {
-      const y = pad.t + (i / 4) * ph;
-      ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(w - pad.r, y); ctx.stroke();
-    }
-
-    // Y-axis labels (dB)
-    ctx.fillStyle = "#5858a0";
-    ctx.font = "8px monospace";
-    ctx.textAlign = "right";
-    for (let i = 0; i <= 4; i++) {
-      const db = (1 - i / 4) * 60 - 20; // -20 to -80 dB
-      ctx.fillText(`${db.toFixed(0)}dB`, pad.l - 2, pad.t + (i / 4) * ph + 3);
-    }
-
-    // Plot line
-    ctx.strokeStyle = "#f472b6";
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    for (let i = 0; i < results.length; i++) {
-      const x = pad.l + ((results[i].freq - minF) / (maxF - minF)) * pw;
-      const db = results[i].energy > 1e-12 ? 20 * Math.log10(results[i].energy) : -80;
-      const y = pad.t + (1 - Math.min(1, Math.max(0, (db + 80) / 60))) * ph;
-      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-
-    // Axis labels
-    ctx.fillStyle = "#5858a0";
-    ctx.font = "8px monospace";
-    ctx.textAlign = "center";
-    ctx.fillText("Frequency (Hz)", w / 2, h - 2);
-    // X-axis ticks (every 200 Hz)
-    for (let f = 200; f <= 1400; f += 200) {
-      const x = pad.l + ((f - minF) / (maxF - minF)) * pw;
-      ctx.fillText(`${f}`, x, h - pad.b + 10);
-    }
-  }, [results]);
-
-  if (!results || results.length === 0) return null;
-
-  return (
-    <div style={{ marginBottom: 6 }}>
-      <canvas ref={ref} width={400} height={110} style={{ width: "100%", height: 110, borderRadius: 4, background: "#07070e" }} />
-      <div style={{ fontSize: 9, color: "#5858a0", marginTop: 2, display: "flex", justifyContent: "space-between" }}>
-        <span>Peak: {(Math.max(...results.map(r => r.energy))).toExponential(2)}</span>
-        <span>Freqs: {results.length}</span>
-      </div>
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════
-// DEBUG OUTPUT COMPONENT
-// ═══════════════════════════════════════════════════════
-
-function DebugOutput() {
-  const [level, setLevel] = useState<CompressLevel>("normal");
-  const [output, setOutput] = useState("");
-  const [clipMsg, setClipMsg] = useState("");
-
-  const copy = async (text: string) => {
-    setOutput(text);
-    if (!text) { setClipMsg("⚠ buffer empty"); setTimeout(() => setClipMsg(""), 2000); return; }
-    try {
-      await navigator.clipboard.writeText(text);
-      setClipMsg("✓ copied");
-    } catch {
-      // Fallback: select text manually
-      setClipMsg("✗ copy failed — select text below");
-    }
-    setTimeout(() => setClipMsg(""), 2500);
-  };
-
-  const genCompress = () => {
-    const total = debugLogger.getTotalEvents();
-    if (total === 0) { setClipMsg("⚠ no events yet — run a test or listen"); setTimeout(() => setClipMsg(""), 3000); return; }
-    copy(compressForLLM(debugLogger, { level }));
-  };
-
-  const genSnapshot = () => {
-    if (debugLogger.getTotalEvents() === 0) { setClipMsg("⚠ no events yet"); setTimeout(() => setClipMsg(""), 2000); return; }
-    const events = debugLogger.getAllEvents();
-    copy(events.map(e => `[${e.stage}] ${e.summary}`).join("\n"));
-  };
-
-  const clearLog = () => {
-    debugLogger.clear();
-    setOutput("");
-    setClipMsg("cleared");
-    setTimeout(() => setClipMsg(""), 1500);
-  };
-
-  const totalEvents = debugLogger.getTotalEvents();
-
-  return (
-    <div>
-      <div style={{ display: "flex", gap: 4, marginBottom: 4, flexWrap: "wrap" }}>
-        <select value={level} onChange={e => setLevel(e.target.value as CompressLevel)}
-          style={{ background: "#0a0a12", color: "#e0e0ee", border: "1px solid #2a2a4e", borderRadius: 4, padding: "2px 4px", fontSize: 10 }}>
-          <option value="brief">Brief</option>
-          <option value="normal">Normal</option>
-          <option value="verbose">Verbose</option>
-        </select>
-        <button onClick={genCompress} style={{ padding: "3px 8px", border: "1px solid #2a2a4e", borderRadius: 4, background: "#16162a", color: "#eab308", cursor: "pointer", fontSize: 10 }}>🤖 Compress for LLM</button>
-        <button onClick={genSnapshot} style={{ padding: "3px 8px", border: "1px solid #2a2a4e", borderRadius: 4, background: "#16162a", color: "#a78bfa", cursor: "pointer", fontSize: 10 }}>📋 Dump State</button>
-        <button onClick={clearLog} style={{ padding: "3px 8px", border: "1px solid #2a2a4e", borderRadius: 4, background: "#16162a", color: "#7878a0", cursor: "pointer", fontSize: 10 }}>🗑 Clear</button>
-        {clipMsg && <span style={{ fontSize: 9, color: clipMsg.includes("✓") ? "#44cc88" : clipMsg.includes("⚠") ? "#eab308" : "#ef4444", lineHeight: "24px" }}>{clipMsg}</span>}
-      </div>
-      <pre style={{ margin: 0, padding: "4px 6px", background: "#07070e", border: "1px solid #1e1e3a", borderRadius: 4, fontSize: 9, color: "#a8a8c8", fontFamily: "monospace", whiteSpace: "pre-wrap", wordBreak: "break-all", maxHeight: 120, overflow: "auto", lineHeight: 1.3 }}>
-        {output || (totalEvents > 0 ? `${totalEvents} events in ring buffer — click Compress or Dump` : "Run a test or listen for signal to collect debug data, then click Compress for LLM")}
-      </pre>
-      <div style={{ marginTop: 4, fontSize: 9, color: "#484870", fontFamily: "monospace" }}>
-        Events: {totalEvents} | Stages: {Object.values(STAGE).length} | {clipMsg || "generates structured LLM-ready output"}
-      </div>
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════
-// CANVAS COMPONENTS
-// ═══════════════════════════════════════════════════════
-
-function ConstellationCanvas({ tone, iVal, qVal, color, label }: { tone: number; iVal: number; qVal: number; color: string; label: string }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-  useEffect(() => {
-    const c = ref.current;
-    if (!c) return;
-    const ctx = c.getContext("2d");
-    if (!ctx) return;
-    const w = c.width, h = c.height, cx = w / 2, cy = h / 2, s = Math.min(w, h) / 2 - 16, scale = s / 0.15;
-    ctx.fillStyle = "#07070e";
-    ctx.fillRect(0, 0, w, h);
-    ctx.strokeStyle = "#16162a";
-    ctx.lineWidth = 0.5;
-    for (let i = -2; i <= 2; i++) { const p = cx + i * s / 3; ctx.beginPath(); ctx.moveTo(p, 0); ctx.lineTo(p, h); ctx.stroke(); ctx.beginPath(); ctx.moveTo(0, p); ctx.lineTo(w, p); ctx.stroke(); }
-    ctx.strokeStyle = "#2a2a4a";
-    ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(w, cy); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, h); ctx.stroke();
-    ctx.fillStyle = color;
-    ctx.font = "bold 10px monospace";
-    ctx.fillText(label, 4, 12);
-    const x = cx + iVal * scale, y = cy - qVal * scale;
-    if (x > 0 && x < w && y > 0 && y < h) {
-      ctx.beginPath(); ctx.arc(x, y, 4, 0, 2 * Math.PI); ctx.fillStyle = color; ctx.fill();
-      ctx.strokeStyle = "#ffffff33"; ctx.lineWidth = 0.5; ctx.stroke();
-      ctx.strokeStyle = color + "33"; ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(x, y); ctx.stroke();
-    }
-    ctx.strokeStyle = "#ffffff08"; ctx.lineWidth = 1; ctx.setLineDash([2, 3]);
-    ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, h); ctx.stroke(); ctx.setLineDash([]);
-  }, [iVal, qVal, color, label]);
-  return <canvas ref={ref} width={150} height={110} style={{ width: "100%", aspectRatio: "150/110", borderRadius: 4, background: "#07070e" }} />;
-}
-
-function WaveformCanvas({ samples }: { samples: Float32Array | null }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-  useEffect(() => {
-    const c = ref.current;
-    if (!c || !samples) return;
-    const ctx = c.getContext("2d");
-    if (!ctx) return;
-    const w = c.width, h = c.height, cy = h / 2, len = Math.min(samples.length, 1024), step = samples.length / len;
-    // Find peak for auto-scaling
-    let peak = 1e-12;
-    for (let i = 0; i < len; i++) {
-      const v = Math.abs(samples[Math.floor(i * step)]);
-      if (v > peak) peak = v;
-    }
-    const scale = Math.max(peak * 1.5, 0.001); // at least show something
-    ctx.fillStyle = "#07070e";
-    ctx.fillRect(0, 0, w, h);
-    ctx.strokeStyle = "#6c6cff";
-    ctx.lineWidth = 0.8;
-    ctx.beginPath();
-    for (let i = 0; i < len; i++) {
-      const x = (i / len) * w;
-      const y = cy - (samples[Math.floor(i * step)] / scale) * (h / 2 - 4);
-      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-    ctx.fillStyle = "#484870";
-    ctx.font = "9px monospace";
-    ctx.fillText(`${(peak * 1e3).toFixed(1)}mV`, 4, 11);
-  }, [samples]);
-  return <canvas ref={ref} width={400} height={70} style={{ width: "100%", height: 70, borderRadius: 4, background: "#07070e" }} />;
-}
-
-function FftView({ samples }: { samples: Float32Array | null }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-  const histRef = useRef<Uint8ClampedArray[]>([]);
-
-  useEffect(() => {
-    const c = ref.current;
-    if (!c || !samples || samples.length < 128) return;
-    const ctx = c.getContext("2d");
-    if (!ctx) return;
-    const w = c.width, h = c.height;
-    const fftSize = 512;
-    const binCount = fftSize / 2;
-
-    // Compute FFT magnitude from sample buffer
-    const n = Math.min(samples.length, fftSize);
-    const real = new Float64Array(fftSize);
-    const imag = new Float64Array(fftSize);
-    for (let i = 0; i < n; i++) real[i] = samples[samples.length - n + i];
-
-    // Simple DFT at key frequency bins (0-1600 Hz in ~25 Hz steps)
-    const bins: number[] = [];
-    const binFreqs: number[] = [];
-    const sampleRate = 3200;
-    for (let f = 0; f <= 1550; f += 25) {
-      let sumSin = 0, sumCos = 0;
-      for (let i = 0; i < n; i++) {
-        const phase = 2 * Math.PI * f * i / sampleRate;
-        sumSin += samples[samples.length - n + i] * Math.sin(phase);
-        sumCos += samples[samples.length - n + i] * Math.cos(phase);
-      }
-      const mag = Math.hypot(sumSin, sumCos) / n;
-      binFreqs.push(f);
-      bins.push(mag);
-    }
-    const maxMag = Math.max(...bins, 1e-12);
-
-    // Shift history and add new frame
-    const hist = histRef.current;
-    hist.push(new Uint8ClampedArray(bins.map(m => Math.min(255, (m / maxMag) * 255))));
-    if (hist.length > h) hist.shift();
-
-    // Draw waterfall (scroll upward)
-    const imgData = ctx.createImageData(bins.length, h);
-    for (let y = 0; y < hist.length; y++) {
-      const row = hist[y];
-      for (let x = 0; x < row.length && x < bins.length; x++) {
-        const v = row[x];
-        const i = (y * bins.length + x) * 4;
-        // Hot colormap: black → red → yellow → white
-        if (v < 64) {
-          imgData.data[i] = v * 4; imgData.data[i+1] = 0; imgData.data[i+2] = 0;
-        } else if (v < 128) {
-          imgData.data[i] = 255; imgData.data[i+1] = (v - 64) * 4; imgData.data[i+2] = 0;
-        } else {
-          imgData.data[i] = 255; imgData.data[i+1] = 255; imgData.data[i+2] = (v - 128) * 4;
-        }
-        imgData.data[i+3] = 255;
-      }
-    }
-    // Fill remaining rows (above hist) with black
-    for (let y = hist.length; y < h; y++) {
-      for (let x = 0; x < bins.length; x++) {
-        const i = (y * bins.length + x) * 4;
-        imgData.data[i] = 0; imgData.data[i+1] = 0; imgData.data[i+2] = 0; imgData.data[i+3] = 255;
-      }
-    }
-
-    ctx.putImageData(imgData, 0, 0);
-
-    // Overlay frequency labels
-    ctx.fillStyle = "#484870";
-    ctx.font = "8px monospace";
-    for (let f = 0; f <= 1500; f += 250) {
-      const x = (f / 1550) * w;
-      ctx.fillText(`${f}Hz`, x + 2, 10);
-    }
-    // Mark pilot frequency
-    const px = (237.5 / 1550) * w;
-    ctx.strokeStyle = "#6c6cff";
-    ctx.lineWidth = 0.5;
-    ctx.setLineDash([2, 2]);
-    ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, h); ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle = "#6c6cff";
-    ctx.font = "7px monospace";
-    ctx.fillText("237Hz", px - 12, h - 4);
-  }, [samples]);
-
-  return <canvas ref={ref} width={512} height={120} style={{ width: "100%", height: 120, borderRadius: 4, background: "#07070e", marginTop: 2 }} />;
-}
+const btnSmall: React.CSSProperties = {
+  flex: "1 1 auto", minWidth: 90,
+  padding: "8px 12px", border: "1px solid rgba(255,255,255,0.1)",
+  borderRadius: 6, background: "rgba(255,255,255,0.04)",
+  color: "#e5e7eb", cursor: "pointer", fontSize: 12, fontWeight: 500,
+};
