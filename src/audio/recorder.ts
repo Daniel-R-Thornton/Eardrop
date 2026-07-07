@@ -113,7 +113,7 @@ export class AudioRecorder {
 
     // Connect: mic → gain boost → worklet → silent destination
     const micGain = this.ctx.createGain();
-    micGain.gain.value = 4.0; // 4× boost for weak mic signals
+    micGain.gain.value = 8.0; // 8× boost for weak mic signals
     this.source.connect(micGain);
     micGain.connect(this.workletNode);
     const silentGain = this.ctx.createGain();
