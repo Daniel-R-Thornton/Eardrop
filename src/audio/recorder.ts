@@ -111,8 +111,11 @@ export class AudioRecorder {
       this.downsampler.feed(e.data);
     };
 
-    // Connect: mic → worklet → gain(0) → destination (graph must reach dest)
-    this.source.connect(this.workletNode);
+    // Connect: mic → gain boost → worklet → silent destination
+    const micGain = this.ctx.createGain();
+    micGain.gain.value = 4.0; // 4× boost for weak mic signals
+    this.source.connect(micGain);
+    micGain.connect(this.workletNode);
     const silentGain = this.ctx.createGain();
     silentGain.gain.value = 0;
     this.workletNode.connect(silentGain);
