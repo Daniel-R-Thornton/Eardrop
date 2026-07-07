@@ -132,6 +132,37 @@ broadcastWorker.onmessage = (e) => {
         };
         setState({ debug });
 
+        // Generate diagnostics when data mode ends
+        if (wasInFrame && !d.inFrame) {
+          const msgs: string[] = [];
+          const snr = d.signalToNoise || 0;
+          const nf = d.noiseFloor || [0,0,0,0];
+          const eng = d.energies || [0,0,0,0];
+          const maxE = Math.max(...eng, 1e-12);
+          const avgNf = nf.reduce((a,b)=>a+b,0) / 4;
+
+          msgs.push(`End: ${d.bitsCollected} bits decoded`);
+
+          if (snr < 1) msgs.push(`⚠ SNR ${snr.toFixed(1)}dB — signal too weak for reliable decode`);
+          else if (snr < 3) msgs.push(`⚠ SNR ${snr.toFixed(1)}dB — borderline, try higher volume`);
+          else msgs.push(`✓ SNR ${snr.toFixed(1)}dB — adequate`);
+
+          if (maxE < 0.001) msgs.push(`⚠ Tone energy ${maxE.toExponential(1)} — very weak, check mic gain / speaker volume`);
+          else if (maxE < 0.01) msgs.push(`⚠ Tone energy ${maxE.toExponential(1)} — weak signal`);
+
+          if (avgNf > maxE * 0.5) msgs.push(`⚠ Noise floor high (${avgNf.toExponential(1)}) — close to signal level`);
+
+          if (d.pilotFreq === 0) msgs.push(`✗ Pilot not detected — check config frequency matches transmitter`);
+
+          if (d.consecutiveSync < 6) msgs.push(`⚠ Low sync count (${d.consecutiveSync}) — may have entered data mode on noise`);
+
+          if (d.bitsCollected === 0) msgs.push(`✗ No bits decoded — signal never entered data mode`);
+
+          if (d.blocksDecoded === 0 && d.bitsCollected > 0) msgs.push(`⚠ No blocks found — BPSK phase reference may be inverted, or SNR too low for sentinel`);
+
+          setState({ diagMessages: msgs });
+        }
+
         // Debug trace from decoder
         if (msg.debugTrace && Array.isArray(msg.debugTrace)) {
           setState({ debugTrace: msg.debugTrace });

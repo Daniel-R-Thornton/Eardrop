@@ -72,6 +72,8 @@ export interface AppState {
   noiseFloorDb: number;
   /** Debug trace log — raw per-frame BPSK data */
   debugTrace: Array<{ sym: number; rawI: number[]; bits: number[]; frameHex: string; blockEvent?: string }>;
+  /** Diagnostic messages from last receive cycle */
+  diagMessages: string[];
 }
 
 const defaultDecoder: DecoderInfo = {
@@ -112,6 +114,7 @@ const defaultState: AppState = {
   rawPeak: 0,
   noiseFloorDb: -80,
   debugTrace: [],
+  diagMessages: [],
 };
 
 // ─── Store ────────────────────────────────────────────

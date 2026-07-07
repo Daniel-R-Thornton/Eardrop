@@ -468,6 +468,29 @@ export function MainApp() {
             />
           </Card>
 
+          {/* Diagnostics */}
+          {s.diagMessages.length > 0 && (
+            <Card title="Diagnostics" accent="#f59e0b">
+              <div style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12 }}>
+                {s.diagMessages.map((m, i) => {
+                  const isGood = m.startsWith("✓");
+                  const isBad = m.startsWith("✗");
+                  const isWarn = m.startsWith("⚠");
+                  return (
+                    <div key={i} style={{
+                      color: isGood ? "#34d399" : isBad ? "#f87171" : isWarn ? "#f59e0b" : "#e5e7eb",
+                      fontFamily: isGood || isBad ? "SF Mono, monospace" : undefined,
+                    }}>{m}</div>
+                  );
+                })}
+                <button onClick={() => setState({ diagMessages: [] })}
+                  style={{ alignSelf: "flex-start", marginTop: 4, padding: "2px 8px", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 4, background: "rgba(255,255,255,0.04)", color: "#6b7280", cursor: "pointer", fontSize: 10 }}>
+                  Clear
+                </button>
+              </div>
+            </Card>
+          )}
+
           {/* Actions */}
           <Card title="Actions" accent="#f59e0b">
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
