@@ -9,6 +9,7 @@ import { ToneMeter } from "./components/ToneMeter";
 import { BitAnalyzer } from "./components/BitAnalyzer";
 import { WaveformScope } from "./components/WaveformScope";
 import { SpectrumAnalyzer } from "./components/SpectrumAnalyzer";
+import { ModemScope } from "./components/ModemScope";
 import { debugLogger, STAGE } from "../modem/debugger";
 
 const TONE_COLORS = ["#4a9eff", "#ff6b4a", "#5eead4", "#f472b6"];
@@ -452,6 +453,19 @@ export function MainApp() {
                 <ConstellationCanvas key={t} tone={t} iVal={debug?.relI[t] ?? 0} qVal={debug?.relQ[t] ?? 0} color={TONE_COLORS[t]} label={`T${t}`} />
               ))}
             </div>
+          </Card>
+
+          {/* Modem Debug Scope */}
+          <Card title="Modem Scope — Phase + Energy" accent="#f472b6">
+            <ModemScope
+              trace={s.debugTrace}
+              energies={(s.debug?.energies || [0,0,0,0]) as [number,number,number,number]}
+              relI={(s.debug?.relI || [0,0,0,0]) as [number,number,number,number]}
+              relQ={(s.debug?.relQ || [0,0,0,0]) as [number,number,number,number]}
+              inFrame={s.debug?.inFrame || false}
+              pilotFreq={s.debug?.pilotFreq || 0}
+              pilotAmp={s.debug?.pilotAmplitude || 0}
+            />
           </Card>
 
           {/* Actions */}
