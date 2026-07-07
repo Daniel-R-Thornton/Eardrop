@@ -91,7 +91,8 @@ function ConstellationCanvas({ tone, iVal, qVal, color, label }: {
   tone: number; iVal: number; qVal: number; color: string; label: string
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
-  const size = 70;
+  const history = useRef<Array<{x:number;y:number}>>([]);
+  const size = 80;
 
   useEffect(() => {
     const c = ref.current;
@@ -99,31 +100,59 @@ function ConstellationCanvas({ tone, iVal, qVal, color, label }: {
     const ctx = c.getContext("2d");
     if (!ctx) return;
     const w = c.width, h = c.height;
-    const cx = w / 2, cy = h / 2, scale = w / 3;
+    const cx = w / 2, cy = h / 2;
+    // Scale to show range ±0.5 with some headroom
+    const scale = (w / 2) / 0.6;
 
-    ctx.fillStyle = "rgba(0,0,0,0.3)";
+    // Don't clear entirely — leave a fading trail
+    ctx.fillStyle = "rgba(0,0,0,0.15)";
     ctx.fillRect(0, 0, w, h);
 
     // Axes
-    ctx.strokeStyle = "rgba(255,255,255,0.08)";
-    ctx.lineWidth = 1;
+    ctx.strokeStyle = "rgba(255,255,255,0.1)";
+    ctx.lineWidth = 0.5;
     ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(w, cy); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, h); ctx.stroke();
+    // Unit circle
+    ctx.beginPath(); ctx.arc(cx, cy, 0.5 * scale, 0, Math.PI * 2); ctx.stroke();
 
-    // Dot
+    // Add to history
     const x = cx + iVal * scale;
     const y = cy - qVal * scale;
+    history.current.push({ x, y });
+    if (history.current.length > 60) history.current.shift();
+
+    // Draw trail
+    if (history.current.length > 1) {
+      ctx.strokeStyle = color;
+      ctx.globalAlpha = 0.3;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (let i = 0; i < history.current.length; i++) {
+        const p = history.current[i];
+        i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y);
+      }
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // Current dot
     ctx.fillStyle = color;
-    ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = "rgba(255,255,255,0.3)";
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 6;
+    ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = "#fff";
     ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI * 2); ctx.stroke();
   }, [iVal, qVal, color]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
-      <canvas ref={ref} width={size} height={size} style={{ borderRadius: 6, background: "rgba(0,0,0,0.3)" }} />
-      <span style={{ fontSize: 9, color, fontFamily: "SF Mono, ui-monospace, monospace" }}>{label}</span>
+      <canvas ref={ref} width={size} height={size} style={{ borderRadius: 6, background: "rgba(0,0,0,0.4)" }} />
+      <span style={{ fontSize: 9, color, fontFamily: "SF Mono, ui-monospace, monospace" }}>
+        {label} I={iVal.toFixed(3)} Q={qVal.toFixed(3)}
+      </span>
     </div>
   );
 }
