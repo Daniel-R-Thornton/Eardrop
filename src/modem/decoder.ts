@@ -16,7 +16,7 @@
 
 import { ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG } from "./types";
 import { PilotScanner, PilotPLL, toneIQ, getDataToneFreqs } from "./pilot";
-import { FramedBlockDecoder, BLOCK_TYPE } from "./framing";
+import { FramedBlockDecoder, BLOCK_TYPE, getSentinel } from "./framing";
 import { BlockProcessor } from "./blockProcessor";
 import { SquawkProcessor } from "./squawk";
 import { debugLogger, STAGE, LOG_LEVEL } from "./debugger";
@@ -91,6 +91,15 @@ export class Decoder {
   private bchBuf: number[] = [];
   private bchBufCount = 0;
 
+  /** Previous frame's phase sign per tone for DPSK decoding (0 or 1) */
+  private prevPhase: number[] = [];
+  /** BPSK phase flip per tone (1 = no flip, -1 = invert). Set by calibration. */
+  private calPhaseFlip: [number, number, number, number] = [1, 1, 1, 1];
+  /** Calibration: count of phase sign samples per tone */
+  private calPhaseSum: [number, number, number, number] = [0, 0, 0, 0];
+  private calPhaseCount: [number, number, number, number] = [0, 0, 0, 0];
+  private calDone = false;
+
   // Noise profiling
   private noiseFloor: [number, number, number, number] = [0, 0, 0, 0];
   private noiseMax: [number, number, number, number] = [0, 0, 0, 0];
@@ -134,7 +143,8 @@ export class Decoder {
       freqTolerance: 30,
     });
 
-    this.framedDecoder = new FramedBlockDecoder();
+    const s = getSentinel(this.cfg.toneCount);
+    this.framedDecoder = new FramedBlockDecoder(s);
     this.squawkProcessor = new SquawkProcessor();
     this.blockProcessor = new BlockProcessor({
       onFileComplete: (file) => {
@@ -193,6 +203,11 @@ export class Decoder {
     this.lastFrameIQ = [];
     this.bchBuf = [];
     this.bchBufCount = 0;
+    this.calPhaseFlip = [1, 1, 1, 1];
+    this.calPhaseSum = [0, 0, 0, 0];
+    this.calPhaseCount = [0, 0, 0, 0];
+    this.calDone = false;
+    this.prevPhase = [];
     this.timing.reset();
     this.berTracker.reset();
     this.constellation.reset();
@@ -345,6 +360,25 @@ export class Decoder {
     // ── Sync tracking ──
     const strong = isBurst;
 
+    // ── Phase calibration: learn BPSK reference sign during preamble ──
+    // Runs during both sync and calibrate phases (even after inFrame, while frameSkip > 0)
+    if (!this.calDone && this.pilotDiscovered && isBurst && this.noiseFrames >= 20) {
+      const maxTone = energies.indexOf(Math.max(...energies));
+      if (maxTone >= 0 && this.calPhaseCount[maxTone] < 3) {
+        this.calPhaseSum[maxTone] += relI[maxTone] >= 0 ? 1 : -1;
+        this.calPhaseCount[maxTone]++;
+        const totalCounts = this.calPhaseCount.reduce((a,b)=>a+b,0);
+        if (totalCounts >= 8) {
+          for (let t = 0; t < 4; t++) {
+            this.calPhaseFlip[t] = this.calPhaseCount[t] >= 2
+              ? (this.calPhaseSum[t] >= 0 ? 1 : -1) : 1;
+          }
+          this.calDone = true;
+          console.warn(`[CAL] BPSK reference signs: flip=[${this.calPhaseFlip.join(',')}]`);
+        }
+      }
+    }
+
     if (strong && !this.inFrame && this.consecutiveSync >= 3) {
       for (let t = 0; t < 4; t++) {
         if (energies[t] > this.syncPeak[t]) this.syncPeak[t] = energies[t];
@@ -445,7 +479,7 @@ export class Decoder {
       this.framedDecoder.reset();
       this.blockProcessor.reset();
       // Skip remaining sync frames (includes the entry frame itself)
-      this.frameSkip = Math.max(0, this.cfg.syncSymbols - this.consecutiveSync) + 1;
+      this.frameSkip = Math.max(0, this.cfg.syncSymbols - this.consecutiveSync) + (this.cfg.toneCount * 4);
       if (this.logging) {
         console.log("[DEC] SYNC DETECTED — entering data mode", {
           pilotFreq: this.pilotFreq.toFixed(1),
@@ -482,36 +516,44 @@ export class Decoder {
         return;
       }
 
-      // ── BPSK bit detection (4 amp + 4 phase = 8 bits/frame) ──
-      // Packed: [amp0, phase0, amp1, phase1, amp2, phase2, amp3, phase3]
-      // Amplitude: energy > pilotAmp * thresholdRatio → 1, else 0
-      // Phase: relI > 0 → 0 (right half-plane), relI < 0 → 1 (left half-plane)
-      const ampThresh = this.pilotAmplitude * this.liveAmpThresholdRatio;
+      // ── BPSK bit detection: all tones always ON, data in 0°/180° phase ──
+      // calPhaseFlip corrects for absolute phase ambiguity learned during calibration.
+      // Frame byte: [p0, 1, p1, 1, p2, 1, p3, 1] where p_t = BPSK phase bit
 
       let frameBits = 0;
-      // Pack: [a0,0,a1,0,a2,0,a3,0] — phase bits always 0 (encoder sends 0° BPSK)
       for (let t = 0; t < 4; t++) {
-        const ampBit = energies[t] > ampThresh ? 1 : 0;
-        // Phase bit is always 0 (encoder uses 0° BPSK for reliability)
-        frameBits |= (ampBit << 1) << (6 - t * 2);
+        const correctedI = this.calPhaseFlip[t] < 0 ? -relI[t] : relI[t];
+        const bit = t < this.cfg.toneCount ? (correctedI < 0 ? 1 : 0) : 0;
+        frameBits |= (bit) << (7 - t * 2);
+        frameBits |= (1) << (6 - t * 2);
       }
 
-      // Pack 2 frame nybbles into 1 block byte before feeding to FramedBlockDecoder
-      // Each frame byte = [a0,0,a1,0,a2,0,a3,0]. Extract hi nibble from each.
+      // Pack frame bytes into block bytes.
+      // 4-tone: 2 frames × 4 bits → 1 byte.  2-tone: 4 frames × 2 bits → 1 byte.
       this.bchBuf.push(frameBits);
       this.bchBufCount++;
-      if (this.bchBufCount >= 2) {
-        // Extract amp bits (positions 7,5,3,1) from each frame byte
-        const hi = ((this.bchBuf[0] >> 7) & 1) << 3 | ((this.bchBuf[0] >> 5) & 1) << 2 |
-                   ((this.bchBuf[0] >> 3) & 1) << 1 | ((this.bchBuf[0] >> 1) & 1);
-        const lo = ((this.bchBuf[1] >> 7) & 1) << 3 | ((this.bchBuf[1] >> 5) & 1) << 2 |
-                   ((this.bchBuf[1] >> 3) & 1) << 1 | ((this.bchBuf[1] >> 1) & 1);
-        const blockByte = (hi << 4) | lo;
-      // One-shot debug: log first 8 bytes decoded in data mode
-      if (this.framedDecoder.totalBits <= 64) {
-        console.warn(`[DEC_BYTE] byte=0x${blockByte.toString(16).padStart(2,'0')} hi=${hi} lo=${lo} bits=${this.framedDecoder.totalBits} energies=${energies.map(e=>e.toExponential(2)).join(',')}`);
-      }
-      this.framedDecoder.feedBytes(new Uint8Array([blockByte]));
+      const tc = this.cfg.toneCount;
+      const framesPerByte = 8 / tc;
+      if (this.bchBufCount >= framesPerByte) {
+        let blockByte = 0;
+        if (tc === 2) {
+          for (let f = 0; f < 4; f++) {
+            const fb = this.bchBuf[f];
+            blockByte |= ((fb >> 7) & 1) << (7 - f * 2);
+            blockByte |= ((fb >> 5) & 1) << (6 - f * 2);
+          }
+        } else {
+          const hi = ((this.bchBuf[0] >> 7) & 1) << 3 | ((this.bchBuf[0] >> 5) & 1) << 2 |
+                     ((this.bchBuf[0] >> 3) & 1) << 1 | ((this.bchBuf[0] >> 1) & 1);
+          const lo = ((this.bchBuf[1] >> 7) & 1) << 3 | ((this.bchBuf[1] >> 5) & 1) << 2 |
+                     ((this.bchBuf[1] >> 3) & 1) << 1 | ((this.bchBuf[1] >> 1) & 1);
+          blockByte = (hi << 4) | lo;
+        }
+        // One-shot debug: log first 8 bytes decoded in data mode
+        if (this.framedDecoder.totalBits <= 64) {
+          console.warn(`[DEC_BYTE] byte=0x${blockByte.toString(16).padStart(2,'0')} bits=${this.framedDecoder.totalBits} energies=${energies.map(e=>e.toExponential(2)).join(',')}`);
+        }
+        this.framedDecoder.feedBytes(new Uint8Array([blockByte]));
         this.bchBuf = [];
         this.bchBufCount = 0;
       }

@@ -32,6 +32,8 @@ export interface ModemConfig {
   dataToneAmplitude: number;
   /** Amplitude threshold ratio relative to pilot: tone ON if energy > pilotAmp * this */
   amplitudeThresholdRatio: number;
+  /** Number of active tones (2 or 4) */
+  toneCount: number;
 
   // ── Sync / framing ──
   /** Number of sync symbols in the sync burst */
@@ -105,6 +107,7 @@ export const DEFAULT_CONFIG: ModemConfig = {
 
   dataToneAmplitude: 0.5,
   amplitudeThresholdRatio: 0.3,
+  toneCount: 4,
 
   syncSymbols: 10,
 

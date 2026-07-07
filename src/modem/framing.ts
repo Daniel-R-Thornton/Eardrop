@@ -27,13 +27,18 @@ export const BLOCK_TYPE = {
 
 export type BlockType = (typeof BLOCK_TYPE)[keyof typeof BLOCK_TYPE];
 
-export const SENTINEL = 0x8888;
+/** Get the sentinel pattern for a given tone count (2 or 4). */
+export function getSentinel(toneCount: number): number {
+  return toneCount <= 2 ? 0xC48CC4 : 0xE79FE7;
+}
+
+export const SENTINEL = getSentinel(4);
 export const SENTINEL_BYTES = 2;
 export const BLOCK_HEADER_BYTES = 5;   // type(1) + len(2) + sentinel(2)
 export const BLOCK_FOOTER_BYTES = 2;   // crc(2)
 export const BLOCK_OVERHEAD = SENTINEL_BYTES + BLOCK_HEADER_BYTES - SENTINEL_BYTES + BLOCK_FOOTER_BYTES; // 5
 // Actually: sentinel(2) + type(1) + len(2) + crc(2) = 7 bytes overhead total
-export const BLOCK_TOTAL_OVERHEAD = SENTINEL_BYTES + 1 + 2 + 2; // 7
+export const BLOCK_TOTAL_OVERHEAD = SENTINEL_BYTES + 1 + 2 + 2; // 8
 
 // ─── CRC-16-CCITT ─────────────────────────────────────
 
@@ -74,16 +79,18 @@ export interface EncodedBlock {
  * The caller provides the block type and data bytes.
  * Returns the complete serialized block.
  */
-export function encodeBlock(type: BlockType, data: Uint8Array): EncodedBlock {
-  // sentinel(2) + type(1) + len(2) + data(N) + crc(2)
+export function encodeBlock(type: BlockType, data: Uint8Array, sentinel?: number): EncodedBlock {
+  const s = sentinel ?? SENTINEL;
+  // sentinel(3) + type(1) + len(2) + data(N) + crc(2)
   const len = data.length;
   const buf = new Uint8Array(BLOCK_TOTAL_OVERHEAD + len);
 
   let off = 0;
 
-  // Sentinel (big-endian)
-  buf[off++] = (SENTINEL >> 8) & 0xFF;
-  buf[off++] = SENTINEL & 0xFF;
+  // Sentinel (big-endian, 3 bytes)
+  buf[off++] = (s >> 16) & 0xFF;
+  buf[off++] = (s >> 8) & 0xFF;
+  buf[off++] = s & 0xFF;
 
   // Block type
   buf[off++] = type;
@@ -109,15 +116,16 @@ export function encodeBlock(type: BlockType, data: Uint8Array): EncodedBlock {
  * Decode and verify a framed block from raw bytes.
  * Returns null if CRC fails.
  */
-export function decodeBlock(bytes: Uint8Array): { type: BlockType; data: Uint8Array } | null {
+export function decodeBlock(bytes: Uint8Array, sentinel?: number): { type: BlockType; data: Uint8Array } | null {
+  const s = sentinel ?? SENTINEL;
   if (bytes.length < BLOCK_TOTAL_OVERHEAD) return null;
 
-  // Verify sentinel
-  const sentinel = (bytes[0] << 8) | bytes[1];
-  if (sentinel !== SENTINEL) return null;
+  // Verify sentinel (3 bytes)
+  const found = (bytes[0] << 16) | (bytes[1] << 8) | bytes[2];
+  if (found !== s) return null;
 
-  const type = bytes[2] as BlockType;
-  const len = bytes[3] | (bytes[4] << 8);
+  const type = bytes[3] as BlockType;
+  const len = bytes[4] | (bytes[5] << 8);
 
   const expectedTotal = BLOCK_TOTAL_OVERHEAD + len;
   if (bytes.length < expectedTotal) return null;
@@ -125,7 +133,7 @@ export function decodeBlock(bytes: Uint8Array): { type: BlockType; data: Uint8Ar
 
   // Verify CRC
   const crcInput = bytes.slice(SENTINEL_BYTES, SENTINEL_BYTES + 1 + 2 + len);
-  const expectedCrc = (bytes[5 + len] | (bytes[5 + len + 1] << 8)) & 0xFFFF;
+  const expectedCrc = (bytes[6 + len] | (bytes[6 + len + 1] << 8)) & 0xFFFF;
   if (crc16(crcInput) !== expectedCrc) return null;
 
   const data = bytes.slice(SENTINEL_BYTES + 1 + 2, SENTINEL_BYTES + 1 + 2 + len);
@@ -153,7 +161,7 @@ export interface BlockEvent {
 /**
  * Bit-level framed block decoder.
  *
- * Feeds decoded bits one at a time. Maintains a 16-bit sliding shift register
+ * Feeds decoded bits one at a time. Maintains a 24-bit sliding shift register
  * to detect the sentinel pattern. On match, reads header, then data, then CRC.
  * Emits completed blocks via onBlock callback.
  *
@@ -161,7 +169,9 @@ export interface BlockEvent {
  * at any bit offset, making it immune to symbol misalignment.
  */
 export class FramedBlockDecoder {
-  /** 16-bit sliding window for sentinel detection */
+  /** 24-bit sentinel pattern to scan for */
+  private sentinel: number;
+  /** 24-bit sliding window for sentinel detection */
   private shiftReg = 0;
   private bitCount = 0;
 
@@ -190,17 +200,21 @@ export class FramedBlockDecoder {
 
   onBlock: ((event: BlockEvent) => void) | null = null;
 
+  constructor(sentinel?: number) {
+    this.sentinel = sentinel ?? SENTINEL;
+  }
+
   /** Feed one bit (0 or 1). The scanner state machine processes it. */
   feedBit(bit: number): void {
     this.totalBits++;
 
-    // Update shift register
-    this.shiftReg = ((this.shiftReg << 1) | (bit & 1)) & 0xFFFF;
+    // Update shift register (24-bit for 3-byte sentinel)
+    this.shiftReg = ((this.shiftReg << 1) | (bit & 1)) & 0xFFFFFF;
     this.bitCount++;
 
     switch (this.phase) {
       case 'SCAN':
-        if (this.bitCount >= 16 && this.shiftReg === SENTINEL) {
+        if (this.bitCount >= 24 && this.shiftReg === this.sentinel) {
           this.phase = 'HEADER';
           this.byteAccum = 0;
           this.byteBits = 0;

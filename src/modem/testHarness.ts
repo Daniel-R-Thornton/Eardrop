@@ -15,7 +15,7 @@ import { Encoder } from "./encoder";
 import { Decoder } from "./decoder";
 import { Channel, ChannelConfig, DEFAULT_CHANNEL_CONFIG } from "./channel";
 import { ModemConfig, DEFAULT_CONFIG } from "./types";
-import { encodeBlock, BLOCK_TYPE } from "./framing";
+import { encodeBlock, BLOCK_TYPE, getSentinel } from "./framing";
 import { BerTracker, TimingProfiler, buildSnapshot } from "./diag";
 import { debugLogger, STAGE, LOG_LEVEL } from "./debugger";
 import { compressForLLM, CompressLevel } from "./compressForLLM";
@@ -213,6 +213,7 @@ export class TestHarness {
     }, `Test: ${name} payload=${testData.length}B SNR=${channelCfg.snrDb}dB`);
 
     // Wrap payload in framed blocks (CONFIG + PAYLOAD + EOF)
+    const sentinel = getSentinel(modemCfg.toneCount);
     const configPayload = new TextEncoder().encode(`test-${name.replace(/[^a-zA-Z0-9]/g, '_')}.bin`);
     const configBlock = encodeBlock(BLOCK_TYPE.CONFIG, (() => {
       const buf = new Uint8Array(2 + configPayload.length + 4 + 1);
@@ -229,8 +230,8 @@ export class TestHarness {
       return buf;
     })());
 
-    const payloadBlock = encodeBlock(BLOCK_TYPE.PAYLOAD, testData);
-    const eofBlock = encodeBlock(BLOCK_TYPE.EOF, new Uint8Array(0));
+    const payloadBlock = encodeBlock(BLOCK_TYPE.PAYLOAD, testData, sentinel);
+    const eofBlock = encodeBlock(BLOCK_TYPE.EOF, new Uint8Array(0), sentinel);
 
     // Concatenate all blocks into one byte stream for encoding
     const allFrameBytes = new Uint8Array(

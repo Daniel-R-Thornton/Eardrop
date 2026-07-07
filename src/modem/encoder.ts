@@ -11,7 +11,7 @@
  */
 
 import { ModemConfig, TONE_OFFSETS, MUSICAL_OFFSETS, DEFAULT_CONFIG } from "./types";
-import { encodeBlock, BLOCK_TYPE } from "./framing";
+import { encodeBlock, BLOCK_TYPE, getSentinel } from "./framing";
 import { encodeSquawkPayload } from "./squawk";
 
 enum Phase { kLeader, kSync, kData, kDone }
@@ -78,8 +78,10 @@ export class Encoder {
 
   /** Build bitstream: initial squawk → data segments → final squawk */
   private buildBitstream(dataBytes: Uint8Array): void {
+    const sentinel = getSentinel(this.cfg.toneCount);
+
     // Emit initial squawk
-    this.emitBlockBits(encodeBlock(BLOCK_TYPE.SQUAWK, encodeSquawkPayload(0)).bytes);
+    this.emitBlockBits(encodeBlock(BLOCK_TYPE.SQUAWK, encodeSquawkPayload(0), sentinel).bytes);
 
     // Emit data in segments with squawks between
     // No segment splitting — all data sent in one contiguous block
@@ -94,13 +96,13 @@ export class Encoder {
 
       if (bytePos < dataBytes.length) {
         squawkId++;
-        this.emitBlockBits(encodeBlock(BLOCK_TYPE.SQUAWK, encodeSquawkPayload(squawkId)).bytes);
+        this.emitBlockBits(encodeBlock(BLOCK_TYPE.SQUAWK, encodeSquawkPayload(squawkId), sentinel).bytes);
       }
     }
 
     // Final squawk
     squawkId++;
-    this.emitBlockBits(encodeBlock(BLOCK_TYPE.SQUAWK, encodeSquawkPayload(squawkId)).bytes);
+    this.emitBlockBits(encodeBlock(BLOCK_TYPE.SQUAWK, encodeSquawkPayload(squawkId), sentinel).bytes);
   }
 
   private resetState(): void {
@@ -116,21 +118,19 @@ export class Encoder {
     this.wobblePhase = 0;
   }
 
-  /** Emit raw bytes -> bits in [amp0,amp1,amp2,amp3] format (4 data bits/symbol)
-   *  Each input byte is split into two 4-bit nibbles, each becomes one frame.
-   *  The frame byte format [a0,0,a1,0,a2,0,a3,0] is reconstructed by the encoder's
-   *  BPSK modulation (phase bits always 0 for reliability). */
+  /** Emit raw bytes -> bits for BPSK phase modulation.
+   *  Each byte is split into frames of toneCount bits each.
+   *  4 tones: 2 frames × 4 bits = 1 byte.  2 tones: 4 frames × 2 bits = 1 byte. */
   private emitBlockBits(data: Uint8Array): void {
+    const frameBits = this.cfg.toneCount;
+    const framesPerByte = 8 / frameBits; // 2 or 4
     for (const byte of data) {
-      const hi = (byte >> 4) & 0x0F;
-      const lo = byte & 0x0F;
-      // High nibble: 4 amp bits for tones 0-3
-      for (let b = 3; b >= 0; b--) {
-        this.bitstream.push((hi >> b) & 1);
-      }
-      // Low nibble: 4 amp bits for next frame
-      for (let b = 3; b >= 0; b--) {
-        this.bitstream.push((lo >> b) & 1);
+      for (let f = 0; f < framesPerByte; f++) {
+        const shift = 8 - (f + 1) * frameBits;
+        for (let ti = 0; ti < frameBits; ti++) {
+          const bit = (byte >> (shift + frameBits - 1 - ti)) & 1;
+          this.bitstream.push(bit);
+        }
       }
     }
   }
@@ -155,8 +155,7 @@ export class Encoder {
   }
 
   private estimateTotalSamples2(bitstreamBits: number): number {
-    // 4 data bits per symbol (amp bits only; phase bits always 0)
-    const dataSymbols = Math.ceil(bitstreamBits / 4);
+    const dataSymbols = Math.ceil(bitstreamBits / this.cfg.toneCount);
     const dataSamples = dataSymbols * this.sps;
     const leaderSamples = this.leaderSamps || Math.floor(this.cfg.sampleRate / 2 / this.sps) * this.sps;
     const syncSamples = this.cfg.syncSymbols * this.sps;
@@ -225,7 +224,7 @@ export class Encoder {
         this.samplesInPhase++;
         if (this.samplesInPhase >= this.sps) {
           this.samplesInPhase = 0;
-          this.bitPos += 4; // 4 bits per symbol (phase bits are always 0)
+          // bitPos already advanced by toneCount at symbol start — no double-advance
         }
         break;
       }
