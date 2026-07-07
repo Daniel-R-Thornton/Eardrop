@@ -15,6 +15,7 @@ import { setState, getState } from "./Store";
 import { debugLogger } from "../modem/debugger";
 import { Encoder } from "../modem/encoder";
 import { Decoder } from "../modem/decoder";
+import { encodeBlock, BLOCK_TYPE, getSentinel } from "../modem/framing";
 import { AudioPlayer } from "../audio/player";
 import { AudioRecorder } from "../audio/recorder";
 import { Visualizer } from "../modem/visualizer";
@@ -634,34 +635,60 @@ function detectToneEnergy(samples: number[], freq: number, sampleRate: number): 
 // ─── Self Test ────────────────────────────────────────
 
 async function runSelfTest() {
-  const testData = new Uint8Array([0x48, 0x65, 0x6C, 0x6C, 0x6F]);
+  const cfg = { ...DEFAULT_CONFIG, toneCount: getState().toneCount, pilotFreqHz: getState().pilotFreqHz };
+  const testData = new Uint8Array([0x48, 0x65, 0x6C, 0x6C, 0x6F]); // 'Hello'
   setState({ sendStatus: { type: "info", msg: "🧪 Running self-test…" } });
 
-  // Encode the raw test data directly for a clean modem loopback
-  const encoder = new Encoder(DEFAULT_CONFIG);
-  const samples = encoder.encode(testData);
+  // Build proper framed blocks (CONFIG + PAYLOAD + EOF)
+  const sentinel = getSentinel(cfg.toneCount);
+  const configPayload = new TextEncoder().encode('self-test.bin');
+  const configData = new Uint8Array(2 + configPayload.length + 4 + 1);
+  let o = 0;
+  configData[o++] = configPayload.length & 0xFF;
+  configData[o++] = (configPayload.length >> 8) & 0xFF;
+  configData.set(configPayload, o); o += configPayload.length;
+  configData[o++] = testData.length & 0xFF;
+  configData[o++] = (testData.length >> 8) & 0xFF;
+  configData[o++] = (testData.length >> 16) & 0xFF;
+  configData[o++] = (testData.length >> 24) & 0xFF;
+  configData[o++] = 0x00;
+  const cb = encodeBlock(BLOCK_TYPE.CONFIG, configData, sentinel);
+  const pb = encodeBlock(BLOCK_TYPE.PAYLOAD, testData, sentinel);
+  const eb = encodeBlock(BLOCK_TYPE.EOF, new Uint8Array(0), sentinel);
+  const allFramed = new Uint8Array(cb.bytes.length + pb.bytes.length + eb.bytes.length);
+  allFramed.set(cb.bytes, 0);
+  allFramed.set(pb.bytes, cb.bytes.length);
+  allFramed.set(eb.bytes, cb.bytes.length + pb.bytes.length);
 
-  const testDecoder = new Decoder(DEFAULT_CONFIG);
-  testDecoder.fastSync = true;
-  testDecoder.reset();
-  for (const s of samples) testDecoder.feedSample(s);
+  // Encode
+  const encoder = new Encoder(cfg);
+  const samples = encoder.encodeFramedBlocks(allFramed);
 
-  const blocksOk = testDecoder.framedDecoder.blocksDecoded;
-  const crcFail = testDecoder.framedDecoder.blocksCrcFailed;
-  // Self-test passes if blocks were decoded with no CRC failures
-  // (Data matching is verified by unit tests)
-  const passed = blocksOk > 0 && crcFail === 0;
+  // Decode
+  const decoder = new Decoder(cfg);
+  decoder.fastSync = true;
+  decoder.reset();
+  let decoded: Uint8Array | null = null;
+  decoder.onFrame = (data: Uint8Array) => { decoded = data; };
+  for (const s of samples) decoder.feedSample(s);
+  decoder.flush();
 
-  // Update self-test result in the DOM
+  const blocksOk = decoder.framedDecoder.blocksDecoded;
+  const crcFail = decoder.framedDecoder.blocksCrcFailed;
+  const dataMatch = decoded && decoded.length === testData.length &&
+    testData.every((b, i) => decoded![i] === b);
+  const passed = blocksOk > 0 && crcFail === 0 && !!dataMatch;
+
   const el = document.getElementById("selfTestResult");
-  if (el) {
-    el.textContent = passed
-      ? `✅ PASS: ${blocksOk} blocks decoded, ${crcFail} CRC failures`
-      : `❌ FAIL: ${blocksOk} blocks, ${crcFail} CRC failures`;
-  }
+  const resultText = passed
+    ? `✅ PASS: ${blocksOk} blocks, ${testData.length}B recovered`
+    : `❌ FAIL: ${blocksOk} blocks/${crcFail} CRC fails, data=${dataMatch ? 'OK' : 'wrong'}`;
+  if (el) el.textContent = resultText;
+  console.warn(`[SELF_TEST] ${resultText}`);
   setState({
     sendStatus: { type: passed ? "success" : "error", msg: passed ? "✅ Self-test PASS" : "❌ Self-test FAIL" },
     debugSamples: samples,
+    txSamples: samples,
   });
 }
 

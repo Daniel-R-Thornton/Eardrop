@@ -295,6 +295,12 @@ export function MainApp() {
               </select>
             </div>
 
+            {/* Symbol Rate */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <span style={{ fontSize: 12, color: "#6b7280" }}>Symbol Rate</span>
+              <span style={{ fontSize: 12, fontFamily: "SF Mono, ui-monospace, monospace", color: "#f59e0b" }}>{s.symbolsPerSec} sym/s · {s.symbolsPerSec * s.toneCount} bit/s</span>
+            </div>
+
             {/* Pilot Freq */}
             <div style={{ marginBottom: 8 }}>
               <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
