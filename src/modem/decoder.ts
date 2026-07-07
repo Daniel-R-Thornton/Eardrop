@@ -304,10 +304,11 @@ export class Decoder {
     // A tone is ON if its pilot-relative energy > pilotAmplitude * thresholdRatio
     const ampThresh = this.pilotAmplitude * this.liveAmpThresholdRatio;
 
-    // Sync: at least 1 strong tone + total energy above noise floor
-    // Use absolute threshold for real-world weak signals (mic pickup varies)
-    const anyToneStrong = Math.max(...energies) > 0.002; // ~10x above typical noise floor
-    const totalAboveNoise = total > 0.0005;
+    // Sync: dynamic threshold based on noise floor or absolute minimum
+    const noiseRef = (this.noiseFloor[0] + this.noiseFloor[1] + this.noiseFloor[2] + this.noiseFloor[3]) / 4;
+    const minEnergy = Math.max(0.0002, noiseRef * 3);
+    const anyToneStrong = Math.max(...energies) > minEnergy;
+    const totalAboveNoise = total > Math.max(0.0002, noiseRef * 4);
     const isBurst = (avg > burstThresh) && anyToneStrong && totalAboveNoise;
 
     // ── Post-pilot trace logging ──

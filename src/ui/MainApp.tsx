@@ -7,6 +7,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useStore, setState } from "./Store";
 import { ToneMeter } from "./components/ToneMeter";
 import { BitAnalyzer } from "./components/BitAnalyzer";
+import { WaveformScope } from "./components/WaveformScope";
 import { debugLogger, STAGE } from "../modem/debugger";
 
 const TONE_COLORS = ["#4a9eff", "#ff6b4a", "#5eead4", "#f472b6"];
@@ -127,40 +128,7 @@ function ConstellationCanvas({ tone, iVal, qVal, color, label }: {
   );
 }
 
-// ─── Waveform Canvas ──────────────────────────────────
-
-function WaveformCanvas({ samples }: { samples: Float32Array | null }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    const c = ref.current;
-    if (!c || !samples) return;
-    const ctx = c.getContext("2d");
-    if (!ctx) return;
-    const w = c.width, h = c.height;
-    ctx.fillStyle = "rgba(0,0,0,0.3)";
-    ctx.fillRect(0, 0, w, h);
-
-    const step = Math.max(1, Math.floor(samples.length / w));
-    ctx.strokeStyle = "#6c6cff";
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    for (let i = 0; i < w; i++) {
-      const idx = Math.min(i * step, samples.length - 1);
-      const y = h / 2 - samples[idx] * h / 3;
-      i === 0 ? ctx.moveTo(i, y) : ctx.lineTo(i, y);
-    }
-    ctx.stroke();
-  }, [samples]);
-
-  if (!samples) return null;
-  return (
-    <canvas ref={ref} width={400} height={60} style={{
-      width: "100%", height: 60, borderRadius: 6,
-      background: "rgba(0,0,0,0.3)",
-    }} />
-  );
-}
+// ─── Waveform — now handled by WaveformScope component ──
 
 // ═══════════════════════════════════════════════════════
 // MAIN APP
@@ -444,7 +412,7 @@ export function MainApp() {
 
           {/* Waveform */}
           <Card title="Waveform" accent="#6c6cff">
-            <WaveformCanvas samples={s.debugSamples} />
+            <WaveformScope rxSamples={s.debugSamples} txSamples={s.txSamples} sampleRate={3200} />
           </Card>
 
           {/* Actions */}

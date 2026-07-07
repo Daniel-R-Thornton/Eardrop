@@ -44,6 +44,7 @@ export interface AppState {
   debug: DecoderInfo | null;
   blockLog: BlockLogEntry[];
   debugSamples: Float32Array | null;
+  txSamples: Float32Array | null;
   debugVisible: boolean;
   txPayload: { name: string; bytes: string } | null;
   rxPayload: { name: string; bytes: string } | null;
@@ -86,6 +87,7 @@ const defaultState: AppState = {
   debug: null,
   blockLog: [],
   debugSamples: null,
+  txSamples: null,
   debugVisible: false,
   txPayload: null,
   rxPayload: null,
