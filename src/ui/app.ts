@@ -16,6 +16,7 @@ import { debugLogger } from "../modem/debugger";
 import { Encoder } from "../modem/encoder";
 import { Decoder } from "../modem/decoder";
 import { encodeBlock, BLOCK_TYPE, getSentinel } from "../modem/framing";
+import { bch3116Encode } from "../modem/ecc";
 import { AudioPlayer } from "../audio/player";
 import { AudioRecorder } from "../audio/recorder";
 import { Visualizer } from "../modem/visualizer";
@@ -672,8 +673,11 @@ async function runSelfTest() {
   configData[o++] = (testData.length >> 16) & 0xFF;
   configData[o++] = (testData.length >> 24) & 0xFF;
   configData[o++] = 0x00;
-  const cb = encodeBlock(BLOCK_TYPE.CONFIG, configData, sentinel);
-  const pb = encodeBlock(BLOCK_TYPE.PAYLOAD, testData, sentinel);
+  // ECC-encode block data before wrapping (decoder expects BCH-protected payloads)
+  const configForWire = bch3116Encode(configData);
+  const payloadForWire = bch3116Encode(testData);
+  const cb = encodeBlock(BLOCK_TYPE.CONFIG, configForWire, sentinel);
+  const pb = encodeBlock(BLOCK_TYPE.PAYLOAD, payloadForWire, sentinel);
   const eb = encodeBlock(BLOCK_TYPE.EOF, new Uint8Array(0), sentinel);
   const allFramed = new Uint8Array(cb.bytes.length + pb.bytes.length + eb.bytes.length);
   allFramed.set(cb.bytes, 0);
