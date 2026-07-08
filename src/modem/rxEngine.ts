@@ -188,8 +188,7 @@ export class RxEngine {
 
   // BPSK calibration
   private calPhaseFlip: number[] = [1, 1, 1, 1];
-  private calSum: number[] = [0, 0, 0, 0];
-  private calCount: number[] = [0, 0, 0, 0];
+  private cal0Signs: boolean[] = [false, false, false, false];
   private calDone = false;
 
   constructor(cfg: Partial<ModemConfig> = {}) {
@@ -240,25 +239,24 @@ export class RxEngine {
       if (frameN === 10) {
         console.warn(`[MARKER] frame=${frameN} E=${totalE.toExponential(2)} signs=[${signs}] I=${rawIQs.map(r => r.i.toFixed(3)).join(',')}`);
       }
-      // Frame 11: Cal 0° — all tones at 0°, expected all I > 0
+      // Frame 11: Cal 0° — all tones at 0°, store signs for comparison
       if (frameN === 11) {
-        const expected = '++++';
-        const match = signs.split('').map((s, i) => s === expected[i] ? '✓' : '✗').join('');
-        console.warn(`[CAL_0°] signs=[${signs}] want=${expected} ${match} I=${rawIQs.map(r => r.i.toFixed(3)).join(',')}`);
-        for (let t = 0; t < TONE_COUNT; t++) {
-          this.calSum[t] += rawIQs[t].i >= 0 ? 1 : -1;
-          this.calCount[t]++;
-        }
+        this.cal0Signs = signs.split('').map(s => s === '+');
+        console.warn(`[CAL_0°] signs=[${signs}] I=${rawIQs.map(r => r.i.toFixed(3)).join(',')}`);
       }
-      // Frame 12: Cal 180° — all tones at 180°, expected all I < 0
+      // Frame 12: Cal 180° — compare with Cal 0° to find inverted tones
       if (frameN === 12) {
-        const expected = '----';
-        const match = signs.split('').map((s, i) => s === expected[i] ? '✓' : '✗').join('');
-        console.warn(`[CAL_180°] signs=[${signs}] want=${expected} ${match} I=${rawIQs.map(r => r.i.toFixed(3)).join(',')}`);
+        const cal180Signs = signs.split('').map(s => s === '+');
+        console.warn(`[CAL_180°] signs=[${signs}] I=${rawIQs.map(r => r.i.toFixed(3)).join(',')}`);
         for (let t = 0; t < TONE_COUNT; t++) {
-          this.calSum[t] += rawIQs[t].i < 0 ? 1 : -1;  // negative is correct for 180°
-          this.calCount[t]++;
+          // If a tone has the SAME sign in both cal0 and cal180, it's inverted
+          // (expected: opposite — 0°=positive, 180°=negative)
+          if (this.cal0Signs[t] === cal180Signs[t]) {
+            this.calPhaseFlip[t] = -1; // inverted
+            console.warn(`[CAL] Tone ${t}: SAME sign in both frames → INVERTED`);
+          }
         }
+        console.warn(`[CAL] flips=[${this.calPhaseFlip.join(',')}]`);
       }
       
       // Frame 13: Guard (pilot only, silence)
@@ -266,12 +264,9 @@ export class RxEngine {
         console.warn(`[GUARD] frame=${frameN} E=${totalE.toExponential(2)}`);
       }
       
-      // After guard: compute flips and enter FRAMES
+      // After guard: enter FRAMES
       if (frameN === 14) {
-        for (let t = 0; t < TONE_COUNT; t++) {
-          this.calPhaseFlip[t] = this.calSum[t] >= 0 ? 1 : -1;
-        }
-        console.warn(`[CAL_DONE] flips=[${this.calPhaseFlip.join(',')}] sums=[${this.calSum.join(',')}]`);
+        console.warn(`[CAL_DONE] flips=[${this.calPhaseFlip.join(',')}]`);
         this.state = RxState.FRAMES;
         this.fileData = [];
         this.framesReceived = 0;
