@@ -222,17 +222,10 @@ export class RxEngine {
     this.pll.update(sample);
     this.pilotAmplitude = this.pll.getAmplitude();
     
-    // Skip preamble (samples 0 through 1983). The preamble is always at the
-    // start of the audio. samplesSeen starts at 1 on the first call.
+    // Skip preamble, then immediately start frame scanning
     if (this.samplesSeen <= PREAMBLE_SAMPLES) {
-      if (this.samplesSeen === 1) console.warn(`[RX] Preamble: ${PREAMBLE_SAMPLES}samp to skip`);
-      if (this.samplesSeen === 1000) console.warn(`[RX] Preamble: 1000/1984 samples done, pilotAmp=${this.pilotAmplitude.toExponential(2)}`);
       return;
     }
-    
-    // After preamble: the first call here has samplesSeen = PREAMBLE_SAMPLES + 1
-    // which corresponds to audio sample 1984 (the frame start).
-    // The next 128 samples form the first frame symbol, starting at this sample.
     
     if (this.state === RxState.WAITING) {
       this.state = RxState.FRAMES;
@@ -242,7 +235,6 @@ export class RxEngine {
       this.fileName = '';
       this.fileSize = 0;
       this.totalFrames = 0;
-      console.warn(`[RX] Preamble done, entering FRAMES state at sample ${this.samplesSeen}, pilotAmp=${this.pilotAmplitude.toExponential(2)}`);
     }
 
     // ── Frame scanning: buffer samples and demodulate ──
