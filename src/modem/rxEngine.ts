@@ -125,7 +125,6 @@ class SentinelScanner {
       this.collecting = true;
       this.byteAccum = 0;
       this.phaseInverted = false;
-      console.warn(`[RX-SCAN] Sentinel at bit ${this.bitCount}`);
     } else if (this.bitCount >= 24 && this.shiftReg === this.sentinelInv) {
       this.collecting = true;
       this.phaseInverted = true;
