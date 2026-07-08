@@ -14,7 +14,7 @@ if (DEBUG) console.log("[RX] worker module loaded");
 
 self.onmessage = (e: MessageEvent) => {
   const msg = e.data;
-  if (DEBUG) console.log("[RX] message:", msg.type);
+  if (DEBUG && msg.type !== "feedSample") console.log("[RX] message:", msg.type);
 
   switch (msg.type) {
     case "startListening": {
