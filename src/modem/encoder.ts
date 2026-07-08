@@ -13,6 +13,7 @@
 import { ModemConfig, TONE_OFFSETS, MUSICAL_OFFSETS, DEFAULT_CONFIG } from "./types";
 import { encodeBlock, BLOCK_TYPE, getSentinel } from "./framing";
 import { encodeSquawkPayload } from "./squawk";
+import { bch3116Encode } from "./ecc";
 
 enum Phase { kLeader, kSync, kCalibrate, kData, kDone }
 
@@ -63,12 +64,17 @@ export class Encoder {
   encode(data: Uint8Array): Float32Array {
     this.resetState();
     this.bitstream = [];
-    const framedPayload = encodeBlock(BLOCK_TYPE.PAYLOAD, data);
+    // BCH(31,16) encode payload data before wrapping in a framed block
+    const dataForWire = this.cfg.eccScheme === 'bch3116' ? bch3116Encode(data) : data;
+    const framedPayload = encodeBlock(BLOCK_TYPE.PAYLOAD, dataForWire);
     this.buildBitstream(framedPayload.bytes);
     return this.generateAudioInternal();
   }
 
-  /** Encode pre-framed block bytes → audio (no extra framing layer) */
+  /** Encode pre-framed block bytes → audio (no extra framing layer).
+   *  NOTE: Blocks should be pre-ECC-encoded by the caller (e.g. test harness).
+   *  This method does NOT apply ECC — it assumes bytes are already ECC-protected
+   *  if the configured eccScheme requires it. */
   encodeFramedBlocks(blockBytes: Uint8Array): Float32Array {
     this.resetState();
     this.bitstream = [];

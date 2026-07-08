@@ -11,6 +11,7 @@ import { Encoder } from "./encoder";
 import { Decoder } from "./decoder";
 import { DEFAULT_CONFIG } from "./types";
 import { encodeBlock, BLOCK_TYPE, getSentinel } from "./framing";
+import { bch3116Encode } from "./ecc";
 
 const TIMEOUT = 30000;
 
@@ -28,7 +29,7 @@ function runRoundtrip(
   decoder.logging = false;
   decoder.reset();
 
-  // Build framed blocks
+  // Build framed blocks with BCH(31,16) encoding per DEFAULT_CONFIG
   const configPayload = new TextEncoder().encode(fileName);
   const configData = new Uint8Array(7 + configPayload.length);
   let o = 0;
@@ -43,8 +44,10 @@ function runRoundtrip(
   configData[o++] = 0x00;
 
   const sentinel = getSentinel(toneCount);
-  const cb = encodeBlock(BLOCK_TYPE.CONFIG, configData, sentinel);
-  const pb = encodeBlock(BLOCK_TYPE.PAYLOAD, payload, sentinel);
+  const configDataForWire = cfg.eccScheme === 'bch3116' ? bch3116Encode(configData) : configData;
+  const payloadForWire = cfg.eccScheme === 'bch3116' ? bch3116Encode(payload) : payload;
+  const cb = encodeBlock(BLOCK_TYPE.CONFIG, configDataForWire, sentinel);
+  const pb = encodeBlock(BLOCK_TYPE.PAYLOAD, payloadForWire, sentinel);
   const eb = encodeBlock(BLOCK_TYPE.EOF, new Uint8Array(0), sentinel);
 
   const allFramed = new Uint8Array(cb.bytes.length + pb.bytes.length + eb.bytes.length);

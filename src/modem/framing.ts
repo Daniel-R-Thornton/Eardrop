@@ -255,6 +255,16 @@ export class FramedBlockDecoder {
         break;
 
       case 'DATA':
+        // Handle len=0: immediately advance to CRC phase (no data bytes to read)
+        if (this.expectedBytes <= 0) {
+          this.pending!.data = this.bytesCollected;
+          this.phase = 'CRC';
+          this.expectedBytes = 2;
+          this.bytesCollected = [];
+          // Re-process this bit in the CRC phase
+          this.feedBit(bit);
+          return;
+        }
         this.byteAccum = (this.byteAccum << 1) | (bit & 1);
         this.byteBits++;
         if (this.byteBits >= 8) {

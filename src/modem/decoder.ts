@@ -21,6 +21,7 @@ import { BlockProcessor } from "./blockProcessor";
 import { SquawkProcessor } from "./squawk";
 import { debugLogger, STAGE, LOG_LEVEL } from "./debugger";
 import { TimingProfiler, BerTracker, ConstellationSampler, buildSnapshot } from "./diag";
+import { bch3116Decode } from "./ecc";
 
 export interface DecoderDebugInfo {
   peakAmp: number;
@@ -83,7 +84,8 @@ export class Decoder {
   private frameSkip = 0;
 
   // ── Preamble phase tracking ──
-  private preamblePhase: 'leader' | 'warble' | 'calibrate' | 'data' = 'leader';
+  private preamblePhase: 'leader' | 'sync' | 'calibrate' | 'data' = 'leader';
+  private syncFrameCount = 0;
   private dominantTones: number[] = [];
   private calibrateCount: number = 0;
 
@@ -180,8 +182,26 @@ export class Decoder {
         if (last) last.blockEvent = evtStr;
         else this.debugTrace.push({ sym: 0, rawI: [0,0,0,0], bits: [0,0,0,0], frameHex: '00', blockEvent: evtStr });
       }
+
+      // BCH(31,16) decode CONFIG and PAYLOAD block data before dispatching.
+      // BCH(31,16) has 2× expansion: N DATA bytes → ceil(N/2)*4 encoded bytes → ceil(N/2)*2 decoded bytes.
+      // We trim trailing padding from the decode output via the known ratio (encoded_len / 2).
+      let processData = event.data;
+      if ((event.type === BLOCK_TYPE.CONFIG || event.type === BLOCK_TYPE.PAYLOAD) && event.data.length >= 4) {
+        const eccResult = bch3116Decode(event.data);
+        const decodedLen = Math.floor(event.data.length / 4) * 2;
+        processData = eccResult.data.slice(0, decodedLen);
+        // Log ECC stats periodically
+        if (eccResult.errors > 0) {
+          const last = this.debugTrace[this.debugTrace.length - 1];
+          if (last) {
+            last.blockEvent = `${evtStr} ECC:${eccResult.errors}err`;
+          }
+        }
+      }
+
       if (event.type !== BLOCK_TYPE.SQUAWK) {
-        const summary = this.blockProcessor.processBlock(event.type, event.data);
+        const summary = this.blockProcessor.processBlock(event.type, processData);
         if (this.logging && this.blockProcessor.stats.blocksReceived <= 5) {
           console.log(`[BLK] ${summary}`);
         }
@@ -200,6 +220,7 @@ export class Decoder {
     this.consecutiveSync = 0;
     this.frameSkip = 0;
     this.preamblePhase = 'leader';
+    this.syncFrameCount = 0;
     this.dominantTones = [];
     this.calibrateCount = 0;
     this.noiseFloor = [3e-10, 3e-10, 3e-10, 3e-10];
@@ -369,28 +390,29 @@ export class Decoder {
         if (this.dominantTones.length > 20) this.dominantTones.shift();
       }
 
-      // Detect preamble phase transitions
+      // Detect preamble phase transitions — matches encoder's leader→sync→calibrate→data
       if (this.preamblePhase === 'leader' && hasSignal) {
-        this.preamblePhase = 'warble';
-        console.warn(`[PREAMBLE] leader→warble at sym ${Math.floor(this.samplesSeen/this.sps)}`);
+        this.preamblePhase = 'sync';
+        this.syncFrameCount = 0;
+        console.warn(`[PREAMBLE] leader→sync at sym ${Math.floor(this.samplesSeen/this.sps)}`);
       }
 
-      if (this.preamblePhase === 'warble' && this.dominantTones.length >= 4) {
-        // Warble: tone changes every frame. Calibrate: same tone for 4 consecutive frames.
-        // Check last 4 entries — all must be identical (calibrate: 4 frames per tone).
-        const recent = this.dominantTones.slice(-4);
-        const allSame = recent.length >= 4 && recent.every(t => t === recent[0]);
-        if (allSame) {
+      if (this.preamblePhase === 'sync') {
+        this.syncFrameCount++;
+        // Encoder sync = 10 frames. Then 16 frames of calibrate.
+        // Enter data mode at approximately the same position as encoder's data start
+        // by counting: sync(10) + calibrate(16) = 26 frames from sync detection.
+        if (this.syncFrameCount >= 10) {
           this.preamblePhase = 'calibrate';
-          this.calibrateCount = 2; // frame offset: decoder sym = encoder frame + 1
-          console.warn(`[PREAMBLE] warble→calibrate at sym ${Math.floor(this.samplesSeen/this.sps)} (count=${this.calibrateCount})`);
+          this.calibrateCount = 0;
+          console.warn(`[PREAMBLE] sync→calibrate at sym ${Math.floor(this.samplesSeen/this.sps)}`);
         }
       }
 
       if (this.preamblePhase === 'calibrate') {
         this.calibrateCount++;
-        // Calibrate is fixed 16 frames. Data starts on frame 17.
-        if (this.calibrateCount > 16) {
+        // Calibrate is 16 frames in encoder. Enter data mode right after.
+        if (this.calibrateCount >= 16) {
           this.preamblePhase = 'data';
           this.inFrame = true;
           this.frameSkip = 0;
@@ -459,7 +481,9 @@ export class Decoder {
       }
 
       this.dataFramesExecuted++;
-      if (this.dataFramesExecuted > 2000 || this.framedDecoder.totalBits > 65536) {
+      // Allow large payloads: 20000 frames ≈ 800s at 25 sym/s, sufficient for
+      // multi-KB files even with BCH(31,16) 2× expansion.
+      if (this.dataFramesExecuted > 20000 || this.framedDecoder.totalBits > 65536) {
         this.inFrame = false;
         return;
       }

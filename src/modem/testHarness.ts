@@ -16,6 +16,7 @@ import { Decoder } from "./decoder";
 import { Channel, ChannelConfig, DEFAULT_CHANNEL_CONFIG } from "./channel";
 import { ModemConfig, DEFAULT_CONFIG } from "./types";
 import { encodeBlock, BLOCK_TYPE, getSentinel } from "./framing";
+import { bch3116Encode } from "./ecc";
 import { BerTracker, TimingProfiler, buildSnapshot } from "./diag";
 import { debugLogger, STAGE, LOG_LEVEL } from "./debugger";
 import { compressForLLM, CompressLevel } from "./compressForLLM";
@@ -213,9 +214,10 @@ export class TestHarness {
     }, `Test: ${name} payload=${testData.length}B SNR=${channelCfg.snrDb}dB`);
 
     // Wrap payload in framed blocks (CONFIG + PAYLOAD + EOF)
+    // BCH(31,16) encode config and payload data per the chosen eccScheme
     const sentinel = getSentinel(modemCfg.toneCount);
     const configPayload = new TextEncoder().encode(`test-${name.replace(/[^a-zA-Z0-9]/g, '_')}.bin`);
-    const configBlock = encodeBlock(BLOCK_TYPE.CONFIG, (() => {
+    const configData = (() => {
       const buf = new Uint8Array(2 + configPayload.length + 4 + 1);
       let off = 0;
       buf[off++] = configPayload.length & 0xFF;
@@ -228,9 +230,12 @@ export class TestHarness {
       buf[off++] = (totalSize >> 24) & 0xFF;
       buf[off++] = 0x00; // dictScheme = no compression
       return buf;
-    })());
+    })();
+    const configDataForWire = modemCfg.eccScheme === 'bch3116' ? bch3116Encode(configData) : configData;
+    const configBlock = encodeBlock(BLOCK_TYPE.CONFIG, configDataForWire, sentinel);
 
-    const payloadBlock = encodeBlock(BLOCK_TYPE.PAYLOAD, testData, sentinel);
+    const payloadDataForWire = modemCfg.eccScheme === 'bch3116' ? bch3116Encode(testData) : testData;
+    const payloadBlock = encodeBlock(BLOCK_TYPE.PAYLOAD, payloadDataForWire, sentinel);
     const eofBlock = encodeBlock(BLOCK_TYPE.EOF, new Uint8Array(0), sentinel);
 
     // Concatenate all blocks into one byte stream for encoding
