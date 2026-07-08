@@ -388,11 +388,9 @@ export class Decoder {
 
       if (this.preamblePhase === 'calibrate') {
         this.calibrateCount++;
-        // After full calibrate (16 frames), all tones come ON simultaneously.
-        // Check that weakest tone is also strong (not just dominant tone).
-        const minEnergy = Math.min(...energies);
-        const allStrong = minEnergy > 0.005 && this.calibrateCount >= 10;
-        if (allStrong) {
+        // Calibrate is fixed 16 frames (4 tones × 4 frames each).
+        // After 16 frames, data phase starts — no energy threshold needed.
+        if (this.calibrateCount >= 16) {
           this.preamblePhase = 'data';
           this.inFrame = true;
           this.frameSkip = 0;
