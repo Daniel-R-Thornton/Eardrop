@@ -241,7 +241,9 @@ export class RxEngine {
       const eHigh = Math.hypot(wHigh.i, wHigh.q);
       const eTot = eLow + eHigh;
       
-      if (eTot > this.warbleThreshold) {
+      // Warble has both frequencies active (ratio ~1). Noise at single freq fails ratio check.
+      const ratio = eLow > eHigh ? eLow / eHigh : eHigh / eLow;
+      if (eTot > this.warbleThreshold && ratio < 3.0 && eLow > 0.005 && eHigh > 0.005) {
         this.warbleFrames++;
         if (this.warbleFrames === 1) console.warn(`[WARBLE] frame 0 eLow=${eLow.toExponential(2)} eHigh=${eHigh.toExponential(2)}`);
         if (this.warbleFrames === 2) console.warn(`[WARBLE] frame 1 eLow=${eLow.toExponential(2)} eHigh=${eHigh.toExponential(2)}`);
