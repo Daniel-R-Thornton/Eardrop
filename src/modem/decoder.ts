@@ -342,14 +342,14 @@ export class Decoder {
     }
 
     // ── Preamble phase detection (pattern-based, not frame-counting) ──
-    // Warble: dominant tone changes every frame (cycling 0→1→2→3)
-    // Calibrate: dominant tone stays same for 4 frames
-    // Data: all tones ON simultaneously
+    // Uses absolute energy thresholds to work for both loopback and weak acoustic.
     if (this.pilotDiscovered && !this.inFrame) {
-      const maxTone = total > 1e-8 ? energies.indexOf(Math.max(...energies)) : -1;
+      const hasSignal = total > 0.0005 && Math.max(...energies) > 0.0003;
+      const maxTone = hasSignal ? energies.indexOf(Math.max(...energies)) : -1;
+      const strongToneCount = energies.filter(e => e > 0.0003).length;
 
       // Phase calibration during warble + calibrate
-      if (!this.calDone && isBurst && maxTone >= 0 && this.calPhaseCount[maxTone] < 3) {
+      if (!this.calDone && hasSignal && maxTone >= 0 && this.calPhaseCount[maxTone] < 3) {
         this.calPhaseSum[maxTone] += relI[maxTone] >= 0 ? 1 : -1;
         this.calPhaseCount[maxTone]++;
         const totalCounts = this.calPhaseCount.reduce((a,b)=>a+b,0);
@@ -370,13 +370,13 @@ export class Decoder {
       }
 
       // Detect preamble phase transitions
-      if (this.preamblePhase === 'leader' && isBurst) {
+      if (this.preamblePhase === 'leader' && hasSignal) {
         this.preamblePhase = 'warble';
         console.warn(`[PREAMBLE] leader→warble at sym ${Math.floor(this.samplesSeen/this.sps)}`);
       }
 
       if (this.preamblePhase === 'warble' && this.dominantTones.length >= 6) {
-        // Warble: tone should change every frame. Calibrate: same tone for 4+ frames.
+        // Warble: tone changes every frame. Calibrate: same tone for 4+ frames.
         const recent = this.dominantTones.slice(-6);
         const sameCount = recent.filter(t => t === recent[recent.length - 1]).length;
         if (sameCount >= 3) {
@@ -388,23 +388,18 @@ export class Decoder {
 
       if (this.preamblePhase === 'calibrate') {
         this.calibrateCount++;
-        // After calibrate (16 frames), all tones go quiet briefly then data starts with all ON
-        // Detect: calibrate phase ends when max energy drops (transition to data)
-        if (this.calibrateCount >= 14 && isBurst && total > this.noiseFloor.reduce((a,b)=>a+b,0) * 2) {
-          // Check if all tones are strong (data phase signature)
-          const strongToneCount = energies.filter(e => e > noiseRef * 3).length;
-          if (strongToneCount >= this.cfg.toneCount) {
-            this.preamblePhase = 'data';
-            this.inFrame = true;
-            this.frameSkip = 0; // No skip needed — pattern-based alignment
-            this.framesSinceStrong = 0;
-            this.dataFramesExecuted = 0;
-            this.lastStrongBitsCollected = 0;
-            this.framesSinceExit = 0;
-            this.framedDecoder.reset();
-            this.blockProcessor.reset();
-            console.warn(`[PREAMBLE] calibrate→DATA at sym ${Math.floor(this.samplesSeen/this.sps)}`);
-          }
+        // After calibrate (16 frames), all tones come ON simultaneously (data phase)
+        if (this.calibrateCount >= 14 && strongToneCount >= this.cfg.toneCount) {
+          this.preamblePhase = 'data';
+          this.inFrame = true;
+          this.frameSkip = 0;
+          this.framesSinceStrong = 0;
+          this.dataFramesExecuted = 0;
+          this.lastStrongBitsCollected = 0;
+          this.framesSinceExit = 0;
+          this.framedDecoder.reset();
+          this.blockProcessor.reset();
+          console.warn(`[PREAMBLE] calibrate→DATA at sym ${Math.floor(this.samplesSeen/this.sps)}`);
         }
       }
     }
