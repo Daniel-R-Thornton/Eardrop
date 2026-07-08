@@ -243,10 +243,12 @@ export class RxEngine {
     
     const rawIQs = this.toneFreqs.map(f => toneIQ(window, f, this.cfg.sampleRate));
     
-    // ── BPSK bit detection from raw I ──
+    // ── BPSK bit detection with pilot-relative rotation ──
+    // Rotate raw I/Q by PLL-tracked pilot phase to get pilot-relative frame.
     let frameBits = 0;
     for (let t = 0; t < TONE_COUNT; t++) {
-      const bit = rawIQs[t].i < 0 ? 1 : 0;
+      const rotated = this.pll!.rotateToPilotRef(rawIQs[t].i, rawIQs[t].q);
+      const bit = rotated.i < 0 ? 1 : 0;
       frameBits |= (bit) << (7 - t * 2);
       frameBits |= (1) << (6 - t * 2);
     }
@@ -254,8 +256,12 @@ export class RxEngine {
     // Debug: log first few frames
     this.dbgFrameCount++;
     if (this.dbgFrameCount <= 5) {
+      const correctedI = rawIQs.map(r => {
+        const rot = this.pll!.rotateToPilotRef(r.i, r.q);
+        return rot.i.toFixed(3);
+      }).join(',');
       const energies = rawIQs.map(r => Math.hypot(r.i, r.q).toExponential(2)).join(',');
-      console.warn(`[RX] Frame ${this.dbgFrameCount}: bits=0x${frameBits.toString(16).padStart(2,'0')} I=${rawIQs.map(r=>r.i.toFixed(3)).join(',')} eng=[${energies}]`);
+      console.warn(`[RX] Frame ${this.dbgFrameCount}: bits=0x${frameBits.toString(16).padStart(2,'0')} I=[${correctedI}] eng=[${energies}]`);
     }
 
     this.bchBuf.push(frameBits);

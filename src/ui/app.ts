@@ -167,12 +167,11 @@ window.addEventListener("eardrop-send", (async () => {
     showTxPayload(raw, selectedFile.name);
 
     const cfg: any = { pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz, musical: getState().musicalMode };
-    const outputRate = player.getSampleRate();
-    const { samples: playSamples } = await transmitFileInWorker(selectedFile.name, raw, cfg);
+    const { samples: playSamples, sampleRate: actualRate } = await transmitFileInWorker(selectedFile.name, raw, cfg);
     setState({ sendStatus: { type: "info", msg: `Playing ${selectedFile.name}…` } });
     setState({ isPlaying: true });
     const cleanPlay = getState().musicalMode;
-    await player.play(playSamples, outputRate, selectedOutputId || undefined, cleanPlay);
+    await player.play(playSamples, actualRate, selectedOutputId || undefined, cleanPlay);
     setState({ isSending: false, isPlaying: false, sendStatus: { type: "success", msg: `✅ Sent ${selectedFile.name}` } });
   } catch (err: any) {
     setState({ isSending: false, isPlaying: false, sendStatus: { type: "error", msg: `❌ ${err.message}` } });
@@ -214,9 +213,8 @@ window.addEventListener("eardrop-send-test", (async () => {
   setState({ sendStatus: { type: "info", msg: "📤 Sending test…" } });
   try {
     const cfg: any = { pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz, musical: getState().musicalMode };
-    const outputRate = player.getSampleRate();
-    const { samples: playSamples } = await transmitFileInWorker("hello.txt", raw, cfg);
-    await player.play(playSamples, outputRate, selectedOutputId || undefined, getState().musicalMode);
+    const { samples: playSamples, sampleRate: actualRate } = await transmitFileInWorker("hello.txt", raw, cfg);
+    await player.play(playSamples, actualRate, selectedOutputId || undefined, getState().musicalMode);
     setState({ sendStatus: { type: "success", msg: "✅ Test sent" } });
   } catch (err: any) {
     setState({ sendStatus: { type: "error", msg: `❌ ${err.message}` } });
