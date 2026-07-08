@@ -49,8 +49,8 @@ export function generatePreamble(cfg: PreambleConfig): Float32Array {
   const calSamps = Math.floor(0.160 * sampleRate);        // 512
   const invSamps = Math.floor(0.160 * sampleRate);        // 512
   const sweepSamps = Math.floor(0.200 * sampleRate);      // 640
-  // Total: warble(1280) + marker(128) + cal0(128) + cal1(128) + guard(128) = 1792
-  const totalSamps = warbleSamps + 128 + 128 + 128 + 128;
+  // Total: warble(1280) + marker(128) + cal0(128) + cal1(128) + guard(512) = 2176
+  const totalSamps = warbleSamps + 128 + 128 + 128 + 512;
 
   const out = new Float32Array(totalSamps);
   let idx = 0;
@@ -100,8 +100,8 @@ export function generatePreamble(cfg: PreambleConfig): Float32Array {
     out[idx++] = s;
   }
 
-  // ── Phase 3: Guard (128 samples = 1 frame for alignment) ─
-  for (let i = 0; i < 128; i++) {
+  // ── Phase 3: Guard (4 frames = 512 samples for alignment) ──
+  for (let i = 0; i < 512; i++) {
     let s = 0;
     s += pilot.advance(pilotFreqHz, sampleRate) * pilotAmplitude;
     for (let t = 0; t < 4; t++) {

@@ -193,7 +193,7 @@ export class RxEngine {
   // BPSK calibration
   private calPhaseFlip: number[] = [1, 1, 1, 1];
   private cal0Signs: boolean[] = [false, false, false, false];
-  private cal180Energy = 0;
+  private guardFrames = 0;
   private calDone = false;
 
   constructor(cfg: Partial<ModemConfig> = {}) {
@@ -274,6 +274,7 @@ export class RxEngine {
         this.cal180Seen = false;
         this.preambleFrames = 0;
         this.markerPeakE = 0;
+        this.guardFrames = 0;
         this.buf = [];
         return;
       }
@@ -294,7 +295,6 @@ export class RxEngine {
       // After cal0: cal180
       if (this.cal0Seen && !this.cal180Seen) {
         this.cal180Seen = true;
-        this.cal180Energy = totalE;
         const cal180 = rawIQs.map(r => r.i >= 0);
         console.warn(`[CAL_180°] signs=[${signs}] I=${rawIQs.map(r=>r.i.toFixed(3)).join(',')}`);
         for (let t = 0; t < TONE_COUNT; t++) {
@@ -303,17 +303,21 @@ export class RxEngine {
         console.warn(`[CAL] flips=[${this.calPhaseFlip.join(',')}]`);
         return;
       }
-      // After cal180: wait for energy to drop significantly (guard trough)
-      if (this.cal180Seen && totalE < Math.max(this.cal180Energy * 0.15, 0.015)) {
-        console.warn(`[GUARD] E=${totalE.toExponential(2)} (cal180 was ${this.cal180Energy.toExponential(2)})`);
-        this.state = RxState.FRAMES;
-        this.fileData = [];
-        this.framesReceived = 0;
-        this.fileID = 0;
-        this.fileName = '';
-        this.fileSize = 0;
-        this.totalFrames = 0;
-        console.warn(`[FRAMES] flips=[${this.calPhaseFlip.join(',')}]`);
+      // After cal180: guard = ~100ms of pilot only ≈ 3 frames. Count them, then FRAMES.
+      if (this.cal180Seen) {
+        this.guardFrames++;
+        if (this.guardFrames === 1) console.warn(`[GUARD] pilot only, waiting 4 frames...`);
+        if (this.guardFrames >= 4) {
+          console.warn(`[FRAMES] flips=[${this.calPhaseFlip.join(',')}]`);
+          this.state = RxState.FRAMES;
+          this.fileData = [];
+          this.framesReceived = 0;
+          this.fileID = 0;
+          this.fileName = '';
+          this.fileSize = 0;
+          this.totalFrames = 0;
+          this.buf = [];
+        }
       }
       return;
     }
@@ -393,6 +397,7 @@ export class RxEngine {
     this.cal0Seen = false;
     this.cal180Seen = false;
     this.markerPeakE = 0;
+    this.guardFrames = 0;
     this.buf = [];
     this.bchBuf = [];
     this.bchBufCount = 0;
