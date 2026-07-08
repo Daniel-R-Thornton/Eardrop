@@ -40,10 +40,10 @@ export class Encoder {
   // Anti-noise-gate: slow amplitude wobble (8 Hz, ±30%) so tones aren't mistaken for stationary hum
   private wobblePhase = 0;
   private readonly WOBBLE_RATE = 8; // Hz
-  private readonly WOBBLE_DEPTH = 0.3; // ±30%
+  private readonly WOBBLE_DEPTH = 0.05; // ±5% (was 0.3) — reduced for cleaner BPSK
   // Correlated noise floor — same PRNG seed as decoder, keeps mic gate open, cancelled at decoder
   private noiseState = 12345;
-  private readonly NOISE_AMP = 0.015;
+  private readonly NOISE_AMP = 0.002; // reduced from 0.015 for cleaner BPSK
 
   constructor(cfg: Partial<ModemConfig> = {}) {
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };

@@ -33,7 +33,7 @@ export function getSentinel(toneCount: number): number {
 }
 
 export const SENTINEL = getSentinel(4);
-export const SENTINEL_BYTES = 2;
+export const SENTINEL_BYTES = 3;
 export const BLOCK_HEADER_BYTES = 5;   // type(1) + len(2) + sentinel(2)
 export const BLOCK_FOOTER_BYTES = 2;   // crc(2)
 export const BLOCK_OVERHEAD = SENTINEL_BYTES + BLOCK_HEADER_BYTES - SENTINEL_BYTES + BLOCK_FOOTER_BYTES; // 5
@@ -216,6 +216,7 @@ export class FramedBlockDecoder {
       case 'SCAN':
         if (this.bitCount >= 24 && this.shiftReg === this.sentinel) {
           this.phase = 'HEADER';
+          console.warn(`[FRAME] sentinel @ bit ${this.totalBits} sr=0x${this.shiftReg.toString(16)} sentinel=0x${this.sentinel.toString(16)}`);
           this.byteAccum = 0;
           this.byteBits = 0;
           this.bytesCollected = [];
@@ -305,6 +306,10 @@ export class FramedBlockDecoder {
               }
             } else {
               this.blocksCrcFailed++;
+              if (this.blocksCrcFailed <= 3) {
+                const expCrc = crc16(crcInput);
+                console.warn(`[FRAME] CRC fail: type=0x${pb.type.toString(16)} len=${pb.len} got=0x${crc.toString(16)} exp=0x${expCrc.toString(16)} @ bit ${this.totalBits}`);
+              }
             }
 
             // Reset to scan for next block
