@@ -229,24 +229,20 @@ export class RxEngine {
     const rawIQs = this.toneFreqs.map(f => toneIQ(window, f, this.cfg.sampleRate));
     const totalE = rawIQs.reduce((a, r) => a + Math.hypot(r.i, r.q), 0);
     
-    // ── WAITING: detect warble pattern (alternating pilot±50Hz) ──
-    // The warble toggles between freq-50 and freq+50 every 10ms (32 samples).
-    // Over a 128-sample frame, we see ~4 toggles. Compute energy at both
-    // warble frequencies and track which one dominates each frame.
+    // ── WAITING: detect warble — sustained energy at pilot±50Hz ──
     if (this.state === RxState.WAITING) {
       const wLow = toneIQ(window, this.cfg.pilotFreqHz - 50, this.cfg.sampleRate);
       const wHigh = toneIQ(window, this.cfg.pilotFreqHz + 50, this.cfg.sampleRate);
       const eLow = Math.hypot(wLow.i, wLow.q);
       const eHigh = Math.hypot(wHigh.i, wHigh.q);
-      const eWarble = eLow + eHigh;  // total warble energy
+      const eTot = eLow + eHigh;
       
-      // Track which frequency is dominant (alternating = warble pattern)
-      if (eWarble > 0.005) {
+      if (eTot > 0.01) {
         this.warbleFrames++;
         if (this.warbleFrames === 1) console.warn(`[WARBLE] frame 0 eLow=${eLow.toExponential(2)} eHigh=${eHigh.toExponential(2)}`);
         if (this.warbleFrames === 2) console.warn(`[WARBLE] frame 1 eLow=${eLow.toExponential(2)} eHigh=${eHigh.toExponential(2)}`);
-        if (this.warbleFrames >= 3) {
-          console.warn(`[WARBLE] Detected!`);
+        if (this.warbleFrames >= 5) {
+          console.warn(`[WARBLE] Detected after ${this.warbleFrames} frames`);
           this.state = RxState.PREAMBLE;
           this.markerPeakE = 0;
         }
