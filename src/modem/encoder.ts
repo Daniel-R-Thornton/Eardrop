@@ -149,13 +149,26 @@ export class Encoder {
 
   // ─── private ───────────────────────────────────────
 
-  /** Generate audio from prepared bitstream */
+  /** Generate audio from prepared bitstream, normalize to [-1, 1] */
   private generateAudioInternal(): Float32Array {
     this.leaderSamps = Math.floor(this.cfg.sampleRate / 2 / this.sps) * this.sps;
     const totalSamples = this.estimateTotalSamples2(this.bitstream.length);
     const out = new Float32Array(totalSamples);
     for (let i = 0; i < totalSamples; i++) {
       out[i] = this.generateSample();
+    }
+    // Normalize to [-1, 1] preserving waveform shape (avoids per-sample
+    // hard clipping which destroys phase information)
+    let peak = 0;
+    for (let i = 0; i < totalSamples; i++) {
+      const abs = Math.abs(out[i]);
+      if (abs > peak) peak = abs;
+    }
+    if (peak > 1.0) {
+      const scale = 1.0 / peak;
+      for (let i = 0; i < totalSamples; i++) {
+        out[i] *= scale;
+      }
     }
     return out;
   }
@@ -265,9 +278,8 @@ export class Encoder {
     this.wobblePhase += this.WOBBLE_RATE / sampleRate;
     if (this.wobblePhase >= 1.0) this.wobblePhase -= 1.0;
     const wobble = 1.0 - this.WOBBLE_DEPTH * 0.5 + this.WOBBLE_DEPTH * 0.5 * Math.sin(2 * Math.PI * this.wobblePhase);
-    const out = output * wobble + noise;
-    // Clamp to [-1, 1] to prevent speaker/mic clipping
-    return Math.max(-1, Math.min(1, out));
+    // No per-sample clamping — full buffer is normalized in generateAudioInternal()
+    return output * wobble + noise;
   }
 
   private advancePhase() {
