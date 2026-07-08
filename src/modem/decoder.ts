@@ -306,9 +306,9 @@ export class Decoder {
 
     // Sync: dynamic threshold based on noise floor or absolute minimum
     const noiseRef = (this.noiseFloor[0] + this.noiseFloor[1] + this.noiseFloor[2] + this.noiseFloor[3]) / 4;
-    const minEnergy = Math.max(0.0002, noiseRef * 3);
+    const minEnergy = Math.max(0.001, noiseRef * 5);
     const anyToneStrong = Math.max(...energies) > minEnergy;
-    const totalAboveNoise = total > Math.max(0.0002, noiseRef * 4);
+    const totalAboveNoise = total > Math.max(0.001, noiseRef * 5);
     const isBurst = (avg > burstThresh) && anyToneStrong && totalAboveNoise;
 
     // ── Post-pilot trace logging ──
@@ -445,7 +445,7 @@ export class Decoder {
       console.warn(`[CAN_ENTER] cons=${this.consecutiveSync} nf=${this.noiseFrames} fse=${this.framesSinceExit} pilot=${this.pilotDiscovered} pilotAmp=${this.pilotAmplitude.toExponential(2)} total=${total.toExponential(2)} noiseFloorSum=${this.noiseFloor.reduce((a,b)=>a+b,0).toExponential(2)}`);
     }
     const canEnter = this.fastSync
-      ? (this.pilotDiscovered && this.consecutiveSync >= 6 && this.noiseFrames >= 25)
+      ? (this.pilotDiscovered && this.consecutiveSync >= 8 && this.noiseFrames >= 25 && this.pilotAmplitude > 0.02)
       : (syncPath && (this.framesSinceExit >= 50 || this.consecutiveSync >= 10));
     if (canEnter && !this.inFrame) {
       this.inFrame = true;
@@ -509,6 +509,13 @@ export class Decoder {
       // Console-log first 16 data frames for devtools debugging
       if (this.dataFramesExecuted <= 16) {
         console.warn(`[BPSK] frm=${this.dataFramesExecuted} sym=${Math.floor(this.samplesSeen/this.sps)} bits=${dbgBits.join('')} hex=0x${frameBits.toString(16).padStart(2,'0')} I=[${relI.map(v=>v.toFixed(3)).join(',')}] flip=[${this.calPhaseFlip.join(',')}]`);
+      }
+
+      // Reset bchBuf alignment on first strong frame to avoid preamble skew
+      const isStrong = Math.max(Math.abs(relI[0]), Math.abs(relI[1]), Math.abs(relI[2]), Math.abs(relI[3])) > 0.01;
+      if (isStrong && this.dataFramesExecuted <= 4 && this.bchBufCount > 0) {
+        this.bchBuf = [];
+        this.bchBufCount = 0;
       }
 
       // Pack frame bytes into block bytes.
