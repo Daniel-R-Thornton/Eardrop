@@ -238,13 +238,13 @@ export class Decoder {
     const window = this.buf.slice(0, this.sps);
     this.buf.splice(0, this.sps);
 
-    // ── Pilot discovery — use configured frequency directly ──
-    // The scanner is unreliable in real-world acoustics (rate mismatch, room modes).
-    // Use the user-configured pilot frequency and let the PLL fine-tune phase.
-    if (!this.pilotDiscovered && !this.inFrame && this.noiseFrames >= 20) {
+    // ── Pilot discovery — use configured frequency, but wait for leader to pass ──
+    // Leader is ~12 symbols of pilot-only. We need to be past it before sync can begin.
+    // Require at least 12*128=1536 samples before declaring pilot discovered.
+    if (!this.pilotDiscovered && !this.inFrame && this.noiseFrames >= 20 && this.samplesSeen > 12 * this.sps) {
       this.pilotDiscovered = true;
       this.pilotFreq = this.cfg.pilotFreqHz;
-      this.pilotAmplitude = 0.05; // initial estimate, PLL converges
+      this.pilotAmplitude = 0.05;
       const nominalTones = getDataToneFreqs(this.cfg.pilotFreqHz, !!this.cfg.musical);
       this.toneFreqs = nominalTones;
       this.pll = new PilotPLL(this.cfg.pilotFreqHz, 0, 0.05, {
