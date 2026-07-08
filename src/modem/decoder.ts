@@ -82,6 +82,11 @@ export class Decoder {
   private consecutiveSync = 0;
   private frameSkip = 0;
 
+  // ── Preamble phase tracking ──
+  private preamblePhase: 'leader' | 'warble' | 'calibrate' | 'data' = 'leader';
+  private dominantTones: number[] = [];
+  private calibrateCount: number = 0;
+
   // ── Framed block decoder (replaces old bitCollector) ──
   public framedDecoder: FramedBlockDecoder;
   public blockProcessor: BlockProcessor;
@@ -194,6 +199,9 @@ export class Decoder {
     this.inFrame = false;
     this.consecutiveSync = 0;
     this.frameSkip = 0;
+    this.preamblePhase = 'leader';
+    this.dominantTones = [];
+    this.calibrateCount = 0;
     this.noiseFloor = [3e-10, 3e-10, 3e-10, 3e-10];
     this.noiseMax = [3e-10, 3e-10, 3e-10, 3e-10];
     this.noiseFrames = this.fastSync ? 25 : 0;
@@ -333,19 +341,19 @@ export class Decoder {
       }
     }
 
-    // ── Sync tracking ──
-    const strong = isBurst;
+    // ── Preamble phase detection (pattern-based, not frame-counting) ──
+    // Warble: dominant tone changes every frame (cycling 0→1→2→3)
+    // Calibrate: dominant tone stays same for 4 frames
+    // Data: all tones ON simultaneously
+    if (this.pilotDiscovered && !this.inFrame) {
+      const maxTone = total > 1e-8 ? energies.indexOf(Math.max(...energies)) : -1;
 
-    // ── Phase calibration: learn BPSK reference sign during preamble ──
-    // Runs during both sync and calibrate phases (even after inFrame, while frameSkip > 0)
-    if (!this.calDone && this.pilotDiscovered && isBurst && this.noiseFrames >= 20) {
-      const maxTone = energies.indexOf(Math.max(...energies));
-      if (maxTone >= 0 && this.calPhaseCount[maxTone] < 3) {
+      // Phase calibration during warble + calibrate
+      if (!this.calDone && isBurst && maxTone >= 0 && this.calPhaseCount[maxTone] < 3) {
         this.calPhaseSum[maxTone] += relI[maxTone] >= 0 ? 1 : -1;
         this.calPhaseCount[maxTone]++;
         const totalCounts = this.calPhaseCount.reduce((a,b)=>a+b,0);
         if (totalCounts >= 8) {
-          // Use majority sign across ALL tones (all should be same at 0° phase)
           let totalSum = 0;
           for (let t = 0; t < 4; t++) totalSum += this.calPhaseSum[t];
           const globalFlip = totalSum >= 0 ? 1 : -1;
@@ -354,42 +362,54 @@ export class Decoder {
           console.warn(`[CAL] BPSK reference signs: flip=[${this.calPhaseFlip.join(',')}] (global=${globalFlip})`);
         }
       }
+
+      // Track dominant tone history
+      if (maxTone >= 0) {
+        this.dominantTones.push(maxTone);
+        if (this.dominantTones.length > 20) this.dominantTones.shift();
+      }
+
+      // Detect preamble phase transitions
+      if (this.preamblePhase === 'leader' && isBurst) {
+        this.preamblePhase = 'warble';
+        console.warn(`[PREAMBLE] leader→warble at sym ${Math.floor(this.samplesSeen/this.sps)}`);
+      }
+
+      if (this.preamblePhase === 'warble' && this.dominantTones.length >= 6) {
+        // Warble: tone should change every frame. Calibrate: same tone for 4+ frames.
+        const recent = this.dominantTones.slice(-6);
+        const sameCount = recent.filter(t => t === recent[recent.length - 1]).length;
+        if (sameCount >= 3) {
+          this.preamblePhase = 'calibrate';
+          this.calibrateCount = 0;
+          console.warn(`[PREAMBLE] warble→calibrate at sym ${Math.floor(this.samplesSeen/this.sps)}`);
+        }
+      }
+
+      if (this.preamblePhase === 'calibrate') {
+        this.calibrateCount++;
+        // After calibrate (16 frames), all tones go quiet briefly then data starts with all ON
+        // Detect: calibrate phase ends when max energy drops (transition to data)
+        if (this.calibrateCount >= 14 && isBurst && total > this.noiseFloor.reduce((a,b)=>a+b,0) * 2) {
+          // Check if all tones are strong (data phase signature)
+          const strongToneCount = energies.filter(e => e > noiseRef * 3).length;
+          if (strongToneCount >= this.cfg.toneCount) {
+            this.preamblePhase = 'data';
+            this.inFrame = true;
+            this.frameSkip = 0; // No skip needed — pattern-based alignment
+            this.framesSinceStrong = 0;
+            this.dataFramesExecuted = 0;
+            this.lastStrongBitsCollected = 0;
+            this.framesSinceExit = 0;
+            this.framedDecoder.reset();
+            this.blockProcessor.reset();
+            console.warn(`[PREAMBLE] calibrate→DATA at sym ${Math.floor(this.samplesSeen/this.sps)}`);
+          }
+        }
+      }
     }
 
-    if (strong && !this.inFrame && this.consecutiveSync >= 3) {
-      for (let t = 0; t < 4; t++) {
-        if (energies[t] > this.syncPeak[t]) this.syncPeak[t] = energies[t];
-      }
-    } else if (!strong && !this.inFrame) {
-      const noiseRef = Math.max(...this.noiseMax) * 2;
-      for (let t = 0; t < 4; t++) {
-        this.syncPeak[t] = Math.max(this.syncPeak[t] * 0.95, noiseRef);
-      }
-    }
-
-    if (strong) {
-      this.consecutiveSync++;
-    } else {
-      this.consecutiveSync = 0;
-      if (!this.inFrame) this.frameSkip = 0;
-    }
-
-    // ── Debug log ──
-    if (this.logging || debugLogger.getTotalEvents() % 10 === 0) {
-      // Log sync state at INFO level every ~10 frames
-      if (this.inFrame || strong) {
-        debugLogger.info(STAGE.SYNC_DETECT, {
-          consecutive: this.consecutiveSync,
-          in_frame: this.inFrame,
-          strong,
-          avg: avg.toExponential(2),
-          burst_thr: burstThresh.toExponential(2),
-          peak_ratio: energies.map(e => (total > 1e-12 ? (e / total) : 0).toFixed(3)).join('/'),
-          noise_frames: this.noiseFrames,
-          pilot_freq: this.pilotFreq.toFixed(1),
-        }, `SYNC ${strong ? 'STRONG' : 'weak'} consecutive=${this.consecutiveSync} avg=${avg.toExponential(2)} nf=${this.noiseFrames} fse=${this.framesSinceExit}`);
-      }
-    }
+    // Legacy debug log (keep for compatibility)
     if (this.logging) {
       const thresholds: [number, number, number, number] = [0, 0, 0, 0];
       let bitPat = 0;
@@ -405,71 +425,24 @@ export class Decoder {
       const totalBits = this.framedDecoder.totalBits;
       this.debugLog.push({
         peakAmp: Math.max(...window.map(Math.abs)),
-        relI: [...relI],
-        relQ: [...relQ],
-        energies,
-        avg,
-        ratios: totalEDbg > 1e-12
-          ? energies.map((e: number) => e / totalEDbg) as [number, number, number, number]
-          : [0, 0, 0, 0],
+        relI: [...relI], relQ: [...relQ], energies, avg,
+        ratios: totalEDbg > 1e-12 ? energies.map((e: number) => e / totalEDbg) as [number,number,number,number] : [0,0,0,0],
         noiseAvg,
-        strong,
+        strong: isBurst,
         consecutiveSync: this.consecutiveSync,
         inFrame: this.inFrame,
         bitsCollected: totalBits,
-        noiseFloor: [...this.noiseFloor],
-        noiseMax: [...this.noiseMax],
-        thresholds,
-        noiseFrames: this.noiseFrames,
-        bitPattern: bitPat,
-        signalToNoise: snr,
+        noiseFloor: [...this.noiseFloor], noiseMax: [...this.noiseMax], thresholds,
+        noiseFrames: this.noiseFrames, bitPattern: bitPat, signalToNoise: snr,
         burstThreshold: burstThresh,
         framesSinceStrong: this.framesSinceStrong,
         framesSinceExit: this.framesSinceExit,
         frameSkip: this.frameSkip,
-        pilotFreq: this.pilotFreq,
-        pilotAmp: this.pilotAmplitude,
+        pilotFreq: this.pilotFreq, pilotAmp: this.pilotAmplitude,
         pilotConfidence: this.pilotDiscovered ? 1 : 0,
-        rawEnergies: [0, 0, 0, 0],
+        rawEnergies: [0,0,0,0],
       });
       if (this.debugLog.length > 200) this.debugLog.shift();
-    }
-
-    // ── Enter data mode ──
-    // Two paths: sync-based (anyToneStrong + totalAboveNoise) or pilot-based (strong pilot + energy present)
-    const syncPath = this.consecutiveSync >= 8 && this.noiseFrames >= 25;
-    const pilotPath = this.pilotDiscovered && this.noiseFrames >= 25 &&
-      this.pilotAmplitude > 0.02 && total > 0.01;
-    // Debug: log enter-data-mode conditions every 50 frames
-    if ((this.samplesSeen / this.sps | 0) % 50 === 0 && !this.inFrame) {
-      console.warn(`[CAN_ENTER] cons=${this.consecutiveSync} nf=${this.noiseFrames} fse=${this.framesSinceExit} pilot=${this.pilotDiscovered} pilotAmp=${this.pilotAmplitude.toExponential(2)} total=${total.toExponential(2)} noiseFloorSum=${this.noiseFloor.reduce((a,b)=>a+b,0).toExponential(2)}`);
-    }
-    const canEnter = this.fastSync
-      ? (this.pilotDiscovered && this.consecutiveSync >= 8 && this.noiseFrames >= 25 && this.pilotAmplitude > 0.02)
-      : (syncPath && (this.framesSinceExit >= 50 || this.consecutiveSync >= 10));
-    if (canEnter && !this.inFrame) {
-      this.inFrame = true;
-      this.framesSinceStrong = 0;
-      this.dataFramesExecuted = 0;
-      this.lastStrongBitsCollected = 0;
-      this.framesSinceExit = 0;
-      this.framedDecoder.reset();
-      this.blockProcessor.reset();
-      // Skip remaining sync frames to land on first data symbol
-      // Skip remaining sync + all calibrate frames to land on first data symbol.
-      // Calibrate is 4 tones × 4 frames each = 16 symbols.
-      this.frameSkip = Math.max(0, this.cfg.syncSymbols - this.consecutiveSync) + (this.cfg.toneCount * 4);
-      if (this.logging) {
-        console.log("[DEC] SYNC DETECTED — entering data mode", {
-          pilotFreq: this.pilotFreq.toFixed(1),
-          pilotAmp: this.pilotAmplitude.toExponential(2),
-          toneFreqs: this.toneFreqs.map(f => f.toFixed(1)),
-          noiseFrames: this.noiseFrames,
-          consecutiveSync: this.consecutiveSync,
-          frameSkip: this.frameSkip,
-          energies: energies.map(e => e.toExponential(2)),
-        });
-      }
     }
 
     // ── Decode bits ──
