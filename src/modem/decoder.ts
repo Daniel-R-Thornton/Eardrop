@@ -456,7 +456,7 @@ export class Decoder {
       this.framedDecoder.reset();
       this.blockProcessor.reset();
       // Skip remaining sync frames to land on first data symbol
-      this.frameSkip = Math.max(0, this.cfg.syncSymbols - this.consecutiveSync + 1);
+      this.frameSkip = Math.max(0, this.cfg.syncSymbols - this.consecutiveSync);
       if (this.logging) {
         console.log("[DEC] SYNC DETECTED — entering data mode", {
           pilotFreq: this.pilotFreq.toFixed(1),
