@@ -304,7 +304,7 @@ export class RxEngine {
         return;
       }
       // After cal180: wait for energy to drop significantly (guard trough)
-      if (this.cal180Seen && totalE < this.cal180Energy * 0.6) {
+      if (this.cal180Seen && totalE < Math.max(this.cal180Energy * 0.15, 0.015)) {
         console.warn(`[GUARD] E=${totalE.toExponential(2)} (cal180 was ${this.cal180Energy.toExponential(2)})`);
         this.state = RxState.FRAMES;
         this.fileData = [];
