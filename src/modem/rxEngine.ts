@@ -168,6 +168,7 @@ export class RxEngine {
   // State machine
   private state: RxState = RxState.WAITING;
   private warbleFrames = 0;
+  private preambleFrames = 0;
   private markerSeen = false;
   private cal0Seen = false;
   private cal180Seen = false;
@@ -237,7 +238,7 @@ export class RxEngine {
       const eHigh = Math.hypot(wHigh.i, wHigh.q);
       const eTot = eLow + eHigh;
       
-      if (eTot > 0.01) {
+      if (eTot > 0.015) {
         this.warbleFrames++;
         if (this.warbleFrames === 1) console.warn(`[WARBLE] frame 0 eLow=${eLow.toExponential(2)} eHigh=${eHigh.toExponential(2)}`);
         if (this.warbleFrames === 2) console.warn(`[WARBLE] frame 1 eLow=${eLow.toExponential(2)} eHigh=${eHigh.toExponential(2)}`);
@@ -256,6 +257,20 @@ export class RxEngine {
     if (this.state === RxState.PREAMBLE) {
       const signs = rawIQs.map(r => r.i >= 0 ? '+' : '-').join('');
       if (totalE > this.markerPeakE) this.markerPeakE = totalE;
+      this.preambleFrames++;
+      // Timeout: if no marker found within 80 frames (~3.2s), reset to WAITING
+      if (this.preambleFrames > 80) {
+        console.warn(`[PREAMBLE] Timeout after ${this.preambleFrames} frames, resetting`);
+        this.state = RxState.WAITING;
+        this.warbleFrames = 0;
+        this.markerSeen = false;
+        this.cal0Seen = false;
+        this.cal180Seen = false;
+        this.preambleFrames = 0;
+        this.markerPeakE = 0;
+        this.buf = [];
+        return;
+      }
       
       // Detect marker: energy jumps high (all 4 tones ON) — use 3× warble energy
       if (totalE > Math.max(this.markerPeakE * 3, 0.03) && !this.markerSeen) {
@@ -365,6 +380,7 @@ export class RxEngine {
     this.state = RxState.WAITING;
     this.warbleFrames = 0;
     this.markerSeen = false;
+    this.preambleFrames = 0;
     this.cal0Seen = false;
     this.cal180Seen = false;
     this.markerPeakE = 0;
