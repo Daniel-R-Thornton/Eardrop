@@ -382,8 +382,8 @@ export class Decoder {
         const allSame = recent.length >= 4 && recent.every(t => t === recent[0]);
         if (allSame) {
           this.preamblePhase = 'calibrate';
-          this.calibrateCount = 0;
-          console.warn(`[PREAMBLE] warble→calibrate at sym ${Math.floor(this.samplesSeen/this.sps)}`);
+          this.calibrateCount = 4; // 4 frames already detected (last 4 dominant tones)
+          console.warn(`[PREAMBLE] warble→calibrate at sym ${Math.floor(this.samplesSeen/this.sps)} (count=${this.calibrateCount})`);
         }
       }
 
