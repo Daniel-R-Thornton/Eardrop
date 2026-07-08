@@ -102,6 +102,7 @@ broadcastWorker.onmessage = (e) => {
       break;
     }
     case "decoderState": {
+      const prevInFrame = wasInFrame;
       if (msg.debugInfo && msg.debugInfo.inFrame && !wasInFrame) {
         decodedAccumulated = [];
         totalDecoded = 0;
@@ -133,7 +134,7 @@ broadcastWorker.onmessage = (e) => {
         setState({ debug });
 
         // Generate diagnostics when data mode ends
-        if (wasInFrame && !d.inFrame) {
+        if (prevInFrame && !d.inFrame) {
           const msgs: string[] = [];
           const snr = d.signalToNoise || 0;
           const nf = d.noiseFloor || [0,0,0,0];
