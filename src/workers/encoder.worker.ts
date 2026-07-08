@@ -3,62 +3,30 @@
  *
  * Messages (main → worker):
  *   { type: 'encode',         id, data: Uint8Array, config? }
- *   { type: 'encodeToOutput', id, data: Uint8Array, outputRate, config? }
+ *   { type: 'transmitFile',   id, fileName: string, data: Uint8Array, config? }
  *
  * Messages (worker → main):
  *   { type: 'encoded', id, samples: ArrayBuffer, sampleRate }
  *   { type: 'error',   id, error: string }
  */
 
-import { Encoder } from "../modem/encoder";
+import { TxEngine } from "../modem/txEngine";
 import { DEFAULT_CONFIG, type ModemConfig } from "../modem/types";
 
-interface EncodeTask {
-  type: "encode";
-  id: number;
-  data: Uint8Array;
-  config?: Partial<ModemConfig>;
-}
-
-interface EncodeToOutputTask {
-  type: "encodeToOutput";
-  id: number;
-  data: Uint8Array;
-  outputRate: number;
-  config?: Partial<ModemConfig>;
-}
-
-type Task = EncodeTask | EncodeToOutputTask;
-
-self.onmessage = (e: MessageEvent<Task>) => {
+self.onmessage = (e: MessageEvent) => {
   const msg = e.data;
 
   try {
-    const encoder = new Encoder(msg.config ?? DEFAULT_CONFIG);
-
-    if (msg.type === "encode") {
-      const samples = encoder.encode(msg.data);
+    if (msg.type === "transmitFile") {
+      const tx = new TxEngine(msg.config ?? DEFAULT_CONFIG);
+      const samples = tx.transmitFile(msg.fileName, new Uint8Array(msg.data));
       const sampleRate = msg.config?.sampleRate ?? DEFAULT_CONFIG.sampleRate;
       self.postMessage(
-        {
-          type: "encoded",
-          id: msg.id,
-          samples: samples.buffer as ArrayBuffer,
-          sampleRate,
-        },
+        { type: "encoded", id: msg.id, samples: samples.buffer, sampleRate },
         { transfer: [samples.buffer] },
       );
-    } else if (msg.type === "encodeToOutput") {
-      const samples = encoder.encodeToOutputRate(msg.data, msg.outputRate);
-      self.postMessage(
-        {
-          type: "encoded",
-          id: msg.id,
-          samples: samples.buffer as ArrayBuffer,
-          sampleRate: msg.outputRate,
-        },
-        { transfer: [samples.buffer] },
-      );
+    } else {
+      self.postMessage({ type: "error", id: msg.id, error: `Unknown type: ${msg.type}` });
     }
   } catch (err: any) {
     self.postMessage({ type: "error", id: msg.id, error: err.message });

@@ -1,28 +1,14 @@
 /**
- * BroadcastWorker — offloads the receive (decoder) pipeline to a dedicated thread.
+ * BroadcastWorker — receives audio, feeds RxEngine, emits completed files.
  */
 
-import { Decoder } from "../modem/decoder";
-import { DEFAULT_CONFIG, type ModemConfig } from "../modem/types";
-import { debugLogger } from "../modem/debugger";
+import { RxEngine } from "../modem/rxEngine";
+import { DEFAULT_CONFIG } from "../modem/types";
 
 const DEBUG = true;
-if (!DEBUG) {
-  // Override console methods to no-op.
-  console.log = function() {};
-  console.error = function() {};
-}
 
-let decoder: Decoder | null = null;
+let rx: RxEngine | null = null;
 let stateInterval: ReturnType<typeof setInterval> | null = null;
-let rawAccum: number[] = [];
-let frameCount = 0;
-
-function hex(bytes: Uint8Array, max = 16): string {
-  const slice = bytes.slice(0, max);
-  const h = Array.from(slice).map((b) => b.toString(16).padStart(2, "0")).join(" ");
-  return bytes.length > max ? `${h} … (${bytes.length}B)` : h;
-}
 
 if (DEBUG) console.log("[RX] worker module loaded");
 
@@ -32,61 +18,24 @@ self.onmessage = (e: MessageEvent) => {
 
   switch (msg.type) {
     case "startListening": {
-      if (decoder) return;
+      if (rx) return;
       if (DEBUG) console.log("[RX] start listening");
-      decoder = new Decoder(msg.config ?? DEFAULT_CONFIG);
-      decoder.logging = true;
-      decoder.fastSync = msg.fastSync ?? false;
-      decoder.reset();
-      frameCount = 0;
+      rx = new RxEngine(msg.config ?? DEFAULT_CONFIG);
 
-      decoder.onFrame = (data: Uint8Array) => {
-        frameCount++;
-        if (DEBUG) console.log(`[RX] frame #${frameCount}: ${data.length}B hex=${hex(data)}`);
-        for (const b of data) {
-          rawAccum.push(b);
-          if (rawAccum.length > 128) rawAccum.shift();
-        }
-        self.postMessage(
-          { type: "frame", data: data.buffer as ArrayBuffer },
-          { transfer: [data.buffer] },
-        );
-      };
-      decoder.reset();
-      rawAccum = [];
-
+      // Poll for completed file every 200ms
       stateInterval = setInterval(() => {
-        if (!decoder) return;
-        const log = decoder.debugLog;
-        const last = log[log.length - 1];
-        const recentLog = log.slice(-3);
-
-        // Periodic console summary every 2s (every 10th tick at 200ms)
-        if (frameCount > 0 && frameCount % 10 === 0) {
-          const info = last;
-          if (info) {
-            const nf = info.noiseFloor.map((n: number) => n.toFixed(4)).join(" ");
-            const en = info.energies.map((e: number) => e.toFixed(4)).join(" ");
-            if (DEBUG) console.log(
-              `[RX] frame=${frameCount} sync=${info.consecutiveSync}` +
-              ` inFrame=${info.inFrame} bits=${info.bitsCollected}` +
-              ` noise=[${nf}] eng=[${en}] strong=${info.strong}`
-            );
-          }
+        if (!rx) return;
+        const file = rx.getFile();
+        if (file) {
+          if (DEBUG) console.log(`[RX] file complete: "${file.fileName}" ${file.data.length}B`);
+          self.postMessage(
+            { type: "fileComplete", fileName: file.fileName, data: file.data.buffer },
+            { transfer: [file.data.buffer] },
+          );
         }
-
-        // Drain debug events from this worker's debugLogger to ship to main thread
-        const debugEvents = debugLogger.drain();
-
         self.postMessage({
           type: "decoderState",
-          bitsCollected: decoder.getProgress(),
-          hasData: decoder.hasData(),
-          debugInfo: last ?? null,
-          debugTrace: decoder.debugTrace.slice(-50),
-          recentLog,
-          rawBytes: new Uint8Array(rawAccum).buffer as ArrayBuffer,
-          debugEvents,
+          state: rx.getState(),
         });
       }, 200);
 
@@ -94,65 +43,20 @@ self.onmessage = (e: MessageEvent) => {
       break;
     }
 
-    case "setExpectedTotal": {
-      if (decoder) decoder.setExpectedTotal(msg.count);
-      break;
-    }
-
-    case "updateThresholds": {
-      if (decoder) {
-        if (msg.ampRatio !== undefined) decoder.liveAmpThresholdRatio = msg.ampRatio;
-        if (msg.syncMul !== undefined) decoder.liveSyncStrongMultiplier = msg.syncMul;
-      }
-      break;
-    }
-
     case "feedSample": {
-      if (!decoder) return;
-      decoder.feedSample(msg.sample);
+      if (!rx) return;
+      rx.feedSample(msg.sample);
       break;
     }
 
     case "stopListening": {
-      if (DEBUG) console.log(`[RX] stop listening — ${rawAccum.length} raw bytes accumulated`);
+      if (DEBUG) console.log("[RX] stop listening");
       if (stateInterval) {
         clearInterval(stateInterval);
         stateInterval = null;
       }
-      if (decoder) {
-        const remaining = decoder.flush();
-        if (remaining.length > 0) {
-          if (DEBUG) console.log(`[RX] flush: ${remaining.length}B hex=${hex(remaining)}`);
-          for (const b of remaining) {
-            rawAccum.push(b);
-            if (rawAccum.length > 128) rawAccum.shift();
-          }
-          self.postMessage(
-            { type: "frame", data: remaining.buffer as ArrayBuffer },
-            { transfer: [remaining.buffer] },
-          );
-        }
-        decoder = null;
-      }
+      rx = null;
       self.postMessage({ type: "stopped" });
-      break;
-    }
-
-    case "flush": {
-      if (decoder) {
-        const remaining = decoder.flush();
-        if (remaining.length > 0) {
-          if (DEBUG) console.log(`[RX] flush: ${remaining.length}B hex=${hex(remaining)}`);
-          for (const b of remaining) {
-            rawAccum.push(b);
-            if (rawAccum.length > 128) rawAccum.shift();
-          }
-          self.postMessage(
-            { type: "frame", data: remaining.buffer as ArrayBuffer },
-            { transfer: [remaining.buffer] },
-          );
-        }
-      }
       break;
     }
   }
