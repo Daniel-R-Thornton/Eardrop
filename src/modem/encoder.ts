@@ -265,7 +265,9 @@ export class Encoder {
     this.wobblePhase += this.WOBBLE_RATE / sampleRate;
     if (this.wobblePhase >= 1.0) this.wobblePhase -= 1.0;
     const wobble = 1.0 - this.WOBBLE_DEPTH * 0.5 + this.WOBBLE_DEPTH * 0.5 * Math.sin(2 * Math.PI * this.wobblePhase);
-    return output * wobble + noise;
+    const out = output * wobble + noise;
+    // Clamp to [-1, 1] to prevent speaker/mic clipping
+    return Math.max(-1, Math.min(1, out));
   }
 
   private advancePhase() {

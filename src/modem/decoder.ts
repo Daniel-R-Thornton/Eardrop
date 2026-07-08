@@ -114,6 +114,10 @@ export class Decoder {
   private noiseFloor: [number, number, number, number] = [0, 0, 0, 0];
   private noiseMax: [number, number, number, number] = [0, 0, 0, 0];
   private noiseFrames = 0;
+  /** Noise magnitude history for stability detection (last 10 frames) */
+  private noiseHistory: Float64Array;
+  private noiseHistoryIdx = 0;
+  private noiseStable = false;
 
   // End detection
   private framesSinceStrong = 0;
@@ -226,6 +230,9 @@ export class Decoder {
     this.noiseFloor = [3e-10, 3e-10, 3e-10, 3e-10];
     this.noiseMax = [3e-10, 3e-10, 3e-10, 3e-10];
     this.noiseFrames = this.fastSync ? 25 : 0;
+    this.noiseHistory = new Float64Array(10);
+    this.noiseHistoryIdx = 0;
+    this.noiseStable = false;
     this.framesSinceStrong = 0;
     this.lastStrongBitsCollected = 0;
     this.syncPeak = [2e-10, 2e-10, 2e-10, 2e-10];
@@ -270,7 +277,12 @@ export class Decoder {
     // ── Pilot discovery — use configured frequency, but wait for leader to pass ──
     // Leader is ~12 symbols of pilot-only. We need to be past it before sync can begin.
     // Require at least 12*128=1536 samples before declaring pilot discovered.
-    if (!this.pilotDiscovered && !this.inFrame && this.noiseFrames >= 20 && this.samplesSeen > 12 * this.sps) {
+    // Dynamic pilot discovery: wait for either sufficient profiling or stability
+    // with at least minimal frames, and past leader phase.
+    const profilingReady = this.fastSync ||
+      this.noiseFrames >= 12 ||
+      (this.noiseStable && this.noiseFrames >= 8);
+    if (!this.pilotDiscovered && !this.inFrame && profilingReady && this.samplesSeen > 12 * this.sps) {
       this.pilotDiscovered = true;
       this.pilotFreq = this.cfg.pilotFreqHz;
       this.pilotAmplitude = 0.05;
@@ -346,7 +358,11 @@ export class Decoder {
     }
 
     // ── Noise profiling ──
-    if (!this.inFrame) {
+    // ── Dynamic noise profiling with early exit ──
+    // Profiles until noise floor stabilizes (std-dev < 20% over last 5 frames)
+    // or up to 25 frames max. Decoupled from pilot discovery — pilot can be
+    // discovered once we have enough data, regardless of profiling status.
+    if (!this.inFrame && !this.noiseStable) {
       this.framesSinceExit++;
       if (this.noiseFrames < 25) {
         this.noiseFrames++;
@@ -359,6 +375,34 @@ export class Decoder {
             this.noiseMax[t] *= 0.9999;
           }
         }
+
+        // Stability detection: track average noise magnitude and check variance
+        if (this.noiseFrames >= 5) {
+          const avgNoise = (this.noiseFloor[0] + this.noiseFloor[1] + this.noiseFloor[2] + this.noiseFloor[3]) / 4;
+          this.noiseHistory[this.noiseHistoryIdx % 10] = avgNoise;
+          this.noiseHistoryIdx++;
+
+          if (this.noiseHistoryIdx >= 5) {
+            const count = Math.min(this.noiseHistoryIdx, 10);
+            let sum = 0, sumSq = 0;
+            for (let i = 0; i < count; i++) {
+              const v = this.noiseHistory[i];
+              sum += v;
+              sumSq += v * v;
+            }
+            const mean = sum / count;
+            const variance = count > 1 ? (sumSq - sum * sum / count) / (count - 1) : 0;
+            const stdDev = Math.sqrt(Math.max(0, variance));
+            // Exit early if noise floor stabilizes (std-dev < 20% of mean)
+            if (mean > 1e-15 && (stdDev / mean) < 0.20) {
+              this.noiseStable = true;
+              if (this.logging) console.log(`[NOISE] Stable at frame ${this.noiseFrames} (std/mean=${(stdDev/mean*100).toFixed(1)}%)`);
+            }
+          }
+        }
+      } else {
+        // Reached 25 frame max — force stable
+        this.noiseStable = true;
       }
     }
 

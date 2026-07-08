@@ -13,6 +13,7 @@
 
 import { describe, it, expect, beforeAll } from "vitest";
 import { TestHarness } from "./testHarness";
+import { DEFAULT_CONFIG } from "./types";
 
 // Increase timeout for full pipeline tests (encoding 128+ bytes takes time)
 const TEST_TIMEOUT = 60000;
@@ -46,8 +47,9 @@ describe("Modem Pipeline", () => {
 
     it("should discover pilot frequency accurately", async () => {
       const result = await harness.runCleanTest({ payloadBytes: 64 });
-      expect(result.metrics.pilotFreq).toBeGreaterThan(60);
-      expect(result.metrics.pilotFreq).toBeLessThan(65);
+      // Pilot frequency should match the configured default
+      expect(result.metrics.pilotFreq).toBeGreaterThan(DEFAULT_CONFIG.pilotFreqHz * 0.95);
+      expect(result.metrics.pilotFreq).toBeLessThan(DEFAULT_CONFIG.pilotFreqHz * 1.05);
     }, TEST_TIMEOUT);
   });
 
