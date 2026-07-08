@@ -110,6 +110,7 @@ class SentinelScanner {
         for (let i = 0; i < this.buf.length && i < FRAME_SIZE - 3; i++) {
           fullFrame[3 + i] = this.buf[i];
         }
+        console.warn(`[RX-SCAN] Frame collected: ${this.buf.length}B (expect ${FRAME_SIZE-3})`);
         if (this.onFrame) {
           this.onFrame(fullFrame);
         }
@@ -121,6 +122,12 @@ class SentinelScanner {
       this.byteBits = 0;
       this.buf = [];
       this.bitsCollected = 0;
+      console.warn(`[RX-SCAN] Sentinel found at bit ${this.bitCount}, collecting ${FRAME_SIZE-3} bytes...`);
+    }
+    
+    // Debug: log every 1000 bits scanned without hit
+    if (this.bitCount > 0 && this.bitCount % 1000 === 0 && !this.collecting) {
+      console.warn(`[RX-SCAN] ${this.bitCount} bits scanned, no sentinel (sr=0x${this.shiftReg.toString(16)})`);
     }
   }
 
@@ -181,11 +188,13 @@ export class RxEngine {
     this.scanner = new SentinelScanner();
 
     this.scanner.onFrame = (frame: Uint8Array) => {
+      console.warn(`[RX] Frame received from scanner (${frame.length}B), processing...`);
       this.processFrame(frame);
     };
   }
 
   // ─── Public API ──────────────────────────────────────
+  private dbgFrameCount = 0;
 
   feedSample(sample: number): void {
     this.samplesSeen++;
@@ -195,6 +204,7 @@ export class RxEngine {
       this.pll = new PilotPLL(this.cfg.pilotFreqHz, 0, 0.05, {
         sampleRate: this.cfg.sampleRate,
       });
+      console.warn(`[RX] PLL init: pilotFreq=${this.cfg.pilotFreqHz}Hz`);
     }
 
     // Feed EVERY sample to the PLL for continuous phase tracking
@@ -204,7 +214,8 @@ export class RxEngine {
     // Skip preamble (samples 0 through 1983). The preamble is always at the
     // start of the audio. samplesSeen starts at 1 on the first call.
     if (this.samplesSeen <= PREAMBLE_SAMPLES) {
-      // Still in preamble — don't buffer for frame scanning
+      if (this.samplesSeen === 1) console.warn(`[RX] Preamble: ${PREAMBLE_SAMPLES}samp to skip`);
+      if (this.samplesSeen === 1000) console.warn(`[RX] Preamble: 1000/1984 samples done, pilotAmp=${this.pilotAmplitude.toExponential(2)}`);
       return;
     }
     
@@ -220,6 +231,7 @@ export class RxEngine {
       this.fileName = '';
       this.fileSize = 0;
       this.totalFrames = 0;
+      console.warn(`[RX] Preamble done, entering FRAMES state at sample ${this.samplesSeen}, pilotAmp=${this.pilotAmplitude.toExponential(2)}`);
     }
 
     // ── Frame scanning: buffer samples and demodulate ──
@@ -237,6 +249,13 @@ export class RxEngine {
       const bit = rawIQs[t].i < 0 ? 1 : 0;
       frameBits |= (bit) << (7 - t * 2);
       frameBits |= (1) << (6 - t * 2);
+    }
+    
+    // Debug: log first few frames
+    this.dbgFrameCount++;
+    if (this.dbgFrameCount <= 5) {
+      const energies = rawIQs.map(r => Math.hypot(r.i, r.q).toExponential(2)).join(',');
+      console.warn(`[RX] Frame ${this.dbgFrameCount}: bits=0x${frameBits.toString(16).padStart(2,'0')} I=${rawIQs.map(r=>r.i.toFixed(3)).join(',')} eng=[${energies}]`);
     }
 
     this.bchBuf.push(frameBits);
@@ -289,16 +308,20 @@ export class RxEngine {
 
   private processFrame(frame: Uint8Array): void {
     const decoded = decodeFrame(frame);
+    console.warn(`[RX] processFrame: valid=${decoded.valid} type=${decoded.header?.type} payload=${decoded.payload?.length}B`);
     if (!decoded.valid) return;
 
     switch (decoded.header!.type) {
       case 0x01: // HEADER
+        console.warn(`[RX] HEADER frame received`);
         this.processHeader(decoded.payload);
         break;
       case 0x02: // PAYLOAD
+        console.warn(`[RX] PAYLOAD frame #${this.framesReceived+1}`);
         this.processPayload(decoded.payload);
         break;
       case 0x03: // TAIL
+        console.warn(`[RX] TAIL frame — assembling ${this.fileData.length}/${this.fileSize}B file`);
         this.processTail();
         break;
     }
