@@ -456,7 +456,9 @@ export class Decoder {
       this.framedDecoder.reset();
       this.blockProcessor.reset();
       // Skip remaining sync frames to land on first data symbol
-      this.frameSkip = Math.max(0, this.cfg.syncSymbols - this.consecutiveSync);
+      // Skip remaining sync + all calibrate frames to land on first data symbol.
+      // Calibrate is 4 tones × 4 frames each = 16 symbols.
+      this.frameSkip = Math.max(0, this.cfg.syncSymbols - this.consecutiveSync) + (this.cfg.toneCount * 4);
       if (this.logging) {
         console.log("[DEC] SYNC DETECTED — entering data mode", {
           pilotFreq: this.pilotFreq.toFixed(1),
@@ -511,12 +513,8 @@ export class Decoder {
         console.warn(`[BPSK] frm=${this.dataFramesExecuted} sym=${Math.floor(this.samplesSeen/this.sps)} bits=${dbgBits.join('')} hex=0x${frameBits.toString(16).padStart(2,'0')} I=[${relI.map(v=>v.toFixed(3)).join(',')}] flip=[${this.calPhaseFlip.join(',')}]`);
       }
 
-      // Reset bchBuf alignment on first strong frame to avoid preamble skew
-      const isStrong = Math.max(Math.abs(relI[0]), Math.abs(relI[1]), Math.abs(relI[2]), Math.abs(relI[3])) > 0.01;
-      if (isStrong && this.dataFramesExecuted <= 4 && this.bchBufCount > 0) {
-        this.bchBuf = [];
-        this.bchBufCount = 0;
-      }
+      // Calibrate phase (16 symbols) ensures bchBuf starts aligned with data.
+      // No need for runtime reset.
 
       // Pack frame bytes into block bytes.
       // 4-tone: 2 frames × 4 bits → 1 byte.  2-tone: 4 frames × 2 bits → 1 byte.

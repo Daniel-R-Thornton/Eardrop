@@ -14,7 +14,7 @@ import { ModemConfig, TONE_OFFSETS, MUSICAL_OFFSETS, DEFAULT_CONFIG } from "./ty
 import { encodeBlock, BLOCK_TYPE, getSentinel } from "./framing";
 import { encodeSquawkPayload } from "./squawk";
 
-enum Phase { kLeader, kSync, kData, kDone }
+enum Phase { kLeader, kSync, kCalibrate, kData, kDone }
 
 export class Encoder {
   private cfg: ModemConfig;
@@ -159,7 +159,8 @@ export class Encoder {
     const dataSamples = dataSymbols * this.sps;
     const leaderSamples = this.leaderSamps || Math.floor(this.cfg.sampleRate / 2 / this.sps) * this.sps;
     const syncSamples = this.cfg.syncSymbols * this.sps;
-    return leaderSamples + syncSamples + dataSamples + this.sps * 6;
+    const calSamples = 4 * 4 * this.sps; // 4 tones × 4 frames each = calibrate
+    return leaderSamples + syncSamples + calSamples + dataSamples + this.sps * 6;
   }
 
   private generateSample(): number {
@@ -194,6 +195,22 @@ export class Encoder {
         if (this.samplesInPhase >= this.sps * this.cfg.syncSymbols) {
           this.advancePhase();
         }
+        break;
+      }
+
+      case Phase.kCalibrate: {
+        // Send each tone ON for 4 frames at 0° phase — decoder measures gain & phase ref
+        const calSymIdx = Math.floor(this.samplesInPhase / this.sps);
+        const calTone = Math.min(numTones - 1, Math.floor(calSymIdx / 4));
+        for (let t = 0; t < numTones; t++) {
+          this.tonePhases[t] += this.toneFreqs[t] / sampleRate;
+          if (this.tonePhases[t] >= 1.0) this.tonePhases[t] -= 1.0;
+          const amp = t === calTone ? dataToneAmplitude : 0;
+          output += Math.sin(2 * Math.PI * this.tonePhases[t]) * amp;
+          this.bpskMul[t] = t === calTone ? 1 : 0;
+        }
+        this.samplesInPhase++;
+        if (this.samplesInPhase >= 4 * 4 * this.sps) this.advancePhase();
         break;
       }
 
