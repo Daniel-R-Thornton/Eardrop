@@ -169,6 +169,8 @@ export class RxEngine {
   private state: RxState = RxState.WAITING;
   private warbleFrames = 0;
   private preambleFrames = 0;
+  private warbleThreshold = 0.025;
+  private warbleTimeoutCount = 0;
   private markerSeen = false;
   private cal0Seen = false;
   private cal180Seen = false;
@@ -238,7 +240,7 @@ export class RxEngine {
       const eHigh = Math.hypot(wHigh.i, wHigh.q);
       const eTot = eLow + eHigh;
       
-      if (eTot > 0.015) {
+      if (eTot > this.warbleThreshold) {
         this.warbleFrames++;
         if (this.warbleFrames === 1) console.warn(`[WARBLE] frame 0 eLow=${eLow.toExponential(2)} eHigh=${eHigh.toExponential(2)}`);
         if (this.warbleFrames === 2) console.warn(`[WARBLE] frame 1 eLow=${eLow.toExponential(2)} eHigh=${eHigh.toExponential(2)}`);
@@ -260,7 +262,10 @@ export class RxEngine {
       this.preambleFrames++;
       // Timeout: if no marker found within 80 frames (~3.2s), reset to WAITING
       if (this.preambleFrames > 80) {
-        console.warn(`[PREAMBLE] Timeout after ${this.preambleFrames} frames, resetting`);
+        this.warbleTimeoutCount++;
+        const newThreshold = 0.025 * Math.pow(1.5, this.warbleTimeoutCount);
+        console.warn(`[PREAMBLE] Timeout #${this.warbleTimeoutCount}, raising threshold to ${newThreshold.toExponential(2)}`);
+        this.warbleThreshold = newThreshold;
         this.state = RxState.WAITING;
         this.warbleFrames = 0;
         this.markerSeen = false;
@@ -272,8 +277,8 @@ export class RxEngine {
         return;
       }
       
-      // Detect marker: energy jumps high (all 4 tones ON) — use 3× warble energy
-      if (totalE > Math.max(this.markerPeakE * 3, 0.03) && !this.markerSeen) {
+      // Detect marker: all 4 tones ON produces distinctly high energy
+      if (totalE > 0.08 && !this.markerSeen) {
         this.markerSeen = true;
         console.warn(`[MARKER] E=${totalE.toExponential(2)} signs=[${signs}]`);
         return;
@@ -297,7 +302,7 @@ export class RxEngine {
         return;
       }
       // After cal180: wait for energy to drop below 33% of peak (guard trough)
-      if (this.cal180Seen && totalE < Math.max(this.markerPeakE * 0.10, 0.008)) {
+      if (this.cal180Seen && totalE < 0.02) {
         console.warn(`[GUARD] E=${totalE.toExponential(2)} (peak was ${this.markerPeakE.toExponential(2)})`);
         this.state = RxState.FRAMES;
         this.fileData = [];
@@ -379,6 +384,8 @@ export class RxEngine {
   reset(): void {
     this.state = RxState.WAITING;
     this.warbleFrames = 0;
+    this.warbleThreshold = 0.025;
+    this.warbleTimeoutCount = 0;
     this.markerSeen = false;
     this.preambleFrames = 0;
     this.cal0Seen = false;
