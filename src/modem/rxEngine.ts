@@ -171,7 +171,7 @@ export class RxEngine {
   private markerSeen = false;
   private cal0Seen = false;
   private cal180Seen = false;
-  private peakEnergy = 0;
+  private markerPeakE = 0;
 
   // File assembly
   private fileID = 0;
@@ -229,19 +229,29 @@ export class RxEngine {
     const rawIQs = this.toneFreqs.map(f => toneIQ(window, f, this.cfg.sampleRate));
     const totalE = rawIQs.reduce((a, r) => a + Math.hypot(r.i, r.q), 0);
     
-    // ── WAITING: look for warble pattern (sustained energy) ──
+    // ── WAITING: detect warble pattern (alternating pilot±50Hz) ──
+    // The warble toggles between freq-50 and freq+50 every 10ms (32 samples).
+    // Over a 128-sample frame, we see ~4 toggles. Compute energy at both
+    // warble frequencies and track which one dominates each frame.
     if (this.state === RxState.WAITING) {
-      if (totalE > 0.005) {
+      const wLow = toneIQ(window, this.cfg.pilotFreqHz - 50, this.cfg.sampleRate);
+      const wHigh = toneIQ(window, this.cfg.pilotFreqHz + 50, this.cfg.sampleRate);
+      const eLow = Math.hypot(wLow.i, wLow.q);
+      const eHigh = Math.hypot(wHigh.i, wHigh.q);
+      const eWarble = eLow + eHigh;  // total warble energy
+      
+      // Track which frequency is dominant (alternating = warble pattern)
+      if (eWarble > 0.005) {
         this.warbleFrames++;
-        if (this.warbleFrames === 1) console.warn(`[WARBLE] frame 0 E=${totalE.toExponential(2)}`);
-        if (this.warbleFrames === 2) console.warn(`[WARBLE] frame 1 E=${totalE.toExponential(2)}`);
+        if (this.warbleFrames === 1) console.warn(`[WARBLE] frame 0 eLow=${eLow.toExponential(2)} eHigh=${eHigh.toExponential(2)}`);
+        if (this.warbleFrames === 2) console.warn(`[WARBLE] frame 1 eLow=${eLow.toExponential(2)} eHigh=${eHigh.toExponential(2)}`);
         if (this.warbleFrames >= 3) {
-          console.warn(`[WARBLE] Detected after ${this.warbleFrames} frames`);
+          console.warn(`[WARBLE] Detected!`);
           this.state = RxState.PREAMBLE;
-          this.pfCount = 3;
+          this.markerPeakE = 0;
         }
       } else {
-        this.warbleFrames = 0; // noise spike, not signal
+        this.warbleFrames = 0;
       }
       return;
     }
@@ -249,26 +259,22 @@ export class RxEngine {
     // ── PREAMBLE: state machine driven by energy signatures ──
     if (this.state === RxState.PREAMBLE) {
       const signs = rawIQs.map(r => r.i >= 0 ? '+' : '-').join('');
+      if (totalE > this.markerPeakE) this.markerPeakE = totalE;
       
-      // Track peak energy to distinguish marker (high) from warble (low)
-      if (totalE > this.peakEnergy) this.peakEnergy = totalE;
-      
-      // Detect marker: high energy (all 4 tones ON)
+      // Detect marker: energy jumps high (all 4 tones ON)
       if (totalE > 0.08 && !this.markerSeen) {
         this.markerSeen = true;
         console.warn(`[MARKER] E=${totalE.toExponential(2)} signs=[${signs}]`);
         return;
       }
-      
-      // After marker: next frame is cal0
+      // After marker: cal0
       if (this.markerSeen && !this.cal0Seen) {
         this.cal0Seen = true;
         this.cal0Signs = rawIQs.map(r => r.i >= 0);
         console.warn(`[CAL_0°] signs=[${signs}] I=${rawIQs.map(r=>r.i.toFixed(3)).join(',')}`);
         return;
       }
-      
-      // After cal0: next frame is cal180
+      // After cal0: cal180
       if (this.cal0Seen && !this.cal180Seen) {
         this.cal180Seen = true;
         const cal180 = rawIQs.map(r => r.i >= 0);
@@ -279,10 +285,9 @@ export class RxEngine {
         console.warn(`[CAL] flips=[${this.calPhaseFlip.join(',')}]`);
         return;
       }
-      
-      // After cal180: wait for low energy (guard), then enter FRAMES
-      if (this.cal180Seen && totalE < 0.02) {
-        console.warn(`[GUARD] E=${totalE.toExponential(2)}`);
+      // After cal180: wait for energy to drop below 33% of peak (guard trough)
+      if (this.cal180Seen && totalE < this.markerPeakE * 0.33) {
+        console.warn(`[GUARD] E=${totalE.toExponential(2)} (peak was ${this.markerPeakE.toExponential(2)})`);
         this.state = RxState.FRAMES;
         this.fileData = [];
         this.framesReceived = 0;
@@ -366,7 +371,7 @@ export class RxEngine {
     this.markerSeen = false;
     this.cal0Seen = false;
     this.cal180Seen = false;
-    this.peakEnergy = 0;
+    this.markerPeakE = 0;
     this.buf = [];
     this.bchBuf = [];
     this.bchBufCount = 0;
