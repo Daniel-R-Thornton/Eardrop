@@ -301,9 +301,9 @@ export class RxEngine {
         console.warn(`[CAL] flips=[${this.calPhaseFlip.join(',')}]`);
         return;
       }
-      // After cal180: wait for energy to drop below 33% of peak (guard trough)
-      if (this.cal180Seen && totalE < 0.02) {
-        console.warn(`[GUARD] E=${totalE.toExponential(2)} (peak was ${this.markerPeakE.toExponential(2)})`);
+      // After cal180: the next frame is always the guard. Accept it immediately.
+      if (this.cal180Seen) {
+        console.warn(`[GUARD] E=${totalE.toExponential(2)}`);
         this.state = RxState.FRAMES;
         this.fileData = [];
         this.framesReceived = 0;
