@@ -58,6 +58,8 @@ class SentinelScanner {
   private shiftReg = 0;
   private bitCount = 0;
   private collecting = false;
+  /** Global phase inversion detected from inverted sentinel */
+  private phaseInverted = false;
   
   /** Byte accumulator for collection phase */
   private byteAccum = 0;
@@ -66,6 +68,7 @@ class SentinelScanner {
   private bitsCollected = 0;
 
   private readonly sentinel = 0xE79FE7;
+  private readonly sentinelInv = 0x186018;
   private readonly collectBytes = FRAME_SIZE - 3; // 76
 
   onFrame: ((frameBytes: Uint8Array) => void) | null = null;
@@ -74,6 +77,7 @@ class SentinelScanner {
     this.shiftReg = 0;
     this.bitCount = 0;
     this.collecting = false;
+    this.phaseInverted = false;
     this.byteAccum = 0;
     this.byteBits = 0;
     this.buf = [];
@@ -81,8 +85,9 @@ class SentinelScanner {
   }
 
   feedByte(byte: number): void {
+    const b = this.phaseInverted ? (~byte) & 0xFF : byte;
     for (let i = 7; i >= 0; i--) {
-      this.feedBit((byte >> i) & 1);
+      this.feedBit((b >> i) & 1);
     }
   }
 
@@ -118,6 +123,12 @@ class SentinelScanner {
       }
     } else if (this.bitCount >= 24 && this.shiftReg === this.sentinel) {
       this.collecting = true;
+      this.byteAccum = 0;
+      this.phaseInverted = false;
+      console.warn(`[RX-SCAN] Sentinel at bit ${this.bitCount}`);
+    } else if (this.bitCount >= 24 && this.shiftReg === this.sentinelInv) {
+      this.collecting = true;
+      this.phaseInverted = true;
       this.byteAccum = 0;
       this.byteBits = 0;
       this.buf = [];
