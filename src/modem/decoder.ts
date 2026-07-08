@@ -375,11 +375,12 @@ export class Decoder {
         console.warn(`[PREAMBLE] leader→warble at sym ${Math.floor(this.samplesSeen/this.sps)}`);
       }
 
-      if (this.preamblePhase === 'warble' && this.dominantTones.length >= 6) {
-        // Warble: tone changes every frame. Calibrate: same tone for 4+ frames.
-        const recent = this.dominantTones.slice(-6);
-        const sameCount = recent.filter(t => t === recent[recent.length - 1]).length;
-        if (sameCount >= 3) {
+      if (this.preamblePhase === 'warble' && this.dominantTones.length >= 4) {
+        // Warble: tone changes every frame. Calibrate: same tone for 4 consecutive frames.
+        // Check last 4 entries — all must be identical (calibrate: 4 frames per tone).
+        const recent = this.dominantTones.slice(-4);
+        const allSame = recent.length >= 4 && recent.every(t => t === recent[0]);
+        if (allSame) {
           this.preamblePhase = 'calibrate';
           this.calibrateCount = 0;
           console.warn(`[PREAMBLE] warble→calibrate at sym ${Math.floor(this.samplesSeen/this.sps)}`);
