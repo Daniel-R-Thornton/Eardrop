@@ -257,8 +257,8 @@ export class RxEngine {
       const signs = rawIQs.map(r => r.i >= 0 ? '+' : '-').join('');
       if (totalE > this.markerPeakE) this.markerPeakE = totalE;
       
-      // Detect marker: energy jumps high (all 4 tones ON)
-      if (totalE > 0.08 && !this.markerSeen) {
+      // Detect marker: energy jumps high (all 4 tones ON) — use 3× warble energy
+      if (totalE > Math.max(this.markerPeakE * 3, 0.03) && !this.markerSeen) {
         this.markerSeen = true;
         console.warn(`[MARKER] E=${totalE.toExponential(2)} signs=[${signs}]`);
         return;
@@ -282,7 +282,7 @@ export class RxEngine {
         return;
       }
       // After cal180: wait for energy to drop below 33% of peak (guard trough)
-      if (this.cal180Seen && totalE < this.markerPeakE * 0.33) {
+      if (this.cal180Seen && totalE < Math.max(this.markerPeakE * 0.10, 0.008)) {
         console.warn(`[GUARD] E=${totalE.toExponential(2)} (peak was ${this.markerPeakE.toExponential(2)})`);
         this.state = RxState.FRAMES;
         this.fileData = [];
