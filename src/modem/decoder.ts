@@ -388,9 +388,8 @@ export class Decoder {
 
       if (this.preamblePhase === 'calibrate') {
         this.calibrateCount++;
-        // Calibrate is fixed 16 frames (4 tones × 4 frames each).
-        // After 16 frames, data phase starts — no energy threshold needed.
-        if (this.calibrateCount >= 16) {
+        // Calibrate is fixed 16 frames. Data starts on frame 17.
+        if (this.calibrateCount > 16) {
           this.preamblePhase = 'data';
           this.inFrame = true;
           this.frameSkip = 0;
