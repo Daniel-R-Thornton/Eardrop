@@ -69,6 +69,7 @@ class SentinelScanner {
 
   private readonly sentinel = 0xE79FE7;
   private readonly sentinelInv = 0x186018;
+  private readonly sentinelInv = 0x186018;
   private readonly collectBytes = FRAME_SIZE - 3; // 76
 
   onFrame: ((frameBytes: Uint8Array) => void) | null = null;
@@ -123,6 +124,12 @@ class SentinelScanner {
       }
     } else if (this.bitCount >= 24 && this.shiftReg === this.sentinel) {
       this.collecting = true;
+      this.byteAccum = 0;
+      this.phaseInverted = false;
+      console.warn(`[RX-SCAN] Sentinel at bit ${this.bitCount}`);
+    } else if (this.bitCount >= 24 && this.shiftReg === this.sentinelInv) {
+      this.collecting = true;
+      this.phaseInverted = true;
       this.byteAccum = 0;
       this.phaseInverted = false;
       console.warn(`[RX-SCAN] Sentinel at bit ${this.bitCount}`);
