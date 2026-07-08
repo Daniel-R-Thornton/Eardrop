@@ -26,8 +26,8 @@ const SPS = 128;
 const BITS_PER_SYMBOL = 4;
 /** Tones count */
 const TONE_COUNT = 4;
-/** Preamble duration in samples (530ms at 3200Hz = 1696 samples) */
-const PREAMBLE_SAMPLES = 1696;
+/** Preamble duration in samples (560ms at 3200Hz = 1792 samples) */
+const PREAMBLE_SAMPLES = 1792;
 /** Skip the preamble (1984 samples). The first frame symbol starts at
  *  sample 1984. Symbol boundaries are at 1984 + n*128. */
 const SKIP_SAMPLES = PREAMBLE_SAMPLES; // 1984
@@ -221,9 +221,68 @@ export class RxEngine {
     this.pll.update(sample);
     this.pilotAmplitude = this.pll.getAmplitude();
     
-    // Skip preamble samples
+    // ── Preamble processing with phase-by-phase logging ──
     if (this.samplesSeen <= PREAMBLE_SAMPLES) {
-      return;
+      this.buf.push(sample);
+      if (this.buf.length < this.sps) return;
+      const window = this.buf.slice(0, this.sps);
+      this.buf.splice(0, this.sps);
+      const rawIQs = this.toneFreqs.map(f => toneIQ(window, f, this.cfg.sampleRate));
+      const totalE = rawIQs.reduce((a, r) => a + Math.hypot(r.i, r.q), 0);
+      const signs = rawIQs.map(r => r.i >= 0 ? '+' : '-').join('');
+      const frameN = Math.floor((this.samplesSeen - 1) / this.sps);
+      
+      // Frame 0-9: Warble (frames 0-9 = 1280 samples)
+      if (frameN >= 0 && frameN < 10) {
+        if (frameN <= 1) console.warn(`[WARBLE] frame=${frameN} E=${totalE.toExponential(2)}`);
+      }
+      // Frame 10: Warble end marker (all tones ON full blast)
+      if (frameN === 10) {
+        console.warn(`[MARKER] frame=${frameN} E=${totalE.toExponential(2)} signs=[${signs}] I=${rawIQs.map(r => r.i.toFixed(3)).join(',')}`);
+      }
+      // Frame 11: Cal 0° — all tones at 0°, expected all I > 0
+      if (frameN === 11) {
+        const expected = '++++';
+        const match = signs.split('').map((s, i) => s === expected[i] ? '✓' : '✗').join('');
+        console.warn(`[CAL_0°] signs=[${signs}] want=${expected} ${match} I=${rawIQs.map(r => r.i.toFixed(3)).join(',')}`);
+        for (let t = 0; t < TONE_COUNT; t++) {
+          this.calSum[t] += rawIQs[t].i >= 0 ? 1 : -1;
+          this.calCount[t]++;
+        }
+      }
+      // Frame 12: Cal 180° — all tones at 180°, expected all I < 0
+      if (frameN === 12) {
+        const expected = '----';
+        const match = signs.split('').map((s, i) => s === expected[i] ? '✓' : '✗').join('');
+        console.warn(`[CAL_180°] signs=[${signs}] want=${expected} ${match} I=${rawIQs.map(r => r.i.toFixed(3)).join(',')}`);
+        for (let t = 0; t < TONE_COUNT; t++) {
+          this.calSum[t] += rawIQs[t].i < 0 ? 1 : -1;  // negative is correct for 180°
+          this.calCount[t]++;
+        }
+      }
+      
+      // Frame 13: Guard (pilot only, silence)
+      if (frameN === 13) {
+        console.warn(`[GUARD] frame=${frameN} E=${totalE.toExponential(2)}`);
+      }
+      
+      // After guard: compute flips and enter FRAMES
+      if (frameN === 14) {
+        for (let t = 0; t < TONE_COUNT; t++) {
+          this.calPhaseFlip[t] = this.calSum[t] >= 0 ? 1 : -1;
+        }
+        console.warn(`[CAL_DONE] flips=[${this.calPhaseFlip.join(',')}] sums=[${this.calSum.join(',')}]`);
+        this.state = RxState.FRAMES;
+        this.fileData = [];
+        this.framesReceived = 0;
+        this.fileID = 0;
+        this.fileName = '';
+        this.fileSize = 0;
+        this.totalFrames = 0;
+        this.buf = [];
+      }
+      // Don't return until preamble frames are done
+      if (frameN < 14) return;
     }
     
     if (this.state === RxState.WAITING) {
@@ -245,10 +304,13 @@ export class RxEngine {
     
     const rawIQs = this.toneFreqs.map(f => toneIQ(window, f, this.cfg.sampleRate));
     
-    // ── BPSK bit detection from raw I ──
+    // ── BPSK bit detection with per-tone phase flip ──
     let frameBits = 0;
+    const correctedI: number[] = [];
     for (let t = 0; t < TONE_COUNT; t++) {
-      const bit = rawIQs[t].i < 0 ? 1 : 0;
+      const ci = this.calPhaseFlip[t] < 0 ? -rawIQs[t].i : rawIQs[t].i;
+      correctedI.push(ci);
+      const bit = ci < 0 ? 1 : 0;
       frameBits |= (bit) << (7 - t * 2);
       frameBits |= (1) << (6 - t * 2);
     }
@@ -272,9 +334,10 @@ export class RxEngine {
         expectedStr = '0x' + eb.toString(16).padStart(2, '0');
         // Show per-tone match: compare raw signs vs expected
         const rawSigns = rawIQs.map(r => r.i >= 0 ? '+' : '-').join('');
+        const corrSigns = correctedI.map(c => c >= 0 ? '+' : '-').join('');
         const expSigns = expPh.map(b => b ? '-' : '+').join('');
-        const matchStr = rawSigns.split('').map((s, i) => s === expSigns[i] ? '✓' : '✗').join('');
-        console.warn(`[RX] Frame ${this.dbgFrameCount}: bits=0x${frameBits.toString(16).padStart(2,'0')} exp=${expectedStr} signs=[${rawSigns}] want=[${expSigns}] ${matchStr} I=[${rawIQs.map(r=>r.i.toFixed(3)).join(',')}]`);
+        const matchStr = corrSigns.split('').map((s, i) => s === expSigns[i] ? '✓' : '✗').join('');
+        console.warn(`[RX] Frame ${this.dbgFrameCount}: bits=0x${frameBits.toString(16).padStart(2,'0')} exp=${expectedStr} raw=[${rawSigns}]→[${corrSigns}] want=[${expSigns}] ${matchStr} flip=[${this.calPhaseFlip.join(',')}]`);
       } else {
         console.warn(`[RX] Frame ${this.dbgFrameCount}: bits=0x${frameBits.toString(16).padStart(2,'0')}`);
       }
