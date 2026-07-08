@@ -416,7 +416,37 @@ export class RxEngine {
   // ─── Private ─────────────────────────────────────
 
   private processFrame(frame: Uint8Array): void {
-    const decoded = decodeFrame(frame);
+    let decoded = decodeFrame(frame);
+    
+    // If decode fails with current flips, try all 16 per-tone flip patterns
+    if (!decoded.valid) {
+      for (let mask = 1; mask < 16; mask++) {
+        // XOR mask maps to byte bits:
+        // tone0 → 0x88 (bit7 high, bit3 low), tone1 → 0x44, tone2 → 0x22, tone3 → 0x11
+        let xorKey = 0;
+        if (mask & 1) xorKey ^= 0x88;
+        if (mask & 2) xorKey ^= 0x44;
+        if (mask & 4) xorKey ^= 0x22;
+        if (mask & 8) xorKey ^= 0x11;
+        
+        const flipped = new Uint8Array(frame.length);
+        for (let i = 0; i < frame.length; i++) flipped[i] = frame[i] ^ xorKey;
+        
+        decoded = decodeFrame(flipped);
+        if (decoded.valid) {
+          // Save working flip as new calPhaseFlip
+          const newFlips = [1,1,1,1];
+          if (mask & 1) newFlips[0] = -1;
+          if (mask & 2) newFlips[1] = -1;
+          if (mask & 4) newFlips[2] = -1;
+          if (mask & 8) newFlips[3] = -1;
+          console.warn(`[RX] Frame retry mask=${mask} new flips=[${newFlips.join(',')}]`);
+          this.calPhaseFlip = newFlips;
+          break;
+        }
+      }
+    }
+    
     console.warn(`[RX] processFrame: valid=${decoded.valid} type=${decoded.header?.type} payload=${decoded.payload?.length}B`);
     if (!decoded.valid) return;
 
