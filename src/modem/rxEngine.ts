@@ -193,6 +193,7 @@ export class RxEngine {
   // BPSK calibration
   private calPhaseFlip: number[] = [1, 1, 1, 1];
   private cal0Signs: boolean[] = [false, false, false, false];
+  private cal180Energy = 0;
   private calDone = false;
 
   constructor(cfg: Partial<ModemConfig> = {}) {
@@ -278,7 +279,7 @@ export class RxEngine {
       }
       
       // Detect marker: all 4 tones ON produces distinctly high energy
-      if (totalE > 0.08 && !this.markerSeen) {
+      if (totalE > 0.15 && !this.markerSeen) {
         this.markerSeen = true;
         console.warn(`[MARKER] E=${totalE.toExponential(2)} signs=[${signs}]`);
         return;
@@ -293,6 +294,7 @@ export class RxEngine {
       // After cal0: cal180
       if (this.cal0Seen && !this.cal180Seen) {
         this.cal180Seen = true;
+        this.cal180Energy = totalE;
         const cal180 = rawIQs.map(r => r.i >= 0);
         console.warn(`[CAL_180°] signs=[${signs}] I=${rawIQs.map(r=>r.i.toFixed(3)).join(',')}`);
         for (let t = 0; t < TONE_COUNT; t++) {
@@ -301,9 +303,9 @@ export class RxEngine {
         console.warn(`[CAL] flips=[${this.calPhaseFlip.join(',')}]`);
         return;
       }
-      // After cal180: the next frame is always the guard. Accept it immediately.
-      if (this.cal180Seen) {
-        console.warn(`[GUARD] E=${totalE.toExponential(2)}`);
+      // After cal180: wait for energy to drop significantly (guard trough)
+      if (this.cal180Seen && totalE < this.cal180Energy * 0.6) {
+        console.warn(`[GUARD] E=${totalE.toExponential(2)} (cal180 was ${this.cal180Energy.toExponential(2)})`);
         this.state = RxState.FRAMES;
         this.fileData = [];
         this.framesReceived = 0;
