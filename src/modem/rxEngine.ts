@@ -167,10 +167,11 @@ export class RxEngine {
 
   // State machine
   private state: RxState = RxState.WAITING;
-  private signalDetectedAt = -1;
-  private preambleStartSample = 0;
-  private skipRemaining = 0;
-  private skipCount = 0;
+  private warbleFrames = 0;
+  private markerSeen = false;
+  private cal0Seen = false;
+  private cal180Seen = false;
+  private peakEnergy = 0;
 
   // File assembly
   private fileID = 0;
@@ -220,53 +221,68 @@ export class RxEngine {
     this.pll.update(sample);
     this.pilotAmplitude = this.pll.getAmplitude();
     
-    // ── Preamble processing with phase-by-phase logging ──
-    if (this.samplesSeen <= PREAMBLE_SAMPLES) {
-      this.buf.push(sample);
-      if (this.buf.length < this.sps) return;
-      const window = this.buf.slice(0, this.sps);
-      this.buf.splice(0, this.sps);
-      const rawIQs = this.toneFreqs.map(f => toneIQ(window, f, this.cfg.sampleRate));
-      const totalE = rawIQs.reduce((a, r) => a + Math.hypot(r.i, r.q), 0);
+    // ── Buffer samples and process by state ──
+    this.buf.push(sample);
+    if (this.buf.length < this.sps) return;
+    const window = this.buf.slice(0, this.sps);
+    this.buf.splice(0, this.sps);
+    const rawIQs = this.toneFreqs.map(f => toneIQ(window, f, this.cfg.sampleRate));
+    const totalE = rawIQs.reduce((a, r) => a + Math.hypot(r.i, r.q), 0);
+    
+    // ── WAITING: look for warble pattern (sustained energy) ──
+    if (this.state === RxState.WAITING) {
+      if (totalE > 0.005) {
+        this.warbleFrames++;
+        if (this.warbleFrames === 1) console.warn(`[WARBLE] frame 0 E=${totalE.toExponential(2)}`);
+        if (this.warbleFrames === 2) console.warn(`[WARBLE] frame 1 E=${totalE.toExponential(2)}`);
+        if (this.warbleFrames >= 3) {
+          console.warn(`[WARBLE] Detected after ${this.warbleFrames} frames`);
+          this.state = RxState.PREAMBLE;
+          this.pfCount = 3;
+        }
+      } else {
+        this.warbleFrames = 0; // noise spike, not signal
+      }
+      return;
+    }
+    
+    // ── PREAMBLE: state machine driven by energy signatures ──
+    if (this.state === RxState.PREAMBLE) {
       const signs = rawIQs.map(r => r.i >= 0 ? '+' : '-').join('');
-      const frameN = Math.floor((this.samplesSeen - 1) / this.sps);
       
-      // Frame 0-9: Warble (frames 0-9 = 1280 samples)
-      if (frameN >= 0 && frameN < 10) {
-        if (frameN <= 1) console.warn(`[WARBLE] frame=${frameN} E=${totalE.toExponential(2)}`);
+      // Track peak energy to distinguish marker (high) from warble (low)
+      if (totalE > this.peakEnergy) this.peakEnergy = totalE;
+      
+      // Detect marker: high energy (all 4 tones ON)
+      if (totalE > 0.08 && !this.markerSeen) {
+        this.markerSeen = true;
+        console.warn(`[MARKER] E=${totalE.toExponential(2)} signs=[${signs}]`);
+        return;
       }
-      // Frame 10: Warble end marker (all tones ON full blast)
-      if (frameN === 10) {
-        console.warn(`[MARKER] frame=${frameN} E=${totalE.toExponential(2)} signs=[${signs}] I=${rawIQs.map(r => r.i.toFixed(3)).join(',')}`);
+      
+      // After marker: next frame is cal0
+      if (this.markerSeen && !this.cal0Seen) {
+        this.cal0Seen = true;
+        this.cal0Signs = rawIQs.map(r => r.i >= 0);
+        console.warn(`[CAL_0°] signs=[${signs}] I=${rawIQs.map(r=>r.i.toFixed(3)).join(',')}`);
+        return;
       }
-      // Frame 11: Cal 0° — all tones at 0°, store signs for comparison
-      if (frameN === 11) {
-        this.cal0Signs = signs.split('').map(s => s === '+');
-        console.warn(`[CAL_0°] signs=[${signs}] I=${rawIQs.map(r => r.i.toFixed(3)).join(',')}`);
-      }
-      // Frame 12: Cal 180° — compare with Cal 0° to find inverted tones
-      if (frameN === 12) {
-        const cal180Signs = signs.split('').map(s => s === '+');
-        console.warn(`[CAL_180°] signs=[${signs}] I=${rawIQs.map(r => r.i.toFixed(3)).join(',')}`);
+      
+      // After cal0: next frame is cal180
+      if (this.cal0Seen && !this.cal180Seen) {
+        this.cal180Seen = true;
+        const cal180 = rawIQs.map(r => r.i >= 0);
+        console.warn(`[CAL_180°] signs=[${signs}] I=${rawIQs.map(r=>r.i.toFixed(3)).join(',')}`);
         for (let t = 0; t < TONE_COUNT; t++) {
-          // If a tone has the SAME sign in both cal0 and cal180, it's inverted
-          // (expected: opposite — 0°=positive, 180°=negative)
-          if (this.cal0Signs[t] === cal180Signs[t]) {
-            this.calPhaseFlip[t] = -1; // inverted
-            console.warn(`[CAL] Tone ${t}: SAME sign in both frames → INVERTED`);
-          }
+          if (this.cal0Signs[t] === cal180[t]) this.calPhaseFlip[t] = -1;
         }
         console.warn(`[CAL] flips=[${this.calPhaseFlip.join(',')}]`);
+        return;
       }
       
-      // Frame 13: Guard (pilot only, silence)
-      if (frameN === 13) {
-        console.warn(`[GUARD] frame=${frameN} E=${totalE.toExponential(2)}`);
-      }
-      
-      // After guard: enter FRAMES
-      if (frameN === 14) {
-        console.warn(`[CAL_DONE] flips=[${this.calPhaseFlip.join(',')}]`);
+      // After cal180: wait for low energy (guard), then enter FRAMES
+      if (this.cal180Seen && totalE < 0.02) {
+        console.warn(`[GUARD] E=${totalE.toExponential(2)}`);
         this.state = RxState.FRAMES;
         this.fileData = [];
         this.framesReceived = 0;
@@ -274,31 +290,11 @@ export class RxEngine {
         this.fileName = '';
         this.fileSize = 0;
         this.totalFrames = 0;
-        this.buf = [];
+        console.warn(`[FRAMES] flips=[${this.calPhaseFlip.join(',')}]`);
       }
-      // Don't return until preamble frames are done
-      if (frameN < 14) return;
-    }
-    
-    if (this.state === RxState.WAITING) {
-      this.state = RxState.FRAMES;
-      this.fileData = [];
-      this.framesReceived = 0;
-      this.fileID = 0;
-      this.fileName = '';
-      this.fileSize = 0;
-      this.totalFrames = 0;
+      return;
     }
 
-    // ── Frame scanning: buffer samples and demodulate ──
-    this.buf.push(sample);
-    if (this.buf.length < this.sps) return;
-    
-    const window = this.buf.slice(0, this.sps);
-    this.buf.splice(0, this.sps);
-    
-    const rawIQs = this.toneFreqs.map(f => toneIQ(window, f, this.cfg.sampleRate));
-    
     // ── BPSK bit detection with per-tone phase flip ──
     let frameBits = 0;
     const correctedI: number[] = [];
@@ -366,9 +362,11 @@ export class RxEngine {
 
   reset(): void {
     this.state = RxState.WAITING;
-    this.signalDetectedAt = -1;
-    this.skipCount = 0;
-    this.skipRemaining = 0;
+    this.warbleFrames = 0;
+    this.markerSeen = false;
+    this.cal0Seen = false;
+    this.cal180Seen = false;
+    this.peakEnergy = 0;
     this.buf = [];
     this.bchBuf = [];
     this.bchBufCount = 0;
