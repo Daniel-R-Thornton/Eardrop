@@ -26,8 +26,8 @@ const SPS = 128;
 const BITS_PER_SYMBOL = 4;
 /** Tones count */
 const TONE_COUNT = 4;
-/** Preamble duration in samples (620ms at 3200Hz) */
-const PREAMBLE_SAMPLES = 1984;
+/** Preamble duration in samples (530ms at 3200Hz = 1696 samples) */
+const PREAMBLE_SAMPLES = 1696;
 /** Skip the preamble (1984 samples). The first frame symbol starts at
  *  sample 1984. Symbol boundaries are at 1984 + n*128. */
 const SKIP_SAMPLES = PREAMBLE_SAMPLES; // 1984
@@ -221,7 +221,7 @@ export class RxEngine {
     this.pll.update(sample);
     this.pilotAmplitude = this.pll.getAmplitude();
     
-    // Skip preamble, then immediately start frame scanning
+    // Skip preamble samples
     if (this.samplesSeen <= PREAMBLE_SAMPLES) {
       return;
     }
@@ -246,9 +246,6 @@ export class RxEngine {
     const rawIQs = this.toneFreqs.map(f => toneIQ(window, f, this.cfg.sampleRate));
     
     // ── BPSK bit detection from raw I ──
-    // Using raw I directly (not pilot-rotated) because the data tone phase
-    // accumulators are independent from the pilot. The toneIQ correlation
-    // at each data tone frequency produces I/Q with consistent sign.
     let frameBits = 0;
     for (let t = 0; t < TONE_COUNT; t++) {
       const bit = rawIQs[t].i < 0 ? 1 : 0;
@@ -256,11 +253,31 @@ export class RxEngine {
       frameBits |= (1) << (6 - t * 2);
     }
     
-    // Debug: log first few frames
+    // Debug: first 5 frames with expected sentinel comparison
     this.dbgFrameCount++;
     if (this.dbgFrameCount <= 5) {
-      const energies = rawIQs.map(r => Math.hypot(r.i, r.q).toExponential(2)).join(',');
-      console.warn(`[RX] Frame ${this.dbgFrameCount}: bits=0x${frameBits.toString(16).padStart(2,'0')} I=${rawIQs.map(r=>r.i.toFixed(3)).join(',')} eng=[${energies}]`);
+      const sentinelBytes = [0xE7, 0x9F, 0xE7];
+      const byteIdx = Math.floor((this.dbgFrameCount - 1) / 2);
+      const nibble = (this.dbgFrameCount - 1) % 2 === 0 ? 'upper' : 'lower';
+      let expectedStr = '?';
+      if (byteIdx < 3) {
+        const b = sentinelBytes[byteIdx];
+        const nibVal = nibble === 'upper' ? (b >> 4) & 0xF : b & 0xF;
+        const expPh = [(nibVal >> 3) & 1, (nibVal >> 2) & 1, (nibVal >> 1) & 1, nibVal & 1];
+        let eb = 0;
+        for (let t = 0; t < TONE_COUNT; t++) {
+          eb |= (expPh[t]) << (7 - t * 2);
+          eb |= (1) << (6 - t * 2);
+        }
+        expectedStr = '0x' + eb.toString(16).padStart(2, '0');
+        // Show per-tone match: compare raw signs vs expected
+        const rawSigns = rawIQs.map(r => r.i >= 0 ? '+' : '-').join('');
+        const expSigns = expPh.map(b => b ? '-' : '+').join('');
+        const matchStr = rawSigns.split('').map((s, i) => s === expSigns[i] ? '✓' : '✗').join('');
+        console.warn(`[RX] Frame ${this.dbgFrameCount}: bits=0x${frameBits.toString(16).padStart(2,'0')} exp=${expectedStr} signs=[${rawSigns}] want=[${expSigns}] ${matchStr} I=[${rawIQs.map(r=>r.i.toFixed(3)).join(',')}]`);
+      } else {
+        console.warn(`[RX] Frame ${this.dbgFrameCount}: bits=0x${frameBits.toString(16).padStart(2,'0')}`);
+      }
     }
 
     this.bchBuf.push(frameBits);
