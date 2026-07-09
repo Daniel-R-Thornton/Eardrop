@@ -58,6 +58,9 @@ export class RxEngine {
   private pilotAmplitude = 0;
   private toneFreqs: [number, number, number, number] = [650, 900, 1150, 1500];
 
+  /** Most recent raw I/Q values per tone (updated every symbol window) */
+  private lastRawIQs: Array<{ i: number; q: number }> = [];
+
   // Accumulators for BPSK bit -> byte packing
   private bchBuf: number[] = [];
   private bchBufCount = 0;
@@ -148,6 +151,7 @@ export class RxEngine {
     const window = this.buf.slice(0, this.sps);
     this.buf.splice(0, this.sps);
     const rawIQs = this.toneFreqs.map((f) => toneIQ(window, f, this.cfg.sampleRate));
+    this.lastRawIQs = rawIQs; // Store for debug snapshot
     const totalE = rawIQs.reduce((a, r) => a + Math.hypot(r.i, r.q), 0);
 
     // ── WAITING: detect warble — sustained energy at pilot±50Hz ──
@@ -640,30 +644,41 @@ export class RxEngine {
 
   getDebugSnapshot() {
     const inFrame = this.state === RxState.FRAMES;
-    const nf = new Array(4).fill(0);
-    const en = new Array(4).fill(0);
-    const ri = this.prevFrameI.slice(0, 4);
-    const rq = this.prevFrameQ.slice(0, 4);
+    const nf: number[] = []; const en: number[] = []; const ri: number[] = []; const rq: number[] = [];
+    for (const r of this.lastRawIQs) {
+      nf.push(0);
+      const e = Math.hypot(r.i, r.q);
+      en.push(e);
+      ri.push(r.i);
+      rq.push(r.q);
+    }
+    // Pad to 4 entries for DecoderInfo tuple type
+    while (nf.length < 4) { nf.push(0); en.push(0); ri.push(0); rq.push(0); }
+    const rif = ri.slice(0,4) as [number,number,number,number];
+    const rqf = rq.slice(0,4) as [number,number,number,number];
+    const enf = en.slice(0,4) as [number,number,number,number];
+    const nff = nf.slice(0,4) as [number,number,number,number];
+    const sigToNoise = this.pilotAmplitude > 1e-6 ? 20 * Math.log10(this.pilotAmplitude / 1e-6) : 0;
     return {
       inFrame,
       consecutiveSync: this.preambleFrames,
       bitsCollected: this.dbgFrameCount * 4,
       pilotFreq: this.cfg.pilotFreqHz,
       pilotAmplitude: this.pilotAmplitude,
-      signalToNoise: 0,
-      noiseFloor: nf,
-      noiseMax: nf,
-      energies: en,
-      relI: ri.length === 4 ? ri as [number,number,number,number] : [0,0,0,0],
-      relQ: rq.length === 4 ? rq as [number,number,number,number] : [0,0,0,0],
+      signalToNoise: sigToNoise,
+      noiseFloor: nff,
+      noiseMax: nff,
+      energies: enf,
+      relI: rif,
+      relQ: rqf,
       bitPattern: 0,
-      thresholds: nf,
-      ratios: nf,
+      thresholds: nff,
+      ratios: nff,
       noiseFrames: 0,
       noiseAvg: 0,
       peakAmp: 0,
-      avg: 0,
-      rawEnergies: en,
+      avg: en.reduce((a,b) => a + (isNaN(b) ? 0 : b), 0) / Math.max(en.length, 1),
+      rawEnergies: enf,
       strong: inFrame,
       burstThreshold: 0,
       framesSinceStrong: 0,
