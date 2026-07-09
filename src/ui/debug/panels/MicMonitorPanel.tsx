@@ -8,7 +8,11 @@
 import React, { useRef, useEffect } from 'react';
 import { useStore } from '../../Store';
 
-const WaveformCanvas: React.FC<{ samples: Float32Array; width: number; height: number }> = ({ samples, width, height }) => {
+const WaveformCanvas: React.FC<{ samples: Float32Array; width: number; height: number }> = ({
+  samples,
+  width,
+  height,
+}) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -27,8 +31,12 @@ const WaveformCanvas: React.FC<{ samples: Float32Array; width: number; height: n
     for (let x = 0; x < width; x++) {
       const idx = Math.floor(x * step);
       if (idx >= samples.length) break;
-      const y = midY + samples[idx] * (height / 2 * 0.8);
-      x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      const y = midY + samples[idx] * ((height / 2) * 0.8);
+      if (x === 0) {
+        ctx.moveTo(x, y);
+      } else {
+        ctx.lineTo(x, y);
+      }
     }
     ctx.stroke();
 
@@ -43,17 +51,24 @@ const WaveformCanvas: React.FC<{ samples: Float32Array; width: number; height: n
     ctx.setLineDash([]);
   }, [samples, width, height]);
 
-  return <canvas ref={canvasRef} width={width} height={height} style={{ width, height, borderRadius: 4 }} />;
+  return (
+    <canvas
+      ref={canvasRef}
+      width={width}
+      height={height}
+      style={{ width, height, borderRadius: 4 }}
+    />
+  );
 };
 
 export const MicMonitorPanel: React.FC = () => {
-  const micDiag = useStore(s => s.micDiag);
+  const micDiag = useStore((s) => s.micDiag);
   const containerRef = useRef<HTMLDivElement>(null);
   const [canvasSize, setCanvasSize] = React.useState({ width: 300, height: 80 });
 
   useEffect(() => {
     if (!containerRef.current) return;
-    const obs = new ResizeObserver(entries => {
+    const obs = new ResizeObserver((entries) => {
       for (const entry of entries) {
         setCanvasSize({
           width: Math.floor(entry.contentRect.width - 16),
@@ -78,7 +93,17 @@ export const MicMonitorPanel: React.FC = () => {
   const barColor = micDiag.rmsDb > -20 ? '#ff6b4a' : micDiag.rmsDb > -40 ? '#eab308' : '#4a9eff';
 
   return (
-    <div style={{ padding: 6, fontSize: 11, fontFamily: 'monospace', height: '100%', display: 'flex', flexDirection: 'column', gap: 6 }}>
+    <div
+      style={{
+        padding: 6,
+        fontSize: 11,
+        fontFamily: 'monospace',
+        height: '100%',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 6,
+      }}
+    >
       {/* Level meter */}
       <div style={{ background: '#080812', borderRadius: 4, padding: '6px 8px' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
@@ -86,13 +111,16 @@ export const MicMonitorPanel: React.FC = () => {
           <span style={{ color: barColor, fontWeight: 700 }}>{micDiag.rmsDb.toFixed(1)} dB</span>
         </div>
         <div style={{ background: '#1a1a2a', borderRadius: 3, height: 12, overflow: 'hidden' }}>
-          <div style={{
-            width: `${levelPct}%`, height: '100%',
-            background: barColor,
-            borderRadius: 3,
-            transition: 'width 100ms ease',
-            opacity: 0.8,
-          }} />
+          <div
+            style={{
+              width: `${levelPct}%`,
+              height: '100%',
+              background: barColor,
+              borderRadius: 3,
+              transition: 'width 100ms ease',
+              opacity: 0.8,
+            }}
+          />
         </div>
       </div>
 
@@ -100,11 +128,15 @@ export const MicMonitorPanel: React.FC = () => {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4 }}>
         <div style={{ background: '#080812', borderRadius: 4, padding: '4px 8px' }}>
           <div style={{ color: '#555', fontSize: 9 }}>Peak</div>
-          <div style={{ color: '#ff6b4a', fontWeight: 700 }}>{(micDiag.peak * 1000).toFixed(1)}×10⁻³</div>
+          <div style={{ color: '#ff6b4a', fontWeight: 700 }}>
+            {(micDiag.peak * 1000).toFixed(1)}×10⁻³
+          </div>
         </div>
         <div style={{ background: '#080812', borderRadius: 4, padding: '4px 8px' }}>
           <div style={{ color: '#555', fontSize: 9 }}>Zero-Xing Rate</div>
-          <div style={{ color: '#4a9eff', fontWeight: 700 }}>{(micDiag.zeroCrossingRate * 100).toFixed(1)}%</div>
+          <div style={{ color: '#4a9eff', fontWeight: 700 }}>
+            {(micDiag.zeroCrossingRate * 100).toFixed(1)}%
+          </div>
         </div>
         <div style={{ background: '#080812', borderRadius: 4, padding: '4px 8px' }}>
           <div style={{ color: '#555', fontSize: 9 }}>Sample Rate</div>
@@ -117,12 +149,22 @@ export const MicMonitorPanel: React.FC = () => {
       </div>
 
       {/* Context state */}
-      <div style={{ display: 'flex', gap: 12, background: '#080812', borderRadius: 4, padding: '4px 8px' }}>
+      <div
+        style={{
+          display: 'flex',
+          gap: 12,
+          background: '#080812',
+          borderRadius: 4,
+          padding: '4px 8px',
+        }}
+      >
         <span style={{ color: '#555' }}>AudioCtx:</span>
-        <span style={{
-          color: micDiag.ctxState === 'running' ? '#5eea5e' : '#eab308',
-          fontWeight: 700,
-        }}>
+        <span
+          style={{
+            color: micDiag.ctxState === 'running' ? '#5eea5e' : '#eab308',
+            fontWeight: 700,
+          }}
+        >
           {micDiag.ctxState}
         </span>
         <span style={{ color: '#555' }}>|</span>
@@ -130,7 +172,10 @@ export const MicMonitorPanel: React.FC = () => {
       </div>
 
       {/* Waveform */}
-      <div ref={containerRef} style={{ flex: 1, minHeight: 60, background: '#080812', borderRadius: 4, padding: 4 }}>
+      <div
+        ref={containerRef}
+        style={{ flex: 1, minHeight: 60, background: '#080812', borderRadius: 4, padding: 4 }}
+      >
         <div style={{ color: '#555', fontSize: 9, marginBottom: 2 }}>Recent Waveform</div>
         <WaveformCanvas
           samples={micDiag.recentSamples}

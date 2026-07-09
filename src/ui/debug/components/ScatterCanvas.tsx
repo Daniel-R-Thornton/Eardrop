@@ -57,16 +57,28 @@ export const ScatterCanvas: React.FC<Props> = ({ points, width, height, toneLabe
     ctx.strokeStyle = '#1a1a28';
     ctx.lineWidth = 0.5;
     for (let i = -3; i <= 3; i++) {
-      const pos = cx + i * maxDim / 3;
-      ctx.beginPath(); ctx.moveTo(pos, 0); ctx.lineTo(pos, height); ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(0, pos); ctx.lineTo(width, pos); ctx.stroke();
+      const pos = cx + (i * maxDim) / 3;
+      ctx.beginPath();
+      ctx.moveTo(pos, 0);
+      ctx.lineTo(pos, height);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(0, pos);
+      ctx.lineTo(width, pos);
+      ctx.stroke();
     }
 
     // Crosshair
     ctx.strokeStyle = '#ff446644';
     ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(width, cy); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, height); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(0, cy);
+    ctx.lineTo(width, cy);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx, 0);
+    ctx.lineTo(cx, height);
+    ctx.stroke();
 
     // Label
     ctx.fillStyle = '#666';

@@ -12,7 +12,7 @@ import React, { useRef, useEffect } from 'react';
 import { useStore } from '../../Store';
 
 export const BitStreamPanel: React.FC = () => {
-  const byteStream = useStore(s => s.debugByteStream);
+  const byteStream = useStore((s) => s.debugByteStream);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll to latest
@@ -26,15 +26,28 @@ export const BitStreamPanel: React.FC = () => {
   const visible = byteStream.slice(-maxVisible);
 
   return (
-    <div style={{ padding: 6, fontSize: 11, fontFamily: 'monospace', height: '100%', display: 'flex', flexDirection: 'column' }}>
+    <div
+      style={{
+        padding: 6,
+        fontSize: 11,
+        fontFamily: 'monospace',
+        height: '100%',
+        display: 'flex',
+        flexDirection: 'column',
+      }}
+    >
       <div style={{ color: '#888', marginBottom: 4, fontSize: 10 }}>
         Byte Stream ({byteStream.length} entries, showing last {visible.length})
       </div>
       <div
         ref={scrollRef}
         style={{
-          flex: 1, overflowY: 'auto', background: '#080812', borderRadius: 4,
-          padding: '4px 6px', lineHeight: '18px',
+          flex: 1,
+          overflowY: 'auto',
+          background: '#080812',
+          borderRadius: 4,
+          padding: '4px 6px',
+          lineHeight: '18px',
         }}
       >
         {visible.length === 0 && (
@@ -59,19 +72,25 @@ export const BitStreamPanel: React.FC = () => {
                 gap: 12,
               }}
             >
-              <span style={{ color: '#555', width: 50, flexShrink: 0 }}>
-                @{entry.bitOffset}
-              </span>
-              <span style={{ width: 60, flexShrink: 0, color: isSentinel ? '#5eea5e' : isFrame ? '#eaea5e' : '#fff' }}>
+              <span style={{ color: '#555', width: 50, flexShrink: 0 }}>@{entry.bitOffset}</span>
+              <span
+                style={{
+                  width: 60,
+                  flexShrink: 0,
+                  color: isSentinel ? '#5eea5e' : isFrame ? '#eaea5e' : '#fff',
+                }}
+              >
                 0x{entry.byte.toString(16).padStart(2, '0')}
               </span>
-              <span style={{
-                color: isSentinel ? '#5eea5e' : isFrame ? '#eaea5e' : '#888',
-                fontWeight: isSentinel || isFrame ? 700 : 400,
-              }}>
+              <span
+                style={{
+                  color: isSentinel ? '#5eea5e' : isFrame ? '#eaea5e' : '#888',
+                  fontWeight: isSentinel || isFrame ? 700 : 400,
+                }}
+              >
                 {isSentinel && '🛡 SENTINEL'}
                 {isFrame && '📦 FRAME'}
-                {isData && `DATA byte`}
+                {isData && 'DATA byte'}
               </span>
             </div>
           );

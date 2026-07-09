@@ -12,25 +12,30 @@ export class AudioPlayer {
   }
 
   private ensureCtx(): AudioContext {
-    if (this.ctx.state === "suspended") this.ctx.resume();
+    if (this.ctx.state === 'suspended') this.ctx.resume();
     return this.ctx;
   }
 
   /** Play float32 samples at given sample rate through selected output device.
    *  @param clean — if true, play as-is (no pre-amplification) for clean musical output */
-  async play(samples: Float32Array, sampleRate: number, deviceId?: string, clean = false): Promise<void> {
+  async play(
+    samples: Float32Array,
+    sampleRate: number,
+    deviceId?: string,
+    clean = false,
+  ): Promise<void> {
     const ctx = this.ensureCtx();
 
     // Set output device if supported and specified
-    if (deviceId && typeof (ctx as any).setSinkId === "function") {
+    if (deviceId && typeof (ctx as any).setSinkId === 'function') {
       try {
         await (ctx as any).setSinkId(deviceId);
-        console.log("[Player] output device set to:", deviceId);
+        console.log('[Player] output device set to:', deviceId);
       } catch (e) {
-        console.warn("[Player] setSinkId failed:", e);
+        console.warn('[Player] setSinkId failed:', e);
       }
     } else {
-      console.log("[Player] default output (deviceId=", deviceId, ")");
+      console.log('[Player] default output (deviceId=', deviceId, ')');
     }
 
     return new Promise((resolve) => {
@@ -52,14 +57,21 @@ export class AudioPlayer {
       source.connect(ctx.destination);
       this.currentSource = source;
       source.start(0);
-      source.onended = () => { this.currentSource = null; resolve(); };
+      source.onended = () => {
+        this.currentSource = null;
+        resolve();
+      };
     });
   }
 
   /** Stop current playback immediately */
   stopPlayback(): void {
     if (this.currentSource) {
-      try { this.currentSource.stop(); } catch {}
+      try {
+        this.currentSource.stop();
+      } catch {
+        // Source may already be stopped — no-op
+      }
       this.currentSource = null;
     }
   }

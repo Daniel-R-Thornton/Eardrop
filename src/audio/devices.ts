@@ -16,17 +16,27 @@ export async function enumerateDevices(): Promise<DeviceList> {
   try {
     const temp = await navigator.mediaDevices.getUserMedia({ audio: true });
     temp.getTracks().forEach((t) => t.stop());
-  } catch { /* user may deny — labels stay empty */ }
+  } catch {
+    /* user may deny — labels stay empty */
+  }
 
   const all = await navigator.mediaDevices.enumerateDevices();
   const inputs: DeviceInfo[] = [];
   const outputs: DeviceInfo[] = [];
 
   for (const dev of all) {
-    if (dev.kind === "audioinput") {
-      inputs.push({ id: dev.deviceId, label: dev.label || `Mic ${inputs.length + 1}`, groupId: dev.groupId });
-    } else if (dev.kind === "audiooutput") {
-      outputs.push({ id: dev.deviceId, label: dev.label || `Speaker ${outputs.length + 1}`, groupId: dev.groupId });
+    if (dev.kind === 'audioinput') {
+      inputs.push({
+        id: dev.deviceId,
+        label: dev.label || `Mic ${inputs.length + 1}`,
+        groupId: dev.groupId,
+      });
+    } else if (dev.kind === 'audiooutput') {
+      outputs.push({
+        id: dev.deviceId,
+        label: dev.label || `Speaker ${outputs.length + 1}`,
+        groupId: dev.groupId,
+      });
     }
   }
 
@@ -39,9 +49,9 @@ export function populateSelect(
   devices: DeviceInfo[],
   selectedId: string,
 ) {
-  select.innerHTML = "";
+  select.innerHTML = '';
   for (const dev of devices) {
-    const opt = document.createElement("option");
+    const opt = document.createElement('option');
     opt.value = dev.id;
     opt.textContent = dev.label;
     if (dev.id === selectedId) opt.selected = true;

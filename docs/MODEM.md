@@ -2,136 +2,233 @@
 
 ## Overview
 
-The Eardrop modem uses a pilot-relative multi-tone scheme. A continuous pilot tone runs throughout the transmission. Data is encoded across 4 tones whose frequencies are at fixed offsets from the pilot. 2 bits per tone (amplitude + phase BPSK) = 8 bits per symbol.
+The Eardrop modem uses BPSK on 4 data tones with a continuous pilot reference. A pilot tone runs throughout the transmission at a fixed frequency. Data tones are at fixed offsets from the pilot. 1 phase bit per tone × 4 tones = 4 data bits per symbol (amplitude bits are hardcoded ON — always active BPSK).
+
+There are two protocol stacks sharing the same physical modulation layer:
+
+| Stack | Use | SPS | Framing | ECC |
+|-------|-----|-----|---------|-----|
+| **Encoder/Decoder** | Self-test, loopback tests | 128 | Self-framing blocks (sentinel scanner) | BCH(31,16) |
+| **TxEngine/RxEngine** | Production file transfer | 256 | Atomic frames (BCH header + RS payload) | BCH(63,30) + RS(52,40) |
+
+Both use the shared `PhaseAcc` oscillator (`oscillator.ts`) with a strict **sin-then-increment** phase contract matching the decoder's `toneIQ()` reference.
 
 ## Configuration (`ModemConfig` in `types.ts`)
 
 | Field | Default | Description |
 |-------|---------|-------------|
 | `sampleRate` | 3200 | Modem sample rate (Hz) |
-| `symbolsPerSec` | 25 | Symbol rate → 128 samples/symbol |
-| `bitsPerFrame` | 8 | 2 bits × 4 tones (amplitude + phase) |
+| `symbolsPerSec` | 25 | Symbol rate |
+| `bitsPerFrame` | 8 | Bits per symbol (amplitude + phase, 2 per tone) |
 | `pilotEnabled` | true | Enable pilot tone |
-| `pilotFreqHz` | 62.5 | Pilot frequency (configurable! decoder discovers) |
-| `pilotAmplitude` | 0.125 | Pilot amplitude (leaves headroom for 4 tones) |
-| `dataToneAmplitude` | 0.2 | Data tone amplitude |
-| `amplitudeThresholdRatio` | 0.3 | Tone ON if energy > pilotAmp × this |
-| `syncSymbols` | 10 | Number of sync symbols in burst |
-| `sentinel` | 0xE79F | 16-bit block sentinel pattern |
-| `squawkIntervalSymbols` | 32 | Data symbols between squawks |
-| `squawkSymbols` | 8 | Symbols per squawk |
-| `eccScheme` | `bch3116` | Error correction scheme |
-| `interleaveDepth` | 8 | Block interleaver depth |
-| `payloadBlockSymbols` | 32 | Symbols per payload block |
+| `pilotFreqHz` | 412.5 | Pilot frequency (Hz) |
+| `musical` | false | Use musical-mode tone intervals |
+| `pilotAmplitude` | 0.4 | Pilot amplitude |
+| `dataToneAmplitude` | 0.5 | Data tone amplitude |
+| `amplitudeThresholdRatio` | 0.3 | Tone ON threshold ratio (legacy) |
+| `toneCount` | 4 | Active tones (2 or 4) |
+| `diversityMode` | false | 3× frame repetition for robustness |
+| `syncSymbols` | 10 | Sync burst symbols (Encoder path only) |
+| `sentinel` | unused | Replaced by `getSentinel()` in framing.ts |
+| `squawkIntervalSymbols` | 32 | Legacy |
+| `squawkSymbols` | 8 | Legacy |
+| `eccScheme` | `bch3116` | ECC scheme (Encoder path) |
+| `interleaveDepth` | 8 | Interleaver depth |
+| `payloadBlockSymbols` | 32 | Legacy |
 
 ## Tone Layout
 
+Offsets from pilot (412.5 Hz):
+
 ```
-pilotFreq + 437.5 Hz  →  Tone 0  (default: 500 Hz)
-pilotFreq + 637.5 Hz  →  Tone 1  (default: 700 Hz)
-pilotFreq + 837.5 Hz  →  Tone 2  (default: 900 Hz)
-pilotFreq + 1037.5 Hz →  Tone 3  (default: 1100 Hz)
+TONE_OFFSETS = [237.5, 487.5, 737.5, 1087.5]
+
+Tone 0:  412.5 + 237.5  =  650 Hz
+Tone 1:  412.5 + 487.5  =  900 Hz
+Tone 2:  412.5 + 737.5  = 1150 Hz
+Tone 3:  412.5 + 1087.5 = 1500 Hz
 ```
 
-Changing the pilot frequency shifts all tones proportionally. Spacing is preserved.
+All tone frequencies are multiples of 25 Hz — every 128-sample window (3200/25) contains an integer number of cycles, eliminating spectral leakage.
 
-## Frame Structure
+## Phase Contract (Critical)
+
+Both encoder and decoder use `sin(ωn)` as their phase reference. This is enforced by the shared `PhaseAcc` oscillator (`src/modem/oscillator.ts`):
+
+```typescript
+advance(freqHz, sampleRate): number {
+    const v = Math.sin(2 * Math.PI * this.phase);  // sin at OLD phase
+    this.phase += freqHz / sampleRate;              // then increment
+    return v;
+}
+```
+
+The decoder's `toneIQ()` correlates with `sin(ωn)` at `idx = 0`. Since both sides use the same reference origin:
+- **0° BPSK → positive I** for all tones
+- **180° BPSK → negative I** for all tones
+
+No per-tone phase calibration is needed — a single global sign flip during the sync/calibration preamble handles any π ambiguity.
+
+---
+
+## Protocol Stack 1: Encoder/Decoder (Self-Test Path)
+
+Used in loopback tests and the UI self-test. SPS = 128.
+
+### Transmission Structure
 
 ```
 ┌─ Transmission ───────────────────────────────────────────────────┐
-│  Leader: ~0.5s of pure pilot (decoder discovers frequency here)  │
-│  Sync:   10 symbols, all 4 tones ON (phase-aligned with pilot)   │
-│  ┌─ Framed Block 1 ───────────────────────────────────────────┐  │
-│  │  0xE79F | TYPE=0x02 | LEN | CONFIG_DATA | CRC16            │  │
-│  │  (file name, size, dict scheme)                            │  │
+│  Leader: ~0.5s of pure pilot                                     │
+│  Sync:   10 symbols, all 4 tones ON at 0° BPSK                   │
+│  Calibrate: 16 symbols (4 per tone), one tone at a time, 0° BPSK │
+│  ┌─ Framed Block 1 (CONFIG) ──────────────────────────────────┐  │
+│  │  ECC-encoded file metadata                                  │  │
 │  └────────────────────────────────────────────────────────────┘  │
-│  ┌─ Framed Block 2..N ────────────────────────────────────────┐  │
-│  │  0xE79F | TYPE=0x04 | LEN | PAYLOAD_DATA | CRC16           │  │
+│  ┌─ Framed Block 2 (PAYLOAD) ─────────────────────────────────┐  │
+│  │  ECC-encoded file data                                      │  │
 │  └────────────────────────────────────────────────────────────┘  │
-│  ┌─ EOF Block ────────────────────────────────────────────────┐  │
-│  │  0xE79F | TYPE=0xFF | LEN=0 | CRC16                        │  │
+│  ┌─ Framed Block 3 (EOF) ─────────────────────────────────────┐  │
 │  └────────────────────────────────────────────────────────────┘  │
-│  Tail: brief silence                                              │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-## Block Format
+### Self-Framing Block Format
 
 ```
-Wire format (little-endian):
-┌─────────┬──────┬──────┬──────┬──────────┐
-│ SENTINEL│ TYPE │ LEN  │ DATA │ CRC16    │
-│ 2 bytes │ 1 B  │ 2 B  │ N B  │ 2 bytes  │
-└─────────┴──────┴──────┴──────┴──────────┘
-Overhead: 7 bytes per block
+[0xE79FE7: 3B] [TYPE: 1B] [LEN: 2B LE] [DATA: N B] [CRC16: 2B]
 ```
 
-**Sentinel**: 0xE79F (16 bits). Chosen for Hamming distance ≥4 from all shifted versions — minimizes false positives during bit-level scanning.
+Sentinel: 0xE79FE7 (24 bits). The `FramedBlockDecoder` scans incoming bits with a 24-bit sliding shift register and triggers collection on exact sentinel match.
 
-**Block Types**:
+Block types: SQUAWK(0x01), CONFIG(0x02), DICT(0x03), PAYLOAD(0x04), EOF(0xFF).
 
-| Value | Name | Content |
-|-------|------|---------|
-| 0x01 | SQUAWK | `[squawkId:1B][refI:2B][refQ:2B]` — calibration beacon |
-| 0x02 | CONFIG | `[nameLen:2B][fileName:L][totalSize:4B][dictScheme:1B]` — file metadata |
-| 0x03 | DICT | `[entries:2B][entry0_len:1B][entry0...]...` — adaptive dictionary |
-| 0x04 | PAYLOAD | Compressed file chunk bytes |
-| 0xFF | EOF | Empty — end of transmission |
+CRC: CRC-16-CCITT over TYPE + LEN + DATA.
 
-**CRC**: CRC-16-CCITT (poly 0x1021) over (TYPE + LEN + DATA). Initial 0xFFFF, final XOR 0xFFFF.
+### BPSK Bit Decision (Decoder)
 
-## Bit Encoding Per Symbol
-
-Each symbol carries 8 bits from 4 tones:
-
-```
-Symbol bits: [amp0 phase0 amp1 phase1 amp2 phase2 amp3 phase3]
-                 ↓       ↓       ↓       ↓       ↓       ↓       ↓       ↓
-Tone 0: ────┬───┬─── , Tone 1: ────┬───┬─── , Tone 2: ────┬───┬─── , Tone 3: ────┬───┬───
-            │   │                   │   │                   │   │                   │   │
-         ON/OFF 0°/180°          ON/OFF 0°/180°          ON/OFF 0°/180°          ON/OFF 0°/180°
+```typescript
+const correctedI = calPhaseFlip[t] < 0 ? -relI[t] : relI[t];
+const bit = correctedI < 0 ? 1 : 0;
 ```
 
-**Amplitude bit**: Tone ON if pilot-relative energy > `pilotAmplitude × amplitudeThresholdRatio` (default 0.3). This is the key pilot-relative mechanism — threshold adapts to volume automatically.
+Calibration computes a **global** `calPhaseFlip` (same sign for all 4 tones) during the sync + calibrate phases. With the sin-then-increment phase contract, 0° BPSK gives positive I for all tones, so `calPhaseFlip = 1` is always correct in clean conditions.
 
-**Phase bit**: BPSK — `relI > 0` → bit 1 (right half-plane), `relI < 0` → bit 0 (left half-plane).
+---
 
-## Pilot Discovery
+## Protocol Stack 2: TxEngine/RxEngine (Production Path)
 
-The decoder discovers the pilot frequency during the leader phase (pure pilot, ~0.5s):
+Used for actual file transfer via the encoder/broadcast workers. SPS = 256.
 
-1. Buffer at least 1024 audio samples
-2. Zero-pad to 2048 and run radix-2 FFT (~1.56 Hz bin spacing)
-3. Scan bins 26-77 (40-120 Hz range)
-4. Find peak magnitude bin
-5. Parabolic interpolation on (peak-1, peak, peak+1) for <0.1 Hz accuracy
-6. Validate: peak-to-median ratio > 5.0 (otherwise keep scanning)
-7. Initialize PilotPLL with discovered frequency
-
-## PilotPLL
-
-A second-order phase-locked loop runs continuously on every audio sample:
+### Transmission Structure
 
 ```
-Input → phase detector (sin multiply) → loop filter (Kp=0.1, Ki=0.01) → NCO → sin/cos refs
-                                                                          ↓
-                                                                     amplitude estimator (α=0.01)
+┌─ Preamble (generatePreamble in preamble.ts) ────────────────────┐
+│  Warble:    1280 samples (40 × 32-sample intervals)             │
+│             Encodes 16-bit warble code 0xAC94 via ±50 Hz FSK    │
+│                                                                  │
+│  Marker:    256 samples — all 4 tones ON full blast              │
+│                                                                  │
+│  Calibration: 16 frames × 256 samples = 4096 samples            │
+│              Gray code sequence through all 16 BPSK permutations │
+│              Gray code: [0,1,3,2,6,7,5,4,12,13,15,14,10,11,9,8] │
+│                                                                  │
+│  Guard:     512 samples — pilot only (2 frames at SPS=256)      │
+└──────────────────────────────────────────────────────────────────┘
+│
+┌─ Header frame (type=0x01) × (1 or 3 with diversity) ───────────┐
+│  Payload: [fileID:4B][totalSize:4B][nameLen:1B][fileName...]    │
+└──────────────────────────────────────────────────────────────────┘
+│
+┌─ Data frames (type=0x02) × N × (1 or 3 with diversity) ────────┐
+│  Payload: 40-byte file data chunks                               │
+└──────────────────────────────────────────────────────────────────┘
+│
+┌─ Tail frame (type=0x03) × (1 or 3 with diversity) ─────────────┐
+│  Signals end of file                                             │
+└──────────────────────────────────────────────────────────────────┘
+│
+  Tail silence: 768 samples
 ```
 
-- Tracks phase at the discovered pilot frequency
-- Amplitude estimate: low-pass filter on instantaneous envelope
-- `rotateToPilotRef(rawI, rawQ)`: rotates I/Q by tracked pilot phase → pilot-relative coordinates
+### Atomic Frame Format (79 bytes)
 
-## Self-Test / Channel Simulator
+```
+[SENTINEL: 3B 0xE79FE7] [BCH_HEADER: 24B] [RS_PAYLOAD: 52B]
+```
 
-The channel simulator (`channel.ts`) applies configurable impairments to test robustness:
+- **Sentinel**: 3 bytes, same 0xE79FE7 pattern
+- **BCH Header**: 3 × BCH(63,30) codewords protecting 9 header bytes (type, seqNum, totalFrames, CRC-32)
+- **RS Payload**: RS(52,40) — 40 data bytes + 12 parity bytes (corrects up to 6 byte errors)
 
-| Effect | Config | Default |
-|--------|--------|---------|
-| AWGN | SNR (-10 to +40 dB) | ∞ (clean) |
-| Echo | delay (0-50ms), attenuation (0-100%) | 0 |
-| Doppler | freq offset (±0.1-10 Hz) | 0 |
-| Amp drift | rate, depth | 0 |
-| Phase noise | stddev (radians) | 0 |
-| Band-limit | cutoff (Hz) | ∞ (none) |
-| Impulse noise | rate (clicks/s), amplitude | 0 |
+### RxEngine Demodulation
+
+**Warble Detection**: Scans for sustained energy at pilotFreq ± 50 Hz. Cross-correlates against the 16-bit warble code 0xAC94. Threshold: ≥9 matching bits out of 16.
+
+**Preamble State Machine**: WAITING → PREAMBLE → FRAMES → (optional timeout)
+
+**Marker Detection**: Total tone energy > 0.15 triggers calibration start.
+
+**Gray Code Calibration**: 16 consecutive frames, each encoding a different 4-bit Gray code value. The RxEngine computes per-tone I/Q centroids for bit=0 and bit=1 reference vectors via direct averaging:
+
+```
+ref0I[t] = mean(I values from frames where tone t had bit=0)
+ref1I[t] = mean(I values from frames where tone t had bit=1)
+```
+
+**Guard**: 2 frames × 256 samples of pilot-only. RxEngine waits 2 guard frames before entering FRAMES state.
+
+**DBPSK Demodulation**: Differential BPSK using dot product of consecutive frames:
+```
+dot = prevI * currI + prevQ * currQ
+diffBit = dot < 0 ? 1 : 0
+```
+
+With centroid fallback when confidence is high (`max(d0,d1) > 3 × min(d0,d1)`):
+```
+centBit = nearest_neighbor(currIQ, ref0IQ, ref1IQ)
+```
+
+**Sentinel Scanner**: 24-bit sliding shift register with Hamming distance threshold ≤2 for sentinel matching. On match, collects 76 bytes (frame minus sentinel), prepends sentinel, and emits the 79-byte atomic frame for BCH/RS decoding.
+
+### Diversity Mode
+
+When `diversityMode: true`, every frame is transmitted 3 times consecutively:
+```
+header ×3, payload1 ×3, payload2 ×3, ..., tail ×3
+```
+
+The RxEngine deduplicates:
+- **Headers**: Skip duplicate headers with same fileID
+- **Payloads**: Skip duplicate sequence numbers via `receivedPayloadSeqs` set
+- **Tails**: Skip after file already completed
+
+This provides 3× redundancy at the cost of 3× transmission time. No voting/consensus — just repetition with first-copy-wins.
+
+---
+
+## Pilot Handling
+
+**Encoder/Decoder path**: Pilot frequency is set from `ModemConfig.pilotFreqHz` (412.5 Hz). A second-order PLL (`PilotPLL` in `pilot.ts`) tracks pilot phase for amplitude estimation, but the data path uses raw I/Q directly — no pilot-relative rotation is needed because the phase contract ensures consistent signs.
+
+**TxEngine/RxEngine path**: Same pilot frequency. PLL is initialized on first sample and updated continuously for amplitude tracking.
+
+---
+
+## Error Correction
+
+| Path | Scheme | Correction Power |
+|------|--------|-----------------|
+| Encoder/Decoder | BCH(31,16) + interleave depth 8 | 3 bit errors per 31-bit codeword |
+| TxEngine/RxEngine | BCH(63,30) × 3 + RS(52,40) | 3 bit errors per BCH codeword + 6 byte errors per RS block |
+
+---
+
+## Test Coverage
+
+| Test File | Path | Tests |
+|-----------|------|-------|
+| `loopback.test.ts` | Encoder→Decoder | 12/12 |
+| `pipeline.test.ts` | Encoder→Decoder + channel sim | 17/20 |
+| `production.test.ts` | TxEngine→RxEngine | 4/4 |
+| `diversity.test.ts` | TxEngine→RxEngine + 3× repetition | 3/3 |

@@ -10,25 +10,25 @@
  *   { type: 'error',   id, error: string }
  */
 
-import { TxEngine } from "../modem/txEngine";
-import { DEFAULT_CONFIG, type ModemConfig } from "../modem/types";
+import { TxEngine } from '../modem/protocol/txEngine';
+import { DEFAULT_CONFIG, type ModemConfig } from '../modem/types';
 
 self.onmessage = (e: MessageEvent) => {
   const msg = e.data;
 
   try {
-    if (msg.type === "transmitFile") {
+    if (msg.type === 'transmitFile') {
       const tx = new TxEngine(msg.config ?? DEFAULT_CONFIG);
       const samples = tx.transmitFile(msg.fileName, new Uint8Array(msg.data));
       const sampleRate = msg.config?.sampleRate ?? DEFAULT_CONFIG.sampleRate;
       self.postMessage(
-        { type: "encoded", id: msg.id, samples: samples.buffer, sampleRate },
+        { type: 'encoded', id: msg.id, samples: samples.buffer, sampleRate },
         { transfer: [samples.buffer] },
       );
     } else {
-      self.postMessage({ type: "error", id: msg.id, error: `Unknown type: ${msg.type}` });
+      self.postMessage({ type: 'error', id: msg.id, error: `Unknown type: ${msg.type}` });
     }
   } catch (err: any) {
-    self.postMessage({ type: "error", id: msg.id, error: err.message });
+    self.postMessage({ type: 'error', id: msg.id, error: err.message });
   }
 };

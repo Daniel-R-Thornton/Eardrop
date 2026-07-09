@@ -2,24 +2,24 @@
  * BroadcastWorker — receives audio, feeds RxEngine, emits completed files.
  */
 
-import { RxEngine } from "../modem/rxEngine";
-import { DEFAULT_CONFIG } from "../modem/types";
+import { RxEngine } from '../modem/protocol/rxEngine';
+import { DEFAULT_CONFIG } from '../modem/types';
 
 const DEBUG = true;
 
 let rx: RxEngine | null = null;
 let stateInterval: ReturnType<typeof setInterval> | null = null;
 
-if (DEBUG) console.log("[RX] worker module loaded");
+if (DEBUG) console.log('[RX] worker module loaded');
 
 self.onmessage = (e: MessageEvent) => {
   const msg = e.data;
-  if (DEBUG && msg.type !== "feedSample") console.log("[RX] message:", msg.type);
+  if (DEBUG && msg.type !== 'feedSample') console.log('[RX] message:', msg.type);
 
   switch (msg.type) {
-    case "startListening": {
+    case 'startListening': {
       if (rx) return;
-      if (DEBUG) console.log("[RX] start listening");
+      if (DEBUG) console.log('[RX] start listening');
       rx = new RxEngine(msg.config ?? DEFAULT_CONFIG);
 
       // Poll for completed file every 200ms
@@ -29,12 +29,12 @@ self.onmessage = (e: MessageEvent) => {
         if (file) {
           if (DEBUG) console.log(`[RX] file complete: "${file.fileName}" ${file.data.length}B`);
           self.postMessage(
-            { type: "fileComplete", fileName: file.fileName, data: file.data.buffer },
+            { type: 'fileComplete', fileName: file.fileName, data: file.data.buffer },
             { transfer: [file.data.buffer] },
           );
         }
         self.postMessage({
-          type: "decoderState",
+          type: 'decoderState',
           state: rx.getState(),
         });
 
@@ -42,7 +42,7 @@ self.onmessage = (e: MessageEvent) => {
         const byteLog = rx.getDebugByteLog();
         if (byteLog.length > 0) {
           self.postMessage({
-            type: "debugByteLog",
+            type: 'debugByteLog',
             bytes: byteLog,
           });
         }
@@ -51,30 +51,30 @@ self.onmessage = (e: MessageEvent) => {
         const shiftRegHistory = rx.getShiftRegHistory();
         if (shiftRegHistory.length > 0) {
           self.postMessage({
-            type: "debugSentinelScan",
+            type: 'debugSentinelScan',
             history: shiftRegHistory,
           });
         }
       }, 200);
 
-      self.postMessage({ type: "listening" });
+      self.postMessage({ type: 'listening' });
       break;
     }
 
-    case "feedSample": {
+    case 'feedSample': {
       if (!rx) return;
       rx.feedSample(msg.sample);
       break;
     }
 
-    case "stopListening": {
-      if (DEBUG) console.log("[RX] stop listening");
+    case 'stopListening': {
+      if (DEBUG) console.log('[RX] stop listening');
       if (stateInterval) {
         clearInterval(stateInterval);
         stateInterval = null;
       }
       rx = null;
-      self.postMessage({ type: "stopped" });
+      self.postMessage({ type: 'stopped' });
       break;
     }
   }

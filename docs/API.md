@@ -9,14 +9,17 @@ interface ModemConfig {
   bitsPerFrame: number;              // 8
 
   pilotEnabled: boolean;             // true
-  pilotFreqHz: number;               // 62.5 (configurable)
-  pilotAmplitude: number;            // 0.125
+  pilotFreqHz: number;               // 412.5
+  musical: boolean;                  // false
+  pilotAmplitude: number;            // 0.4
 
-  dataToneAmplitude: number;         // 0.2
+  dataToneAmplitude: number;         // 0.5
   amplitudeThresholdRatio: number;   // 0.3
+  toneCount: number;                 // 4 (2 or 4)
+  diversityMode: boolean;            // false (3× repetition)
 
   syncSymbols: number;               // 10
-  sentinel: number;                  // 0xE79F
+  sentinel: number;                  // unused
 
   squawkIntervalSymbols: number;     // 32
   squawkSymbols: number;             // 8
@@ -28,51 +31,104 @@ interface ModemConfig {
 }
 ```
 
+Constants:
+- `TONE_OFFSETS`: `[237.5, 487.5, 737.5, 1087.5]`
+- `MUSICAL_OFFSETS`: `[87.5, 162.5, 287.5, 487.5]`
+- `WARBLE_CODE`: `0xAC94` (16-bit preamble detection code)
+- `DEFAULT_CONFIG`: All defaults above
+
 Helpers:
-- `getToneFreqs(pilotFreqHz) → [f0, f1, f2, f3]`
-- `getDefaultToneFreqs() → [f0, f1, f2, f3]`
-- `TONE_OFFSETS`: `[437.5, 637.5, 837.5, 1037.5]`
-- `TONE_COLORS`: `["#4a9eff", "#ff6b4a", "#5eead4", "#f472b6"]`
+- `getToneFreqs(pilotFreqHz, musical?) → [f0, f1, f2, f3]`
+- `getDataToneFreqs(pilotFreqHz, musical?) → [f0, f1, f2, f3]`
+- `getOffsets(musical?) → [o0, o1, o2, o3]`
 
 ---
 
-## `Encoder` (`modem/encoder.ts`)
+## `PhaseAcc` (`modem/oscillator.ts`)
+
+```typescript
+class PhaseAcc {
+  advance(freqHz: number, sampleRate: number): number
+  reset(): void
+}
+```
+
+Shared sin-then-increment oscillator. `advance()` returns `sin(2π · phase)` at the current phase, then increments. Used by all tone generation paths (Encoder, TxEngine, preamble).
+
+---
+
+## `toneIQ` (`modem/pilot.ts`)
+
+```typescript
+function toneIQ(
+  samples: readonly number[],
+  toneFreq: number,
+  sampleRate: number
+): { i: number; q: number }
+```
+
+Goertzel-style sin/cos correlation over a sample window. Computes raw I/Q at a single frequency. Matches the `sin(ωn)` reference of `PhaseAcc`.
+
+---
+
+## `PilotPLL` (`modem/pilot.ts`)
+
+```typescript
+class PilotPLL {
+  constructor(freq: number, initialPhase: number, initialAmplitude: number, cfg?: Partial<PLLConfig>)
+
+  update(sample: number): void
+  getAmplitude(): number
+  getPhase(): number
+  getFrequency(): number
+  getSinRef(): number
+  getCosRef(): number
+  rotateToPilotRef(rawI: number, rawQ: number): { i: number; q: number }
+  setFrequency(f: number): void
+}
+
+interface PLLConfig {
+  Kp: number          // 0.1
+  Ki: number          // 0.01
+  sampleRate: number  // 3200
+}
+```
+
+Second-order PLL. Used for amplitude tracking; phase rotation is not needed since the phase contract ensures consistent I signs across all tones.
+
+---
+
+## `Encoder` (`modem/encoder.ts`) — Self-Test Path
 
 ```typescript
 class Encoder {
   constructor(cfg?: Partial<ModemConfig>)
-  encode(data: Uint8Array): Float32Array        // → audio samples at modem rate
+  encode(data: Uint8Array): Float32Array
+  encodeFramedBlocks(blockBytes: Uint8Array): Float32Array
   encodeToOutputRate(data: Uint8Array, outputRate: number): Float32Array
   onDone(cb: () => void): void
 }
 ```
 
-The encoder generates a continuous pilot tone at `pilotFreqHz` plus 4 data tones at `pilotFreq + TONE_OFFSETS[t]`. Each symbol carries 8 bits (2 bits per tone: amplitude + BPSK phase).
+Generates leader (pilot-only) → sync (all tones ON) → calibrate (one tone at a time) → data (self-framing blocks). Uses `PhaseAcc` oscillator. SPS=128. BCH(31,16) ECC applied via `encode()`; `encodeFramedBlocks()` accepts pre-ECC bytes.
 
-Frame structure: leader (0.5s pilot only) → sync (10 symbols, all tones ON) → framed data blocks → done.
-
----
-
-## `Decoder` (`modem/decoder.ts`)
+## `Decoder` (`modem/decoder.ts`) — Self-Test Path
 
 ```typescript
 class Decoder {
   constructor(cfg?: Partial<ModemConfig>)
 
-  feedSample(sample: number): void              // feed one audio sample
+  feedSample(sample: number): void
   reset(): void
   flush(): Uint8Array
 
   hasData(): boolean
-  takeBytes(): Uint8Array
   getProgress(): number
-
   getNoiseFloor(): [number, number, number, number]
-  getNoiseMax(): [number, number, number, number]
   getPilotFreq(): number
   getPilotAmplitude(): number
 
-  onFrame: ((data: Uint8Array) => void) | null  // called per completed file
+  onFrame: ((data: Uint8Array) => void) | null
 
   // Debug
   debugLog: DecoderDebugInfo[]
@@ -83,197 +139,151 @@ class Decoder {
 }
 ```
 
-The decoder runs two phases:
-1. **Pilot discovery** (leader): FFT scan 40-120 Hz → find pilot frequency → init PLL
-2. **Data mode** (after sync): per-frame I/Q → pilot-relative rotation → bit extraction → FramedBlockDecoder → BlockProcessor
+Preamble detection via frame counting (leader → sync → calibrate → data). BPSK bit detection via raw I sign with global calibration flip. `FramedBlockDecoder` scans bits for sentinel patterns and emits validated blocks.
 
 ---
 
-## `PilotScanner` (`modem/pilot.ts`)
+## `TxEngine` (`modem/txEngine.ts`) — Production Path
 
 ```typescript
-class PilotScanner {
-  constructor(cfg?: Partial<PilotScannerConfig>)
-  feedSample(sample: number): PilotDiscovery | null
-  forceDiscover(): PilotDiscovery | null
-  isDone(): boolean
-  getResult(): PilotDiscovery | null
+class TxEngine {
+  constructor(cfg?: Partial<ModemConfig>)
+  transmitFile(fileName: string, data: Uint8Array): Float32Array
+  transmitFrame(header: AtomicHeader, payload: Uint8Array): Float32Array
   reset(): void
 }
+```
 
-interface PilotDiscovery {
-  freq: number        // discovered pilot frequency (Hz)
-  amplitude: number   // estimated amplitude
-  confidence: number  // 0-1
+Generates warble preamble + atomic frames. Supports diversity mode (3× repetition). SPS=256.
+
+## `RxEngine` (`modem/rxEngine.ts`) — Production Path
+
+```typescript
+class RxEngine {
+  constructor(cfg?: Partial<ModemConfig>)
+  feedSample(sample: number): void
+  getFile(): ReceivedFile | null
 }
 
-interface PilotScannerConfig {
-  scanRange: [number, number]  // [40, 120]
-  sampleRate: number           // 3200
-  fftSize: number              // 2048
-  minSamples: number           // 1024
-  minSignalRatio: number       // 5.0
+interface ReceivedFile {
+  fileName: string
+  data: Uint8Array
+  totalBytes: number
 }
 ```
 
-Uses FFT with zero-padding (2048-pt) and parabolic peak interpolation for <0.1 Hz accuracy.
+State machine: WAITING (warble detection) → PREAMBLE (marker, Gray code calibration, guard) → FRAMES (DBPSK + sentinel scanning) → COMPLETE (file ready). SPS=256.
 
 ---
 
-## `PilotPLL` (`modem/pilot.ts`)
+## `generatePreamble` (`modem/preamble.ts`)
 
 ```typescript
-class PilotPLL {
-  constructor(freq: number, initialPhase: number, initialAmplitude: number, cfg?: Partial<PLLConfig>)
+function generatePreamble(cfg: PreambleConfig): Float32Array
 
-  update(sample: number): void                  // feed one sample
-  getPhase(): number                            // tracked phase (cycles, 0..1)
-  getAmplitude(): number                        // smoothed amplitude
-  getFrequency(): number                        // tracked frequency
-  getSinRef(): number                           // sin(2π * phase)
-  getCosRef(): number                           // cos(2π * phase)
-  rotateToPilotRef(rawI: number, rawQ: number): { i: number; q: number }
-  setFrequency(f: number): void
-}
-
-interface PLLConfig {
-  Kp: number          // 0.1 (proportional gain)
-  Ki: number          // 0.01 (integral gain)
-  sampleRate: number  // 3200
+interface PreambleConfig {
+  pilotFreqHz: number
+  pilotAmplitude: number
+  dataToneAmplitude: number
+  sampleRate: number
+  toneOffsets: [number, number, number, number]
 }
 ```
 
-Second-order PLL. Loop bandwidth ~10 Hz (rejects data tone modulation). Amplitude estimated via low-pass filter (α=0.01).
+Generates warble (1280 samples, 16-bit code FSK) → marker (256 samples, all tones ON) → Gray code calibration (16 × 256 samples) → guard (512 samples, pilot only).
 
 ---
 
-## `toneIQ` (`modem/pilot.ts`)
+## Atomic Frame (`modem/atomicFrame.ts`)
 
 ```typescript
-function toneIQ(samples: readonly number[], toneFreq: number, sampleRate: number): { i: number; q: number }
-```
+const FRAME_SIZE = 79
+const PAYLOAD_DATA_SIZE = 40
 
-Computes raw sin/cos correlation for a single frequency over a sample buffer. Returns I/Q components.
+function encodeFrame(header: AtomicHeader, payload: Uint8Array): Uint8Array
+function decodeFrame(frame: Uint8Array): DecodedFrame
 
----
+interface AtomicHeader {
+  type: number        // 0x01=HEADER, 0x02=PAYLOAD, 0x03=TAIL
+  seqNum: number      // 0-based sequence number
+  totalFrames: number
+  crc: number         // CRC-32 of header fields
+}
 
-## Block Framing (`modem/framing.ts`)
-
-### `encodeBlock`
-
-```typescript
-function encodeBlock(type: BlockType, data: Uint8Array): EncodedBlock
-
-interface EncodedBlock {
-  bytes: Uint8Array     // [SENTINEL|TYPE|LEN|DATA|CRC16]
-  bitLength: number
+interface DecodedFrame {
+  header: AtomicHeader | null
+  payload: Uint8Array  // 40 bytes
+  valid: boolean       // CRC verified AND BCH+RS decode succeeded
 }
 ```
 
-Wraps raw data in a self-framing block with sentinel (0xE79F), type, length, data, and CRC-16-CCITT.
+79-byte wire format: `[SENTINEL:3B][BCH_HEADER:24B][RS_PAYLOAD:52B]`. BCH(63,30) × 3 protects the 9-byte header. RS(52,40) protects the 40-byte payload (corrects up to 6 byte errors).
 
-### `decodeBlock`
+---
 
-```typescript
-function decodeBlock(bytes: Uint8Array): { type: BlockType; data: Uint8Array } | null
-```
-
-Verifies sentinel and CRC, returns block contents. Returns null on CRC failure.
-
-### `FramedBlockDecoder`
+## Self-Framing Blocks (`modem/framing.ts`)
 
 ```typescript
+function encodeBlock(type: BlockType, data: Uint8Array, sentinel?: number): EncodedBlock
+function decodeBlock(bytes: Uint8Array, sentinel?: number): { type: BlockType; data: Uint8Array } | null
+function getSentinel(toneCount: number): number  // 0xE79FE7 (4-tone) or 0xC48CC4 (2-tone)
+
 class FramedBlockDecoder {
   totalBits: number
   blocksDecoded: number
   blocksCrcFailed: number
-  blocksLenRejected: number
-
   onBlock: ((event: BlockEvent) => void) | null
 
-  feedBit(bit: number): void                    // one bit at a time
-  feedSymbol(symbolBits: number, count: number): void  // MSB-first
-  feedBits(bits: readonly number[]): void
+  feedBit(bit: number): void
   feedBytes(bytes: Uint8Array): void
   reset(): void
-  getPhase(): BlockScanPhase
+}
+
+interface BlockEvent {
+  type: number
+  data: Uint8Array
+  bitOffset: number
 }
 ```
 
-Bit-level sentinel scanner state machine: `SCAN → HEADER → DATA → CRC`. Emits validated blocks via `onBlock` callback. CRC failures are silently discarded.
+24-bit sentinel scanner (0xE79FE7). Wire format: `[SENTINEL:3B][TYPE:1B][LEN:2B LE][DATA:NB][CRC16:2B]`. CRC-16-CCITT over TYPE+LEN+DATA.
+
+Block types: SQUAWK(0x01), CONFIG(0x02), DICT(0x03), PAYLOAD(0x04), EOF(0xFF).
 
 ---
 
-## `BlockProcessor` (`modem/blockProcessor.ts`)
+## Error Correction
 
-```typescript
-class BlockProcessor {
-  stats: {
-    blocksReceived: number
-    configBlocks: number
-    dictBlocks: number
-    payloadBlocks: number
-    eofBlocks: number
-    squawkBlocks: number
-    bytesAssembled: number
-    resets: number
-  }
-
-  constructor(cfg: BlockProcessorConfig)
-  processBlock(type: number, data: Uint8Array): string
-  reset(): void
-  getProgress(): { fileName: string; bytesSoFar: number; totalBytes: number } | null
-}
-
-interface BlockProcessorConfig {
-  onFileComplete: (file: { name: string; data: Uint8Array }) => void
-  onPayloadProgress: (bytesSoFar: number, fileSize: number) => void
-  onSquawk?: (squawkId: number, refI: number, refQ: number) => void
-}
-```
-
-Expected block sequence: `CONFIG → [DICT] → (PAYLOAD)* → EOF`. Out-of-order blocks cause a reset.
-
----
-
-## Error Correction (`modem/ecc.ts`) — Phase F
-
-```typescript
-function bch3116Encode(data: Uint8Array): Uint8Array
-function bch3116Decode(data: Uint8Array): { data: Uint8Array; errors: number }
-
-function interleave(data: Uint8Array, depth: number): Uint8Array
-function deinterleave(data: Uint8Array, depth: number): Uint8Array
-```
+| Module | Function | Description |
+|--------|----------|-------------|
+| `ecc.ts` | `bch3116Encode/Decode` | BCH(31,16) — 3 bit errors per codeword, rate 0.52 |
+| `bch63.ts` | `bch63Encode/Decode` | BCH(63,30) — 3 bit errors per codeword, rate 0.48 |
+| `reedsolomon.ts` | `rsEncode/Decode` | RS(52,40) — 6 byte errors per block, rate 0.77 |
 
 ---
 
 ## Worker Message Protocol
 
-### `encoder.worker.ts`
+### `encoder.worker.ts` (uses TxEngine)
 
 ```
 Main → Worker:
-  { type: 'encode',         id, data: Uint8Array, config? }
-  { type: 'encodeToOutput', id, data: Uint8Array, outputRate, config? }
+  { type: 'encode', id, fileName, data: ArrayBuffer, config? }
 
 Worker → Main:
   { type: 'encoded', id, samples: ArrayBuffer, sampleRate }
-  { type: 'error',   id, error: string }
+  { type: 'error', id, error: string }
 ```
 
-### `broadcast.worker.ts`
+### `broadcast.worker.ts` (uses RxEngine)
 
 ```
 Main → Worker:
-  { type: 'startListening', config?, fastSync? }
+  { type: 'startListening', config? }
   { type: 'feedSample', sample: number }
   { type: 'stopListening' }
-  { type: 'flush' }
 
 Worker → Main:
   { type: 'listening' }
-  { type: 'stopped' }
-  { type: 'frame', data: ArrayBuffer }           // completed file bytes
-  { type: 'decoderState', bitsCollected, hasData, debugInfo, recentLog, rawBytes }
+  { type: 'fileComplete', fileName, data: ArrayBuffer }
 ```

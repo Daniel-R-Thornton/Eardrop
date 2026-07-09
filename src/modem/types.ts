@@ -36,6 +36,10 @@ export interface ModemConfig {
   toneCount: number;
   /** Hail Mary mode: 1 tone data, all tones repeat same bit for consensus voting */
   diversityMode: boolean;
+  /** Amplitude threshold ratio relative to pilot: tone ON if energy > pilotAmp * this */
+  ampThresholdRatio?: number;
+  /** Sync strong multiplier for frame sync sensitivity */
+  syncStrongMultiplier?: number;
 
   // ── Sync / framing ──
   /** Number of sync symbols in the sync burst */
@@ -70,7 +74,10 @@ export const TONE_OFFSETS: [number, number, number, number] = [
 
 /** Musical mode offsets — playable intervals from pilot */
 export const MUSICAL_OFFSETS: [number, number, number, number] = [
-  87.5, 162.5, 287.5, 487.5,  // 500, 575, 700, 900 Hz — B4, D5, F5, A5
+  87.5,
+  162.5,
+  287.5,
+  487.5, // 500, 575, 700, 900 Hz — B4, D5, F5, A5
 ] as const;
 
 /** Get offsets based on musical mode */
@@ -79,7 +86,10 @@ export function getOffsets(musical: boolean): [number, number, number, number] {
 }
 
 /** Compute absolute tone frequencies for a given pilot frequency */
-export function getToneFreqs(pilotFreqHz: number, musical = false): [number, number, number, number] {
+export function getToneFreqs(
+  pilotFreqHz: number,
+  musical = false,
+): [number, number, number, number] {
   const offs = getOffsets(musical);
   return [
     pilotFreqHz + offs[0],
@@ -95,7 +105,7 @@ export function getDefaultToneFreqs(musical = false): [number, number, number, n
 }
 
 /** Tone colors for debug display (one per tone index) */
-export const TONE_COLORS = ["#4a9eff", "#ff6b4a", "#5eead4", "#f472b6"];
+export const TONE_COLORS = ['#4a9eff', '#ff6b4a', '#5eead4', '#f472b6'];
 
 /**
  * 16-bit warble code for preamble detection.
@@ -104,7 +114,7 @@ export const TONE_COLORS = ["#4a9eff", "#ff6b4a", "#5eead4", "#f472b6"];
  *   1 = pilotFreq + 50 Hz
  * The decoder cross-correlates against this code to reject noise.
  */
-export const WARBLE_CODE = 0xAC94; // 1010 1100 1001 0100
+export const WARBLE_CODE = 0xac94; // 1010 1100 1001 0100
 /** Minimum bits (out of 16) that must correlate to accept warble detection */
 export const WARBLE_CODE_THRESHOLD = 12;
 
@@ -125,7 +135,7 @@ export const DEFAULT_CONFIG: ModemConfig = {
 
   syncSymbols: 10,
 
-  sentinel: 0x8888,  // unused — actual framing uses getSentinel() in framing.ts
+  sentinel: 0x8888, // unused — actual framing uses getSentinel() in framing.ts
 
   squawkIntervalSymbols: 32,
   squawkSymbols: 8,

@@ -7,7 +7,7 @@
  * back to the main thread via postMessage.
  */
 
-import { createDownsampler } from "./resampler";
+import { createDownsampler } from './dsp/Resampler';
 
 export type SampleCallback = (sample: number) => void;
 
@@ -32,7 +32,7 @@ class RecorderProcessor extends AudioWorkletProcessor {
 registerProcessor('recorder-processor', RecorderProcessor);
 `.trim();
 
-const WORKLET_BLOB = new Blob([WORKLET_SOURCE], { type: "application/javascript" });
+const WORKLET_BLOB = new Blob([WORKLET_SOURCE], { type: 'application/javascript' });
 const WORKLET_URL = URL.createObjectURL(WORKLET_BLOB);
 
 export class AudioRecorder {
@@ -57,10 +57,14 @@ export class AudioRecorder {
   /** Set a calibration factor for the mic sample rate (frequency offset detected via sweep) */
   setCalibration(factor: number) {
     this.calibratedMicRate = Math.round(this.ctx.sampleRate * factor);
-    console.log(`[Recorder] mic rate calibrated: ${this.ctx.sampleRate} × ${factor} = ${this.calibratedMicRate} Hz`);
+    console.log(
+      `[Recorder] mic rate calibrated: ${this.ctx.sampleRate} × ${factor} = ${this.calibratedMicRate} Hz`,
+    );
   }
 
-  get isRunning() { return this.running; }
+  get isRunning() {
+    return this.running;
+  }
 
   async start(modemRate: number, onSample: SampleCallback, deviceId?: string): Promise<void> {
     if (this.running) return;
@@ -68,21 +72,21 @@ export class AudioRecorder {
     this.pending = null;
     this.modemFrameSamples = 0;
 
-    console.log("[Recorder] start");
+    console.log('[Recorder] start');
 
-    console.log("[Recorder] context state:", this.ctx.state);
+    console.log('[Recorder] context state:', this.ctx.state);
 
-    if (this.ctx.state === "suspended") {
-      console.log("[Recorder] context suspended — resuming…");
+    if (this.ctx.state === 'suspended') {
+      console.log('[Recorder] context suspended — resuming…');
       await this.ctx.resume();
-      console.log("[Recorder] after resume:", this.ctx.state);
+      console.log('[Recorder] after resume:', this.ctx.state);
     }
 
     // Load the AudioWorklet module
     try {
       await this.ctx.audioWorklet.addModule(WORKLET_URL);
     } catch (err: any) {
-      console.error("[Recorder] AudioWorklet addModule failed:", err);
+      console.error('[Recorder] AudioWorklet addModule failed:', err);
       throw new Error(`AudioWorklet init failed: ${err.message}`);
     }
 
@@ -96,7 +100,7 @@ export class AudioRecorder {
       },
     };
     this.stream = await navigator.mediaDevices.getUserMedia(constraints);
-    console.log("[Recorder] stream active:", this.stream.active);
+    console.log('[Recorder] stream active:', this.stream.active);
 
     const micRate = this.calibratedMicRate || this.ctx.sampleRate;
     console.log(`[Recorder] using mic rate: ${micRate} Hz (ctx says ${this.ctx.sampleRate})`);
@@ -105,7 +109,7 @@ export class AudioRecorder {
     this.downsampler = createDownsampler(micRate, modemRate, onSample);
 
     // Create AudioWorkletNode
-    this.workletNode = new AudioWorkletNode(this.ctx, "recorder-processor");
+    this.workletNode = new AudioWorkletNode(this.ctx, 'recorder-processor');
     this.workletNode.port.onmessage = (e: MessageEvent<Float32Array>) => {
       if (!this.running || !this.downsampler) return;
       this.downsampler.feed(e.data);
@@ -122,7 +126,7 @@ export class AudioRecorder {
     silentGain.connect(this.ctx.destination);
 
     this.running = true;
-    console.log("[Recorder] running");
+    console.log('[Recorder] running');
   }
 
   stop() {
@@ -143,7 +147,7 @@ export class AudioRecorder {
     this.downsampler = null;
     this.onSample = null;
     this.running = false;
-    console.log("[Recorder] stopped");
+    console.log('[Recorder] stopped');
   }
 
   /**
@@ -151,7 +155,15 @@ export class AudioRecorder {
    * Returns recent waveform, RMS level, peak, zero-crossing rate,
    * and context info.
    */
-  getDiag(): { rmsDb: number; peak: number; zeroCrossingRate: number; ctxState: string; sampleRate: number; calibrationFactor: number; recentSamples: Float32Array } {
+  getDiag(): {
+    rmsDb: number;
+    peak: number;
+    zeroCrossingRate: number;
+    ctxState: string;
+    sampleRate: number;
+    calibrationFactor: number;
+    recentSamples: Float32Array;
+    } {
     // Build recent samples from downsampled data if available
     // We use the raw input when available through pending worklet buffer
     let recent: Float32Array;
@@ -182,7 +194,8 @@ export class AudioRecorder {
       zeroCrossingRate: zcr,
       ctxState: this.ctx.state,
       sampleRate: this.calibratedMicRate || this.ctx.sampleRate,
-      calibrationFactor: this.calibratedMicRate > 0 ? this.calibratedMicRate / this.ctx.sampleRate : 1.0,
+      calibrationFactor:
+        this.calibratedMicRate > 0 ? this.calibratedMicRate / this.ctx.sampleRate : 1.0,
       recentSamples: recent.slice(-128),
     };
   }

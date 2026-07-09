@@ -3,7 +3,7 @@
  * app.ts pushes updates, React components subscribe.
  */
 
-import { useSyncExternalStore } from "react";
+import { useSyncExternalStore } from 'react';
 
 // ─── State Shape ──────────────────────────────────────
 
@@ -73,7 +73,13 @@ export interface AppState {
   /** Noise floor estimate for VU reference */
   noiseFloorDb: number;
   /** Debug trace log — raw per-frame BPSK data */
-  debugTrace: Array<{ sym: number; rawI: number[]; bits: number[]; frameHex: string; blockEvent?: string }>;
+  debugTrace: Array<{
+    sym: number;
+    rawI: number[];
+    bits: number[];
+    frameHex: string;
+    blockEvent?: string;
+  }>;
   /** Diagnostic messages from last receive cycle */
   diagMessages: string[];
   /** Theme: 'dark' | 'light' */
@@ -83,16 +89,34 @@ export interface AppState {
   /** Sentinel scanner shift register history */
   sentinelScan: Array<{ bit: number; shiftReg: number; matched: boolean; phase: string }>;
   /** Mic diagnostic snapshot */
-  micDiag: { rmsDb: number; peak: number; zeroCrossingRate: number; ctxState: string; sampleRate: number; calibrationFactor: number; recentSamples: Float32Array } | null;
+  micDiag: {
+    rmsDb: number;
+    peak: number;
+    zeroCrossingRate: number;
+    ctxState: string;
+    sampleRate: number;
+    calibrationFactor: number;
+    recentSamples: Float32Array;
+  } | null;
 }
 
 const defaultDecoder: DecoderInfo = {
-  inFrame: false, consecutiveSync: 0, bitsCollected: 0,
-  pilotFreq: 0, pilotAmplitude: 0, signalToNoise: 0,
-  noiseFloor: [0, 0, 0, 0], energies: [0, 0, 0, 0],
-  relI: [0, 0, 0, 0], relQ: [0, 0, 0, 0], bitPattern: 0,
-  thresholds: [0, 0, 0, 0], noiseFrames: 0,
-  blocksDecoded: 0, blocksCrcFailed: 0, noiseAvg: 0,
+  inFrame: false,
+  consecutiveSync: 0,
+  bitsCollected: 0,
+  pilotFreq: 0,
+  pilotAmplitude: 0,
+  signalToNoise: 0,
+  noiseFloor: [0, 0, 0, 0],
+  energies: [0, 0, 0, 0],
+  relI: [0, 0, 0, 0],
+  relQ: [0, 0, 0, 0],
+  bitPattern: 0,
+  thresholds: [0, 0, 0, 0],
+  noiseFrames: 0,
+  blocksDecoded: 0,
+  blocksCrcFailed: 0,
+  noiseAvg: 0,
 };
 
 const defaultState: AppState = {
@@ -139,21 +163,25 @@ type Listener = () => void;
 let state: AppState = { ...defaultState };
 const listeners = new Set<Listener>();
 
-export function getState(): AppState { return state; }
+export function getState(): AppState {
+  return state;
+}
 
 export function setState(update: Partial<AppState>): void {
   state = { ...state, ...update };
-  listeners.forEach(fn => fn());
+  listeners.forEach((fn) => fn());
 }
 
 export function resetState(): void {
   state = { ...defaultState };
-  listeners.forEach(fn => fn());
+  listeners.forEach((fn) => fn());
 }
 
 export function subscribe(fn: Listener): () => void {
   listeners.add(fn);
-  return () => { listeners.delete(fn); };
+  return () => {
+    listeners.delete(fn);
+  };
 }
 
 export function useStore<T>(selector: (s: AppState) => T): T {
