@@ -204,10 +204,11 @@ export class Encoder {
 
       case Phase.kSync: {
         // All tones ON — phase-aligned with pilot. Amplitude=1, phase=0.
+        // sin-then-increment: sample n → sin(ωn) matching decoder's toneIQ reference
         for (let t = 0; t < numTones; t++) {
+          output += Math.sin(2 * Math.PI * this.tonePhases[t]) * dataToneAmplitude;
           this.tonePhases[t] += this.toneFreqs[t] / sampleRate;
           if (this.tonePhases[t] >= 1.0) this.tonePhases[t] -= 1.0;
-          output += Math.sin(2 * Math.PI * this.tonePhases[t]) * dataToneAmplitude;
           this.bpskMul[t] = 1;
         }
         this.samplesInPhase++;
@@ -221,11 +222,12 @@ export class Encoder {
         // Send each tone ON for 4 frames at 0° phase — decoder measures gain & phase ref
         const calSymIdx = Math.floor(this.samplesInPhase / this.sps);
         const calTone = Math.min(numTones - 1, Math.floor(calSymIdx / 4));
+        // sin-then-increment: sample n → sin(ωn) matching decoder's toneIQ
         for (let t = 0; t < numTones; t++) {
-          this.tonePhases[t] += this.toneFreqs[t] / sampleRate;
-          if (this.tonePhases[t] >= 1.0) this.tonePhases[t] -= 1.0;
           const amp = t === calTone ? dataToneAmplitude : 0;
           output += Math.sin(2 * Math.PI * this.tonePhases[t]) * amp;
+          this.tonePhases[t] += this.toneFreqs[t] / sampleRate;
+          if (this.tonePhases[t] >= 1.0) this.tonePhases[t] -= 1.0;
           this.bpskMul[t] = t === calTone ? 1 : 0;
         }
         this.samplesInPhase++;
@@ -250,11 +252,11 @@ export class Encoder {
           this.bitPos += active;
         }
 
-        // Generate this sample
+        // Generate this sample — sin-then-increment matching decoder's toneIQ
         for (let t = 0; t < numTones; t++) {
+          output += Math.sin(2 * Math.PI * this.tonePhases[t]) * dataToneAmplitude * this.bpskMul[t];
           this.tonePhases[t] += this.toneFreqs[t] / sampleRate;
           if (this.tonePhases[t] >= 1.0) this.tonePhases[t] -= 1.0;
-          output += Math.sin(2 * Math.PI * this.tonePhases[t]) * dataToneAmplitude * this.bpskMul[t];
         }
 
         this.samplesInPhase++;

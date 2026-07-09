@@ -159,6 +159,7 @@ export class Decoder {
   constructor(cfg: Partial<ModemConfig> = {}) {
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
     this.sps = this.cfg.sampleRate / this.cfg.symbolsPerSec;
+    this.noiseHistory = new Float64Array(10);
     this.liveAmpThresholdRatio = this.cfg.amplitudeThresholdRatio;
     this.scanner = new PilotScanner({
       sampleRate: this.cfg.sampleRate,
@@ -432,9 +433,12 @@ export class Decoder {
         this.calPhaseCount[maxTone]++;
         const totalCounts = this.calPhaseCount.reduce((a,b)=>a+b,0);
         if (totalCounts >= 8) {
-          for (let t = 0; t < 4; t++) this.calPhaseFlip[t] = this.calPhaseSum[t] >= 0 ? 1 : -1;
+          let totalSum = 0;
+          for (let t = 0; t < 4; t++) totalSum += this.calPhaseSum[t];
+          const globalFlip = totalSum >= 0 ? 1 : -1;
+          for (let t = 0; t < 4; t++) this.calPhaseFlip[t] = globalFlip;
           this.calDone = true;
-          console.warn(`[CAL] BPSK reference signs: flip=[${this.calPhaseFlip.join(',')}] (per-tone)`);
+          console.warn(`[CAL] BPSK reference signs: flip=[${this.calPhaseFlip.join(',')}] (global=${globalFlip})`);
         }
       }
 

@@ -32,12 +32,14 @@ const TAIL_SILENCE = 768;
 
 class PhaseAcc {
   private phase = 0;
-  advance(freqHz: number, sampleRate: number): void {
+  /** Advance phase and return sin at the OLD phase (sin-then-increment, matching toneIQ). */
+  advance(freqHz: number, sampleRate: number): number {
+    const v = Math.sin(2 * Math.PI * this.phase);
     this.phase += freqHz / sampleRate;
     if (this.phase >= 1.0) this.phase -= 1.0;
     if (this.phase < 0) this.phase += 1.0;
+    return v;
   }
-  getSin(): number { return Math.sin(2 * Math.PI * this.phase); }
   reset() { this.phase = 0; }
   copy(): PhaseAcc { const p = new PhaseAcc(); p.phase = this.phase; return p; }
 }
@@ -200,14 +202,12 @@ export class TxEngine {
       for (let s = 0; s < SPS; s++) {
         let sample = 0;
 
-        // Pilot (continuous)
-        this.pilotPhase.advance(this.cfg.pilotFreqHz, this.cfg.sampleRate);
-        sample += this.pilotPhase.getSin() * this.cfg.pilotAmplitude;
+        // Pilot (continuous) — advance() returns sin-then-increment
+        sample += this.pilotPhase.advance(this.cfg.pilotFreqHz, this.cfg.sampleRate) * this.cfg.pilotAmplitude;
 
-        // Data tones with BPSK
+        // Data tones with BPSK — advance() returns sin-then-increment
         for (let t = 0; t < TONE_COUNT; t++) {
-          this.tonePhases[t].advance(this.toneFreqs[t], this.cfg.sampleRate);
-          sample += this.tonePhases[t].getSin() * this.cfg.dataToneAmplitude * bpskMul[t];
+          sample += this.tonePhases[t].advance(this.toneFreqs[t], this.cfg.sampleRate) * this.cfg.dataToneAmplitude * bpskMul[t];
         }
 
         audio[sym * SPS + s] = sample;
