@@ -4,7 +4,7 @@
  */
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { useStore, setState } from './Store';
+import { useStore, setState, resetState } from './Store';
 import { ToneMeter } from './components/ToneMeter';
 import { BitAnalyzer } from './components/BitAnalyzer';
 import { WaveformScope } from './components/WaveformScope';
@@ -109,6 +109,28 @@ export function MainApp() {
           title="Toggle theme"
         >
           {s.theme === 'dark' ? '☀' : '🌙'}
+        </button>
+        {/* Reset to defaults button */}
+        <button
+          onClick={() => {
+            // Stop listening if active
+            if (s.isListening) dispatch('eardrop-record');
+            // Reset the UI store to its defaults
+            resetState();
+          }}
+          className="reset-button"
+          title="Reset UI to defaults"
+          style={{
+            marginLeft: 8,
+            padding: '4px 8px',
+            background: '#f87171',
+            color: '#fff',
+            border: 'none',
+            borderRadius: 4,
+            cursor: 'pointer',
+          }}
+        >
+          Reset
         </button>
       </div>
 
@@ -283,6 +305,7 @@ export function MainApp() {
               >
                 <option value={2}>2 tones</option>
                 <option value={4}>4 tones</option>
+                <option value={8}>8 tones</option>
               </select>
             </div>
 
@@ -756,6 +779,15 @@ export function MainApp() {
               </button>
               <button onClick={() => dispatch('eardrop-fine-sweep')} style={{ ...btnSmall, background: 'rgba(20,184,166,0.15)', color: '#14b8a6', borderColor: 'rgba(20,184,166,0.3)' }}>
                 Fine Sweep
+              </button>
+              <button onClick={() => dispatch('eardrop-speed-sweep')} style={{ ...btnSmall, background: 'rgba(250,204,21,0.15)', color: '#facc15', borderColor: 'rgba(250,204,21,0.3)' }}>
+                Speed Sweep
+              </button>
+              <button onClick={() => dispatch('eardrop-combo-sweep')} style={{ ...btnSmall, background: 'rgba(249,115,22,0.15)', color: '#f97316', borderColor: 'rgba(249,115,22,0.3)' }}>
+                Combo Sweep
+              </button>
+              <button onClick={() => dispatch('eardrop-acoustic-speed')} style={{ ...btnSmall, background: 'rgba(220,38,38,0.15)', color: '#dc2626', borderColor: 'rgba(220,38,38,0.3)' }}>
+                Acoustic Speed
               </button>
               <button onClick={() => dispatch('eardrop-download-wav')} style={btnSmall}>
                 Download WAV

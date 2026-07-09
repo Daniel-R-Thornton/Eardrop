@@ -194,8 +194,14 @@ broadcastWorker.onmessage = (e) => {
       setState({ recvStatus: { type: 'info', msg: `📡 ${label}` } });
       break;
     }
-    case 'debugByteLog':
-      setState({ debugByteStream: msg.bytes });
+    case 'debugDecoderState': {
+      // Forward to global store + custom event for debug panels
+      setState({ debug: msg.snapshot });
+      window.dispatchEvent(new CustomEvent('eardrop-decoder-state', {
+        detail: { type: 'decoderState', snapshot: msg.snapshot },
+      }));
+      break;
+    }
       break;
     case 'debugSentinelScan':
       setState({ sentinelScan: msg.history });
@@ -217,10 +223,12 @@ function getDeviceRefs() {
     fastSyncCb = document.getElementById('fastSyncCb') as HTMLInputElement;
     refreshBtn?.addEventListener('click', refreshDeviceList);
     inputSelect.addEventListener('change', () => {
-      selectedInputId = inputSelect!.value;
+      const id = inputSelect!.value;
+      setState({ selectedInputId: id });
     });
     outputSelect.addEventListener('change', () => {
-      selectedOutputId = outputSelect!.value;
+      const id = outputSelect!.value;
+      setState({ selectedOutputId: id });
     });
   }
 }
@@ -242,7 +250,12 @@ async function refreshDeviceList() {
   try {
     const { inputs, outputs } = await enumerateDevices();
     populateSelect(inputSelect, inputs, '');
+      // If we have a persisted mic/device, select it
+      const storedIn = getState().selectedInputId;
+      if (storedIn) inputSelect.value = storedIn;
     populateSelect(outputSelect, outputs, '');
+      const storedOut = getState().selectedOutputId;
+      if (storedOut) outputSelect.value = storedOut;
   } catch {
     /* silent */
   }
@@ -281,7 +294,7 @@ window.addEventListener('eardrop-send', (async () => {
     setState({ sendStatus: { type: 'info', msg: `Playing ${selectedFile.name}…` } });
     setState({ isPlaying: true });
     const cleanPlay = getState().musicalMode;
-    await player.play(playSamples, actualRate, selectedOutputId || undefined, cleanPlay);
+    await player.play(playSamples, actualRate, getState().selectedOutputId || undefined, cleanPlay);
     setState({
       isSending: false,
       isPlaying: false,
@@ -345,7 +358,7 @@ window.addEventListener('eardrop-send-test', (async () => {
     await player.play(
       playSamples,
       actualRate,
-      selectedOutputId || undefined,
+      getState().selectedOutputId || undefined,
       getState().musicalMode,
     );
     setState({ sendStatus: { type: 'success', msg: '✅ Test sent' } });
@@ -466,7 +479,7 @@ window.addEventListener('eardrop-acoustic-sweep', (async () => {
     }
     const playBuf = resample(tone, modemRate, outputRate);
     const recvCount = recvSamples.length;
-    await player.play(playBuf, outputRate, selectedOutputId || undefined, getState().musicalMode);
+    await player.play(playBuf, outputRate, getState().selectedOutputId || undefined, getState().musicalMode);
     await new Promise((r) => setTimeout(r, 50));
 
     const newSamples = recvSamples.slice(recvCount);
@@ -534,8 +547,6 @@ let micWatchdog: ReturnType<typeof setTimeout> | null = null;
 let recvSamples: number[] = [];
 let tickCount = 0;
 let isListening = false;
-let selectedInputId = '';
-let selectedOutputId = '';
 
 function recvBuf(existing: Uint8Array[], chunk: Uint8Array) {
   existing.push(chunk);
@@ -633,6 +644,7 @@ async function startListening() {
       pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz,
       musical: getState().musicalMode,
       toneCount: getState().toneCount || DEFAULT_CONFIG.toneCount,
+      bitsPerFrame: (getState().toneCount || DEFAULT_CONFIG.toneCount) * 2,
       symbolsPerSec: getState().symbolsPerSec || DEFAULT_CONFIG.symbolsPerSec,
       ampThresholdRatio: getState().ampThresholdRatio ?? DEFAULT_CONFIG.ampThresholdRatio,
       syncStrongMultiplier: getState().syncStrongMultiplier ?? DEFAULT_CONFIG.syncStrongMultiplier,
@@ -664,7 +676,7 @@ async function startListening() {
       if (recvSamples.length > modemRate * 10)
         recvSamples.splice(0, recvSamples.length - modemRate * 5);
     };
-    await recorder.start(modemRate, feedSample, selectedInputId || undefined);
+    await recorder.start(modemRate, feedSample, getState().selectedInputId || undefined);
 
     micWatchdog = setTimeout(() => {
       if (recvSamples.length === 0) {
@@ -804,7 +816,7 @@ async function sendCalibrationOnly() {
   console.warn(`[CAL-TEST] Pre-transmission noise floor: RMS=${noiseFloor.rms.toExponential(2)} peak=${noiseFloor.peak.toExponential(2)} (${noiseFloor.samples.length} samples)`);
 
   const pilotFreq = getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz;
-  const tx = new TxEngine({ pilotFreqHz: pilotFreq });
+  const tx = new TxEngine({ pilotFreqHz: pilotFreq, symbolsPerSec: getState().symbolsPerSec, toneCount: getState().toneCount });
   const preamble = tx.transmitPreamble();
 
   let txPeak = 0;
@@ -819,7 +831,7 @@ async function sendCalibrationOnly() {
   // Show first 16 samples for waveform inspection
   console.warn(`[CAL-TEST] TX first 16 samples: [${Array.from(preamble.slice(0, 16)).map((v) => v.toFixed(3)).join(', ')}]`);
 
-  const silence = new Float32Array(1536);
+  const silence = new Float32Array(Math.round(DEFAULT_CONFIG.sampleRate / getState().symbolsPerSec * 6));
   const full = new Float32Array(preamble.length + silence.length);
   full.set(preamble, 0);
   full.set(silence, preamble.length);
@@ -827,7 +839,7 @@ async function sendCalibrationOnly() {
   // Snapshot received samples count before play
   const preCount = recvSamples.length;
   setState({ isPlaying: true });
-  await player.play(full, DEFAULT_CONFIG.sampleRate, selectedOutputId || undefined);
+  await player.play(full, DEFAULT_CONFIG.sampleRate, getState().selectedOutputId || undefined);
 
   // Wait for all received audio to buffer
   await new Promise((r) => setTimeout(r, 500));
@@ -856,7 +868,7 @@ async function sendSingleFrame() {
   console.warn(`[FRAME-TEST] Pre-transmission noise floor: RMS=${noiseFloor.rms.toExponential(2)} peak=${noiseFloor.peak.toExponential(2)}`);
 
   const pilotFreq = getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz;
-  const tx = new TxEngine({ pilotFreqHz: pilotFreq });
+  const tx = new TxEngine({ pilotFreqHz: pilotFreq, symbolsPerSec: getState().symbolsPerSec, toneCount: getState().toneCount });
 
   // Build one header frame with known data
   const payload = new Uint8Array(40);
@@ -881,7 +893,7 @@ async function sendSingleFrame() {
 
   // Prepend preamble so RxEngine can sync
   const preamble = tx.transmitPreamble();
-  const silence = new Float32Array(1536);
+  const silence = new Float32Array(Math.round(DEFAULT_CONFIG.sampleRate / getState().symbolsPerSec * 6));
   const full = new Float32Array(preamble.length + frameAudio.length + silence.length);
   full.set(preamble, 0);
   full.set(frameAudio, preamble.length);
@@ -891,7 +903,7 @@ async function sendSingleFrame() {
 
   const preCount = recvSamples.length;
   setState({ isPlaying: true });
-  await player.play(full, DEFAULT_CONFIG.sampleRate, selectedOutputId || undefined);
+  await player.play(full, DEFAULT_CONFIG.sampleRate, getState().selectedOutputId || undefined);
 
   // Wait and inspect what we got
   await new Promise((r) => setTimeout(r, 800));
@@ -915,7 +927,7 @@ async function sendSentinelOnly() {
   await new Promise((r) => setTimeout(r, 300));
 
   const pilotFreq = getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz;
-  const tx = new TxEngine({ pilotFreqHz: pilotFreq });
+  const tx = new TxEngine({ pilotFreqHz: pilotFreq, symbolsPerSec: getState().symbolsPerSec, toneCount: getState().toneCount });
 
   // Build the 24-bit sentinel 0xE79FE7 as 12 BPSK symbols (2 bits/symbol)
   // Actually use 4 tones = 4 bits/symbol = 6 symbols for 24 bits
@@ -947,14 +959,14 @@ async function sendSentinelOnly() {
 
   console.warn(`[SENTINEL-TEST] Audio: ${shortAudio.length} samples = ${(shortAudio.length / DEFAULT_CONFIG.sampleRate).toFixed(2)}s`);
 
-  const silence = new Float32Array(512);
+  const silence = new Float32Array(Math.round(DEFAULT_CONFIG.sampleRate / getState().symbolsPerSec * 2));
   const full = new Float32Array(preamble.length + shortAudio.length + silence.length);
   full.set(preamble, 0);
   full.set(shortAudio, preamble.length);
   full.set(silence, preamble.length + shortAudio.length);
 
   setState({ isPlaying: true });
-  await player.play(full, DEFAULT_CONFIG.sampleRate, selectedOutputId || undefined);
+  await player.play(full, DEFAULT_CONFIG.sampleRate, getState().selectedOutputId || undefined);
   await new Promise((r) => setTimeout(r, 500));
   console.warn('━━━ [SENTINEL-TEST] Done — check for sentinel detection ━━━');
   setState({ isPlaying: false, sendStatus: { type: 'success', msg: '✅ Sentinel sent — check console' } });
@@ -1008,7 +1020,7 @@ async function runAudioValidation() {
     // Snapshot received samples count
     const preCount = recvSamples.length;
     setState({ isPlaying: true });
-    await player.play(playBuf, outputRate, selectedOutputId || undefined);
+    await player.play(playBuf, outputRate, getState().selectedOutputId || undefined);
     setState({ isPlaying: false });
     await new Promise((r) => setTimeout(r, 100));
 
@@ -1117,7 +1129,7 @@ async function runFullSweep() {
 
     const preCount = recvSamples.length;
     setState({ isPlaying: true });
-    await player.play(playBuf, outputRate, selectedOutputId || undefined);
+    await player.play(playBuf, outputRate, getState().selectedOutputId || undefined);
     setState({ isPlaying: false });
     await new Promise((r) => setTimeout(r, 50));
 
@@ -1280,7 +1292,7 @@ async function runMultiToneSweep() {
 
     const preCount = recvSamples.length;
     setState({ isPlaying: true });
-    await player.play(playBuf, outputRate, selectedOutputId || undefined);
+    await player.play(playBuf, outputRate, getState().selectedOutputId || undefined);
     setState({ isPlaying: false });
     await new Promise((r) => setTimeout(r, 60));
 
@@ -1457,7 +1469,7 @@ async function runInterferenceSweep() {
 
       const preCount = recvSamples.length;
       setState({ isPlaying: true });
-      await player.play(playBuf, outputRate, selectedOutputId || undefined);
+      await player.play(playBuf, outputRate, getState().selectedOutputId || undefined);
       setState({ isPlaying: false });
       await new Promise((r) => setTimeout(r, 50));
 
@@ -1594,7 +1606,7 @@ async function runFineSweep() {
 
       const preCount = recvSamples.length;
       setState({ isPlaying: true });
-      await player.play(playBuf, outputRate, selectedOutputId || undefined);
+      await player.play(playBuf, outputRate, getState().selectedOutputId || undefined);
       setState({ isPlaying: false });
       await new Promise((r) => setTimeout(r, 50));
 
@@ -1657,6 +1669,296 @@ window.addEventListener('eardrop-fine-sweep', (async () => {
   await runFineSweep();
 }) as EventListener);
 (window as any).runFineSweep = runFineSweep;
+
+// ─── Combined Tone+Rate Sweep ─────────────────────────
+
+/** Sweep tone counts × symbol rates in-memory to find optimal combo. */
+async function runComboSweep() {
+  console.warn('━━━ [COMBO] Tone count × symbol rate sweep ━━━');
+  setState({ sendStatus: { type: 'info', msg: '⚡ Combo sweep…' } });
+
+  const { Encoder } = await import('../modem/protocol/encoder');
+  const { Decoder } = await import('../modem/protocol/decoder');
+  const { encodeBlock, BLOCK_TYPE, getSentinel } = await import('../modem/protocol/framing');
+  const { bch3116Encode } = await import('../modem/ecc/ecc');
+
+  const payload = new TextEncoder().encode('Combo test payload!'); // 18 bytes
+  const sampleRate = DEFAULT_CONFIG.sampleRate;
+
+  // Tone counts to test
+  const toneCounts = [2, 4, 8];
+  // Valid rates (integer SPS only)
+  const allRates = [10, 20, 25, 32, 40, 50, 64, 80, 100];
+  const rates = allRates.filter((r) => (sampleRate / r) === Math.round(sampleRate / r));
+
+  const total = toneCounts.length * rates.length;
+  console.warn(`[COMBO] Testing ${toneCounts.length} tone counts × ${rates.length} rates = ${total} combos`);
+
+  const results: Array<{ tones: number; rate: number; sps: number; durationMs: number; bitsPerSec: number; errors: number }> = [];
+
+  for (const tones of toneCounts) {
+    for (const rate of rates) {
+      const cfg = { ...DEFAULT_CONFIG, toneCount: tones, bitsPerFrame: tones * 2, symbolsPerSec: rate };
+      const SPS = Math.round(cfg.sampleRate / cfg.symbolsPerSec);
+
+      const encoder = new Encoder(cfg);
+      const decoder = new Decoder(cfg);
+      decoder.fastSync = true;
+
+      // Build CONFIG + PAYLOAD + EOF blocks
+      const sentinel = getSentinel(tones);
+      const configPayload = new TextEncoder().encode('combo.bin');
+      const configData = new Uint8Array(2 + configPayload.length + 4 + 1);
+      let o = 0;
+      configData[o++] = configPayload.length & 0xff;
+      configData[o++] = (configPayload.length >> 8) & 0xff;
+      configData.set(configPayload, o); o += configPayload.length;
+      configData[o++] = payload.length & 0xff;
+      configData[o++] = (payload.length >> 8) & 0xff;
+      configData[o++] = (payload.length >> 16) & 0xff;
+      configData[o++] = (payload.length >> 24) & 0xff;
+      configData[o++] = 0x00;
+      const configForWire = bch3116Encode(configData);
+      const payloadForWire = bch3116Encode(payload);
+      const cb = encodeBlock(BLOCK_TYPE.CONFIG, configForWire, sentinel);
+      const pb = encodeBlock(BLOCK_TYPE.PAYLOAD, payloadForWire, sentinel);
+      const eb = encodeBlock(BLOCK_TYPE.EOF, new Uint8Array(0), sentinel);
+      const allFramed = new Uint8Array(cb.bytes.length + pb.bytes.length + eb.bytes.length);
+      allFramed.set(cb.bytes, 0);
+      allFramed.set(pb.bytes, cb.bytes.length);
+      allFramed.set(eb.bytes, cb.bytes.length + pb.bytes.length);
+
+      const samples = encoder.encodeFramedBlocks(allFramed);
+
+      const t0 = performance.now();
+      let decoded: Uint8Array | null = null;
+      decoder.onFrame = (data: Uint8Array) => { decoded = data; };
+      for (const s of samples) decoder.feedSample(s);
+      decoder.flush();
+      const t1 = performance.now();
+
+      const durationMs = t1 - t0;
+      const bytesPerSec = (payload.length / durationMs) * 1000;
+      const result = decoded as Uint8Array | null;
+      let errors = payload.length;
+      if (result && result.length === payload.length && payload.every((b, i) => result[i] === b)) {
+        errors = 0;
+      }
+
+      results.push({
+        tones, rate, sps: SPS,
+        durationMs: Math.round(durationMs),
+        bitsPerSec: Math.round(bytesPerSec * 8),
+        errors,
+      });
+    }
+  }
+
+  // Show as matrix: rows = tone counts, columns = rates
+  console.warn('━━━ [COMBO] Results (tone count × symbol rate → bit/s, ✅=clean) ━━━');
+  const matrix: Record<string, string | number>[] = [];
+  for (const tones of toneCounts) {
+    const row: Record<string, string | number> = { 'Tones': tones };
+    for (const rate of rates) {
+      const r = results.find((x) => x.tones === tones && x.rate === rate);
+      if (r) {
+        row[`${rate}s/s`] = r.errors === 0 ? `✅${r.bitsPerSec}` : `✗`;
+      }
+    }
+    matrix.push(row);
+  }
+  console.table(matrix);
+
+  // Find best combo
+  const passing = results.filter((r) => r.errors === 0);
+  if (passing.length > 0) {
+    const best = passing.reduce((a, b) => (b.bitsPerSec > a.bitsPerSec ? b : a));
+    console.warn(`[COMBO] Best: ${best.tones} tones @ ${best.rate} sym/s → ${best.bitsPerSec} bit/s (${best.durationMs}ms, SPS=${best.sps})`);
+    setState({ sendStatus: { type: 'success', msg: `⚡ Best: ${best.tones}t × ${best.rate}/s → ${best.bitsPerSec}bps` } });
+  } else {
+    console.warn('[COMBO] No combo passed — all had errors');
+    setState({ sendStatus: { type: 'error', msg: '❌ No combo passed' } });
+  }
+}
+
+// ─── Acoustic Speed Sweep ────────────────────────────
+
+/** Sweep symbol rates acoustically — sends a small file at each rate,
+ *  measures transfer time and reports pass/fail. */
+async function runAcousticSpeedSweep() {
+  console.warn('━━━ [ACOUSTIC-SPEED] Acoustic transfer speed sweep ━━━');
+  setState({ sendStatus: { type: 'info', msg: '🔊 Acoustic speed sweep…' } });
+  await refreshDeviceList();
+  if (!isListening) await startListening();
+  await new Promise((r) => setTimeout(r, 300));
+
+  const { TxEngine } = await import('../modem/protocol/txEngine');
+  const outputRate = player.getSampleRate();
+  player.volume = getState().playbackVolume;
+
+  const payload = new TextEncoder().encode('speed test!'); // 11 bytes
+  const sampleRate = DEFAULT_CONFIG.sampleRate;
+  const allRates = [10, 20, 25, 32, 40, 50, 64];
+  const rates = allRates.filter((r) => (sampleRate / r) === Math.round(sampleRate / r));
+
+  const results: Array<{ rate: number; sps: number; durationSec: number; framesFound: number; passed: boolean }> = [];
+
+  for (const rate of rates) {
+    const cfg = { ...DEFAULT_CONFIG, symbolsPerSec: rate };
+    const SPS = Math.round(sampleRate / rate);
+    const tx = new TxEngine(cfg);
+    const audio = tx.transmitFile('speed.bin', payload);
+
+    // Count actual frame bytes transmitted
+    const totalSamples = audio.length;
+    const durationSec = totalSamples / sampleRate;
+
+    // Reset RxEngine by cycling listening
+    broadcastWorker.postMessage({ type: 'stopListening' });
+    await new Promise((r) => setTimeout(r, 100));
+    broadcastWorker.postMessage({ type: 'startListening', config: cfg });
+    await new Promise((r) => setTimeout(r, 200));
+
+    const preCount = recvSamples.length;
+    setState({ isPlaying: true });
+    await player.play(audio, sampleRate, getState().selectedOutputId || undefined);
+    setState({ isPlaying: false });
+
+    // Wait for receiver to process
+    await new Promise((r) => setTimeout(r, Math.max(2000, durationSec * 1000 + 1500)));
+
+    const newCount = recvSamples.length - preCount;
+    console.warn(`[ACOUSTIC-SPEED] ${rate} sym/s (SPS=${SPS}): TX=${durationSec.toFixed(1)}s, RX samples=${newCount}`);
+
+    results.push({ rate, sps: SPS, durationSec, framesFound: 0, passed: false });
+
+    // Brief gap between tests
+    await new Promise((r) => setTimeout(r, 500));
+  }
+
+  console.warn('━━━ [ACOUSTIC-SPEED] Summary ━━━');
+  console.table(results.map((r) => ({
+    'Rate': `${r.rate} sym/s`,
+    'SPS': r.sps,
+    'TX time': `${r.durationSec.toFixed(1)}s`,
+    'B/s': (payload.length / r.durationSec).toFixed(1),
+  })));
+
+  setState({ sendStatus: { type: 'success', msg: `✅ Sweep done — ${rates.length} rates tested` } });
+
+  // Restart listening for normal use
+  broadcastWorker.postMessage({ type: 'stopListening' });
+  await new Promise((r) => setTimeout(r, 100));
+  const listenCfg = { ...DEFAULT_CONFIG, pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz };
+  broadcastWorker.postMessage({ type: 'startListening', config: listenCfg });
+}
+
+window.addEventListener('eardrop-acoustic-speed', (async () => {
+  await runAcousticSpeedSweep();
+}) as EventListener);
+
+window.addEventListener('eardrop-combo-sweep', (async () => {
+  await runComboSweep();
+}) as EventListener);
+
+// ─── Speed Benchmark Sweep ───────────────────────────
+
+/** Sweep symbol rates in-memory, measure throughput and error rate. */
+async function runSpeedSweep() {
+  console.warn('━━━ [SPEED] In-memory speed benchmark ━━━');
+  setState({ sendStatus: { type: 'info', msg: '⚡ Speed sweep…' } });
+
+  const { Encoder } = await import('../modem/protocol/encoder');
+  const { Decoder } = await import('../modem/protocol/decoder');
+  const { encodeBlock, BLOCK_TYPE, getSentinel } = await import('../modem/protocol/framing');
+  const { bch3116Encode } = await import('../modem/ecc/ecc');
+
+  const payload = new TextEncoder().encode('Hello World! Bench'); // 17 bytes
+  // Only test rates that produce integer SPS (sampleRate / rate must be integer)
+  const sampleRate = DEFAULT_CONFIG.sampleRate;
+  const allRates = [10, 20, 25, 32, 40, 50, 64, 80, 100, 128, 160, 200];
+  const rates = allRates.filter((r) => (sampleRate / r) === Math.round(sampleRate / r));
+  const results: Array<{ rate: number; sps: number; durationMs: number; bytesPerSec: number; bitsPerSec: number; errors: number; passed: boolean }> = [];
+
+  for (const rate of rates) {
+    const cfg = { ...DEFAULT_CONFIG, symbolsPerSec: rate };
+    const SPS = Math.round(cfg.sampleRate / cfg.symbolsPerSec);
+
+    const encoder = new Encoder(cfg);
+    const decoder = new Decoder(cfg);
+    decoder.fastSync = true;
+
+    // Build framed blocks (CONFIG + PAYLOAD + EOF — matches runSelfTest pattern)
+    const sentinel = getSentinel(cfg.toneCount);
+    const configPayload = new TextEncoder().encode('speed-test.bin');
+    const configData = new Uint8Array(2 + configPayload.length + 4 + 1);
+    let o = 0;
+    configData[o++] = configPayload.length & 0xff;
+    configData[o++] = (configPayload.length >> 8) & 0xff;
+    configData.set(configPayload, o); o += configPayload.length;
+    configData[o++] = payload.length & 0xff;
+    configData[o++] = (payload.length >> 8) & 0xff;
+    configData[o++] = (payload.length >> 16) & 0xff;
+    configData[o++] = (payload.length >> 24) & 0xff;
+    configData[o++] = 0x00;
+    const configForWire = bch3116Encode(configData);
+    const payloadForWire = bch3116Encode(payload);
+    const cb = encodeBlock(BLOCK_TYPE.CONFIG, configForWire, sentinel);
+    const pb = encodeBlock(BLOCK_TYPE.PAYLOAD, payloadForWire, sentinel);
+    const eb = encodeBlock(BLOCK_TYPE.EOF, new Uint8Array(0), sentinel);
+    const allFramed = new Uint8Array(cb.bytes.length + pb.bytes.length + eb.bytes.length);
+    allFramed.set(cb.bytes, 0);
+    allFramed.set(pb.bytes, cb.bytes.length);
+    allFramed.set(eb.bytes, cb.bytes.length + pb.bytes.length);
+
+    const samples = encoder.encodeFramedBlocks(allFramed);
+
+    const t0 = performance.now();
+    let decoded: Uint8Array | null = null;
+    decoder.onFrame = (data: Uint8Array) => { decoded = data; };
+    for (const s of samples) decoder.feedSample(s);
+    decoder.flush();
+    const t1 = performance.now();
+
+    const durationMs = t1 - t0;
+    const bytesPerSec = (payload.length / durationMs) * 1000;
+    const result = decoded as Uint8Array | null;
+    let errors = payload.length;
+    if (result && result.length === payload.length
+      && payload.every((b, i) => result[i] === b)) {
+      errors = 0;
+    }
+    const dataMatch = errors === 0;
+
+    results.push({
+      rate, sps: SPS,
+      durationMs: Math.round(durationMs),
+      bytesPerSec: Math.round(bytesPerSec * 10) / 10,
+      bitsPerSec: Math.round(bytesPerSec * 8),
+      errors,
+      passed: !!dataMatch,
+    });
+  }
+
+  console.warn('━━━ [SPEED] In-memory benchmark results ━━━');
+  console.table(results.map((r) => ({
+    'Sym/s': r.rate,
+    'SPS': r.sps,
+    'Time': `${r.durationMs}ms`,
+    'B/s': r.bytesPerSec.toFixed(1),
+    'bit/s': r.bitsPerSec,
+    'Errors': r.errors > 0 ? `❌${r.errors}` : '✅',
+  })));
+
+  const best = results.filter((r) => r.passed).reduce((a, b) => (b.bitsPerSec > a.bitsPerSec ? b : a), results[0]);
+  console.warn(`[SPEED] Fastest clean: ${best.rate} sym/s → ${best.bitsPerSec} bit/s (${best.bytesPerSec.toFixed(1)} B/s)`);
+
+  setState({ sendStatus: { type: 'success', msg: `⚡ Best: ${best.rate} sym/s → ${best.bitsPerSec} bit/s` } });
+}
+
+window.addEventListener('eardrop-speed-sweep', (async () => {
+  await runSpeedSweep();
+}) as EventListener);
 
 // Expose self-test for event wiring
 (window as any).runSelfTest = runSelfTest;

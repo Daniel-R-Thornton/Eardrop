@@ -4,6 +4,7 @@
  */
 
 import { useSyncExternalStore } from 'react';
+import { DEFAULT_CONFIG } from '../modem/types';
 
 // ─── State Shape ──────────────────────────────────────
 
@@ -39,6 +40,10 @@ export interface AppState {
   isSending: boolean;
   isPlaying: boolean;
   selectedFile: { name: string; size: number } | null;
+  /** Persisted mic (input) device ID */
+  selectedInputId: string;
+  /** Persisted speaker (output) device ID */
+  selectedOutputId: string;
   receivedFiles: Array<{ name: string; url: string; size: number }>;
   progress: number; // 0-100
   debug: DecoderInfo | null;
@@ -61,7 +66,7 @@ export interface AppState {
   /** Acoustic sweep test results */
   sweepResults: Array<{ freq: number; energy: number }> | null;
   /** Active tones: 2 or 4 */
-  toneCount: number;
+  toneCount: number; // 2, 4, or 8
   /** Hail Mary diversity mode: all tones carry same bit for consensus */
   diversityMode: boolean;
   /** Symbols per second (baud rate) */
@@ -130,6 +135,8 @@ const defaultState: AppState = {
   isSending: false,
   isPlaying: false,
   selectedFile: null,
+  selectedInputId: '',
+  selectedOutputId: '',
   receivedFiles: [],
   progress: 0,
   debug: null,
@@ -140,15 +147,15 @@ const defaultState: AppState = {
   txPayload: null,
   rxPayload: null,
   micLevel: -80,
-  toneEnergies: [0, 0, 0, 0],
+  toneEnergies: new Array(DEFAULT_CONFIG.toneCount).fill(0),
   pilotFreqHz: 600,
   musicalMode: false,
   ampThresholdRatio: 0.3,
   syncStrongMultiplier: 0.5,
   sweepResults: null,
-  toneCount: 4,
+  toneCount: DEFAULT_CONFIG.toneCount,
   diversityMode: false,
-  symbolsPerSec: 25,
+  symbolsPerSec: 50,
   fftSpectrum: null,
   rawPeak: 0,
   noiseFloorDb: -80,
@@ -169,16 +176,70 @@ type Listener = () => void;
 let state: AppState = { ...defaultState };
 const listeners = new Set<Listener>();
 
+// -------------------------------------------------------------------
+// Persistence – store UI settings in localStorage so they survive reload.
+// -------------------------------------------------------------------
+const PERSIST_KEY = 'eardrop_ui_state';
+
+/** Load persisted UI state from localStorage (if any) */
+function loadPersistedState(): Partial<AppState> | null {
+  try {
+    const raw = localStorage.getItem(PERSIST_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<AppState>;
+    // Basic sanity‑check – ensure required fields exist
+    if (typeof parsed.toneCount !== 'number') return null;
+    return parsed;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** Save the current UI state (only the fields we want to persist) */
+function persistState(s: AppState): void {
+  try {
+    const toSave: Partial<AppState> = {
+      // Persist only the configuration‑related fields – everything else is transient.
+      toneCount: s.toneCount,
+      pilotFreqHz: s.pilotFreqHz,
+      musicalMode: s.musicalMode,
+      ampThresholdRatio: s.ampThresholdRatio,
+      syncStrongMultiplier: s.syncStrongMultiplier,
+      diversityMode: s.diversityMode,
+      symbolsPerSec: s.symbolsPerSec,
+      micGain: s.micGain,
+      playbackVolume: s.playbackVolume,
+      selectedInputId: s.selectedInputId,
+      selectedOutputId: s.selectedOutputId,
+      theme: s.theme,
+    };
+    localStorage.setItem(PERSIST_KEY, JSON.stringify(toSave));
+  } catch (_) {
+    // Silently ignore storage errors (e.g., in private mode)
+  }
+}
+
+// Load persisted state at module init (if present)
+const persisted = loadPersistedState();
+if (persisted) {
+  state = { ...state, ...persisted };
+}
+
+
 export function getState(): AppState {
   return state;
 }
 
 export function setState(update: Partial<AppState>): void {
   state = { ...state, ...update };
+  // After every state change, persist the configuration part.
+  persistState(state);
   listeners.forEach((fn) => fn());
 }
 
 export function resetState(): void {
+  // Clear persisted config so a fresh reload starts from defaults.
+  localStorage.removeItem(PERSIST_KEY);
   state = { ...defaultState };
   listeners.forEach((fn) => fn());
 }

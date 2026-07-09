@@ -637,4 +637,40 @@ export class RxEngine {
     this.fileName = '';
     this.fileData = [];
   }
+
+  getDebugSnapshot() {
+    const inFrame = this.state === RxState.FRAMES;
+    const nf = new Array(4).fill(0);
+    const en = new Array(4).fill(0);
+    const ri = this.prevFrameI.slice(0, 4);
+    const rq = this.prevFrameQ.slice(0, 4);
+    return {
+      inFrame,
+      consecutiveSync: this.preambleFrames,
+      bitsCollected: this.dbgFrameCount * 4,
+      pilotFreq: this.cfg.pilotFreqHz,
+      pilotAmplitude: this.pilotAmplitude,
+      signalToNoise: 0,
+      noiseFloor: nf,
+      noiseMax: nf,
+      energies: en,
+      relI: ri.length === 4 ? ri as [number,number,number,number] : [0,0,0,0],
+      relQ: rq.length === 4 ? rq as [number,number,number,number] : [0,0,0,0],
+      bitPattern: 0,
+      thresholds: nf,
+      ratios: nf,
+      noiseFrames: 0,
+      noiseAvg: 0,
+      peakAmp: 0,
+      avg: 0,
+      rawEnergies: en,
+      strong: inFrame,
+      burstThreshold: 0,
+      framesSinceStrong: 0,
+      framesSinceExit: 0,
+      frameSkip: 0,
+      pilotAmp: this.pilotAmplitude,
+      pilotConfidence: this.state !== RxState.WAITING ? 1 : 0,
+    };
+  }
 }

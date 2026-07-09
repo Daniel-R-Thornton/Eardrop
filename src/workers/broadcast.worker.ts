@@ -42,6 +42,12 @@ self.onmessage = (e: MessageEvent) => {
           state: rx.getState(),
         });
 
+        // Debug snapshot for UI diagnostics
+        self.postMessage({
+          type: 'debugDecoderState',
+          snapshot: rx.getDebugSnapshot(),
+        });
+
         // DEBUG: forward byte log
         const byteLog = rx.getDebugByteLog();
         if (byteLog.length > 0) {
