@@ -16,6 +16,7 @@
 import { ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG } from './types';
 import { generatePreamble, PreambleConfig } from './preamble';
 import { encodeFrame, AtomicHeader, FRAME_SIZE, PAYLOAD_DATA_SIZE } from './atomicFrame';
+import { PhaseAcc } from './oscillator';
 
 // ─── Constants ───────────────────────────────────────
 
@@ -27,22 +28,6 @@ const BITS_PER_SYMBOL = 4;
 const TONE_COUNT = 4;
 /** Tail silence in samples (~6 symbols) */
 const TAIL_SILENCE = 768;
-
-// ─── Phase Accumulator ───────────────────────────────
-
-class PhaseAcc {
-  private phase = 0;
-  /** Advance phase and return sin at the OLD phase (sin-then-increment, matching toneIQ). */
-  advance(freqHz: number, sampleRate: number): number {
-    const v = Math.sin(2 * Math.PI * this.phase);
-    this.phase += freqHz / sampleRate;
-    if (this.phase >= 1.0) this.phase -= 1.0;
-    if (this.phase < 0) this.phase += 1.0;
-    return v;
-  }
-  reset() { this.phase = 0; }
-  copy(): PhaseAcc { const p = new PhaseAcc(); p.phase = this.phase; return p; }
-}
 
 // ─── TxEngine ────────────────────────────────────────
 

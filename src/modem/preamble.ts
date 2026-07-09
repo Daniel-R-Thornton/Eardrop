@@ -16,23 +16,7 @@ export interface PreambleConfig {
 }
 
 import { WARBLE_CODE } from './types';
-
-// ─── Phase accumulator helper ────────────────────────
-
-class PhaseAcc {
-  private phase = 0;
-  /** Return sin at current phase, then advance. Matches decoder toneIQ reference sin(ωn). */
-  advance(freqHz: number, sampleRate: number): number {
-    const v = Math.sin(2 * Math.PI * this.phase);
-    this.phase += freqHz / sampleRate;
-    if (this.phase >= 1.0) this.phase -= 1.0;
-    if (this.phase < 0) this.phase += 1.0;
-    return v;
-  }
-  reset() { this.phase = 0; }
-  get raw() { return this.phase; }
-  set raw(v: number) { this.phase = v; }
-}
+import { PhaseAcc } from './oscillator';
 
 // ─── Generate full preamble ──────────────────────────
 
