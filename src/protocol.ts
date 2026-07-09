@@ -3,12 +3,15 @@
  * @deprecated Use src/lib/protocol instead
  */
 
-export {
+export type {
   FilePreamble,
   FileBlock,
+  ParseResult,
+} from './lib/protocol/index';
+
+export {
   preambleSize,
   buildPacket,
-  ParseResult,
   tryParsePreamble,
   verifyPayload,
 } from './lib/protocol/index';
