@@ -302,6 +302,14 @@ export function MainApp() {
               </select>
             </div>
 
+            {/* Hail Mary Mode */}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <span style={{ fontSize: 12, color: "#6b7280" }}>🚀 Hail Mary</span>
+              <input type="checkbox" checked={s.diversityMode} 
+                onChange={e => setState({ diversityMode: e.target.checked })}
+                style={{ accentColor: "#ef4444", width: 18, height: 18 }} />
+            </div>
+
             {/* Symbol Rate */}
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
               <span style={{ fontSize: 12, color: "#6b7280" }}>Symbol Rate</span>

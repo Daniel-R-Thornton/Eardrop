@@ -9,6 +9,9 @@
 import React, { useCallback, useState } from 'react';
 import { FloatingWindow } from './components/FloatingWindow';
 import { useDecoderState } from './hooks/useDecoderState';
+import { BitStreamPanel } from './panels/BitStreamPanel';
+import { SentinelScanPanel } from './panels/SentinelScanPanel';
+import { MicMonitorPanel } from './panels/MicMonitorPanel';
 
 interface WindowState {
   id: string;
@@ -24,8 +27,9 @@ export const DebugContainer: React.FC = () => {
   const [windows, setWindows] = useState<WindowState[]>([
     { id: 'constellation', title: 'Constellation', visible: true, position: { x: 60, y: 60 }, size: { width: 420, height: 280 }, zIndex: 1000 },
     { id: 'decoder', title: 'Decoder State', visible: true, position: { x: 500, y: 60 }, size: { width: 380, height: 280 }, zIndex: 999 },
-    { id: 'bits', title: 'Bit Stream', visible: true, position: { x: 60, y: 360 }, size: { width: 420, height: 200 }, zIndex: 998 },
-    { id: 'squawk', title: 'Squawk History', visible: true, position: { x: 500, y: 360 }, size: { width: 380, height: 200 }, zIndex: 997 },
+    { id: 'bits', title: 'Bit Stream', visible: true, position: { x: 60, y: 360 }, size: { width: 420, height: 280 }, zIndex: 998 },
+    { id: 'mic', title: 'Mic Monitor', visible: true, position: { x: 60, y: 660 }, size: { width: 420, height: 300 }, zIndex: 997 },
+    { id: 'sentinel', title: 'Sentinel Scan', visible: true, position: { x: 500, y: 660 }, size: { width: 380, height: 240 }, zIndex: 996 },
   ]);
   const [nextZ, setNextZ] = useState(1005);
 
@@ -83,28 +87,13 @@ export const DebugContainer: React.FC = () => {
   );
 
   // ─── Bit Stream Panel ────────────────────────────
-  const bitsContent = (
-    <div style={{ fontSize: 10, lineHeight: '16px' }}>
-      <div style={{ color: '#888', marginBottom: 4 }}>Bits decoded per frame</div>
-      <div style={{ color: '#4a9eff' }}>
-        {decoderState.relI.map((_, t) => {
-          const ampBit = decoderState.energies[t] > 0.01 ? 1 : 0;
-          const phaseBit = decoderState.relI[t] > 0 ? 1 : 0;
-          return `${ampBit}${phaseBit}`;
-        }).join(' ')}
-      </div>
-    </div>
-  );
+  const bitsContent = <BitStreamPanel />;
 
-  // ─── Squawk Panel ────────────────────────────────
-  const squawkContent = (
-    <div style={{ fontSize: 10, lineHeight: '16px' }}>
-      <div style={{ color: '#888' }}>Squawk tracking (from debug logger)</div>
-      <div style={{ color: '#5eead4', marginTop: 4 }}>
-        Δ drift: tracking...
-      </div>
-    </div>
-  );
+  // ─── Mic Monitor Panel ──────────────────────────
+  const micContent = <MicMonitorPanel />;
+
+  // ─── Sentinel Scan Panel ─────────────────────────
+  const sentinelContent = <SentinelScanPanel />;
 
   return (
     <>
@@ -114,7 +103,9 @@ export const DebugContainer: React.FC = () => {
           case 'constellation': content = constellationContent; break;
           case 'decoder': content = decoderContent; break;
           case 'bits': content = bitsContent; break;
-          case 'squawk': content = squawkContent; break;
+
+          case 'mic': content = micContent; break;
+          case 'sentinel': content = sentinelContent; break;
           default: content = null;
         }
         return (

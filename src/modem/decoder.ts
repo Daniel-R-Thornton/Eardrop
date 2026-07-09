@@ -432,12 +432,9 @@ export class Decoder {
         this.calPhaseCount[maxTone]++;
         const totalCounts = this.calPhaseCount.reduce((a,b)=>a+b,0);
         if (totalCounts >= 8) {
-          let totalSum = 0;
-          for (let t = 0; t < 4; t++) totalSum += this.calPhaseSum[t];
-          const globalFlip = totalSum >= 0 ? 1 : -1;
-          for (let t = 0; t < 4; t++) this.calPhaseFlip[t] = globalFlip;
+          for (let t = 0; t < 4; t++) this.calPhaseFlip[t] = this.calPhaseSum[t] >= 0 ? 1 : -1;
           this.calDone = true;
-          console.warn(`[CAL] BPSK reference signs: flip=[${this.calPhaseFlip.join(',')}] (global=${globalFlip})`);
+          console.warn(`[CAL] BPSK reference signs: flip=[${this.calPhaseFlip.join(',')}] (per-tone)`);
         }
       }
 

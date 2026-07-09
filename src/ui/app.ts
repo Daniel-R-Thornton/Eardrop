@@ -23,6 +23,27 @@ import { Visualizer } from "../modem/visualizer";
 import { DEFAULT_CONFIG, TONE_COLORS } from "../modem/types";
 import { enumerateDevices, populateSelect } from "../audio/devices";
 import { buildPacket, tryParsePreamble, verifyPayload } from "../protocol";
+import { mountReactDebug } from "./react";
+
+// ─── Debug toggle keyboard shortcut ────────────────
+let debugVisible = false;
+
+document.addEventListener("keydown", (e: KeyboardEvent) => {
+  if (e.ctrlKey && e.shiftKey && e.code === "KeyD") {
+    e.preventDefault();
+    debugVisible = !debugVisible;
+    const el = document.getElementById("react-debug");
+    if (el) {
+      if (debugVisible) {
+        el.style.display = "block";
+        mountReactDebug();
+      } else {
+        el.style.display = "none";
+      }
+    }
+    window.dispatchEvent(new CustomEvent("eardrop-toggle-debug", { detail: { visible: debugVisible } }));
+  }
+});
 
 // ─── Debug logging ────────────────────────────────────
 let DEBUG = false;
@@ -88,15 +109,58 @@ broadcastWorker.onmessage = (e) => {
       break;
     case "fileComplete": {
       const data = new Uint8Array(msg.data);
-      setState({ recvStatus: { type: "success", msg: `✅ Received "${msg.fileName}" (${data.length}B)` } });
-      // Trigger download
-      const blob = new Blob([data], { type: "application/octet-stream" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = msg.fileName;
-      a.click();
-      URL.revokeObjectURL(url);
+      if (getState().diversityMode) {
+        // Accumulate copies for majority voting
+        if (!diversityCopies[msg.fileName]) diversityCopies[msg.fileName] = [];
+        diversityCopies[msg.fileName].push(data);
+        const n = diversityCopies[msg.fileName].length;
+        setState({ recvStatus: { type: "info", msg: `📦 Copy ${n}/3 of "${msg.fileName}"` } });
+        if (n >= 3) {
+          // Bit-by-bit majority vote across 3 copies
+          const len = Math.max(...diversityCopies[msg.fileName].map(b => b.length));
+          const voted = new Uint8Array(len);
+          for (let i = 0; i < len; i++) {
+            let ones = 0, zeros = 0;
+            for (const copy of diversityCopies[msg.fileName]) {
+              if (i < copy.length) {
+                for (let b = 0; b < 8; b++) {
+                  if ((copy[i] >> b) & 1) ones++; else zeros++;
+                }
+              }
+            }
+            voted[i] = ones > zeros ? 0xFF : 0x00;
+            // Per-byte majority vote instead of per-bit
+            let byteVotes: number[] = [];
+            for (const copy of diversityCopies[msg.fileName]) {
+              if (i < copy.length) byteVotes.push(copy[i]);
+            }
+            byteVotes.sort((a, b) => {
+              const ca = byteVotes.filter(v => v === a).length;
+              const cb = byteVotes.filter(v => v === b).length;
+              return cb - ca;
+            });
+            voted[i] = byteVotes[0];
+          }
+          delete diversityCopies[msg.fileName];
+          setState({ recvStatus: { type: "success", msg: `✅ Majority vote: "${msg.fileName}" (${voted.length}B)` } });
+          const blob = new Blob([voted], { type: "application/octet-stream" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = msg.fileName;
+          a.click();
+          URL.revokeObjectURL(url);
+        }
+      } else {
+        setState({ recvStatus: { type: "success", msg: `✅ Received "${msg.fileName}" (${data.length}B)` } });
+        const blob = new Blob([data], { type: "application/octet-stream" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = msg.fileName;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
       break;
     }
     case "decoderState": {
@@ -105,6 +169,12 @@ broadcastWorker.onmessage = (e) => {
       setState({ recvStatus: { type: "info", msg: `📡 ${label}` } });
       break;
     }
+    case "debugByteLog":
+      setState({ debugByteStream: msg.bytes });
+      break;
+    case "debugSentinelScan":
+      setState({ sentinelScan: msg.history });
+      break;
   }
 };
 
@@ -129,6 +199,7 @@ function getDeviceRefs() {
 // ─── State ────────────────────────────────────────────
 
 let selectedFile: File | null = null;
+let diversityCopies: Record<string, Uint8Array[]> = {};
 let receivedFileData: Array<{ name: string; bytes: Uint8Array; blob: Blob; url: string }> = [];
 const audioCtx = new AudioContext();
 const viz = new Visualizer();
@@ -166,7 +237,7 @@ window.addEventListener("eardrop-send", (async () => {
     const raw = new Uint8Array(await selectedFile.arrayBuffer());
     showTxPayload(raw, selectedFile.name);
 
-    const cfg: any = { pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz, musical: getState().musicalMode };
+    const cfg: any = { pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz, musical: getState().musicalMode, diversityMode: getState().diversityMode };
     const { samples: playSamples, sampleRate: actualRate } = await transmitFileInWorker(selectedFile.name, raw, cfg);
     setState({ sendStatus: { type: "info", msg: `Playing ${selectedFile.name}…` } });
     setState({ isPlaying: true });
@@ -441,7 +512,16 @@ async function startListening() {
     wasInFrame = false;
     setState({ isListening: true, recvStatus: { type: "info", msg: "🔊 Noise profiling…" }, progress: 0 });
 
-    const listenCfg = { ...DEFAULT_CONFIG, musical: getState().musicalMode };
+    const listenCfg = {
+      ...DEFAULT_CONFIG,
+      pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz,
+      musical: getState().musicalMode,
+      toneCount: getState().toneCount || DEFAULT_CONFIG.toneCount,
+      symbolsPerSec: getState().symbolsPerSec || DEFAULT_CONFIG.symbolsPerSec,
+      ampThresholdRatio: getState().ampThresholdRatio ?? DEFAULT_CONFIG.ampThresholdRatio,
+      syncStrongMultiplier: getState().syncStrongMultiplier ?? DEFAULT_CONFIG.syncStrongMultiplier,
+      diversityMode: getState().diversityMode,
+    };
     broadcastWorker.postMessage({ type: "startListening", config: listenCfg, fastSync: fastSyncCb?.checked ?? false });
     recorder = new AudioRecorder(audioCtx);
     const modemRate = DEFAULT_CONFIG.sampleRate;
@@ -495,6 +575,12 @@ async function startListening() {
       const noiseFloorDb = rmsDb < -50 ? rmsDb : 20 * Math.log10(Math.max(rms, 1e-6));
 
       setState({ micLevel: rmsDb, rawPeak, toneEnergies: energies, fftSpectrum: spectrum, noiseFloorDb });
+
+      // Mic diagnostic snapshot (every tick ~100ms)
+      if (recorder) {
+        const diag = recorder.getDiag();
+        setState({ micDiag: diag });
+      }
 
       // Waveform and debug samples every tick
       tickCount++;

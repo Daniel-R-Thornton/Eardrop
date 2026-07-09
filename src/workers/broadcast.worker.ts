@@ -37,6 +37,24 @@ self.onmessage = (e: MessageEvent) => {
           type: "decoderState",
           state: rx.getState(),
         });
+
+        // DEBUG: forward byte log
+        const byteLog = rx.getDebugByteLog();
+        if (byteLog.length > 0) {
+          self.postMessage({
+            type: "debugByteLog",
+            bytes: byteLog,
+          });
+        }
+
+        // DEBUG: forward sentinel scan history
+        const shiftRegHistory = rx.getShiftRegHistory();
+        if (shiftRegHistory.length > 0) {
+          self.postMessage({
+            type: "debugSentinelScan",
+            history: shiftRegHistory,
+          });
+        }
       }, 200);
 
       self.postMessage({ type: "listening" });

@@ -20,7 +20,7 @@ import { encodeFrame, AtomicHeader, FRAME_SIZE, PAYLOAD_DATA_SIZE } from './atom
 // ─── Constants ───────────────────────────────────────
 
 /** Samples per symbol */
-const SPS = 128;
+const SPS = 256;
 /** Bits per symbol (4 = 1 phase bit per tone) */
 const BITS_PER_SYMBOL = 4;
 /** Tones count */
@@ -85,7 +85,9 @@ export class TxEngine {
     const totalFrames = this.calcFrameCount(data.length);
     const frameAudios: Float32Array[] = [preamble];
 
-    // Header frame (type 0x01)
+    const repeats = this.cfg.diversityMode ? 3 : 1;
+
+    // Header frame (type 0x01) — repeat 3× if diversity mode
     const headerPayload = this.buildHeaderPayload(fileName, data.length);
     const headerFrame = this.transmitFrame({
       type: 0x01,
@@ -93,9 +95,9 @@ export class TxEngine {
       totalFrames,
       crc: 0,
     }, headerPayload);
-    frameAudios.push(headerFrame);
+    for (let r = 0; r < repeats; r++) frameAudios.push(headerFrame);
 
-    // Data frames (type 0x02)
+    // Data frames (type 0x02) — repeat 3× if diversity mode
     const dataFrames = this.splitDataIntoFrames(data);
     for (let i = 0; i < dataFrames.length; i++) {
       const frameAudio = this.transmitFrame({
@@ -104,7 +106,7 @@ export class TxEngine {
         totalFrames,
         crc: 0,
       }, dataFrames[i]);
-      frameAudios.push(frameAudio);
+      for (let r = 0; r < repeats; r++) frameAudios.push(frameAudio);
     }
 
     // Tail frame (type 0x03)
@@ -114,7 +116,7 @@ export class TxEngine {
       totalFrames,
       crc: 0,
     }, new Uint8Array(PAYLOAD_DATA_SIZE));
-    frameAudios.push(tailFrame);
+    for (let r = 0; r < repeats; r++) frameAudios.push(tailFrame);
 
     // 3. Add tail silence
     frameAudios.push(new Float32Array(TAIL_SILENCE));
@@ -237,6 +239,9 @@ export class TxEngine {
     payload[off++] = (hash >> 8) & 0xFF;
     payload[off++] = hash & 0xFF;
 
+    // File ID (little-endian)
+    console.log(`[TX-ENDIAN] File ID: 0x${(hash >> 24).toString(16)} 0x${((hash >> 16) & 0xFF).toString(16)} 0x${((hash >> 8) & 0xFF).toString(16)} 0x${(hash & 0xFF).toString(16)}`);
+
     // Total file size (4 bytes LE)
     payload[off++] = totalSize & 0xFF;
     payload[off++] = (totalSize >> 8) & 0xFF;
@@ -256,6 +261,12 @@ export class TxEngine {
     while (off < PAYLOAD_DATA_SIZE) {
       payload[off++] = 0;
     }
+
+    // Compute CRC for entire payload (40 bytes)
+    const crc = this.computeCRC16(payload);
+    console.log(`[TX] Header CRC: 0x${(crc >>> 0).toString(16).padStart(4, '0')}`);
+    // CRC (little-endian)
+    console.log(`[TX-ENDIAN] CRC: 0x${(crc >> 8).toString(16).padStart(2, '0')} 0x${(crc & 0xFF).toString(16).padStart(2, '0')}`);
 
     return payload;
   }
@@ -290,5 +301,17 @@ export class TxEngine {
     }
 
     return frames;
+  }
+
+  private computeCRC16(data: Uint8Array): number {
+    let crc = 0xFFFF;
+    for (let i = 0; i < data.length; i++) {
+      crc ^= data[i] << 8;
+      for (let j = 0; j < 8; j++) {
+        if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
+        else crc <<= 1;
+      }
+    }
+    return crc & 0xFFFF;
   }
 }

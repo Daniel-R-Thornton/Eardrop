@@ -15,6 +15,8 @@ export interface PreambleConfig {
   toneOffsets: [number, number, number, number];
 }
 
+import { WARBLE_CODE } from './types';
+
 // ─── Phase accumulator helper ────────────────────────
 
 class PhaseAcc {
@@ -49,25 +51,27 @@ export function generatePreamble(cfg: PreambleConfig): Float32Array {
   const calSamps = Math.floor(0.160 * sampleRate);        // 512
   const invSamps = Math.floor(0.160 * sampleRate);        // 512
   const sweepSamps = Math.floor(0.200 * sampleRate);      // 640
-  // Total: warble(1280) + marker(128) + cal0(128) + cal1(128) + guard(512) = 2176
-  const totalSamps = warbleSamps + 128 + 128 + 128 + 512;
+  // Total: warble(1280) + marker(256) + cal(16×256=4096) + guard(512) = 6144
+  const totalSamps = warbleSamps + 256 + 4096 + 512;
 
   const out = new Float32Array(totalSamps);
   let idx = 0;
 
   // ── Phase 1: Warble (400ms) ────────────────────────
-  // Toggle between pilotFreq-50 and pilotFreq+50 at 100Hz
+  // Encode the 16-bit warble code, repeating for the entire warble duration.
+  // Each bit selects pilotFreq-50Hz (0) or pilotFreq+50Hz (1) for 32 samples.
   const warbleInterval = Math.floor(0.010 * sampleRate); // 32 samples
   for (let i = 0; i < warbleSamps; i++) {
     let s = 0;
     s += pilot.advance(pilotFreqHz, sampleRate) * pilotAmplitude;
-    const cycleIdx = Math.floor(i / warbleInterval) % 2;
-    const warbleFreq = cycleIdx === 0 ? pilotFreqHz - 50 : pilotFreqHz + 50;
+    const interval = Math.floor(i / warbleInterval);
+    const codeBit = (WARBLE_CODE >> (15 - (interval % 16))) & 1;
+    const warbleFreq = codeBit === 0 ? pilotFreqHz - 50 : pilotFreqHz + 50;
     s += warble.advance(warbleFreq, sampleRate) * dataToneAmplitude;
     out[idx++] = s;
   }
-  // ── Warble end marker: 128 samples of all tones ON full blast ──
-  for (let i = 0; i < 128; i++) {
+  // ── Warble end marker: 256 samples of all tones ON full blast ──
+  for (let i = 0; i < 256; i++) {
     let s = 0;
     s += pilot.advance(pilotFreqHz, sampleRate) * pilotAmplitude;
     for (let t = 0; t < 4; t++) {
@@ -76,28 +80,23 @@ export function generatePreamble(cfg: PreambleConfig): Float32Array {
     out[idx++] = s;
   }
 
-  // ── Phase 2: Calibration ───────────────────────────
-  // Frame 0: All 4 tones ON at 0° phase
-  for (let i = 0; i < 128; i++) {
-    let s = 0;
-    s += pilot.advance(pilotFreqHz, sampleRate) * pilotAmplitude;
-    for (let t = 0; t < 4; t++) {
-      s += tones[t].advance(toneFreqs[t], sampleRate) * dataToneAmplitude;
+  // ── Phase 2: Calibration — Gray code through all 16 permutations ──
+  // Each 256-sample frame encodes one 4-bit Gray code value (2×128 for SPS=256).
+  // Bits 0-3 map to tones 0-3. Bit=0 → 0° phase, Bit=1 → 180° phase.
+  const grayCodes = [0,1,3,2,6,7,5,4,12,13,15,14,10,11,9,8];
+  const calFrameSamps = 256;
+  const bpskMul = (bit: number) => bit === 0 ? 1 : -1;
+  for (let gf = 0; gf < grayCodes.length; gf++) {
+    const gc = grayCodes[gf];
+    const bits = [(gc >> 3) & 1, (gc >> 2) & 1, (gc >> 1) & 1, gc & 1];
+    for (let i = 0; i < calFrameSamps; i++) {
+      let s = 0;
+      s += pilot.advance(pilotFreqHz, sampleRate) * pilotAmplitude;
+      for (let t = 0; t < 4; t++) {
+        s += tones[t].advance(toneFreqs[t], sampleRate) * dataToneAmplitude * bpskMul(bits[t]);
+      }
+      out[idx++] = s;
     }
-    out[idx++] = s;
-  }
-  // Frame 1: All 4 tones ON at 180° phase (inverted)
-  for (let t = 0; t < 4; t++) {
-    // Reset phase accumulators to advance by 180° more
-    tones[t] = new PhaseAcc();
-  }
-  for (let i = 0; i < 128; i++) {
-    let s = 0;
-    s += pilot.advance(pilotFreqHz, sampleRate) * pilotAmplitude;
-    for (let t = 0; t < 4; t++) {
-      s += tones[t].advance(toneFreqs[t], sampleRate) * (-dataToneAmplitude); // 180° = NEGATE
-    }
-    out[idx++] = s;
   }
 
   // ── Phase 3: Guard (4 frames = 512 samples for alignment) ──

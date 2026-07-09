@@ -145,4 +145,45 @@ export class AudioRecorder {
     this.running = false;
     console.log("[Recorder] stopped");
   }
+
+  /**
+   * Get a diagnostic snapshot of the current mic state.
+   * Returns recent waveform, RMS level, peak, zero-crossing rate,
+   * and context info.
+   */
+  getDiag(): { rmsDb: number; peak: number; zeroCrossingRate: number; ctxState: string; sampleRate: number; calibrationFactor: number; recentSamples: Float32Array } {
+    // Build recent samples from downsampled data if available
+    // We use the raw input when available through pending worklet buffer
+    let recent: Float32Array;
+    if (this.pending && this.pending.length > 0) {
+      const start = Math.max(0, this.pending.length - 512);
+      recent = this.pending.slice(start, start + 512);
+    } else {
+      recent = new Float32Array(0);
+    }
+    let rms = 0;
+    let peak = 0;
+    let zeroCrossings = 0;
+    for (let i = 0; i < recent.length; i++) {
+      const s = recent[i];
+      rms += s * s;
+      if (Math.abs(s) > peak) peak = Math.abs(s);
+      if (i > 0 && ((recent[i - 1] >= 0 && s < 0) || (recent[i - 1] < 0 && s >= 0))) {
+        zeroCrossings++;
+      }
+    }
+    if (recent.length > 0) rms = Math.sqrt(rms / recent.length);
+    const rmsDb = rms > 0.0001 ? 20 * Math.log10(rms) : -80;
+    const zcr = recent.length > 0 ? zeroCrossings / recent.length : 0;
+
+    return {
+      rmsDb,
+      peak,
+      zeroCrossingRate: zcr,
+      ctxState: this.ctx.state,
+      sampleRate: this.calibratedMicRate || this.ctx.sampleRate,
+      calibrationFactor: this.calibratedMicRate > 0 ? this.calibratedMicRate / this.ctx.sampleRate : 1.0,
+      recentSamples: recent.slice(-128),
+    };
+  }
 }

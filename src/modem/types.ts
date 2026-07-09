@@ -34,6 +34,8 @@ export interface ModemConfig {
   amplitudeThresholdRatio: number;
   /** Number of active tones (2 or 4) */
   toneCount: number;
+  /** Hail Mary mode: 1 tone data, all tones repeat same bit for consensus voting */
+  diversityMode: boolean;
 
   // ── Sync / framing ──
   /** Number of sync symbols in the sync burst */
@@ -63,7 +65,7 @@ export interface ModemConfig {
  *  All are integer-cycle multiples (f/25): 19, 21, 25, 31 cycles at 3200 Hz.
  */
 export const TONE_OFFSETS: [number, number, number, number] = [
-  62.5, 112.5, 212.5, 362.5,
+  237.5, 487.5, 737.5, 1087.5,
 ] as const;
 
 /** Musical mode offsets — playable intervals from pilot */
@@ -95,6 +97,17 @@ export function getDefaultToneFreqs(musical = false): [number, number, number, n
 /** Tone colors for debug display (one per tone index) */
 export const TONE_COLORS = ["#4a9eff", "#ff6b4a", "#5eead4", "#f472b6"];
 
+/**
+ * 16-bit warble code for preamble detection.
+ * Each bit selects the warble frequency for a 32-sample interval:
+ *   0 = pilotFreq - 50 Hz
+ *   1 = pilotFreq + 50 Hz
+ * The decoder cross-correlates against this code to reject noise.
+ */
+export const WARBLE_CODE = 0xAC94; // 1010 1100 1001 0100
+/** Minimum bits (out of 16) that must correlate to accept warble detection */
+export const WARBLE_CODE_THRESHOLD = 12;
+
 export const DEFAULT_CONFIG: ModemConfig = {
   sampleRate: 3200,
   symbolsPerSec: 25,
@@ -108,6 +121,7 @@ export const DEFAULT_CONFIG: ModemConfig = {
   dataToneAmplitude: 0.5,
   amplitudeThresholdRatio: 0.3,
   toneCount: 4,
+  diversityMode: false,
 
   syncSymbols: 10,
 

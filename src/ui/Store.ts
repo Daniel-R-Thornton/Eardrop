@@ -62,6 +62,8 @@ export interface AppState {
   sweepResults: Array<{ freq: number; energy: number }> | null;
   /** Active tones: 2 or 4 */
   toneCount: number;
+  /** Hail Mary diversity mode: all tones carry same bit for consensus */
+  diversityMode: boolean;
   /** Symbols per second (baud rate) */
   symbolsPerSec: number;
   /** FFT spectrum data for waterfall display */
@@ -76,6 +78,12 @@ export interface AppState {
   diagMessages: string[];
   /** Theme: 'dark' | 'light' */
   theme: 'dark' | 'light';
+  /** Bit-level debug stream from decoder */
+  debugByteStream: Array<{ byte: number; phase: string; bitOffset: number }>;
+  /** Sentinel scanner shift register history */
+  sentinelScan: Array<{ bit: number; shiftReg: number; matched: boolean; phase: string }>;
+  /** Mic diagnostic snapshot */
+  micDiag: { rmsDb: number; peak: number; zeroCrossingRate: number; ctxState: string; sampleRate: number; calibrationFactor: number; recentSamples: Float32Array } | null;
 }
 
 const defaultDecoder: DecoderInfo = {
@@ -111,6 +119,7 @@ const defaultState: AppState = {
   syncStrongMultiplier: 0.5,
   sweepResults: null,
   toneCount: 4,
+  diversityMode: false,
   symbolsPerSec: 25,
   fftSpectrum: null,
   rawPeak: 0,
@@ -118,6 +127,9 @@ const defaultState: AppState = {
   debugTrace: [],
   diagMessages: [],
   theme: 'dark',
+  debugByteStream: [],
+  sentinelScan: [],
+  micDiag: null,
 };
 
 // ─── Store ────────────────────────────────────────────
