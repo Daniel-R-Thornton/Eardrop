@@ -23,15 +23,19 @@ self.onmessage = (e: MessageEvent) => {
       rx = new RxEngine(msg.config ?? DEFAULT_CONFIG);
 
       // Poll for completed file every 200ms
+      let fileSent = false;
       stateInterval = setInterval(() => {
         if (!rx) return;
-        const file = rx.getFile();
-        if (file) {
-          if (DEBUG) console.log(`[RX] file complete: "${file.fileName}" ${file.data.length}B`);
-          self.postMessage(
-            { type: 'fileComplete', fileName: file.fileName, data: file.data.buffer },
-            { transfer: [file.data.buffer] },
-          );
+        if (!fileSent) {
+          const file = rx.getFile();
+          if (file) {
+            fileSent = true;
+            if (DEBUG) console.log(`[RX] file complete: "${file.fileName}" ${file.data.length}B`);
+            self.postMessage(
+              { type: 'fileComplete', fileName: file.fileName, data: file.data.buffer },
+              { transfer: [file.data.buffer] },
+            );
+          }
         }
         self.postMessage({
           type: 'decoderState',
