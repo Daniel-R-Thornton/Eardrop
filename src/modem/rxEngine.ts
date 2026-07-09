@@ -58,8 +58,6 @@ class SentinelScanner {
   private shiftReg = 0;
   private bitCount = 0;
   private collecting = false;
-  /** Global phase inversion detected from inverted sentinel */
-  private phaseInverted = false;
   
   /** Byte accumulator for collection phase */
   private byteAccum = 0;
@@ -68,7 +66,6 @@ class SentinelScanner {
   private bitsCollected = 0;
 
   private readonly sentinel = 0xE79FE7;
-  private readonly sentinelInv = 0x186018;
   private readonly collectBytes = FRAME_SIZE - 3; // 76
 
   // DEBUG: byte-level debug log ring buffer (last 256)
@@ -80,7 +77,7 @@ class SentinelScanner {
   private maxRegHistory = 64;
 
   /** Hamming distance threshold for sentinel matching (allows bit errors) */
-  private readonly sentinelHammingThreshold = 8;
+  private readonly sentinelHammingThreshold = 4;
 
   onFrame: ((frameBytes: Uint8Array) => void) | null = null;
 
@@ -88,7 +85,6 @@ class SentinelScanner {
     this.shiftReg = 0;
     this.bitCount = 0;
     this.collecting = false;
-    this.phaseInverted = false;
     this.byteAccum = 0;
     this.byteBits = 0;
     this.buf = [];
@@ -96,9 +92,8 @@ class SentinelScanner {
   }
 
   feedByte(byte: number): void {
-    const b = this.phaseInverted ? (~byte) & 0xFF : byte;
     for (let i = 7; i >= 0; i--) {
-      this.feedBit((b >> i) & 1);
+      this.feedBit((byte >> i) & 1);
     }
   }
 
@@ -111,7 +106,7 @@ class SentinelScanner {
       this.shiftRegHistory.push({
         bit,
         shiftReg: this.shiftReg,
-        matched: !this.collecting && this.bitCount >= 24 && (this.shiftReg === this.sentinel || this.shiftReg === this.sentinelInv),
+        matched: !this.collecting && this.bitCount >= 24 && this.shiftReg === this.sentinel,
         phase: this.collecting ? 'COLLECT' : 'SCAN',
       });
       if (this.shiftRegHistory.length > this.maxRegHistory) this.shiftRegHistory.shift();
@@ -152,25 +147,9 @@ class SentinelScanner {
     } else if (this.bitCount >= 24) {
       // Hamming distance-based sentinel matching (tolerant to bit errors)
       const dist = this.popcount(this.shiftReg ^ this.sentinel);
-      const distInv = this.popcount(this.shiftReg ^ this.sentinelInv);
       if (dist <= this.sentinelHammingThreshold) {
-        // DEBUG: log sentinel detection
-        this.byteLog.push({ byte: 0xFF, phase: 'SENTINEL', bitOffset: this.bitCount });
-        if (this.byteLog.length > this.maxByteLog) this.byteLog.shift();
         this.collecting = true;
         this.byteAccum = 0;
-        this.phaseInverted = false;
-      } else if (distInv <= this.sentinelHammingThreshold) {
-        this.collecting = true;
-        this.phaseInverted = true;
-        this.byteAccum = 0;
-        this.byteBits = 0;
-        this.buf = [];
-        this.bitsCollected = 0;
-        // DEBUG: log inverted sentinel detection
-        this.byteLog.push({ byte: 0xF0, phase: 'SENTINEL', bitOffset: this.bitCount });
-        if (this.byteLog.length > this.maxByteLog) this.byteLog.shift();
-        console.warn(`[RX-SCAN] Inverted sentinel at bit ${this.bitCount}`);
       }
     }
     
@@ -264,12 +243,6 @@ export class RxEngine {
   /** Guard counter */
   private guardFrames = 0;
 
-  // Warble-based symbol alignment
-  private warbleSubEnergies: number[] = [0, 0, 0, 0];
-  private warbleSubFrames = 0;
-  private symbolAlignOffset = 0;
-  /** Sample offset still to skip for symbol alignment */
-  private pendingAlignSamples = 0;
   /** Ring buffer of decoded warble code bits (0=low freq, 1=high freq) */
   private warbleCodeBits: number[] = [];
   /** Expected 16-bit warble code from types.ts (imported via config or local const) */
@@ -305,12 +278,6 @@ export class RxEngine {
     this.pll.update(sample);
     this.pilotAmplitude = this.pll.getAmplitude();
     
-    // ── Skip samples for symbol alignment ──
-    if (this.pendingAlignSamples > 0) {
-      this.pendingAlignSamples--;
-      return;
-    }
-    
     // ── Buffer samples and process by state ──
     this.buf.push(sample);
     if (this.buf.length < this.sps) return;
@@ -332,10 +299,8 @@ export class RxEngine {
           const qELow = Math.hypot(qLow.i, qLow.q);
           const qEHigh = Math.hypot(qHigh.i, qHigh.q);
           qRatios[q] = qEHigh > 1e-12 ? qELow / qEHigh : 0;
-          this.warbleSubEnergies[q] += qRatios[q];
         }
       }
-      this.warbleSubFrames++;
       
       // --- Warble code correlation ---
       // Decode each sub-window as a bit: 0 = low freq dominant, 1 = high freq dominant
@@ -382,31 +347,8 @@ export class RxEngine {
             this.warbleFrames = 0;
           } else {
             console.warn(`[WARBLE] Detected after ${this.warbleFrames} frames (codeCorr=${bestCodeCorr}/16)`);
-              // Compute warble sub-frame alignment for symbol sync
-              if (this.warbleSubFrames > 0) {
-                const avgRatios = this.warbleSubEnergies.map(e => e / this.warbleSubFrames);
-                let maxIdx = 0;
-                for (let i = 1; i < 4; i++) {
-                  if (avgRatios[i] > avgRatios[maxIdx]) maxIdx = i;
-                }
-                const rawOffset = maxIdx * 32;
-                const minR = Math.min(...avgRatios);
-                const maxR = Math.max(...avgRatios);
-                if (maxR > minR * 2.0) {
-                  this.symbolAlignOffset = rawOffset;
-                  console.warn(`[WARBLE] Sub-frame ratios: [${avgRatios.map(r => r.toFixed(2)).join(',')}] maxQuarter=${maxIdx} offset=${this.symbolAlignOffset} (alternation OK)`);
-                } else {
-                  this.symbolAlignOffset = 0;
-                  console.warn(`[WARBLE] Sub-frame ratios: [${avgRatios.map(r => r.toFixed(2)).join(',')}] maxQuarter=${maxIdx} offset=0 (no alternation)`);
-                }
-              }
             this.state = RxState.PREAMBLE;
             this.markerPeakE = 0;
-            // Skip alignment-offset samples so all subsequent frames are aligned
-            this.pendingAlignSamples = this.symbolAlignOffset;
-            if (this.symbolAlignOffset > 0) {
-              console.warn(`[ALIGN] Skipping ${this.symbolAlignOffset} samples from PREAMBLE entry`);
-            }
           }
         }
       } else {
@@ -507,9 +449,9 @@ export class RxEngine {
       // After calibration: guard frames (pilot only)
       if (this.calFrameCount >= 16) {
         this.guardFrames++;
-        if (this.guardFrames === 1) console.warn(`[GUARD] pilot only, waiting 4 frames...`);
-        if (this.guardFrames >= 4) {
-          console.warn(`[FRAMES] alignOffset=${this.symbolAlignOffset}`);
+        if (this.guardFrames === 1) console.warn(`[GUARD] pilot only, waiting 2 frames...`);
+        if (this.guardFrames >= 2) {
+          console.warn(`[FRAMES] entering data decode`);
           this.state = RxState.FRAMES;
           this.fileData = [];
           this.framesReceived = 0;
@@ -627,10 +569,6 @@ export class RxEngine {
     this.markerPeakE = 0;
     this.guardFrames = 0;
     this.buf = [];
-    this.warbleSubEnergies = [0, 0, 0, 0];
-    this.warbleSubFrames = 0;
-    this.symbolAlignOffset = 0;
-    this.pendingAlignSamples = 0;
     this.absBits = [0,0,0,0];
     this.warbleCodeBits = [];
     this.calFrameCount = 0;
