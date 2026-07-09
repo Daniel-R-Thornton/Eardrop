@@ -686,6 +686,8 @@ export class RxEngine {
       frameSkip: 0,
       pilotAmp: this.pilotAmplitude,
       pilotConfidence: this.state !== RxState.WAITING ? 1 : 0,
+      blocksDecoded: 0,
+      blocksCrcFailed: 0,
     };
   }
 }
