@@ -6,6 +6,3 @@ export { AudioRecorder } from './recorder';
 export { enumerateDevices, populateSelect } from './devices';
 export type { DeviceInfo, DeviceList } from './devices';
 export type { SampleCallback } from './recorder';
-
-// DSP utilities
-export { createDownsampler } from './dsp/Resampler';

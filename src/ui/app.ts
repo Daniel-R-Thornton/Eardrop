@@ -520,12 +520,8 @@ window.addEventListener('eardrop-acoustic-sweep', (async () => {
   // Apply sample rate calibration based on observed -25 Hz shift at 500 Hz
   // True ratio = played_freq / detected_peak = 500 / 475 ≈ 1.0526
   // Mic rate correction = 475 / 500 ≈ 0.95
-  const calFactor = 0.95;
-  if (recorder) {
-    recorder.setCalibration(calFactor);
-  }
   console.log(
-    `[SWEEP] Calibrated mic rate: ×${calFactor} (${(audioCtx.sampleRate * calFactor).toFixed(0)} Hz)`,
+    `[SWEEP] Sweep complete — ${results.length} frequencies tested`,
   );
 }) as EventListener);
 

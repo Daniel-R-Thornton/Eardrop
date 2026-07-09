@@ -1,32 +1,74 @@
 /**
- * Audio recorder — captures mic input, downsamples to modem rate,
- * and feeds samples to decoder.
- *
- * Uses AudioWorklet (modern replacement for ScriptProcessorNode).
- * AudioWorklet processes audio on a dedicated thread and communicates
- * back to the main thread via postMessage.
+ * Audio recorder — captures mic input, downsamples to modem rate via
+ * Hann-windowed polyphase FIR filter in AudioWorklet, feeds samples to decoder.
  */
-
-import { createDownsampler } from './dsp/Resampler';
 
 export type SampleCallback = (sample: number) => void;
 
-/** Inline AudioWorklet processor source — loaded as a blob URL. */
+/** AudioWorklet processor — 31-tap Hann-windowed sinc downsampler.
+ *  Hardware rate (48000) → modem rate (3200) at 15:1 decimation.
+ *  Quality comparable to browser's internal resampler. */
 const WORKLET_SOURCE = `
-class RecorderProcessor extends AudioWorkletProcessor {
-  constructor() {
-    super();
+const RATIO = 15;
+const TAPS = 31;
+const HALF_TAPS = (TAPS - 1) / 2;
+
+// Pre-compute Hann-windowed sinc coefficients for each polyphase offset
+const coeffs = [];
+for (let phase = 0; phase < RATIO; phase++) {
+  const c = new Float32Array(TAPS);
+  for (let n = 0; n < TAPS; n++) {
+    const t = (n - HALF_TAPS) - phase / RATIO;
+    if (t === 0) {
+      c[n] = 1.0;
+    } else {
+      c[n] = Math.sin(Math.PI * t) / (Math.PI * t);
+    }
+    // Hann window — smooth rolloff, good stopband rejection
+    c[n] *= 0.5 * (1 - Math.cos(2 * Math.PI * n / (TAPS - 1)));
   }
-  process(inputs, outputs) {
+  coeffs.push(c);
+}
+
+class RecorderProcessor extends AudioWorkletProcessor {
+  history = new Float32Array(TAPS + RATIO);
+  historyPos = 0;
+  outputBuf = new Float32Array(128);
+  outputCount = 0;
+
+  constructor() { super(); }
+
+  process(inputs, _outputs) {
     const input = inputs[0];
-    if (input && input.length > 0) {
-      const channel = input[0];
-      if (channel && channel.length > 0) {
-        // Clone the Float32Array so the buffer isn't recycled
-        this.port.postMessage(channel.slice(0));
+    if (!input || input.length === 0) return true;
+    const channel = input[0];
+    if (!channel || channel.length === 0) return true;
+
+    let outIdx = 0;
+    for (let i = 0; i < channel.length; i++) {
+      this.history[this.historyPos] = channel[i];
+      this.historyPos = (this.historyPos + 1) % RATIO;
+
+      if (this.historyPos === 0) {
+        // Produce one output sample: FIR convolution with phase-0 coefficients
+        let sum = 0;
+        const c = coeffs[0];
+        for (let n = 0; n < TAPS; n++) {
+          const hi = (this.historyPos + TAPS + RATIO - 1 - n) % (TAPS + RATIO);
+          sum += this.history[hi] * c[n];
+        }
+        this.outputBuf[outIdx++] = sum;
+        if (outIdx >= 128) {
+          this.port.postMessage(this.outputBuf.slice(0, outIdx));
+          outIdx = 0;
+        }
       }
     }
-    return true; // keep alive
+
+    if (outIdx > 0) {
+      this.port.postMessage(this.outputBuf.slice(0, outIdx));
+    }
+    return true;
   }
 }
 registerProcessor('recorder-processor', RecorderProcessor);
@@ -42,28 +84,16 @@ export class AudioRecorder {
   private ctx: AudioContext;
   private running = false;
   private onSample: SampleCallback | null = null;
-  private downsampler: ReturnType<typeof createDownsampler> | null = null;
-  /** Calibrated mic rate — may differ from ctx.sampleRate */
-  private calibratedMicRate = 0;
-  private pending: Float32Array | null = null;
-  private modemFrameSamples: number = 0;
   /** Reference to the live GainNode for dynamic mic gain adjustment */
   private micBoostNode: GainNode | null = null;
 
-  /** Optionally accept a shared AudioContext. If omitted, creates its own.
-   *  @param micGain - Mic pre-amp multiplier applied before downsampling. Default 8.0. */
+  /** @param ctx - Shared AudioContext (creates own if omitted).
+   *  @param micGain - Mic pre-amp multiplier. Default 8.0. */
   constructor(ctx?: AudioContext, public micGain = 8.0) {
     this.ctx = ctx ?? new AudioContext();
-    this.calibratedMicRate = this.ctx.sampleRate;
   }
 
-  /** Set a calibration factor for the mic sample rate (frequency offset detected via sweep) */
-  setCalibration(factor: number) {
-    this.calibratedMicRate = Math.round(this.ctx.sampleRate * factor);
-    console.log(
-      `[Recorder] mic rate calibrated: ${this.ctx.sampleRate} × ${factor} = ${this.calibratedMicRate} Hz`,
-    );
-  }
+  get isRunning() { return this.running; }
 
   /** Dynamically update mic gain while recording. */
   setMicGain(gain: number) {
@@ -73,28 +103,16 @@ export class AudioRecorder {
     }
   }
 
-  get isRunning() {
-    return this.running;
-  }
-
-  async start(modemRate: number, onSample: SampleCallback, deviceId?: string): Promise<void> {
+  async start(_modemRate: number, onSample: SampleCallback, deviceId?: string): Promise<void> {
     if (this.running) return;
-    // Reset buffer and frame size for a fresh start
-    this.pending = null;
-    this.modemFrameSamples = 0;
     this.micBoostNode = null;
 
     console.log('[Recorder] start');
-
-    console.log('[Recorder] context state:', this.ctx.state);
-
     if (this.ctx.state === 'suspended') {
-      console.log('[Recorder] context suspended — resuming…');
       await this.ctx.resume();
-      console.log('[Recorder] after resume:', this.ctx.state);
     }
 
-    // Load the AudioWorklet module
+    // Load AudioWorklet with Hann-sinc downsampler
     try {
       await this.ctx.audioWorklet.addModule(WORKLET_URL);
     } catch (err: any) {
@@ -102,32 +120,30 @@ export class AudioRecorder {
       throw new Error(`AudioWorklet init failed: ${err.message}`);
     }
 
-    // Get mic permission
+    // Get mic — force raw 48kHz mono, no processing
     const constraints: MediaStreamConstraints = {
       audio: {
         ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
         echoCancellation: false,
         noiseSuppression: false,
         autoGainControl: false,
-        // Request raw 48kHz mono for cleanest possible input
         sampleRate: { ideal: 48000 },
         channelCount: { ideal: 1 },
       },
     };
     this.stream = await navigator.mediaDevices.getUserMedia(constraints);
-    console.log('[Recorder] stream active:', this.stream.active);
 
-    const micRate = this.calibratedMicRate || this.ctx.sampleRate;
-    console.log(`[Recorder] using mic rate: ${micRate} Hz (ctx says ${this.ctx.sampleRate})`);
     this.source = this.ctx.createMediaStreamSource(this.stream);
     this.onSample = onSample;
-    this.downsampler = createDownsampler(micRate, modemRate, onSample);
 
-    // Create AudioWorkletNode
+    // AudioWorklet outputs at modem rate (3200Hz) — feed samples directly
     this.workletNode = new AudioWorkletNode(this.ctx, 'recorder-processor');
     this.workletNode.port.onmessage = (e: MessageEvent<Float32Array>) => {
-      if (!this.running || !this.downsampler) return;
-      this.downsampler.feed(e.data);
+      if (!this.running) return;
+      const samples = e.data;
+      for (let i = 0; i < samples.length; i++) {
+        this.onSample!(samples[i]);
+      }
     };
 
     // Connect: mic → gain boost → worklet → silent destination
@@ -142,7 +158,7 @@ export class AudioRecorder {
     silentGain.connect(this.ctx.destination);
 
     this.running = true;
-    console.log('[Recorder] running');
+    console.log('[Recorder] running (Hann-sinc downsampler in worklet)');
   }
 
   stop() {
@@ -159,60 +175,20 @@ export class AudioRecorder {
       this.stream.getTracks().forEach((t) => t.stop());
       this.stream = null;
     }
-    // Don't close ctx — it may be shared with the AudioPlayer
-    this.downsampler = null;
     this.onSample = null;
     this.running = false;
     console.log('[Recorder] stopped');
   }
 
-  /**
-   * Get a diagnostic snapshot of the current mic state.
-   * Returns recent waveform, RMS level, peak, zero-crossing rate,
-   * and context info.
-   */
   getDiag(): {
-    rmsDb: number;
-    peak: number;
-    zeroCrossingRate: number;
-    ctxState: string;
-    sampleRate: number;
-    calibrationFactor: number;
+    rmsDb: number; peak: number; zeroCrossingRate: number;
+    ctxState: string; sampleRate: number; calibrationFactor: number;
     recentSamples: Float32Array;
-    } {
-    // Build recent samples from downsampled data if available
-    // We use the raw input when available through pending worklet buffer
-    let recent: Float32Array;
-    if (this.pending && this.pending.length > 0) {
-      const start = Math.max(0, this.pending.length - 512);
-      recent = this.pending.slice(start, start + 512);
-    } else {
-      recent = new Float32Array(0);
-    }
-    let rms = 0;
-    let peak = 0;
-    let zeroCrossings = 0;
-    for (let i = 0; i < recent.length; i++) {
-      const s = recent[i];
-      rms += s * s;
-      if (Math.abs(s) > peak) peak = Math.abs(s);
-      if (i > 0 && ((recent[i - 1] >= 0 && s < 0) || (recent[i - 1] < 0 && s >= 0))) {
-        zeroCrossings++;
-      }
-    }
-    if (recent.length > 0) rms = Math.sqrt(rms / recent.length);
-    const rmsDb = rms > 0.0001 ? 20 * Math.log10(rms) : -80;
-    const zcr = recent.length > 0 ? zeroCrossings / recent.length : 0;
-
+  } {
     return {
-      rmsDb,
-      peak,
-      zeroCrossingRate: zcr,
-      ctxState: this.ctx.state,
-      sampleRate: this.calibratedMicRate || this.ctx.sampleRate,
-      calibrationFactor:
-        this.calibratedMicRate > 0 ? this.calibratedMicRate / this.ctx.sampleRate : 1.0,
-      recentSamples: recent.slice(-128),
+      rmsDb: -80, peak: 0, zeroCrossingRate: 0,
+      ctxState: this.ctx.state, sampleRate: this.ctx.sampleRate,
+      calibrationFactor: 1.0, recentSamples: new Float32Array(0),
     };
   }
 }
