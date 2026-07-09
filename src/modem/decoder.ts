@@ -326,9 +326,8 @@ export class Decoder {
     // Raw I/Q at each tone frequency
     const rawIQs = this.toneFreqs.map(f => toneIQ(window, f, this.cfg.sampleRate));
 
-    // Use raw I/Q directly — the toneIQ reference sin starts at 0, encoder
-    // advances one sample ahead (sin(ω*(n+1))), giving a constant ω phase offset
-    // per tone. For 0° BPSK: raw.i = A/2*cos(ω) > 0. For 180°: raw.i < 0.
+    // Use raw I/Q directly. Both encoder and toneIQ use sin(ωn) as reference,
+    // so 0° BPSK → raw.i = A/2 > 0 and 180° BPSK → raw.i < 0 for all tones.
     // No rotation needed — just use raw I component for BPSK decision.
     const relI: [number, number, number, number] = [0, 0, 0, 0];
     const relQ: [number, number, number, number] = [0, 0, 0, 0];

@@ -316,10 +316,6 @@ export class RxEngine {
     if (this.buf.length < this.sps) return;
     const window = this.buf.slice(0, this.sps);
     this.buf.splice(0, this.sps);
-    // Save current pilot phase reference (start of NEXT window)
-    // Used to rotate raw tone I/Q from pilot-relative to absolute
-    this.pilotCosRef = this.pll?.getCosRef() ?? 1;
-    this.pilotSinRef = this.pll?.getSinRef() ?? 0;
     const rawIQs = this.toneFreqs.map(f => toneIQ(window, f, this.cfg.sampleRate));
     const totalE = rawIQs.reduce((a, r) => a + Math.hypot(r.i, r.q), 0);
     
