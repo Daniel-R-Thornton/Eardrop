@@ -77,7 +77,7 @@ class SentinelScanner {
   private maxRegHistory = 64;
 
   /** Hamming distance threshold for sentinel matching (allows bit errors) */
-  private readonly sentinelHammingThreshold = 4;
+  private readonly sentinelHammingThreshold = 2;
 
   onFrame: ((frameBytes: Uint8Array) => void) | null = null;
 
@@ -455,6 +455,7 @@ export class RxEngine {
           this.state = RxState.FRAMES;
           this.fileData = [];
           this.framesReceived = 0;
+          this.receivedPayloadSeqs = new Set();
           this.fileID = 0;
           this.fileName = '';
           this.fileSize = 0;
@@ -584,6 +585,7 @@ export class RxEngine {
     this.samplesSeen = 0;
     this.fileData = [];
     this.framesReceived = 0;
+    this.receivedPayloadSeqs = new Set();
     this.fileName = '';
     this.fileSize = 0;
     this.totalFrames = 0;
@@ -627,7 +629,7 @@ export class RxEngine {
         break;
       case 0x02: // PAYLOAD
         console.warn(`[RX] PAYLOAD frame #${this.framesReceived+1}`);
-        this.processPayload(decoded.payload);
+        this.processPayload(decoded.payload, decoded.header!.seqNum);
         break;
       case 0x03: // TAIL
         console.warn(`[RX] TAIL frame — assembling ${this.fileData.length}/${this.fileSize}B file`);
@@ -636,12 +638,21 @@ export class RxEngine {
     }
   }
 
+  /** Track received payload sequence numbers for diversity-mode dedup */
+  private receivedPayloadSeqs = new Set<number>();
+
   private processHeader(payload: Uint8Array): void {
     // Header payload format: [fileID:4B][totalSize:4B][nameLen:1B][name...]
     const fileID = (payload[0] << 24) | (payload[1] << 16) | (payload[2] << 8) | payload[3];
     // File ID validation (little-endian)
     const receivedFileID = (payload[0] << 24) | (payload[1] << 16) | (payload[2] << 8) | payload[3];
     console.log(`[RX-ENDIAN] File ID: 0x${receivedFileID.toString(16)}`);
+
+    // Duplicate header (diversity mode repetition) — ignore, keep existing state
+    if (fileID === this.fileID && this.fileName !== '') {
+      console.warn(`[RX] Duplicate header (diversity mode), skipping reset`);
+      return;
+    }
 
     const totalSize = (payload[4] | (payload[5] << 8) | (payload[6] << 16) | (payload[7] << 24)) >>> 0;
     const nameLen = Math.min(payload[8] & 0xFF, 31);
@@ -657,13 +668,18 @@ export class RxEngine {
     this.fileName = name;
     this.fileData = [];
     this.framesReceived = 0;
+    this.receivedPayloadSeqs = new Set();
   }
 
-  private processPayload(payload: Uint8Array): void {
-    if (!this.fileName) {
-      // No header received yet — ignore
+  private processPayload(payload: Uint8Array, seqNum: number): void {
+    if (!this.fileName) return;
+
+    // Skip duplicate payload frames (diversity mode repetition)
+    if (this.receivedPayloadSeqs.has(seqNum)) {
+      console.warn(`[RX] Duplicate payload seq=${seqNum}, skipping`);
       return;
     }
+    this.receivedPayloadSeqs.add(seqNum);
 
     for (let i = 0; i < payload.length && this.fileData.length < this.fileSize; i++) {
       this.fileData.push(payload[i]);
@@ -673,6 +689,13 @@ export class RxEngine {
 
   private processTail(): void {
     if (!this.fileName || this.fileData.length === 0) {
+      // Duplicate tail (diversity mode) — already handled, or no data yet
+      return;
+    }
+
+    // Already completed (duplicate tail from diversity mode)
+    if (this.state === RxState.COMPLETE) {
+      console.warn(`[RX] Duplicate tail frame (diversity mode), skipping`);
       return;
     }
 
