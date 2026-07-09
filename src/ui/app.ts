@@ -1071,6 +1071,304 @@ async function runAudioValidation() {
   setState({ sendStatus: { type: allDetected ? 'success' : 'error', msg: allDetected ? `✅ Audio path OK (${avgSnr.toFixed(0)}dB SNR)` : `❌ Audio issues — check console` } });
 }
 
+// ─── Full Frequency Sweep ────────────────────────────
+
+/** Sweep 100-1500Hz at 100Hz steps to find optimal tone placement. */
+async function runFullSweep() {
+  console.warn('━━━ [FULL-SWEEP] Full frequency response sweep 100-1500Hz ━━━');
+  setState({ sendStatus: { type: 'info', msg: '🔊 Full sweep…' } });
+  await refreshDeviceList();
+  if (!isListening) await startListening();
+  await new Promise((r) => setTimeout(r, 200));
+
+  const modemRate = DEFAULT_CONFIG.sampleRate;
+  const outputRate = player.getSampleRate();
+  player.volume = getState().playbackVolume;
+
+  const testFreqs: number[] = [];
+  for (let f = 100; f <= 1500; f += 100) testFreqs.push(f);
+
+  console.warn(`[FULL-SWEEP] ${testFreqs.length} frequencies: ${testFreqs[0]}-${testFreqs[testFreqs.length - 1]}Hz`);
+
+  const toneDuration = 0.15; // 150ms — long enough to survive RxEngine preamble
+  const toneSamples = Math.floor(modemRate * toneDuration);
+  const gapSamples = Math.floor(modemRate * 0.03);
+
+  const results: Array<{ freq: number; energy: number; snr: number }> = [];
+
+  for (const freq of testFreqs) {
+    const tone = new Float32Array(toneSamples + gapSamples);
+    for (let i = 0; i < toneSamples; i++) {
+      tone[i] = Math.sin((2 * Math.PI * freq * i) / modemRate) * 0.5;
+    }
+
+    // Upsample to output rate
+    const ratio = modemRate / outputRate;
+    const outLen = Math.ceil(tone.length / ratio);
+    const playBuf = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const pos = i * ratio;
+      const idx = Math.floor(pos);
+      const frac = pos - idx;
+      const a = tone[idx] ?? 0;
+      const b = tone[Math.min(idx + 1, tone.length - 1)] ?? 0;
+      playBuf[i] = a + (b - a) * frac;
+    }
+
+    const preCount = recvSamples.length;
+    setState({ isPlaying: true });
+    await player.play(playBuf, outputRate, selectedOutputId || undefined);
+    setState({ isPlaying: false });
+    await new Promise((r) => setTimeout(r, 50));
+
+    const newSamples = recvSamples.slice(preCount);
+    if (newSamples.length < 32) {
+      results.push({ freq, energy: 0, snr: -999 });
+      continue;
+    }
+
+    const tail = newSamples.slice(-Math.min(256, newSamples.length));
+    const tail32 = new Float32Array(tail);
+
+    // Energy at freq
+    let sSin = 0, sCos = 0;
+    for (let i = 0; i < tail32.length; i++) {
+      const ph = (2 * Math.PI * freq * i) / modemRate;
+      sSin += tail32[i] * Math.sin(ph);
+      sCos += tail32[i] * Math.cos(ph);
+    }
+    const energy = Math.hypot(sSin, sCos) / tail32.length;
+
+    // Noise at freq+25Hz
+    let nSin = 0, nCos = 0;
+    for (let i = 0; i < tail32.length; i++) {
+      const ph = (2 * Math.PI * (freq + 25) * i) / modemRate;
+      nSin += tail32[i] * Math.sin(ph);
+      nCos += tail32[i] * Math.cos(ph);
+    }
+    const noise = Math.hypot(nSin, nCos) / tail32.length;
+    const snr = noise > 1e-12 ? 20 * Math.log10(energy / noise) : 999;
+
+    results.push({ freq, energy, snr });
+
+    if (results.length % 5 === 0) {
+      setState({ sendStatus: { type: 'info', msg: `🔊 Sweep: ${results.length}/${testFreqs.length}` } });
+    }
+  }
+
+  // Find best frequencies — top 5 by SNR, at least 100Hz apart
+  const sorted = [...results].sort((a, b) => b.snr - a.snr);
+  const bestSpots: typeof results = [];
+  for (const r of sorted) {
+    if (bestSpots.length >= 5) break;
+    if (bestSpots.every((s) => Math.abs(s.freq - r.freq) >= 100)) {
+      bestSpots.push(r);
+    }
+  }
+  bestSpots.sort((a, b) => a.freq - b.freq);
+
+  // Find contiguous good bands (2+ consecutive frequencies with SNR > 15dB)
+  const MIN_SNR = 15;
+  const goodBands: Array<{ start: number; end: number; avgSnr: number; width: number }> = [];
+  let bandStart = -1;
+  for (let i = 0; i < results.length; i++) {
+    if (results[i].snr >= MIN_SNR) {
+      if (bandStart < 0) bandStart = i;
+    } else {
+      if (bandStart >= 0 && i - bandStart >= 2) {
+        const band = results.slice(bandStart, i);
+        goodBands.push({
+          start: band[0].freq,
+          end: band[band.length - 1].freq,
+          avgSnr: band.reduce((a, r) => a + r.snr, 0) / band.length,
+          width: band[band.length - 1].freq - band[0].freq,
+        });
+      }
+      bandStart = -1;
+    }
+  }
+  // Flush last band
+  if (bandStart >= 0 && results.length - bandStart >= 2) {
+    const band = results.slice(bandStart);
+    goodBands.push({
+      start: band[0].freq,
+      end: band[band.length - 1].freq,
+      avgSnr: band.reduce((a, r) => a + r.snr, 0) / band.length,
+      width: band[band.length - 1].freq - band[0].freq,
+    });
+  }
+
+  console.warn('━━━ [FULL-SWEEP] Results ━━━');
+  console.table(results.map((r) => ({
+    'Freq (Hz)': r.freq,
+    'Energy': r.energy.toExponential(2),
+    'SNR (dB)': r.snr.toFixed(1),
+  })));
+
+  if (goodBands.length > 0) {
+    console.warn(`[FULL-SWEEP] Good bands (SNR > ${MIN_SNR}dB, ≥2 consecutive):`);
+    console.table(goodBands.map((b) => ({
+      'Range': `${b.start}-${b.end}Hz`,
+      'Width': `${b.width}Hz`,
+      'Avg SNR': `${b.avgSnr.toFixed(1)}dB`,
+    })));
+    // Suggest best band for tones
+    const best = goodBands.reduce((a, b) => (b.width > a.width ? b : a), goodBands[0]);
+    console.warn(`[FULL-SWEEP] Widest good band: ${best.start}-${best.end}Hz (${best.width}Hz, ${best.avgSnr.toFixed(1)}dB SNR)`);
+  } else {
+    console.warn('[FULL-SWEEP] No contiguous good bands found — SNR too low across range');
+  }
+
+  console.warn(`[FULL-SWEEP] Best 5 spaced spots: ${bestSpots.map((s) => `${s.freq}Hz (${s.snr.toFixed(1)}dB)`).join(', ')}`);
+  console.warn(`[FULL-SWEEP] Suggested pilot: ${bestSpots[0]?.freq ?? '?'}Hz, tones: ${bestSpots.slice(1).map((s) => `${s.freq}Hz`).join(', ')}`);
+
+  setState({ sendStatus: { type: 'success', msg: `✅ Sweep done — ${results.length} freqs. Best: ${bestSpots.map((s) => s.freq).join(',')}Hz` } });
+}
+
+// ─── Multi-Tone Overlap Sweep ────────────────────────
+
+/** Play 5 simultaneous tones at 100Hz spacing, sweeping the base frequency
+ *  from 100 to 1100Hz. Maps which channels survive cross-talk at every position. */
+async function runMultiToneSweep() {
+  console.warn('━━━ [MULTI-TONE] Full-range 5-tone overlap sweep ━━━');
+  setState({ sendStatus: { type: 'info', msg: '🔊 Multi-tone sweep (slow)…' } });
+  await refreshDeviceList();
+  if (!isListening) await startListening();
+  await new Promise((r) => setTimeout(r, 200));
+
+  const modemRate = DEFAULT_CONFIG.sampleRate;
+  const outputRate = player.getSampleRate();
+  player.volume = getState().playbackVolume;
+
+  // Sweep base from 100 to 1100Hz (last tone at base+400 fits within 1500Hz Nyquist)
+  // At each position, play 5 tones: base, +100, +200, +300, +400
+  const baseFreqs: number[] = [];
+  for (let f = 100; f <= 1100; f += 100) baseFreqs.push(f);
+
+  console.warn(`[MULTI-TONE] Testing ${baseFreqs.length} base positions (100-1100Hz), 5 tones each at 100Hz spacing`);
+
+  const allResults: Array<{ base: number; freqs: number[]; snrs: number[] }> = [];
+
+  for (const base of baseFreqs) {
+    const freqs = [base, base + 100, base + 200, base + 300, base + 400];
+    const toneDuration = 0.15;
+    const toneSamples = Math.floor(modemRate * toneDuration);
+    const gapSamples = Math.floor(modemRate * 0.05);
+
+    // Generate all 5 tones mixed together
+    const tone = new Float32Array(toneSamples + gapSamples);
+    for (let i = 0; i < toneSamples; i++) {
+      let s = 0;
+      for (const f of freqs) {
+        s += Math.sin((2 * Math.PI * f * i) / modemRate) * 0.1;
+      }
+      tone[i] = s;
+    }
+
+    // Upsample to output rate
+    const ratio = modemRate / outputRate;
+    const outLen = Math.ceil(tone.length / ratio);
+    const playBuf = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const pos = i * ratio;
+      const idx = Math.floor(pos);
+      const frac = pos - idx;
+      const a = tone[idx] ?? 0;
+      const b = tone[Math.min(idx + 1, tone.length - 1)] ?? 0;
+      playBuf[i] = a + (b - a) * frac;
+    }
+
+    const preCount = recvSamples.length;
+    setState({ isPlaying: true });
+    await player.play(playBuf, outputRate, selectedOutputId || undefined);
+    setState({ isPlaying: false });
+    await new Promise((r) => setTimeout(r, 60));
+
+    const newSamples = recvSamples.slice(preCount);
+    if (newSamples.length < 64) {
+      allResults.push({ base, freqs, snrs: [0, 0, 0, 0, 0] });
+      continue;
+    }
+
+    const tail = new Float32Array(newSamples.slice(-Math.min(512, newSamples.length)));
+
+    // Measure SNR of each tone
+    const snrs: number[] = [];
+    for (const freq of freqs) {
+      let sSin = 0, sCos = 0;
+      for (let i = 0; i < tail.length; i++) {
+        const ph = (2 * Math.PI * freq * i) / modemRate;
+        sSin += tail[i] * Math.sin(ph);
+        sCos += tail[i] * Math.cos(ph);
+      }
+      const energy = Math.hypot(sSin, sCos) / tail.length;
+
+      // Cross-talk energy at +50Hz offset
+      let nSin = 0, nCos = 0;
+      for (let i = 0; i < tail.length; i++) {
+        const ph = (2 * Math.PI * (freq + 50) * i) / modemRate;
+        nSin += tail[i] * Math.sin(ph);
+        nCos += tail[i] * Math.cos(ph);
+      }
+      const noise = Math.hypot(nSin, nCos) / tail.length;
+      snrs.push(noise > 1e-12 ? 20 * Math.log10(energy / noise) : 999);
+    }
+
+    allResults.push({ base, freqs, snrs });
+
+    if (allResults.length % 5 === 0) {
+      setState({ sendStatus: { type: 'info', msg: `🔊 Multi-tone: ${allResults.length}/${baseFreqs.length}` } });
+    }
+  }
+
+  // Display as frequency-response table: each row = a tone slot, columns = base positions
+  const toneLabels = ['T0', 'T1', 'T2', 'T3', 'T4'];
+  console.warn('━━━ [MULTI-TONE] Per-frequency SNR at each position (5 tones, 100Hz spacing) ━━━');
+  console.warn('Format: each column is a base frequency. Each row is the Nth tone (base + N*100Hz).');
+  const rows: Record<string, string | number>[] = [];
+  for (let t = 0; t < 5; t++) {
+    const row: Record<string, string | number> = { 'Tone': toneLabels[t] };
+    for (const r of allResults) {
+      row[`${r.base}Hz`] = r.snrs[t].toFixed(1);
+    }
+    rows.push(row);
+  }
+  console.table(rows);
+
+  // Summary: which positions have all 5 tones > 15dB?
+  const goodPositions = allResults.filter((r) => r.snrs.every((s) => s > 15));
+  console.warn(`[MULTI-TONE] Positions with ALL 5 tones >15dB: ${goodPositions.length}/${allResults.length}`);
+  if (goodPositions.length > 0) {
+    const ranges: string[] = [];
+    let rangeStart = goodPositions[0].base;
+    let prev = rangeStart;
+    for (let i = 1; i <= goodPositions.length; i++) {
+      const cur = i < goodPositions.length ? goodPositions[i].base : -1;
+      if (cur !== prev + 100) {
+        const rangeEnd = prev + 400; // last tone = base + 400
+        ranges.push(`${rangeStart}-${rangeEnd}Hz`);
+        rangeStart = cur;
+      }
+      if (cur > 0) prev = cur;
+    }
+    console.warn(`[MULTI-TONE] Usable all-5-tone ranges: ${ranges.join(', ')}`);
+  }
+
+  setState({ sendStatus: { type: 'success', msg: `✅ Multi-tone done. ${goodPositions.length}/${allResults.length} positions OK` } });
+}
+
+// Wire
+window.addEventListener('eardrop-multi-tone', (async () => {
+  await runMultiToneSweep();
+}) as EventListener);
+(window as any).runMultiToneSweep = runMultiToneSweep;
+
+// Wire
+window.addEventListener('eardrop-full-sweep', (async () => {
+  await runFullSweep();
+}) as EventListener);
+(window as any).runFullSweep = runFullSweep;
+
 // Wire audio validation
 window.addEventListener('eardrop-audio-validation', (async () => {
   await runAudioValidation();
@@ -1094,6 +1392,271 @@ window.addEventListener('eardrop-sentinel-only', (async () => {
 (window as any).sendCalibrationOnly = sendCalibrationOnly;
 (window as any).sendSingleFrame = sendSingleFrame;
 (window as any).sendSentinelOnly = sendSentinelOnly;
+
+// ─── Interference Matrix Sweep ────────────────────────
+
+/** Test all tone pairs at variable offsets to map cross-channel interference.
+ *  Builds a matrix: base × offset → min SNR. Shows what spacings work
+ *  at each frequency range. Slow but comprehensive. */
+async function runInterferenceSweep() {
+  console.warn('━━━ [INTERFERENCE] Two-tone interference matrix sweep ━━━');
+  setState({ sendStatus: { type: 'info', msg: '🔊 Interference sweep (slow)…' } });
+  await refreshDeviceList();
+  if (!isListening) await startListening();
+  await new Promise((r) => setTimeout(r, 200));
+
+  const modemRate = DEFAULT_CONFIG.sampleRate;
+  const outputRate = player.getSampleRate();
+  player.volume = getState().playbackVolume;
+
+  // Base frequencies: every 50Hz from 100 to 1300
+  const bases: number[] = [];
+  for (let f = 100; f <= 1300; f += 50) bases.push(f);
+
+  // Offsets: how far apart the two tones are
+  const offsets = [50, 100, 150, 200, 250, 300, 400];
+
+  console.warn(`[INTERFERENCE] ${bases.length} base × ${offsets.length} offsets = ${bases.length * offsets.length} tests`);
+  console.warn(`[INTERFERENCE] Estimated time: ~${(bases.length * offsets.length * 0.35).toFixed(0)}s`);
+
+  // Matrix: base → offset → [snr_tone1, snr_tone2]
+  const matrix: Array<{ base: number; offset: number; freq1: number; freq2: number; snr1: number; snr2: number; minSnr: number }> = [];
+  let testNum = 0;
+  const total = bases.length * offsets.length;
+
+  for (const base of bases) {
+    for (const offset of offsets) {
+      testNum++;
+      const freq1 = base;
+      const freq2 = base + offset;
+      if (freq2 > 1500) continue; // skip beyond Nyquist
+
+      const toneDuration = 0.12;
+      const toneSamples = Math.floor(modemRate * toneDuration);
+      const gapSamples = Math.floor(modemRate * 0.03);
+
+      // Two tones mixed
+      const tone = new Float32Array(toneSamples + gapSamples);
+      for (let i = 0; i < toneSamples; i++) {
+        tone[i] = Math.sin((2 * Math.PI * freq1 * i) / modemRate) * 0.25
+                + Math.sin((2 * Math.PI * freq2 * i) / modemRate) * 0.25;
+      }
+
+      // Upsample
+      const ratio = modemRate / outputRate;
+      const outLen = Math.ceil(tone.length / ratio);
+      const playBuf = new Float32Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const pos = i * ratio;
+        const idx = Math.floor(pos);
+        const frac = pos - idx;
+        const a = tone[idx] ?? 0;
+        const b = tone[Math.min(idx + 1, tone.length - 1)] ?? 0;
+        playBuf[i] = a + (b - a) * frac;
+      }
+
+      const preCount = recvSamples.length;
+      setState({ isPlaying: true });
+      await player.play(playBuf, outputRate, selectedOutputId || undefined);
+      setState({ isPlaying: false });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const newSamples = recvSamples.slice(preCount);
+      if (newSamples.length < 64) {
+        matrix.push({ base, offset, freq1, freq2, snr1: -999, snr2: -999, minSnr: -999 });
+        continue;
+      }
+
+      const tail = new Float32Array(newSamples.slice(-Math.min(384, newSamples.length)));
+
+      // Measure SNR of each tone
+      const measureSnr = (freq: number): number => {
+        let sSin = 0, sCos = 0;
+        for (let i = 0; i < tail.length; i++) {
+          const ph = (2 * Math.PI * freq * i) / modemRate;
+          sSin += tail[i] * Math.sin(ph);
+          sCos += tail[i] * Math.cos(ph);
+        }
+        const energy = Math.hypot(sSin, sCos) / tail.length;
+        // Noise at +/-25Hz (avoid the other tone)
+        const noiseFreq = freq < freq2 ? freq - 25 : freq + 25;
+        let nSin = 0, nCos = 0;
+        for (let i = 0; i < tail.length; i++) {
+          const ph = (2 * Math.PI * noiseFreq * i) / modemRate;
+          nSin += tail[i] * Math.sin(ph);
+          nCos += tail[i] * Math.cos(ph);
+        }
+        const noise = Math.hypot(nSin, nCos) / tail.length;
+        return noise > 1e-12 ? 20 * Math.log10(energy / noise) : 999;
+      };
+
+      const snr1 = measureSnr(freq1);
+      const snr2 = measureSnr(freq2);
+      matrix.push({ base, offset, freq1, freq2, snr1, snr2, minSnr: Math.min(snr1, snr2) });
+
+      if (testNum % 20 === 0) {
+        setState({ sendStatus: { type: 'info', msg: `🔊 Interference: ${testNum}/${total}` } });
+      }
+    }
+  }
+
+  // Display as offset × base heatmap of min SNR
+  console.warn('━━━ [INTERFERENCE] Two-tone interference matrix (min SNR of the pair) ━━━');
+  const offsetRows: Record<string, string | number>[] = [];
+  for (const offset of offsets) {
+    const row: Record<string, string | number> = { 'Offset': `${offset}Hz` };
+    for (const base of bases) {
+      const entry = matrix.find((m) => m.base === base && m.offset === offset);
+      if (entry) {
+        const snr = entry.minSnr;
+        row[`${base}`] = snr > 15 ? `✓${snr.toFixed(0)}` : snr > 5 ? `${snr.toFixed(0)}` : `✗${snr.toFixed(0)}`;
+      } else {
+        row[`${base}`] = '—';
+      }
+    }
+    offsetRows.push(row);
+  }
+  console.table(offsetRows);
+
+  // Summary: minimum safe offset at each base frequency
+  console.warn('[INTERFERENCE] Minimum offset for both tones >15dB SNR:');
+  for (const base of bases) {
+    const safe = offsets.find((off) => {
+      const e = matrix.find((m) => m.base === base && m.offset === off);
+      return e && e.minSnr > 15;
+    });
+    if (safe) {
+      console.warn(`  ${base}Hz: ≥${safe}Hz spacing needed`);
+    }
+  }
+
+  setState({ sendStatus: { type: 'success', msg: `✅ Interference done — ${matrix.length} pairs` } });
+}
+
+// Wire
+window.addEventListener('eardrop-interference', (async () => {
+  await runInterferenceSweep();
+}) as EventListener);
+(window as any).runInterferenceSweep = runInterferenceSweep;
+
+// ─── Fine Verification Sweep ─────────────────────────
+
+/** Tight sweep around candidate frequencies to verify spacing is robust,
+ *  not just an artifact of the coarse sweep resolution. */
+async function runFineSweep() {
+  console.warn('━━━ [FINE-SWEEP] Fine verification at 10Hz resolution ━━━');
+  setState({ sendStatus: { type: 'info', msg: '🔊 Fine sweep…' } });
+  await refreshDeviceList();
+  if (!isListening) await startListening();
+  await new Promise((r) => setTimeout(r, 200));
+
+  const modemRate = DEFAULT_CONFIG.sampleRate;
+  const outputRate = player.getSampleRate();
+  player.volume = getState().playbackVolume;
+
+  // Test bases 550-650Hz with offsets 80-120Hz at 10Hz steps
+  const bases: number[] = [];
+  for (let f = 550; f <= 650; f += 10) bases.push(f);
+  const offsets: number[] = [];
+  for (let o = 80; o <= 120; o += 10) offsets.push(o);
+
+  const total = bases.length * offsets.length;
+  console.warn(`[FINE-SWEEP] ${bases.length} bases × ${offsets.length} offsets = ${total} tests at 10Hz resolution`);
+
+  const matrix: Array<{ base: number; offset: number; minSnr: number }> = [];
+
+  for (const base of bases) {
+    for (const offset of offsets) {
+      const freq1 = base;
+      const freq2 = base + offset;
+
+      const toneDuration = 0.12;
+      const toneSamples = Math.floor(modemRate * toneDuration);
+      const gapSamples = Math.floor(modemRate * 0.03);
+
+      const tone = new Float32Array(toneSamples + gapSamples);
+      for (let i = 0; i < toneSamples; i++) {
+        tone[i] = Math.sin((2 * Math.PI * freq1 * i) / modemRate) * 0.25
+                + Math.sin((2 * Math.PI * freq2 * i) / modemRate) * 0.25;
+      }
+
+      const ratio = modemRate / outputRate;
+      const outLen = Math.ceil(tone.length / ratio);
+      const playBuf = new Float32Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const pos = i * ratio;
+        const idx = Math.floor(pos);
+        const frac = pos - idx;
+        const a = tone[idx] ?? 0;
+        const b = tone[Math.min(idx + 1, tone.length - 1)] ?? 0;
+        playBuf[i] = a + (b - a) * frac;
+      }
+
+      const preCount = recvSamples.length;
+      setState({ isPlaying: true });
+      await player.play(playBuf, outputRate, selectedOutputId || undefined);
+      setState({ isPlaying: false });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const newSamples = recvSamples.slice(preCount);
+      if (newSamples.length < 64) {
+        matrix.push({ base, offset, minSnr: -999 });
+        continue;
+      }
+
+      const tail = new Float32Array(newSamples.slice(-Math.min(384, newSamples.length)));
+
+      const measureSnr = (freq: number): number => {
+        let sSin = 0, sCos = 0;
+        for (let i = 0; i < tail.length; i++) {
+          const ph = (2 * Math.PI * freq * i) / modemRate;
+          sSin += tail[i] * Math.sin(ph);
+          sCos += tail[i] * Math.cos(ph);
+        }
+        const energy = Math.hypot(sSin, sCos) / tail.length;
+        const nf = freq < freq2 ? freq - 25 : freq + 25;
+        let nSin = 0, nCos = 0;
+        for (let i = 0; i < tail.length; i++) {
+          const ph = (2 * Math.PI * nf * i) / modemRate;
+          nSin += tail[i] * Math.sin(ph);
+          nCos += tail[i] * Math.cos(ph);
+        }
+        const noise = Math.hypot(nSin, nCos) / tail.length;
+        return noise > 1e-12 ? 20 * Math.log10(energy / noise) : 999;
+      };
+
+      const snr1 = measureSnr(freq1);
+      const snr2 = measureSnr(freq2);
+      matrix.push({ base, offset, minSnr: Math.min(snr1, snr2) });
+    }
+  }
+
+  console.warn('━━━ [FINE-SWEEP] Results (base × offset → min SNR) ━━━');
+  const rows: Record<string, string | number>[] = [];
+  for (const base of bases) {
+    const row: Record<string, string | number> = { 'Base': `${base}Hz` };
+    for (const offset of offsets) {
+      const e = matrix.find((m) => m.base === base && m.offset === offset);
+      if (e) {
+        row[`+${offset}`] = e.minSnr > 15 ? `✓${e.minSnr.toFixed(0)}` : e.minSnr > 5 ? `${e.minSnr.toFixed(0)}` : `✗${e.minSnr.toFixed(0)}`;
+      }
+    }
+    rows.push(row);
+  }
+  console.table(rows);
+
+  const allGood = matrix.every((m) => m.minSnr > 15);
+  const worst = matrix.reduce((a, b) => (b.minSnr < a.minSnr ? b : a), matrix[0]);
+  console.warn(`[FINE-SWEEP] All pass (>15dB)? ${allGood ? '✅ YES — 100Hz spacing is robust' : '❌ NO — spacing needs adjustment'}`);
+  console.warn(`[FINE-SWEEP] Worst case: base=${worst.base}Hz +${worst.offset}Hz → ${worst.minSnr.toFixed(1)}dB`);
+
+  setState({ sendStatus: { type: allGood ? 'success' : 'error', msg: allGood ? '✅ 100Hz verified robust' : '❌ Spacing fragile — check console' } });
+}
+
+window.addEventListener('eardrop-fine-sweep', (async () => {
+  await runFineSweep();
+}) as EventListener);
+(window as any).runFineSweep = runFineSweep;
 
 // Expose self-test for event wiring
 (window as any).runSelfTest = runSelfTest;

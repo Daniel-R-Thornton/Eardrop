@@ -31,10 +31,13 @@ for (let phase = 0; phase < RATIO; phase++) {
 }
 
 class RecorderProcessor extends AudioWorkletProcessor {
-  history = new Float32Array(TAPS + RATIO);
-  historyPos = 0;
-  outputBuf = new Float32Array(128);
-  outputCount = 0;
+  // Circular buffer with power-of-2 size for fast modulo
+  mask = 127; // 128 slots
+  history = new Float32Array(128);
+  head = 0; // next write position
+  sampleCount = 0; // monotonically increasing, used only for decimation trigger
+  outBuf = new Float32Array(128);
+  outIdx = 0;
 
   constructor() { super(); }
 
@@ -44,29 +47,33 @@ class RecorderProcessor extends AudioWorkletProcessor {
     const channel = input[0];
     if (!channel || channel.length === 0) return true;
 
-    let outIdx = 0;
     for (let i = 0; i < channel.length; i++) {
-      this.history[this.historyPos] = channel[i];
-      this.historyPos = (this.historyPos + 1) % RATIO;
+      // Write to circular buffer
+      this.history[this.head] = channel[i];
+      this.head = (this.head + 1) & this.mask;
+      this.sampleCount++;
 
-      if (this.historyPos === 0) {
-        // Produce one output sample: FIR convolution with phase-0 coefficients
+      // Produce one output sample every RATIO input samples
+      if ((this.sampleCount % RATIO) === 0 && this.sampleCount >= TAPS * RATIO) {
         let sum = 0;
         const c = coeffs[0];
+        // Read TAPS newest samples (head-1 = newest, head-TAPS = oldest)
+        let pos = (this.head - 1) & this.mask;
         for (let n = 0; n < TAPS; n++) {
-          const hi = (this.historyPos + TAPS + RATIO - 1 - n) % (TAPS + RATIO);
-          sum += this.history[hi] * c[n];
+          sum += this.history[pos] * c[n];
+          pos = (pos - 1) & this.mask;
         }
-        this.outputBuf[outIdx++] = sum;
-        if (outIdx >= 128) {
-          this.port.postMessage(this.outputBuf.slice(0, outIdx));
-          outIdx = 0;
+        this.outBuf[this.outIdx++] = sum;
+        if (this.outIdx >= 128) {
+          this.port.postMessage(this.outBuf.slice(0, this.outIdx));
+          this.outIdx = 0;
         }
       }
     }
 
-    if (outIdx > 0) {
-      this.port.postMessage(this.outputBuf.slice(0, outIdx));
+    if (this.outIdx > 0) {
+      this.port.postMessage(this.outBuf.slice(0, this.outIdx));
+      this.outIdx = 0;
     }
     return true;
   }

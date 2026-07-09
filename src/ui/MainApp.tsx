@@ -745,6 +745,18 @@ export function MainApp() {
               <button onClick={() => dispatch('eardrop-audio-validation')} style={{ ...btnSmall, background: 'rgba(34,197,94,0.15)', color: '#22c55e', borderColor: 'rgba(34,197,94,0.3)' }}>
                 Audio Check
               </button>
+              <button onClick={() => dispatch('eardrop-full-sweep')} style={{ ...btnSmall, background: 'rgba(59,130,246,0.15)', color: '#3b82f6', borderColor: 'rgba(59,130,246,0.3)' }}>
+                Full Sweep
+              </button>
+              <button onClick={() => dispatch('eardrop-multi-tone')} style={{ ...btnSmall, background: 'rgba(168,85,247,0.15)', color: '#a855f7', borderColor: 'rgba(168,85,247,0.3)' }}>
+                Multi-Tone
+              </button>
+              <button onClick={() => dispatch('eardrop-interference')} style={{ ...btnSmall, background: 'rgba(236,72,153,0.15)', color: '#ec4899', borderColor: 'rgba(236,72,153,0.3)' }}>
+                Interference
+              </button>
+              <button onClick={() => dispatch('eardrop-fine-sweep')} style={{ ...btnSmall, background: 'rgba(20,184,166,0.15)', color: '#14b8a6', borderColor: 'rgba(20,184,166,0.3)' }}>
+                Fine Sweep
+              </button>
               <button onClick={() => dispatch('eardrop-download-wav')} style={btnSmall}>
                 Download WAV
               </button>

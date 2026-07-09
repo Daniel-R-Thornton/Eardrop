@@ -69,7 +69,7 @@ export interface ModemConfig {
  *  All are integer-cycle multiples (f/25): 19, 21, 25, 31 cycles at 3200 Hz.
  */
 export const TONE_OFFSETS: [number, number, number, number] = [
-  237.5, 487.5, 737.5, 1087.5,
+  100, 200, 300, 400, // 100Hz spacing — optimal from interference sweep
 ] as const;
 
 /** Musical mode offsets — playable intervals from pilot */
@@ -124,7 +124,7 @@ export const DEFAULT_CONFIG: ModemConfig = {
   bitsPerFrame: 8,
 
   pilotEnabled: true,
-  pilotFreqHz: 412.5,
+  pilotFreqHz: 600, // Optimal: in 300-1500Hz sweet spot, tones at 700/800/900/1000Hz
   musical: false,
   pilotAmplitude: 0.4,
 
