@@ -21,18 +21,9 @@ import { SentinelScanner } from '../receiver/SentinelScanner';
 
 // ─── Constants ───────────────────────────────────────
 
-/** Samples per symbol */
+/** Samples per symbol — atomic frame protocol uses fixed 256 SPS */
 const SPS = 256;
-/** Bits per symbol (4 = 1 phase bit × 4 tones) */
-const BITS_PER_SYMBOL = 4;
-/** Tones count */
 const TONE_COUNT = 4;
-/** Preamble duration in samples (560ms at 3200Hz = 1792 samples) */
-const PREAMBLE_SAMPLES = 1792;
-/** Skip the preamble (1984 samples). The first frame symbol starts at
- *  sample 1984. Symbol boundaries are at 1984 + n*128. */
-const SKIP_SAMPLES = PREAMBLE_SAMPLES; // 1984
-/** Energy threshold for signal detection */
 const ENERGY_THRESHOLD = 0.0003;
 
 // ─── RxState ─────────────────────────────────────────
@@ -380,14 +371,16 @@ export class RxEngine {
       const diffBit = (prevI !== 0 || prevQ !== 0) && dot < 0 ? 1 : 0;
       const dpskAbs = this.absBits[t] ^ diffBit;
 
-      // Centroid: nearest neighbor to cal references
+      // Centroid: nearest neighbor to cal references (use exclusively when DBPSK is unreliable)
       const d0 = (rawIQs[t].i - this.ref0I[t]) ** 2 + (rawIQs[t].q - this.ref0Q[t]) ** 2;
       const d1 = (rawIQs[t].i - this.ref1I[t]) ** 2 + (rawIQs[t].q - this.ref1Q[t]) ** 2;
       const centAbs = d1 < d0 ? 1 : 0;
 
-      // Hybrid: trust DBPSK for continuity, centroid for re-sync when confident
-      const confident = Math.min(d0, d1) > 0 && Math.max(d0, d1) > Math.min(d0, d1) * 3.0;
-      const absBit = confident && centAbs !== dpskAbs ? centAbs : dpskAbs;
+      // Use centroid when separation is clear, fall back to DBPSK otherwise.
+      // Lowered threshold from 3.0 to 1.3 — acoustic channel needs more aggressive centroid use.
+      const separation = Math.max(d0, d1) / Math.max(Math.min(d0, d1), 1e-12);
+      const confident = separation > 1.3;
+      const absBit = confident ? centAbs : dpskAbs;
       this.absBits[t] = absBit;
 
       bits.push(absBit);
@@ -397,7 +390,18 @@ export class RxEngine {
       this.prevFrameQ[t] = rawIQs[t].q;
     }
 
-    // Debug: first 5 frames with expected sentinel comparison
+    // Debug: first 5 frames — show centroid distances and decision mode
+    if (this.dbgFrameCount === 0) {
+      const sepInfo = [0, 1, 2, 3].map((t) => {
+        const d0 = (rawIQs[t].i - this.ref0I[t]) ** 2 + (rawIQs[t].q - this.ref0Q[t]) ** 2;
+        const d1 = (rawIQs[t].i - this.ref1I[t]) ** 2 + (rawIQs[t].q - this.ref1Q[t]) ** 2;
+        const sep = Math.max(d0, d1) / Math.max(Math.min(d0, d1), 1e-12);
+        return `t${t}:${sep.toFixed(1)}x`;
+      }).join(' ');
+      console.warn(`[RX] Centroid separations: ${sepInfo}`);
+    }
+
+    // Debug: first 5 frames with expected sentinel comparison, then periodic progress
     this.dbgFrameCount++;
     if (this.dbgFrameCount <= 5) {
       const sentinelBytes = [0xe7, 0x9f, 0xe7];
@@ -433,6 +437,10 @@ export class RxEngine {
           `[RX] Frame ${this.dbgFrameCount}: bits=0x${frameBits.toString(16).padStart(2, '0')}`,
         );
       }
+    } else if (this.dbgFrameCount % 50 === 0) {
+      console.warn(
+        `[RX] Frame ${this.dbgFrameCount}: ${this.fileData.length}B assembled (${this.framesReceived} payload frames)`,
+      );
     }
 
     this.bchBuf.push(frameBits);

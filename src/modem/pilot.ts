@@ -206,9 +206,15 @@ export class PilotPLL {
     this.updateRef();
   }
   update(sample: number): void {
+    // Scale Kp/Ki to maintain constant loop bandwidth regardless of sample rate.
+    // Defaults (0.1, 0.01) are tuned for 3200Hz. At higher rates, each sample
+    // contributes proportionally less, so the gains are reduced accordingly.
+    const rateScale = DEFAULT_PLL_CONFIG.sampleRate / this.cfg.sampleRate;
+    const scaledKp = this.cfg.Kp * rateScale;
+    const scaledKi = this.cfg.Ki * rateScale;
     const error = sample * this.sinRef,
-      prop = this.cfg.Kp * error;
-    this.integrator += this.cfg.Ki * error;
+      prop = scaledKp * error;
+    this.integrator += scaledKi * error;
     this.integrator = Math.max(-0.5, Math.min(0.5, this.integrator));
     this.phase += this.freq / this.cfg.sampleRate + prop + this.integrator;
     if (this.phase >= 1.0) this.phase -= 1.0;

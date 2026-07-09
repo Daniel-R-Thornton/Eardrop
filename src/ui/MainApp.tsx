@@ -400,6 +400,28 @@ export function MainApp() {
               />
             </div>
 
+            {/* Playback Volume */}
+            <div style={{ marginBottom: 8 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+                <span style={{ fontSize: 12, color: '#6b7280' }}>🔊 Play Vol</span>
+                <span style={{ fontSize: 12, fontFamily: 'SF Mono', color: '#f59e0b' }}>{s.playbackVolume}×</span>
+              </div>
+              <input type="range" min="1" max="10" step="1" value={s.playbackVolume}
+                onChange={(e) => setState({ playbackVolume: parseInt(e.target.value) })}
+                style={{ width: '100%' }} />
+            </div>
+
+            {/* Mic Gain */}
+            <div style={{ marginBottom: 8 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+                <span style={{ fontSize: 12, color: '#6b7280' }}>🎤 Mic Gain</span>
+                <span style={{ fontSize: 12, fontFamily: 'SF Mono', color: '#f59e0b' }}>{s.micGain}×</span>
+              </div>
+              <input type="range" min="1" max="20" step="1" value={s.micGain}
+                onChange={(e) => setState({ micGain: parseInt(e.target.value) })}
+                style={{ width: '100%' }} />
+            </div>
+
             {/* Audio Devices */}
             <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
               <select
@@ -710,6 +732,18 @@ export function MainApp() {
               </button>
               <button onClick={() => dispatch('eardrop-send-test')} style={btnSmall}>
                 Send Test
+              </button>
+              <button onClick={() => dispatch('eardrop-calibration-test')} style={{ ...btnSmall, background: 'rgba(245,158,11,0.15)', color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)' }}>
+                Cal Only
+              </button>
+              <button onClick={() => dispatch('eardrop-single-frame')} style={{ ...btnSmall, background: 'rgba(245,158,11,0.15)', color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)' }}>
+                Single Frame
+              </button>
+              <button onClick={() => dispatch('eardrop-sentinel-only')} style={{ ...btnSmall, background: 'rgba(239,68,68,0.15)', color: '#ef4444', borderColor: 'rgba(239,68,68,0.3)' }}>
+                Sentinel Only
+              </button>
+              <button onClick={() => dispatch('eardrop-audio-validation')} style={{ ...btnSmall, background: 'rgba(34,197,94,0.15)', color: '#22c55e', borderColor: 'rgba(34,197,94,0.3)' }}>
+                Audio Check
               </button>
               <button onClick={() => dispatch('eardrop-download-wav')} style={btnSmall}>
                 Download WAV

@@ -47,9 +47,12 @@ export class AudioRecorder {
   private calibratedMicRate = 0;
   private pending: Float32Array | null = null;
   private modemFrameSamples: number = 0;
+  /** Reference to the live GainNode for dynamic mic gain adjustment */
+  private micBoostNode: GainNode | null = null;
 
-  /** Optionally accept a shared AudioContext. If omitted, creates its own. */
-  constructor(ctx?: AudioContext) {
+  /** Optionally accept a shared AudioContext. If omitted, creates its own.
+   *  @param micGain - Mic pre-amp multiplier applied before downsampling. Default 8.0. */
+  constructor(ctx?: AudioContext, public micGain = 8.0) {
     this.ctx = ctx ?? new AudioContext();
     this.calibratedMicRate = this.ctx.sampleRate;
   }
@@ -62,6 +65,14 @@ export class AudioRecorder {
     );
   }
 
+  /** Dynamically update mic gain while recording. */
+  setMicGain(gain: number) {
+    this.micGain = gain;
+    if (this.micBoostNode) {
+      this.micBoostNode.gain.value = gain;
+    }
+  }
+
   get isRunning() {
     return this.running;
   }
@@ -71,6 +82,7 @@ export class AudioRecorder {
     // Reset buffer and frame size for a fresh start
     this.pending = null;
     this.modemFrameSamples = 0;
+    this.micBoostNode = null;
 
     console.log('[Recorder] start');
 
@@ -94,9 +106,12 @@ export class AudioRecorder {
     const constraints: MediaStreamConstraints = {
       audio: {
         ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
-        echoCancellation: { exact: false },
-        noiseSuppression: { exact: false },
-        autoGainControl: { exact: false },
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        // Request raw 48kHz mono for cleanest possible input
+        sampleRate: { ideal: 48000 },
+        channelCount: { ideal: 1 },
       },
     };
     this.stream = await navigator.mediaDevices.getUserMedia(constraints);
@@ -116,10 +131,11 @@ export class AudioRecorder {
     };
 
     // Connect: mic → gain boost → worklet → silent destination
-    const micGain = this.ctx.createGain();
-    micGain.gain.value = 8.0; // 8× boost for weak mic signals
-    this.source.connect(micGain);
-    micGain.connect(this.workletNode);
+    const micBoost = this.ctx.createGain();
+    micBoost.gain.value = this.micGain;
+    this.micBoostNode = micBoost;
+    this.source.connect(micBoost);
+    micBoost.connect(this.workletNode);
     const silentGain = this.ctx.createGain();
     silentGain.gain.value = 0;
     this.workletNode.connect(silentGain);

@@ -20,14 +20,9 @@ import { BPSKModulator, type BPSKModulatorConfig } from '../modulation/BPSKModul
 
 // ─── Constants ───────────────────────────────────────
 
-/** Samples per symbol */
+/** Samples per symbol — atomic frame protocol uses fixed 256 SPS */
 const SPS = 256;
-/** Bits per symbol (4 = 1 phase bit per tone) */
-const BITS_PER_SYMBOL = 4;
-/** Tones count */
 const TONE_COUNT = 4;
-/** Tail silence in samples (~6 symbols) */
-const TAIL_SILENCE = 768;
 
 // ─── TxEngine ────────────────────────────────────────
 
@@ -121,7 +116,7 @@ export class TxEngine {
     for (let r = 0; r < repeats; r++) frameAudios.push(tailFrame);
 
     // 3. Add tail silence
-    frameAudios.push(new Float32Array(TAIL_SILENCE));
+    frameAudios.push(new Float32Array(SPS * 6));
 
     // 4. Concatenate all audio segments
     const totalLen = frameAudios.reduce((a, b) => a + b.length, 0);

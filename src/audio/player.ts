@@ -5,6 +5,8 @@
 export class AudioPlayer {
   private ctx: AudioContext;
   private currentSource: AudioBufferSourceNode | null = null;
+  /** Playback volume multiplier (1.0 = unity, applied before hard-clip at ±1). Default 6×. */
+  public volume = 6.0;
 
   /** Optionally accept a shared AudioContext. If omitted, creates its own. */
   constructor(ctx?: AudioContext) {
@@ -45,8 +47,7 @@ export class AudioPlayer {
         buf.set(samples);
       } else {
         for (let i = 0; i < samples.length; i++) {
-          const s = samples[i] * 6.0;
-          buf[i] = s > 1.0 ? 1.0 : s < -1.0 ? -1.0 : s;
+          buf[i] = samples[i] * this.volume;
         }
       }
       const buffer = ctx.createBuffer(1, buf.length, sampleRate);

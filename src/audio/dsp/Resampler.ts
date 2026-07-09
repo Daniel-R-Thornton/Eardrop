@@ -1,50 +1,41 @@
 /**
- * Resampler — downsamples mic input to modem rate using linear interpolation.
- * Works with any input/output rate ratio.
+ * Resampler — downsamples mic input to modem rate using block averaging.
+ *
+ * Uses moving-average decimation: for each output sample at outRate,
+ * averages `ratio` input samples from inRate. This provides natural
+ * anti-aliasing and eliminates the phase distortion that linear
+ * interpolation introduces on sparse waveforms.
  */
 
 export function createDownsampler(inRate: number, outRate: number, onSample: (s: number) => void) {
-  const ratio = inRate / outRate; // e.g. 48000/3200 = 15
+  const ratio = Math.round(inRate / outRate); // e.g. 48000/3200 = 15
   let buf: number[] = [];
-  let accPos = 0; // accumulated fractional position
 
   return {
     feed(input: Float32Array) {
       buf.push(...input);
 
-      // Process as many output samples as we can
-      while (buf.length > 0) {
-        const pos = accPos;
-        const idx = Math.floor(pos);
-        const frac = pos - idx;
-
-        if (idx + 1 >= buf.length) break; // need more input
-
-        // Linear interpolation
-        const a = buf[idx];
-        const b = buf[idx + 1];
-        const sample = a + (b - a) * frac;
-        onSample(sample);
-
-        accPos += ratio;
-        // Remove consumed samples from buffer
-        const consumed = Math.floor(accPos);
-        buf.splice(0, consumed);
-        accPos -= consumed;
+      // Output one sample for every `ratio` input samples — block average
+      while (buf.length >= ratio) {
+        let sum = 0;
+        for (let i = 0; i < ratio; i++) {
+          sum += buf[i];
+        }
+        onSample(sum / ratio);
+        buf.splice(0, ratio);
       }
     },
 
     flush() {
-      // Output whatever's left, zero-padded
-      for (let i = 0; i < buf.length; i += ratio) {
-        const idx = Math.floor(i);
-        const frac = i - idx;
-        const a = buf[idx] ?? 0;
-        const b = buf[Math.min(idx + 1, buf.length - 1)] ?? 0;
-        onSample(a + (b - a) * frac);
+      // Output whatever's left as-is (partial block)
+      if (buf.length > 0) {
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) {
+          sum += buf[i];
+        }
+        onSample(sum / buf.length);
       }
       buf = [];
-      accPos = 0;
     },
   };
 }

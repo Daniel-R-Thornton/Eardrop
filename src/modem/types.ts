@@ -119,7 +119,7 @@ export const WARBLE_CODE = 0xac94; // 1010 1100 1001 0100
 export const WARBLE_CODE_THRESHOLD = 12;
 
 export const DEFAULT_CONFIG: ModemConfig = {
-  sampleRate: 3200,
+  sampleRate: 3200, // Modem native rate. App sets audioCtx.sampleRate at runtime for Encoder/Decoder path.
   symbolsPerSec: 25,
   bitsPerFrame: 8,
 

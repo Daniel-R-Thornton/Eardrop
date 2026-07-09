@@ -98,6 +98,10 @@ export interface AppState {
     calibrationFactor: number;
     recentSamples: Float32Array;
   } | null;
+  /** Playback volume multiplier (1-10, default 2) */
+  playbackVolume: number;
+  /** Mic pre-amp gain (1-20, default 1) */
+  micGain: number;
 }
 
 const defaultDecoder: DecoderInfo = {
@@ -154,6 +158,8 @@ const defaultState: AppState = {
   debugByteStream: [],
   sentinelScan: [],
   micDiag: null,
+  playbackVolume: 2,
+  micGain: 1,
 };
 
 // ─── Store ────────────────────────────────────────────

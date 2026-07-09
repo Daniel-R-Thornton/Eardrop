@@ -11,7 +11,7 @@
  */
 
 import '../style.css';
-import { setState, getState } from './Store';
+import { setState, getState, subscribe } from './Store';
 import { debugLogger } from '../modem/debug/debugger';
 import { Encoder } from '../modem/protocol/encoder';
 import { Decoder } from '../modem/protocol/decoder';
@@ -22,6 +22,8 @@ import { AudioRecorder } from '../audio/recorder';
 import { Visualizer } from '../modem/debug/visualizer';
 import { DEFAULT_CONFIG, TONE_COLORS } from '../modem/types';
 import { enumerateDevices, populateSelect } from '../audio/devices';
+import { TxEngine } from '../modem/protocol/txEngine';
+import { encodeFrame } from '../modem/protocol/atomicFrame';
 import { buildPacket, tryParsePreamble, verifyPayload } from '../protocol';
 import { mountReactDebug } from './react';
 import { runSelfTest } from './controllers/selfTest';
@@ -530,6 +532,7 @@ window.addEventListener('eardrop-acoustic-sweep', (async () => {
 // ─── Receive ──────────────────────────────────────────
 
 let recorder: AudioRecorder | null = null;
+let unsubMicGain: (() => void) | null = null;
 let recvTimer: number | null = null;
 let micWatchdog: ReturnType<typeof setTimeout> | null = null;
 let recvSamples: number[] = [];
@@ -644,7 +647,19 @@ async function startListening() {
       config: listenCfg,
       fastSync: fastSyncCb?.checked ?? false,
     });
-    recorder = new AudioRecorder(audioCtx);
+    recorder = new AudioRecorder(audioCtx, getState().micGain);
+
+    // Sync mic gain slider → live GainNode while listening
+    let lastMicGain = getState().micGain;
+    const unsub = subscribe(() => {
+      const g = getState().micGain;
+      if (g !== lastMicGain && recorder) {
+        lastMicGain = g;
+        recorder.setMicGain(g);
+        console.warn(`[MicGain] updated to ${g}×`);
+      }
+    });
+    unsubMicGain = unsub;
     const modemRate = DEFAULT_CONFIG.sampleRate;
 
     const feedSample = (s: number) => {
@@ -739,6 +754,10 @@ function stopListening() {
   }
   recorder?.stop();
   recorder = null;
+  if (unsubMicGain) {
+    unsubMicGain();
+    unsubMicGain = null;
+  }
   if (recvTimer) {
     clearInterval(recvTimer);
     recvTimer = null;
@@ -754,6 +773,331 @@ function showTxPayload(bytes: Uint8Array, fileName: string) {
 function showRxPayload(bytes: Uint8Array, fileName: string) {
   setState({ rxPayload: { name: fileName, bytes: formatPayloadHex(bytes) } });
 }
+
+// ─── Debug: Single-frame acoustic tests ──────────────
+
+/** Capture received audio buffer for offline analysis. Exposed as window.dumpRxBuffer(). */
+function dumpRxBuffer(durationSec = 2): { samples: Float32Array; rms: number; peak: number; sampleRate: number } {
+  const modemRate = DEFAULT_CONFIG.sampleRate;
+  const count = Math.min(recvSamples.length, Math.floor(modemRate * durationSec));
+  const tail = recvSamples.slice(-count);
+  const buf = new Float32Array(tail);
+  let sumSq = 0;
+  let peak = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const v = Math.abs(buf[i]);
+    sumSq += v * v;
+    if (v > peak) peak = v;
+  }
+  const rms = Math.sqrt(sumSq / buf.length);
+  return { samples: buf, rms, peak, sampleRate: modemRate };
+}
+(window as any).dumpRxBuffer = dumpRxBuffer;
+
+/** Transmit just the preamble + calibration, no data frames. */
+async function sendCalibrationOnly() {
+  player.volume = getState().playbackVolume;
+  console.warn('━━━ [CAL-TEST] Starting calibration-only transmission ━━━');
+  setState({ sendStatus: { type: 'info', msg: '🔊 Sending calibration only…' } });
+  await refreshDeviceList();
+  if (!isListening) await startListening();
+
+  // Wait a moment for noise profiling
+  await new Promise((r) => setTimeout(r, 300));
+  const noiseFloor = dumpRxBuffer(0.5);
+  console.warn(`[CAL-TEST] Pre-transmission noise floor: RMS=${noiseFloor.rms.toExponential(2)} peak=${noiseFloor.peak.toExponential(2)} (${noiseFloor.samples.length} samples)`);
+
+  const pilotFreq = getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz;
+  const tx = new TxEngine({ pilotFreqHz: pilotFreq });
+  const preamble = tx.transmitPreamble();
+
+  let txPeak = 0;
+  let txSumSq = 0;
+  for (let i = 0; i < preamble.length; i++) {
+    const v = Math.abs(preamble[i]);
+    txSumSq += v * v;
+    if (v > txPeak) txPeak = v;
+  }
+  const txRms = Math.sqrt(txSumSq / preamble.length);
+  console.warn(`[CAL-TEST] TX preamble: ${preamble.length} samples, peak=${txPeak.toFixed(3)}, RMS=${txRms.toExponential(2)}, pilotFreq=${pilotFreq}Hz`);
+  // Show first 16 samples for waveform inspection
+  console.warn(`[CAL-TEST] TX first 16 samples: [${Array.from(preamble.slice(0, 16)).map((v) => v.toFixed(3)).join(', ')}]`);
+
+  const silence = new Float32Array(1536);
+  const full = new Float32Array(preamble.length + silence.length);
+  full.set(preamble, 0);
+  full.set(silence, preamble.length);
+
+  // Snapshot received samples count before play
+  const preCount = recvSamples.length;
+  setState({ isPlaying: true });
+  await player.play(full, DEFAULT_CONFIG.sampleRate, selectedOutputId || undefined);
+
+  // Wait for all received audio to buffer
+  await new Promise((r) => setTimeout(r, 500));
+
+  const rxDump = dumpRxBuffer(2);
+  const newSampleCount = recvSamples.length - preCount;
+  console.warn(`[CAL-TEST] RX: ${newSampleCount} new samples received, peak=${rxDump.peak.toExponential(2)}, RMS=${rxDump.rms.toExponential(2)}`);
+  if (rxDump.samples.length >= 16) {
+    console.warn(`[CAL-TEST] RX first 16 samples: [${Array.from(rxDump.samples.slice(0, 16)).map((v) => v.toFixed(3)).join(', ')}]`);
+  }
+  console.warn('━━━ [CAL-TEST] Done — check RxEngine logs above for warble/marker/calibration results ━━━');
+
+  setState({ isPlaying: false, sendStatus: { type: 'success', msg: '✅ Calibration sent — check console' } });
+}
+
+/** Transmit a single atomic frame (79 bytes) — tests sentinel detection. */
+async function sendSingleFrame() {
+  player.volume = getState().playbackVolume;
+  console.warn('━━━ [FRAME-TEST] Starting single-frame transmission ━━━');
+  setState({ sendStatus: { type: 'info', msg: '🔊 Sending single frame…' } });
+  await refreshDeviceList();
+  if (!isListening) await startListening();
+
+  await new Promise((r) => setTimeout(r, 300));
+  const noiseFloor = dumpRxBuffer(0.5);
+  console.warn(`[FRAME-TEST] Pre-transmission noise floor: RMS=${noiseFloor.rms.toExponential(2)} peak=${noiseFloor.peak.toExponential(2)}`);
+
+  const pilotFreq = getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz;
+  const tx = new TxEngine({ pilotFreqHz: pilotFreq });
+
+  // Build one header frame with known data
+  const payload = new Uint8Array(40);
+  payload[0] = 0xde;
+  payload[1] = 0xad;
+  payload[2] = 0xbe;
+  payload[3] = 0xef;
+  const header = { type: 0x01 as const, seqNum: 0, totalFrames: 1, crc: 0 };
+  const rawFrame = encodeFrame(header, payload);
+
+  console.warn(`[FRAME-TEST] TX frame (${rawFrame.length}B): ${Array.from(rawFrame.slice(0, 24)).map((b) => b.toString(16).padStart(2, '0')).join(' ')}…`);
+  console.warn(`[FRAME-TEST] Expected sentinel: 0xE7 0x9F 0xE7 (bits: 11100111 10011111 11100111)`);
+  console.warn(`[FRAME-TEST] Expected first 4 frame symbols after sentinel: 0xFD 0x7F 0xD7 0xFF (upper nibbles of bytes 3-6)`);
+
+  const frameAudio = tx.transmitFrame(header, payload);
+  let txPeak = 0;
+  for (let i = 0; i < frameAudio.length; i++) {
+    const v = Math.abs(frameAudio[i]);
+    if (v > txPeak) txPeak = v;
+  }
+  console.warn(`[FRAME-TEST] TX frame audio: ${frameAudio.length} samples, peak=${txPeak.toFixed(3)}`);
+
+  // Prepend preamble so RxEngine can sync
+  const preamble = tx.transmitPreamble();
+  const silence = new Float32Array(1536);
+  const full = new Float32Array(preamble.length + frameAudio.length + silence.length);
+  full.set(preamble, 0);
+  full.set(frameAudio, preamble.length);
+  full.set(silence, preamble.length + frameAudio.length);
+
+  console.warn(`[FRAME-TEST] Total TX: preamble=${preamble.length}samp + frame=${frameAudio.length}samp + silence=${silence.length}samp`);
+
+  const preCount = recvSamples.length;
+  setState({ isPlaying: true });
+  await player.play(full, DEFAULT_CONFIG.sampleRate, selectedOutputId || undefined);
+
+  // Wait and inspect what we got
+  await new Promise((r) => setTimeout(r, 800));
+  const rxDump = dumpRxBuffer(3);
+  const newCount = recvSamples.length - preCount;
+  console.warn(`[FRAME-TEST] RX: ${newCount} new samples, peak=${rxDump.peak.toExponential(2)}, RMS=${rxDump.rms.toExponential(2)}`);
+  console.warn(`[FRAME-TEST] RX signal-to-noise: ${(20 * Math.log10(rxDump.rms / Math.max(noiseFloor.rms, 1e-12))).toFixed(1)}dB`);
+  console.warn('━━━ [FRAME-TEST] Done — check RxEngine logs for sentinel detection and frame decode ━━━');
+
+  setState({ isPlaying: false, sendStatus: { type: 'success', msg: '✅ Single frame sent — check console' } });
+}
+
+/** Transmit just the 24-bit sentinel pattern as raw BPSK symbols (~0.8s).
+ *  Tests if the sentinel scanner can detect the pattern in isolation. */
+async function sendSentinelOnly() {
+  player.volume = getState().playbackVolume;
+  console.warn('━━━ [SENTINEL-TEST] Sending raw sentinel pattern ━━━');
+  setState({ sendStatus: { type: 'info', msg: '🔊 Sending sentinel…' } });
+  await refreshDeviceList();
+  if (!isListening) await startListening();
+  await new Promise((r) => setTimeout(r, 300));
+
+  const pilotFreq = getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz;
+  const tx = new TxEngine({ pilotFreqHz: pilotFreq });
+
+  // Build the 24-bit sentinel 0xE79FE7 as 12 BPSK symbols (2 bits/symbol)
+  // Actually use 4 tones = 4 bits/symbol = 6 symbols for 24 bits
+  const sentinel = 0xe79fe7;
+  const bits: number[] = [];
+  for (let i = 23; i >= 0; i--) bits.push((sentinel >> i) & 1);
+  console.warn(`[SENTINEL-TEST] Sentinel bits (24): ${bits.join('')}`);
+
+  // Pad to 8 symbols (32 bits) with zeros for clean symbol boundaries
+  while (bits.length < 32) bits.push(0);
+
+  // Generate raw BPSK audio using TxEngine's modulator
+  const preamble = tx.transmitPreamble();
+  const symbols = bits.length / 4; // 8 symbols
+  const SPS = 256;
+  const totalSamples = symbols * SPS;
+  const audio = new Float32Array(totalSamples);
+  let bitIdx = 0;
+
+  // Build a minimal frame-like header for transmitFrame
+  const payload = new Uint8Array(40);
+  // Just use the sentinel bytes directly in the payload for visual confirmation
+  payload[0] = 0xe7;
+  payload[1] = 0x9f;
+  payload[2] = 0xe7;
+  const frameAudio = tx.transmitFrame({ type: 0x01, seqNum: 0, totalFrames: 1, crc: 0 }, payload);
+  // But strip to just the first 8 symbols (sentinel + 2 more symbols)
+  const shortAudio = frameAudio.slice(0, 8 * SPS);
+
+  console.warn(`[SENTINEL-TEST] Audio: ${shortAudio.length} samples = ${(shortAudio.length / DEFAULT_CONFIG.sampleRate).toFixed(2)}s`);
+
+  const silence = new Float32Array(512);
+  const full = new Float32Array(preamble.length + shortAudio.length + silence.length);
+  full.set(preamble, 0);
+  full.set(shortAudio, preamble.length);
+  full.set(silence, preamble.length + shortAudio.length);
+
+  setState({ isPlaying: true });
+  await player.play(full, DEFAULT_CONFIG.sampleRate, selectedOutputId || undefined);
+  await new Promise((r) => setTimeout(r, 500));
+  console.warn('━━━ [SENTINEL-TEST] Done — check for sentinel detection ━━━');
+  setState({ isPlaying: false, sendStatus: { type: 'success', msg: '✅ Sentinel sent — check console' } });
+}
+
+// ─── Audio Path Validation Sweep ─────────────────────
+
+/** Quick audio loopback validation: play tones, measure mic response. */
+async function runAudioValidation() {
+  console.warn('━━━ [AUDIO-VAL] Audio path validation sweep ━━━');
+  setState({ sendStatus: { type: 'info', msg: '🔊 Audio validation…' } });
+  await refreshDeviceList();
+  if (!isListening) await startListening();
+  await new Promise((r) => setTimeout(r, 300));
+
+  const modemRate = DEFAULT_CONFIG.sampleRate;
+  const outputRate = player.getSampleRate();
+  const testFreqs = [412.5, 612.5, 762.5, 912.5, 1112.5];
+  const toneDuration = 0.15; // 150ms per tone
+  const toneSamples = Math.floor(modemRate * toneDuration);
+  const gapSamples = Math.floor(modemRate * 0.05); // 50ms gap
+
+  console.warn(`[AUDIO-VAL] Modem rate: ${modemRate}Hz, Output rate: ${outputRate}Hz`);
+  console.warn(`[AUDIO-VAL] Testing ${testFreqs.length} frequencies: ${testFreqs.join(', ')}Hz`);
+
+  player.volume = getState().playbackVolume;
+
+  const results: Array<{ freq: number; txPeak: number; rxEnergy: number; rxPeak: number; rxSnr: number }> = [];
+
+  for (const freq of testFreqs) {
+    // Generate tone at modem rate
+    const tone = new Float32Array(toneSamples + gapSamples);
+    for (let i = 0; i < toneSamples; i++) {
+      tone[i] = Math.sin((2 * Math.PI * freq * i) / modemRate) * 0.5;
+    }
+    const txPeak = 0.5;
+
+    // Upsample to output rate for clean playback
+    const ratio = modemRate / outputRate; // 3200 / 48000 = 0.0667
+    const outLen = Math.ceil(tone.length / ratio);
+    const playBuf = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const pos = i * ratio;
+      const idx = Math.floor(pos);
+      const frac = pos - idx;
+      const a = tone[idx] ?? 0;
+      const b = tone[Math.min(idx + 1, tone.length - 1)] ?? 0;
+      playBuf[i] = a + (b - a) * frac;
+    }
+
+    // Snapshot received samples count
+    const preCount = recvSamples.length;
+    setState({ isPlaying: true });
+    await player.play(playBuf, outputRate, selectedOutputId || undefined);
+    setState({ isPlaying: false });
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Analyze received audio at this frequency
+    const newSamples = recvSamples.slice(preCount);
+    if (newSamples.length < 64) {
+      results.push({ freq, txPeak, rxEnergy: 0, rxPeak: 0, rxSnr: -999 });
+      console.warn(`[AUDIO-VAL] ${freq}Hz: no samples received`);
+      continue;
+    }
+
+    const tail = newSamples.slice(-Math.min(512, newSamples.length));
+    let rxPeak = 0;
+    let sumSq = 0;
+    for (const s of tail) {
+      const abs = Math.abs(s);
+      if (abs > rxPeak) rxPeak = abs;
+      sumSq += s * s;
+    }
+    const rxRms = Math.sqrt(sumSq / tail.length);
+
+    // Energy at the transmitted frequency (Goertzel)
+    let sinCorr = 0, cosCorr = 0;
+    for (let i = 0; i < tail.length; i++) {
+      const phase = (2 * Math.PI * freq * i) / modemRate;
+      sinCorr += tail[i] * Math.sin(phase);
+      cosCorr += tail[i] * Math.cos(phase);
+    }
+    const rxEnergy = Math.hypot(sinCorr, cosCorr) / tail.length;
+
+    // Background energy at nearby frequencies (for SNR)
+    const offFreq = freq + 25;
+    let offSin = 0, offCos = 0;
+    for (let i = 0; i < tail.length; i++) {
+      const phase = (2 * Math.PI * offFreq * i) / modemRate;
+      offSin += tail[i] * Math.sin(phase);
+      offCos += tail[i] * Math.cos(phase);
+    }
+    const noiseEnergy = Math.hypot(offSin, offCos) / tail.length;
+    const snr = noiseEnergy > 1e-12 ? 20 * Math.log10(rxEnergy / noiseEnergy) : 999;
+
+    results.push({ freq, txPeak, rxEnergy, rxPeak, rxSnr: snr });
+    console.warn(`[AUDIO-VAL] ${freq}Hz: rxEnergy=${rxEnergy.toExponential(2)} rxPeak=${rxPeak.toFixed(3)} SNR=${snr.toFixed(1)}dB`);
+  }
+
+  // Summary
+  console.warn('━━━ [AUDIO-VAL] Results ━━━');
+  console.table(results.map((r) => ({
+    'Freq (Hz)': r.freq,
+    'TX Peak': r.txPeak.toFixed(2),
+    'RX Peak': r.rxPeak.toFixed(3),
+    'RX Energy': r.rxEnergy.toExponential(2),
+    'SNR (dB)': r.rxSnr.toFixed(1),
+  })));
+
+  const avgSnr = results.reduce((a, r) => a + r.rxSnr, 0) / results.length;
+  const allDetected = results.every((r) => r.rxEnergy > 1e-5);
+  console.warn(`[AUDIO-VAL] Average SNR: ${avgSnr.toFixed(1)}dB | All detected: ${allDetected ? 'YES ✅' : 'NO ❌'}`);
+
+  setState({ sendStatus: { type: allDetected ? 'success' : 'error', msg: allDetected ? `✅ Audio path OK (${avgSnr.toFixed(0)}dB SNR)` : `❌ Audio issues — check console` } });
+}
+
+// Wire audio validation
+window.addEventListener('eardrop-audio-validation', (async () => {
+  await runAudioValidation();
+}) as EventListener);
+(window as any).runAudioValidation = runAudioValidation;
+
+// Wire debug test events
+window.addEventListener('eardrop-calibration-test', (async () => {
+  await sendCalibrationOnly();
+}) as EventListener);
+
+window.addEventListener('eardrop-single-frame', (async () => {
+  await sendSingleFrame();
+}) as EventListener);
+
+window.addEventListener('eardrop-sentinel-only', (async () => {
+  await sendSentinelOnly();
+}) as EventListener);
+
+// Expose for console
+(window as any).sendCalibrationOnly = sendCalibrationOnly;
+(window as any).sendSingleFrame = sendSingleFrame;
+(window as any).sendSentinelOnly = sendSentinelOnly;
 
 // Expose self-test for event wiring
 (window as any).runSelfTest = runSelfTest;
