@@ -9,6 +9,8 @@ import {
 import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
 import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
 import { toneIQ } from '../pilot';
+import { OFDMEngine } from '../protocol/ofdmEngine';
+import { encodeFrame } from '../protocol/atomicFrame';
 
 test('ofdmSamples derives integer windows at both common hardware rates', () => {
   expect(ofdmSamples(48000)).toEqual({ fftSamples: 1920, cpSamples: 240, symSamples: 2160 });
@@ -104,3 +106,14 @@ for (const rate of [48000, 44100]) {
     expect(got).toEqual(sent);
   });
 }
+
+// ── Task 4: OFDMEngine rate-aware test ──
+
+test('engine @48k/16 tones: 2 bytes per symbol, sync burst sized in time', () => {
+  const engine = new OFDMEngine({ sampleRate: 48000, toneCount: 16 });
+  const { symSamples } = ofdmSamples(48000);
+  const frame = encodeFrame({ type: 0x01, seqNum: 0, totalFrames: 1, crc: 0 }, new Uint8Array(40));
+  const audio = engine.modulateFrame(frame); // 79 bytes / 4 blocks = 20 symbols
+  expect(audio.length).toBe(Math.ceil(79 / 4) * symSamples);
+  expect(engine.generateSyncBurst(24).length).toBe(24 * symSamples);
+});
