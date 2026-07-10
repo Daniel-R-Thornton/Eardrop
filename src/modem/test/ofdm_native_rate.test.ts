@@ -7,6 +7,7 @@ import {
   OFDM_DEFAULTS,
 } from '../types';
 import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
+import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
 import { toneIQ } from '../pilot';
 
 test('ofdmSamples derives integer windows at both common hardware rates', () => {
@@ -74,3 +75,32 @@ test('cross-tone leakage below -30 dB (orthogonality on the 25 Hz grid)', () => 
   const ratio = Math.hypot(off.i, off.q) / Math.hypot(on.i, on.q);
   expect(ratio).toBeLessThan(0.03);
 });
+
+// ── Task 3: Demodulator roundtrip tests ──
+
+for (const rate of [48000, 44100]) {
+  test(`mod→demod roundtrip with sync training @${rate}`, () => {
+    const freqs = ofdmToneFrequencies({ toneCount: 16 });
+    const mod = makeMod(rate);
+    const demod = new OFDMQPSKDemodulator({
+      sampleRate: rate,
+      toneFrequencies: freqs,
+      pilotFreqHz: OFDM_DEFAULTS.pilotFreqHz,
+    });
+    const { symSamples } = ofdmSamples(rate);
+
+    // 12 sync symbols (all zeros) to train
+    mod.setSymbols(new Array(16).fill(0));
+    for (let s = 0; s < 12; s++) demod.trainOnSyncSymbol(mod.generateSymbol());
+    expect(demod.isTraining()).toBe(false);
+
+    const sent = Array.from({ length: 16 }, (_unused, t) => (t * 3) % 4);
+    mod.setSymbols(sent);
+    const audio = mod.generateSymbol();
+    expect(audio.length).toBe(symSamples);
+    const result = demod.demodulate(audio);
+    const got = [];
+    for (let t = 0; t < 16; t++) got.push((result.bits[t * 2] << 1) | result.bits[t * 2 + 1]);
+    expect(got).toEqual(sent);
+  });
+}
