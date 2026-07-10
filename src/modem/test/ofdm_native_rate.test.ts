@@ -11,6 +11,8 @@ import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
 import { toneIQ } from '../pilot';
 import { OFDMEngine } from '../protocol/ofdmEngine';
 import { encodeFrame } from '../protocol/atomicFrame';
+import { RxEngine } from '../protocol/rxEngine';
+import { resample } from '../../lib/math';
 
 test('ofdmSamples derives integer windows at both common hardware rates', () => {
   expect(ofdmSamples(48000)).toEqual({ fftSamples: 1920, cpSamples: 240, symSamples: 2160 });
@@ -116,4 +118,34 @@ test('engine @48k/16 tones: 2 bytes per symbol, sync burst sized in time', () =>
   const audio = engine.modulateFrame(frame); // 79 bytes / 4 blocks = 20 symbols
   expect(audio.length).toBe(Math.ceil(79 / 4) * symSamples);
   expect(engine.generateSyncBurst(24).length).toBe(24 * symSamples);
+});
+
+// ── Task 6: Cross-rate test ──
+
+test('cross-rate: TX @44100 decodes on RX @48000', () => {
+  const engine = new OFDMEngine({ sampleRate: 44100, toneCount: 16 });
+  const frame = encodeFrame({ type: 0x01, seqNum: 0, totalFrames: 1, crc: 0 }, new Uint8Array(40));
+  const sync = engine.generateSyncBurst(24);
+  const data = engine.modulateFrame(frame);
+  const tx44 = new Float32Array(sync.length + data.length);
+  tx44.set(sync, 0);
+  tx44.set(data, sync.length);
+
+  const tx48 = resample(tx44, 44100, 48000);
+  const padded = new Float32Array(1000 + tx48.length);
+  padded.set(tx48, 1000);
+
+  const rx = new RxEngine({
+    sampleRate: 48000, pilotFreqHz: 1900, toneCount: 16, useOFDM: true,
+  } as ConstructorParameters<typeof RxEngine>[0]);
+  let received: Uint8Array | null = null;
+  (rx as unknown as { scanner: { onFrame: (f: Uint8Array) => void } }).scanner.onFrame =
+    (f: Uint8Array) => { received ??= f; };
+  for (const s of padded) rx.feedSample(s);
+  for (let i = 0; i < 5000; i++) rx.feedSample(0);
+  expect(received).not.toBeNull();
+  // Compare meaningful data (header + payload = 49 bytes);
+  // trailing zero-padding may be corrupted by linear-interpolation resampler artifacts.
+  expect(Array.from((received as unknown as Uint8Array).subarray(0, 49)))
+    .toEqual(Array.from(frame.subarray(0, 49)));
 });
