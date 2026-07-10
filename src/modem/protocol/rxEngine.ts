@@ -19,8 +19,7 @@ import { PilotPLL, toneIQ, getDataToneFreqs } from '../pilot';
 import { decodeFrame, FRAME_SIZE, PAYLOAD_DATA_SIZE, RAW_HEADER_SIZE } from '../protocol/atomicFrame';
 import { SentinelScanner } from '../receiver/SentinelScanner';
 import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
-import { OFDMEngine } from '../protocol/ofdmEngine';
-import { makeToneOffsets, makeToneFrequencies } from '../../lib/math';
+import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_SYMBOL_MS, OFDM_CP_MS } from '../types';
 import { dlog } from '../../lib/debug/dlog';
 
 // ─── Constants ───────────────────────────────────────
@@ -60,7 +59,6 @@ export class RxEngine {
 
   private cfg: ModemConfig;
   private sps: number;
-  private ofdmFftSize = 256;
 
   // Demodulation buffer
   private buf: number[] = [];
@@ -91,8 +89,10 @@ export class RxEngine {
   private ofdmWindowsSinceDetect = 0;
   /** Whether the scanner produced a frame since the last OFDM detection */
   private ofdmFrameSeen = false;
-  /** Watchdog: reset to WAITING if no frame within this many windows (~13 s) */
-  private readonly OFDM_WATCHDOG_WINDOWS = 150;
+  /** Watchdog: reset to WAITING if no frame within this many windows (~15 s at any rate) */
+  private get OFDM_WATCHDOG_WINDOWS() {
+    return Math.round(15000 / (OFDM_SYMBOL_MS + OFDM_CP_MS));
+  }
 
   // PLL
   private pll: PilotPLL | null = null;
@@ -163,22 +163,18 @@ export class RxEngine {
 
     // Default SPS = 256 for atomic frame protocol (BPSK). OFDM may override.
     this.sps = 256;
-    this.ofdmFftSize = 256;
 
     this.toneFreqs = getDataToneFreqs(this.cfg.pilotFreqHz, !!this.cfg.musical);
     this.scanner = new SentinelScanner();
 
     // Initialize OFDM demodulator (256 FFT + 16 CP = 272 samples/symbol)
     if (this.useOFDM) {
-      const demodToneFreqs = this.initOfdmDemod();
+      this.initOfdmDemod();
+      const { symSamples: sps } = ofdmSamples(this.cfg.sampleRate);
       dlog('RX-OFDM', {
-        v: 'v4-eq-align',
         pilot: this.cfg.pilotFreqHz,
-        cp: OFDMEngine.CP_LENGTH,
-        sps: this.sps,
-        bins: Array.from(demodToneFreqs).map((f) =>
-          Math.round((f * OFDMEngine.FFT_SIZE) / this.cfg.sampleRate),
-        ),
+        sps,
+        tones: this.ofdmToneCount,
       });
     }
 
@@ -694,29 +690,21 @@ export class RxEngine {
    * Returns the demod tone frequencies for logging.
    */
   private initOfdmDemod(): Float32Array {
-    this.sps = OFDMEngine.FFT_SIZE + OFDMEngine.CP_LENGTH;
-    let ofdmToneCount = this.cfg.toneCount || 4;
+    const { symSamples } = ofdmSamples(this.cfg.sampleRate);
+    this.sps = symSamples;
+    let ofdmToneCount = this.cfg.toneCount || OFDM_DEFAULTS.toneCount;
     if (ofdmToneCount % 4 !== 0) {
       dlog('RX-OFDM', { badToneCount: ofdmToneCount, using: 4 }, { level: 'warn' });
       ofdmToneCount = 4;
     }
     this.ofdmToneCount = ofdmToneCount;
-    let demodToneFreqs: Float32Array;
-    if (ofdmToneCount === 4) {
-      demodToneFreqs = new Float32Array(this.toneFreqs);
-    } else {
-      const offsets = makeToneOffsets(ofdmToneCount, 100, 100);
-      demodToneFreqs = makeToneFrequencies(this.cfg.pilotFreqHz, offsets);
-    }
+    const demodToneFreqs = ofdmToneFrequencies({ toneCount: ofdmToneCount });
+    this.ofdmToneFreqs = demodToneFreqs;
     this.ofdmDemod = new OFDMQPSKDemodulator({
       sampleRate: this.cfg.sampleRate,
-      fftSize: OFDMEngine.FFT_SIZE,
-      toneCount: ofdmToneCount,
-      pilotFreqHz: this.cfg.pilotFreqHz,
       toneFrequencies: demodToneFreqs,
-      cpLength: OFDMEngine.CP_LENGTH,
+      pilotFreqHz: this.cfg.pilotFreqHz,
     });
-    this.ofdmToneFreqs = demodToneFreqs;
     return demodToneFreqs;
   }
 
@@ -732,7 +720,7 @@ export class RxEngine {
     score: number;
     sharpness: number;
   } {
-    const fft = this.ofdmFftSize;
+    const fft = ofdmSamples(this.cfg.sampleRate).fftSamples;
     const cp = this.sps - fft;
     if (recent.length < this.sps + cp) return { offset: -1, score: 0, sharpness: 0 };
     let bestOffset = -1;

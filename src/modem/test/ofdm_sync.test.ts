@@ -5,20 +5,13 @@ import { expect, test } from 'vitest';
 import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
 import { OFDMEngine } from '../protocol/ofdmEngine';
 import { encodeFrame } from '../protocol/atomicFrame';
+import { ofdmSamples, ofdmToneFrequencies } from '../types';
 
-const FFT_SIZE = 256;
-const CP_LEN = 16;
-const SYM_LEN = FFT_SIZE + CP_LEN;
-const PILOT_FREQ = 487.5;
-
-function makeDemod() {
-  return new OFDMQPSKDemodulator({
-    sampleRate: 3200, fftSize: FFT_SIZE, toneCount: 4,
-    pilotFreqHz: PILOT_FREQ,
-    toneFrequencies: new Float32Array([587.5, 687.5, 787.5, 887.5]),
-    cpLength: CP_LEN,
-  });
-}
+const SAMPLE_RATE = 48000;
+const { symSamples: SYM_LEN } = ofdmSamples(SAMPLE_RATE);
+const PILOT_FREQ = 1900;
+const TONE_FREQS = ofdmToneFrequencies({ toneCount: 4 });
+const SYNC_COUNT = 24;
 
 function nibbleBits(byte: number): number[] {
   const upper = (byte >> 4) & 0xf;
@@ -32,8 +25,19 @@ function nibbleBits(byte: number): number[] {
 }
 
 test('OFDM sync burst + frame decodes correctly with CP', () => {
-  const demod = makeDemod();
-  const engine = new OFDMEngine({ pilotFreqHz: PILOT_FREQ, sampleRate: 3200, symbolsPerSec: 12.5 });
+  const engine = new OFDMEngine({ pilotFreqHz: PILOT_FREQ, sampleRate: SAMPLE_RATE, toneCount: 4 });
+  const demod = new OFDMQPSKDemodulator({
+    sampleRate: SAMPLE_RATE,
+    toneFrequencies: TONE_FREQS,
+    pilotFreqHz: PILOT_FREQ,
+  });
+
+  // Train on first 12 sync symbols
+  const sync = engine.generateSyncBurst(SYNC_COUNT);
+  for (let s = 0; s < 12; s++) {
+    const start = s * SYM_LEN;
+    demod.trainOnSyncSymbol(sync.slice(start, start + SYM_LEN));
+  }
 
   const payload = new Uint8Array(40);
   payload[0] = 0xde; payload[1] = 0xad;

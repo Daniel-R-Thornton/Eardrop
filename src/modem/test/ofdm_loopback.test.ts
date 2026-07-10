@@ -5,30 +5,37 @@ import { expect, test } from 'vitest';
 import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
 import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
 import { encodeFrame } from '../protocol/atomicFrame';
+import { ofdmSamples, ofdmToneFrequencies } from '../types';
 
 const TONE_COUNT = 4;
-const FFT_SIZE = 256; const SYM_PER_SEC = 12.5;
-const PILOT_FREQ = 487.5;
-const TONE_FREQS = new Float32Array([587.5, 687.5, 787.5, 887.5]);
+const PILOT_FREQ = 1900;
+const TONE_FREQS = ofdmToneFrequencies({ toneCount: TONE_COUNT });
+const SAMPLE_RATE = 48000;
+const { symSamples: SYM_LEN } = ofdmSamples(SAMPLE_RATE);
 
 function makeMod() {
   return new OFDMQPSKModulator({
-    sampleRate: 3200, toneCount: TONE_COUNT, ifftSize: FFT_SIZE,
-    amplitude: 1.0, pilotFreqHz: PILOT_FREQ, pilotAmplitude: 0.4,
-    toneFrequencies: TONE_FREQS, cpLength: 0,
+    sampleRate: SAMPLE_RATE,
+    toneFrequencies: TONE_FREQS,
+    pilotFreqHz: PILOT_FREQ,
+    pilotAmplitude: 0.4,
   });
 }
 
-function makeDemod() {
-  return new OFDMQPSKDemodulator({
-    sampleRate: 3200, fftSize: FFT_SIZE, toneCount: TONE_COUNT,
-    pilotFreqHz: PILOT_FREQ, toneFrequencies: TONE_FREQS, cpLength: 0,
+function makeTrainedDemod() {
+  const mod = makeMod();
+  const demod = new OFDMQPSKDemodulator({
+    sampleRate: SAMPLE_RATE,
+    toneFrequencies: TONE_FREQS,
+    pilotFreqHz: PILOT_FREQ,
   });
+  mod.setSymbols(new Array(TONE_COUNT).fill(0));
+  for (let s = 0; s < 12; s++) demod.trainOnSyncSymbol(mod.generateSymbol());
+  return { mod, demod };
 }
 
 function testOneQPSK(symbols: number[], label: string): boolean {
-  const mod = makeMod();
-  const demod = makeDemod();
+  const { mod, demod } = makeTrainedDemod();
   mod.setSymbols(symbols);
   const audio = mod.generateSymbol();
   const result = demod.demodulate(audio);
@@ -62,8 +69,7 @@ test('OFDM single symbol QPSK decoding — mixed', () => {
 });
 
 test('OFDM multi-symbol frame loopback', () => {
-  const mod = makeMod();
-  const demod = makeDemod();
+  const { mod, demod } = makeTrainedDemod();
 
   // Build a real atomic frame
   const payload = new Uint8Array(40);
@@ -97,8 +103,8 @@ test('OFDM multi-symbol frame loopback', () => {
   // Demodulate all symbols
   const decodedBits: number[] = [];
   for (let i = 0; i < totalSymbols; i++) {
-    const start = i * FFT_SIZE;
-    const window = fullAudio.slice(start, start + FFT_SIZE);
+    const start = i * SYM_LEN;
+    const window = fullAudio.slice(start, start + SYM_LEN);
     const result = demod.demodulate(window);
     decodedBits.push(...result.bits);
   }
