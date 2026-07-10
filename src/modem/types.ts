@@ -156,3 +156,38 @@ export const DEFAULT_CONFIG: ModemConfig = {
 
   payloadBlockSymbols: 32,
 };
+
+/** OFDM symbol timing — defined in TIME so any hardware rate works. */
+export const OFDM_SYMBOL_MS = 40; // FFT-equivalent window: 25 Hz tone grid
+export const OFDM_CP_MS = 5; // cyclic prefix / timing guard
+
+export function ofdmSamples(sampleRate: number): {
+  fftSamples: number;
+  cpSamples: number;
+  symSamples: number;
+} {
+  const fftSamples = Math.round((sampleRate * OFDM_SYMBOL_MS) / 1000);
+  const cpSamples = Math.round((sampleRate * OFDM_CP_MS) / 1000);
+  return { fftSamples, cpSamples, symSamples: fftSamples + cpSamples };
+}
+
+/** Native-rate OFDM defaults — tones in the 2–4 kHz hardware sweet spot. */
+export const OFDM_DEFAULTS = {
+  pilotFreqHz: 1900,
+  pilotAmplitude: 2.0,
+  toneStartHz: 2000,
+  toneSpacingHz: 50,
+  toneCount: 16,
+} as const;
+
+export function ofdmToneFrequencies(opts: {
+  toneCount: number;
+  startHz?: number;
+  spacingHz?: number;
+}): Float32Array {
+  const start = opts.startHz ?? OFDM_DEFAULTS.toneStartHz;
+  const spacing = opts.spacingHz ?? OFDM_DEFAULTS.toneSpacingHz;
+  const freqs = new Float32Array(opts.toneCount);
+  for (let t = 0; t < opts.toneCount; t++) freqs[t] = start + t * spacing;
+  return freqs;
+}
