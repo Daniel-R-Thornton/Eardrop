@@ -79,6 +79,8 @@ export class RxEngine {
 
   /** OFDM tone count (4 or 8 — multiples of 4 only) */
   private ofdmToneCount = 4;
+  /** OFDM demod tone frequencies — used for sync-energy detection too */
+  private ofdmToneFreqs: Float32Array = new Float32Array(0);
   /** Rolling buffer of recent samples (2 OFDM symbols) for boundary search */
   private ofdmAlignBuf: number[] = [];
   /** Samples still to discard so the window grid lands on a symbol boundary */
@@ -199,9 +201,10 @@ export class RxEngine {
     // ── OFDM symbol-boundary alignment ──
     if (this.useOFDM) {
       if (this.state === RxState.WAITING) {
-        // Keep the last 2 symbols of audio for the CP boundary search
+        // Keep the last 4 symbols of audio for the CP boundary search —
+        // extra periods let the search average correlation across repeats
         this.ofdmAlignBuf.push(sample);
-        if (this.ofdmAlignBuf.length > 2 * this.sps) this.ofdmAlignBuf.shift();
+        if (this.ofdmAlignBuf.length > 4 * this.sps) this.ofdmAlignBuf.shift();
       }
       if (this.ofdmSkip > 0) {
         this.ofdmSkip--;
@@ -223,7 +226,13 @@ export class RxEngine {
       // OFDM mode: detect energy at the tone frequencies (not just pilot).
       // The sync burst has all 4 tones at QPSK 0°, so total tone energy is high.
       if (this.useOFDM && this.ofdmDemod) {
-        const totalE = rawIQs.reduce((a, r) => a + Math.hypot(r.i, r.q), 0);
+        // Measure energy at the actual OFDM tone frequencies — this.toneFreqs
+        // are the BPSK tones, which only partially overlap the OFDM bins and
+        // made detection marginal (fired barely above threshold).
+        const totalE = Array.from(this.ofdmToneFreqs).reduce((acc, f) => {
+          const iq = toneIQ(window, f, this.cfg.sampleRate);
+          return acc + Math.hypot(iq.i, iq.q);
+        }, 0);
         // Heartbeat while waiting: 1 line per 25 windows (~2/s)
         dlog(
           'OFDM-SYNC',
@@ -658,6 +667,7 @@ export class RxEngine {
       toneFrequencies: demodToneFreqs,
       cpLength: OFDMEngine.CP_LENGTH,
     });
+    this.ofdmToneFreqs = demodToneFreqs;
     return demodToneFreqs;
   }
 
@@ -675,14 +685,21 @@ export class RxEngine {
     let bestOffset = -1;
     let bestScore = -Infinity;
     const maxOffset = Math.min(this.sps, recent.length - fft - cp);
+    // Average the CP correlation over as many whole sync-symbol periods as
+    // the buffer holds — one 16-sample window is noise-fragile.
+    const periods = Math.max(1, Math.floor((recent.length - fft - cp) / this.sps));
     for (let offset = 0; offset < maxOffset; offset++) {
       let corr = 0;
       let energy = 0;
-      for (let n = 0; n < cp; n++) {
-        const early = recent[offset + n];
-        const late = recent[offset + n + fft];
-        corr += early * late;
-        energy += early * early + late * late;
+      for (let p = 0; p < periods; p++) {
+        const base = offset + p * this.sps;
+        if (base + fft + cp > recent.length) break;
+        for (let n = 0; n < cp; n++) {
+          const early = recent[base + n];
+          const late = recent[base + n + fft];
+          corr += early * late;
+          energy += early * early + late * late;
+        }
       }
       const score = energy > 1e-9 ? corr / (energy / 2) : 0;
       if (score > bestScore) {
