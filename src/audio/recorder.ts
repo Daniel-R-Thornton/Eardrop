@@ -3,6 +3,9 @@
  * Hann-windowed polyphase FIR filter in AudioWorklet, feeds samples to decoder.
  */
 
+import { dbg } from '../lib/debug';
+import { dlog } from '../lib/debug/dlog';
+
 export type SampleCallback = (sample: number) => void;
 
 /** AudioWorklet processor — 31-tap Hann-windowed sinc downsampler.
@@ -94,6 +97,8 @@ export class AudioRecorder {
   /** Reference to the live GainNode for dynamic mic gain adjustment */
   private micBoostNode: GainNode | null = null;
 
+  private static workletLoaded = false;
+
   /** @param ctx - Shared AudioContext (creates own if omitted).
    *  @param micGain - Mic pre-amp multiplier. Default 8.0. */
   constructor(ctx?: AudioContext, public micGain = 8.0) {
@@ -114,18 +119,36 @@ export class AudioRecorder {
     if (this.running) return;
     this.micBoostNode = null;
 
-    console.log('[Recorder] start');
+    dlog('REC', {
+      start: this.ctx.currentTime.toFixed(2),
+      ctxRate: this.ctx.sampleRate,
+      ctxState: this.ctx.state,
+      gain: this.micGain,
+      device: (deviceId || 'default').slice(0, 8),
+    });
+
     if (this.ctx.state === 'suspended') {
+      console.debug('[Recorder] Resuming suspended AudioContext');
       await this.ctx.resume();
+      console.debug('[Recorder] ✅ AudioContext resumed');
     }
 
-    // Load AudioWorklet with Hann-sinc downsampler
-    try {
-      await this.ctx.audioWorklet.addModule(WORKLET_URL);
-    } catch (err: any) {
-      console.error('[Recorder] AudioWorklet addModule failed:', err);
-      throw new Error(`AudioWorklet init failed: ${err.message}`);
+    // Load AudioWorklet with Hann-sinc downsampler (once per class lifetime)
+    if (!AudioRecorder.workletLoaded) {
+      console.debug('[Recorder] Initializing AudioWorklet processor...');
+      try {
+        await this.ctx.audioWorklet.addModule(WORKLET_URL);
+        AudioRecorder.workletLoaded = true;
+        console.debug('[Recorder] ✅ AudioWorklet module loaded');
+      } catch (err: any) {
+        console.error('[Recorder] ❌ AudioWorklet addModule failed:', err);
+        throw new Error(`AudioWorklet init failed: ${err.message}`);
+      }
+    } else {
+      console.debug('[Recorder] AudioWorklet already loaded, skipping');
     }
+
+    console.debug('[Recorder] Requesting mic stream (raw 48kHz mono, AGC/NS/EC off)');
 
     // Get mic — force raw 48kHz mono, no processing
     const constraints: MediaStreamConstraints = {
@@ -148,9 +171,16 @@ export class AudioRecorder {
     this.workletNode.port.onmessage = (e: MessageEvent<Float32Array>) => {
       if (!this.running) return;
       const samples = e.data;
+      dbg.trace('recorder', 'Processing worklet buffer:', {
+        samples: samples.length,
+        downscaledFrom: '48000 Hz → 3200 Hz',
+      });
+      let samplesProcessed = 0;
       for (let i = 0; i < samples.length; i++) {
         this.onSample!(samples[i]);
+        samplesProcessed++;
       }
+      dbg.trace('recorder', '✅ Processed worklet chunk:', samplesProcessed, 'samples');
     };
 
     // Connect: mic → gain boost → worklet → silent destination
@@ -165,14 +195,19 @@ export class AudioRecorder {
     silentGain.connect(this.ctx.destination);
 
     this.running = true;
-    console.log('[Recorder] running (Hann-sinc downsampler in worklet)');
+    dlog('REC', { running: true, worklet: 'hann-sinc', gain: this.micGain, outRate: 3200 });
   }
 
   stop() {
+    console.log('[Recorder] ⏹ Stopping recording...');
     if (this.workletNode) {
       this.workletNode.port.onmessage = null;
       this.workletNode.disconnect();
       this.workletNode = null;
+    }
+    if (this.micBoostNode) {
+      this.micBoostNode.disconnect();
+      this.micBoostNode = null;
     }
     if (this.source) {
       this.source.disconnect();
@@ -184,14 +219,14 @@ export class AudioRecorder {
     }
     this.onSample = null;
     this.running = false;
-    console.log('[Recorder] stopped');
+    console.log('[Recorder] ✅ stopped');
   }
 
   getDiag(): {
     rmsDb: number; peak: number; zeroCrossingRate: number;
     ctxState: string; sampleRate: number; calibrationFactor: number;
     recentSamples: Float32Array;
-  } {
+    } {
     return {
       rmsDb: -80, peak: 0, zeroCrossingRate: 0,
       ctxState: this.ctx.state, sampleRate: this.ctx.sampleRate,

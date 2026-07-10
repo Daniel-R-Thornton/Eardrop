@@ -4,22 +4,29 @@
 
 import { RxEngine } from '../modem/protocol/rxEngine';
 import { DEFAULT_CONFIG } from '../modem/types';
+import { dlog, dlogSetMode } from '../lib/debug/dlog';
 
 const DEBUG = true;
+// Worker code version — increment when changing rxEngine sync detection
+const WORKER_VERSION = 'v4-eq-align';
+
+// Forward all dlog lines to the main thread so they land in ONE console ring
+dlogSetMode('forward', (line) => self.postMessage({ type: 'dlog', line }));
+dlog('RX', { worker: WORKER_VERSION });
 
 let rx: RxEngine | null = null;
 let stateInterval: ReturnType<typeof setInterval> | null = null;
 
-if (DEBUG) console.log('[RX] worker module loaded');
-
 self.onmessage = (e: MessageEvent) => {
   const msg = e.data;
-  if (DEBUG && msg.type !== 'feedSample') console.log('[RX] message:', msg.type);
+  if (DEBUG && msg.type !== 'feedSample' && msg.type !== 'startListening' && msg.type !== 'stopListening') {
+    dlog('RX', { msg: msg.type });
+  }
 
   switch (msg.type) {
     case 'startListening': {
       if (rx) return;
-      if (DEBUG) console.log('[RX] start listening');
+      dlog('RX', { listening: true });
       rx = new RxEngine(msg.config ?? DEFAULT_CONFIG);
 
       // Poll for completed file every 200ms
@@ -30,7 +37,7 @@ self.onmessage = (e: MessageEvent) => {
           const file = rx.getFile();
           if (file) {
             fileSent = true;
-            if (DEBUG) console.log(`[RX] file complete: "${file.fileName}" ${file.data.length}B`);
+            dlog('RX', { fileComplete: file.fileName, bytes: file.data.length });
             self.postMessage(
               { type: 'fileComplete', fileName: file.fileName, data: file.data.buffer },
               { transfer: [file.data.buffer] },
@@ -78,13 +85,19 @@ self.onmessage = (e: MessageEvent) => {
     }
 
     case 'stopListening': {
-      if (DEBUG) console.log('[RX] stop listening');
+      dlog('RX', { listening: false });
       if (stateInterval) {
         clearInterval(stateInterval);
         stateInterval = null;
       }
       rx = null;
       self.postMessage({ type: 'stopped' });
+      break;
+    }
+
+    case 'setRxVerboseLogging': {
+      RxEngine.verboseRxLogging = !!msg.enabled;
+      dlog('RX', { verbose: RxEngine.verboseRxLogging });
       break;
     }
   }
