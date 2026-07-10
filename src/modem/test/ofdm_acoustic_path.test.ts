@@ -1,29 +1,21 @@
 /**
- * OFDM acoustic-path regression tests.
+ * OFDM acoustic-path regression tests — native-rate (48 kHz).
  *
- * The in-memory OFDM tests decode with hand-aligned symbol windows and a
- * clean channel, which never exercises the real RX path. These tests feed
- * a full transmission (sync burst + atomic frame) through RxEngine
- * sample-by-sample, reproducing the two acoustic failure modes:
- *
- *  1. Arbitrary window-grid offset — the receiver starts listening at a
- *     random point, so its 272-sample window grid is misaligned with the
- *     TX symbol grid (only ~6% of offsets land within the cyclic prefix).
- *  2. Per-tone channel phase — even with an aligned grid, a real channel
- *     rotates each tone's constellation by a different phase (here a pure
- *     8-sample delay: −2π·bin·8/256 per bin).
+ * Uses the new time-domain constants: 40 ms symbol + 5 ms CP.
+ * Tone frequencies are absolute Hz on the 25 Hz grid.
  */
 import { expect, test } from 'vitest';
 import { RxEngine } from '../protocol/rxEngine';
 import { OFDMEngine } from '../protocol/ofdmEngine';
 import { encodeFrame } from '../protocol/atomicFrame';
+import { ofdmSamples } from '../types';
 
-const PILOT_FREQ = 600;
-const SAMPLE_RATE = 3200;
-const SYM_LEN = OFDMEngine.FFT_SIZE + OFDMEngine.CP_LENGTH;
+const PILOT_FREQ = 1900;
+const SAMPLE_RATE = 48000;
+const { symSamples: SYM_LEN } = ofdmSamples(SAMPLE_RATE);
 const SYNC_COUNT = 24;
 
-function buildTransmission(toneCount = 4): { tx: Float32Array; frame: Uint8Array } {
+function buildTransmission(toneCount = 16): { tx: Float32Array; frame: Uint8Array } {
   const engine = new OFDMEngine({ pilotFreqHz: PILOT_FREQ, sampleRate: SAMPLE_RATE, toneCount });
   const payload = new Uint8Array(40);
   payload.set([0xde, 0xad, 0xbe, 0xef]);
@@ -38,8 +30,7 @@ function buildTransmission(toneCount = 4): { tx: Float32Array; frame: Uint8Array
   return { tx, frame };
 }
 
-/** Feed audio through RxEngine, capture any frame the sentinel scanner emits. */
-function receive(audio: Float32Array, toneCount = 4): Uint8Array | null {
+function receive(audio: Float32Array, toneCount = 16): Uint8Array | null {
   const rx = new RxEngine({
     pilotFreqHz: PILOT_FREQ,
     sampleRate: SAMPLE_RATE,
@@ -54,45 +45,41 @@ function receive(audio: Float32Array, toneCount = 4): Uint8Array | null {
   };
 
   for (const sample of audio) rx.feedSample(sample);
-  // Trailing silence so any buffered windows flush through
-  for (let i = 0; i < SYM_LEN * 4; i++) rx.feedSample(0);
+  for (let i = 0; i < SYM_LEN * 6; i++) rx.feedSample(0);
   return received;
 }
 
 test('OFDM acoustic path: decodes with misaligned window grid', () => {
   const { tx, frame } = buildTransmission();
-  // 100 leading silence samples → window grid offset 100 mod 272 (outside CP)
-  const audio = new Float32Array(100 + tx.length);
-  audio.set(tx, 100);
+  // 1000 leading silence samples → window grid offset 1000 mod symSamples (outside CP)
+  const audio = new Float32Array(1000 + tx.length);
+  audio.set(tx, 1000);
 
   const received = receive(audio);
   expect(received, 'frame should decode despite window-grid misalignment').not.toBeNull();
   expect(Array.from(received as Uint8Array)).toEqual(Array.from(frame));
 });
 
-test('OFDM acoustic path: 8 tones — 2 bytes/symbol, misaligned grid + delay', () => {
-  const { tx, frame } = buildTransmission(8);
-  // 8 tones must carry 2 bytes per OFDM symbol: frame airtime halves.
-  const expectedDataSymbols = Math.ceil(frame.length / 2);
-  expect(tx.length).toBe((SYNC_COUNT + expectedDataSymbols) * SYM_LEN);
-  // Worst case: arbitrary grid offset AND channel delay
+test('OFDM acoustic path: decodes with 100-sample delay (inside CP)', () => {
+  const { tx, frame } = buildTransmission();
+  // 100-sample delay — ~2 ms, well inside the 240-sample CP at 48 kHz
   const audio = new Float32Array(100 + tx.length);
   audio.set(tx, 100);
 
-  const received = receive(audio, 8);
-  expect(received, '8-tone frame should decode').not.toBeNull();
+  const received = receive(audio);
+  expect(received, 'frame should decode despite channel delay').not.toBeNull();
   expect(Array.from(received as Uint8Array)).toEqual(Array.from(frame));
 });
 
-test('OFDM acoustic path: decodes with per-tone channel phase (8-sample delay)', () => {
-  const { tx, frame } = buildTransmission();
-  // Grid-aligned start, but the channel delays the signal by 8 samples —
-  // inside the CP, so timing is fine, yet every tone's constellation
-  // rotates by a different phase (−bin·11.25°).
-  const audio = new Float32Array(8 + tx.length);
-  audio.set(tx, 8);
+test('OFDM acoustic path: 32 tones — 4 bytes/symbol', () => {
+  const { tx, frame } = buildTransmission(32);
+  // 32 tones → 8 blocks → 8 bytes/symbol → frame airtime = ceil(79/8) symbols
+  const expectedDataSymbols = Math.ceil(frame.length / 8);
+  expect(tx.length).toBe((SYNC_COUNT + expectedDataSymbols) * SYM_LEN);
+  const audio = new Float32Array(1000 + tx.length);
+  audio.set(tx, 1000);
 
-  const received = receive(audio);
-  expect(received, 'frame should decode despite per-tone channel phase').not.toBeNull();
+  const received = receive(audio, 32);
+  expect(received, '32-tone frame should decode').not.toBeNull();
   expect(Array.from(received as Uint8Array)).toEqual(Array.from(frame));
 });

@@ -1,32 +1,40 @@
 /**
  * Test OFDM modulation/demodulation with pilot-phase correction.
- * Each individual QPSK symbol is decoded correctly through FFT + phase detection.
+ * Each individual QPSK symbol is decoded correctly through toneIQ + phase detection.
  */
 import { expect, test } from 'vitest';
 import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
 import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
+import { ofdmToneFrequencies } from '../types';
 
-const PILOT_FREQ = 600;
-const TONE_FREQS = new Float32Array([700, 800, 900, 1000]);
+const PILOT_FREQ = 1900;
+const TONE_FREQS = ofdmToneFrequencies({ toneCount: 4 });
+const SAMPLE_RATE = 48000;
 
 function makeMod() {
   return new OFDMQPSKModulator({
-    sampleRate: 3200, toneCount: 4, ifftSize: 256,
-    amplitude: 0.5, pilotFreqHz: PILOT_FREQ, pilotAmplitude: 0.4,
-    toneFrequencies: TONE_FREQS, cpLength: 0,
+    sampleRate: SAMPLE_RATE,
+    toneFrequencies: TONE_FREQS,
+    pilotFreqHz: PILOT_FREQ,
+    pilotAmplitude: 0.4,
   });
 }
 
-function makeDemod() {
-  return new OFDMQPSKDemodulator({
-    sampleRate: 3200, fftSize: 256, toneCount: 4,
-    pilotFreqHz: PILOT_FREQ, toneFrequencies: TONE_FREQS, cpLength: 0,
+function makeTrainedDemod() {
+  const mod = makeMod();
+  const demod = new OFDMQPSKDemodulator({
+    sampleRate: SAMPLE_RATE,
+    toneFrequencies: TONE_FREQS,
+    pilotFreqHz: PILOT_FREQ,
   });
+  // Train with 12 sync symbols (all phase 0)
+  mod.setSymbols([0, 0, 0, 0]);
+  for (let s = 0; s < 12; s++) demod.trainOnSyncSymbol(mod.generateSymbol());
+  return { mod, demod };
 }
 
 function testOneQPSK(symbols: number[], label: string): boolean {
-  const mod = makeMod();
-  const demod = makeDemod();
+  const { mod, demod } = makeTrainedDemod();
   mod.setSymbols(symbols);
   const audio = mod.generateSymbol();
   const result = demod.demodulate(audio);

@@ -13,7 +13,7 @@
  * peak-normalized to [-1, 1].
  */
 
-import { type ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG } from '../types';
+import { type ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG, ofdmSamples } from '../types';
 import { generatePreamble, type PreambleConfig } from '../protocol/preamble';
 import { encodeFrame, type AtomicHeader, FRAME_SIZE, PAYLOAD_DATA_SIZE } from '../protocol/atomicFrame';
 import { BPSKModulator, type BPSKModulatorConfig } from '../modulation/BPSKModulator';
@@ -73,12 +73,9 @@ export class TxEngine {
 
       this.ofdmEngine = new OFDMEngine({
         pilotFreqHz: this.cfg.pilotFreqHz,
-        musical: this.cfg.musical,
         sampleRate: this.cfg.sampleRate,
         pilotAmplitude: this.cfg.pilotAmplitude,
-        dataToneAmplitude: this.cfg.dataToneAmplitude,
         toneCount: this.cfg.toneCount,
-        symbolsPerSec: this.cfg.symbolsPerSec,
       });
     }
   }
@@ -99,8 +96,9 @@ export class TxEngine {
    */
   getSymbolLengthInSamples(): number {
     if (this.useOFDM && this.ofdmEngine) {
-      // OFDM symbol = FFT size + cyclic prefix
-      return OFDMEngine.FFT_SIZE + OFDMEngine.CP_LENGTH; // 256 + 16 = 272
+      // OFDM symbol = FFT window + cyclic prefix — derived from OFDM_SYMBOL_MS + OFDM_CP_MS
+      const { symSamples } = ofdmSamples(this.cfg.sampleRate);
+      return symSamples;
     }
     // BPSK symbol - maintain backward compatibility
     return 256;
