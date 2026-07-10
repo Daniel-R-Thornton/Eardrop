@@ -149,3 +149,29 @@ test('cross-rate: TX @44100 decodes on RX @48000', () => {
   expect(Array.from((received as unknown as Uint8Array).subarray(0, 49)))
     .toEqual(Array.from(frame.subarray(0, 49)));
 });
+
+// ── Task 7: Hum immunity test ──
+
+test('50 Hz hum at high level neither triggers sync nor blocks decode', () => {
+  const engine = new OFDMEngine({ sampleRate: 48000, toneCount: 16 });
+  const frame = encodeFrame({ type: 0x01, seqNum: 0, totalFrames: 1, crc: 0 }, new Uint8Array(40));
+  const sync = engine.generateSyncBurst(24);
+  const data = engine.modulateFrame(frame);
+
+  // 2 s of hum-only lead-in, then the burst riding on hum
+  const lead = Math.round(48000 * 2);
+  const total = lead + sync.length + data.length + 5000;
+  const audio = new Float32Array(total);
+  for (let n = 0; n < total; n++) audio[n] = 0.3 * Math.sin((2 * Math.PI * 50 * n) / 48000);
+  for (let n = 0; n < sync.length; n++) audio[lead + n] += sync[n];
+  for (let n = 0; n < data.length; n++) audio[lead + sync.length + n] += data[n];
+
+  const rx = new RxEngine({
+    sampleRate: 48000, pilotFreqHz: 1900, toneCount: 16, useOFDM: true,
+  } as ConstructorParameters<typeof RxEngine>[0]);
+  let received: Uint8Array | null = null;
+  (rx as unknown as { scanner: { onFrame: (f: Uint8Array) => void } }).scanner.onFrame =
+    (f: Uint8Array) => { received ??= f; };
+  for (const s of audio) rx.feedSample(s);
+  expect(Array.from(received as unknown as Uint8Array)).toEqual(Array.from(frame));
+});
