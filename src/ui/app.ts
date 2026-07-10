@@ -253,6 +253,8 @@ const audioCtx = new AudioContext();
 const viz = new Visualizer();
 const player = new AudioPlayer(audioCtx);
 
+dlog('APP', { hwRate: audioCtx.sampleRate });
+
 // ─── Device Enumeration ───────────────────────────────
 
 async function refreshDeviceList() {
@@ -315,6 +317,7 @@ window.addEventListener('eardrop-send', (async () => {
       musical: getState().musicalMode,
       diversityMode: getState().diversityMode,
       useOFDM: getState().useOFDM,
+      sampleRate: getState().useOFDM ? audioCtx.sampleRate : DEFAULT_CONFIG.sampleRate,
     };
     const { samples: playSamples, sampleRate: actualRate } = await transmitFileInWorker(
       selectedFile.name,
@@ -380,6 +383,7 @@ window.addEventListener('eardrop-send-test', (async () => {
       pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz,
       musical: getState().musicalMode,
       useOFDM: getState().useOFDM,
+      sampleRate: getState().useOFDM ? audioCtx.sampleRate : DEFAULT_CONFIG.sampleRate,
     };
     const { samples: playSamples, sampleRate: actualRate } = await transmitFileInWorker(
       'hello.txt',
@@ -676,6 +680,7 @@ async function startListening() {
 
     const listenCfg = {
       ...DEFAULT_CONFIG,
+      sampleRate: getState().useOFDM ? audioCtx.sampleRate : DEFAULT_CONFIG.sampleRate,
       pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz,
       musical: getState().musicalMode,
       toneCount: getState().toneCount || DEFAULT_CONFIG.toneCount,
@@ -704,7 +709,7 @@ async function startListening() {
       }
     });
     unsubMicGain = unsub;
-    const modemRate = DEFAULT_CONFIG.sampleRate;
+    const modemRate = getState().useOFDM ? audioCtx.sampleRate : DEFAULT_CONFIG.sampleRate;
 
     const feedSample = (s: number) => {
       broadcastWorker.postMessage({ type: 'feedSample', sample: s });
@@ -855,7 +860,9 @@ async function sendCalibrationOnly() {
   dlog('CAL-TEST', { noiseRms: noiseFloor.rms, noisePeak: noiseFloor.peak, n: noiseFloor.samples.length });
 
   const pilotFreq = getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz;
-  const tx = new TxEngine({ pilotFreqHz: pilotFreq, symbolsPerSec: getState().symbolsPerSec, toneCount: getState().toneCount, useOFDM: getState().useOFDM });
+  const useOFDM = getState().useOFDM;
+  const modemRate = useOFDM ? audioCtx.sampleRate : DEFAULT_CONFIG.sampleRate;
+  const tx = new TxEngine({ sampleRate: modemRate, pilotFreqHz: pilotFreq, symbolsPerSec: getState().symbolsPerSec, toneCount: getState().toneCount, useOFDM });
   const preamble = tx.transmitPreamble();
 
   let txPeak = 0;
@@ -870,7 +877,7 @@ async function sendCalibrationOnly() {
   // Show first 16 samples for waveform inspection
   dlog('CAL-TEST', { txHead: Array.from(preamble.slice(0, 8)).map((v) => v.toFixed(2)) });
 
-  const silence = new Float32Array(Math.round(DEFAULT_CONFIG.sampleRate / getState().symbolsPerSec * 6));
+  const silence = new Float32Array(Math.round(modemRate / getState().symbolsPerSec * 6));
   const full = new Float32Array(preamble.length + silence.length);
   full.set(preamble, 0);
   full.set(silence, preamble.length);
@@ -878,7 +885,7 @@ async function sendCalibrationOnly() {
   // Snapshot received samples count before play
   const preCount = recvSamples.length;
   setState({ isPlaying: true });
-  await player.play(full, DEFAULT_CONFIG.sampleRate, getState().selectedOutputId || undefined);
+  await player.play(full, modemRate, getState().selectedOutputId || undefined);
 
   // Wait for all received audio to buffer
   await new Promise((r) => setTimeout(r, 500));
@@ -907,7 +914,9 @@ async function sendSingleFrame() {
   dlog('FRAME-TEST', { noiseRms: noiseFloor.rms, noisePeak: noiseFloor.peak });
 
   const pilotFreq = getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz;
-  const tx = new TxEngine({ pilotFreqHz: pilotFreq, symbolsPerSec: getState().symbolsPerSec, toneCount: getState().toneCount, useOFDM: getState().useOFDM });
+  const useOFDM = getState().useOFDM;
+  const modemRate = useOFDM ? audioCtx.sampleRate : DEFAULT_CONFIG.sampleRate;
+  const tx = new TxEngine({ sampleRate: modemRate, pilotFreqHz: pilotFreq, symbolsPerSec: getState().symbolsPerSec, toneCount: getState().toneCount, useOFDM });
 
   // Build one header frame with known data
   const payload = new Uint8Array(40);
@@ -956,7 +965,7 @@ async function sendSingleFrame() {
   const preamble = getState().useOFDM && (tx as any).ofdmEngine
     ? (tx as any).ofdmEngine.generateSyncBurst(24)
     : tx.transmitPreamble();
-  const silence = new Float32Array(Math.round(DEFAULT_CONFIG.sampleRate / getState().symbolsPerSec * 6));
+  const silence = new Float32Array(Math.round(modemRate / getState().symbolsPerSec * 6));
   const full = new Float32Array(preamble.length + frameAudio.length + silence.length);
   full.set(preamble, 0);
   full.set(frameAudio, preamble.length);
@@ -966,7 +975,7 @@ async function sendSingleFrame() {
 
   const preCount = recvSamples.length;
   setState({ isPlaying: true });
-  await player.play(full, DEFAULT_CONFIG.sampleRate, getState().selectedOutputId || undefined);
+  await player.play(full, modemRate, getState().selectedOutputId || undefined);
 
   // Wait and inspect what we got
   await new Promise((r) => setTimeout(r, 800));
