@@ -6,6 +6,8 @@ import {
   ofdmToneFrequencies,
   OFDM_DEFAULTS,
 } from '../types';
+import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
+import { toneIQ } from '../pilot';
 
 test('ofdmSamples derives integer windows at both common hardware rates', () => {
   expect(ofdmSamples(48000)).toEqual({ fftSamples: 1920, cpSamples: 240, symSamples: 2160 });
@@ -26,4 +28,49 @@ test('defaults: pilot below tone band, on grid', () => {
   expect(OFDM_DEFAULTS.pilotFreqHz % (1000 / OFDM_SYMBOL_MS)).toBe(0);
   expect(OFDM_DEFAULTS.pilotAmplitude).toBe(2.0);
   expect(OFDM_CP_MS).toBe(5);
+});
+
+// ── Task 2: Modulator tests ──
+
+function makeMod(sampleRate: number, toneCount = 16) {
+  return new OFDMQPSKModulator({
+    sampleRate,
+    toneFrequencies: ofdmToneFrequencies({ toneCount }),
+    pilotFreqHz: OFDM_DEFAULTS.pilotFreqHz,
+    pilotAmplitude: OFDM_DEFAULTS.pilotAmplitude,
+  });
+}
+
+for (const rate of [48000, 44100]) {
+  test(`synthesis @${rate}: correct length, QPSK phases recoverable per tone`, () => {
+    const mod = makeMod(rate);
+    const { fftSamples, cpSamples, symSamples } = ofdmSamples(rate);
+    const sent = [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3];
+    mod.setSymbols(sent);
+    const audio = mod.generateSymbol();
+    expect(audio.length).toBe(symSamples);
+
+    // Demodulate directly with toneIQ over the CP-stripped window
+    const win = [...audio.slice(cpSamples, cpSamples + fftSamples)];
+    const freqs = ofdmToneFrequencies({ toneCount: 16 });
+    sent.forEach((sym, t) => {
+      const { i, q } = toneIQ(win, freqs[t], rate);
+      let phase = Math.atan2(q, i);
+      if (phase < 0) phase += 2 * Math.PI;
+      const got = Math.round(phase / (Math.PI / 2)) % 4;
+      expect(got, `tone ${t}`).toBe(sym);
+    });
+  });
+}
+
+test('cross-tone leakage below -30 dB (orthogonality on the 25 Hz grid)', () => {
+  const mod = makeMod(48000, 4); // tones 2000..2150
+  mod.setSymbols([0, 0, 0, 0]);
+  const { fftSamples, cpSamples } = ofdmSamples(48000);
+  const audio = mod.generateSymbol();
+  const win = [...audio.slice(cpSamples, cpSamples + fftSamples)];
+  const on = toneIQ(win, 2000, 48000);
+  const off = toneIQ(win, 2025, 48000); // grid neighbour, not transmitted
+  const ratio = Math.hypot(off.i, off.q) / Math.hypot(on.i, on.q);
+  expect(ratio).toBeLessThan(0.03);
 });
