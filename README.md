@@ -22,20 +22,20 @@ Press **Ctrl+Shift+D** for the debug panel.
 
 BPSK on 2/4/8 configurable data tones with a continuous pilot tone as the phase/amplitude reference — magnitudes and phases are decoded *relative* to the pilot, giving echo and drift immunity. A 620 ms preamble (warble code correlation → 16-frame Gray-code calibration → guard) locks the receiver before data starts.
 
-An experimental **OFDM/QPSK mode** (256-point FFT, 16-sample cyclic prefix, QPSK per subcarrier) is toggleable in the UI — solid in-memory, intermittent acoustically (see Known issues).
+An experimental **OFDM/QPSK mode** (native-rate, 40 ms symbol + 5 ms CP, Goertzel/toneIQ demodulation with per-tone equalization, 16 tones default at 2000-2750 Hz) is toggleable in the UI — solid in-memory, acoustic testing pending (see Known issues).
 
 ## Modem specs
 
 | Parameter | Value |
 |-----------|-------|
-| Sample rate (modem) | 3200 Hz (Hann-sinc AudioWorklet downsampler from 48 kHz) |
-| Symbol rate | 25 sym/s (BPSK) · ~11.76 sym/s (OFDM, 272-sample symbols) |
+| Sample rate (modem) | Hardware rate (48 kHz / 44.1 kHz); OFDM uses native rate, BPSK uses Hann-sinc AudioWorklet downsampler to 3200 Hz |
+| Symbol rate | 25 sym/s (BPSK) · ~22.22 sym/s (OFDM, 40 ms + 5 ms CP) |
 | Data tones | 2 / 4 / 8, configurable |
 | Pilot frequency | Configurable via UI slider (default 487.5 Hz, ~600 Hz measured optimal) |
 | Framing | 79-byte atomic frames, Hamming-distance sentinel scanning |
 | ECC | BCH(63,30) × 3 header + RS(52,40) payload, soft-decision |
 | Diversity ("hail mary") mode | Optional 3× frame repetition for noisy channels |
-| Effective throughput | ~5–6 byte/s acoustic (≈9.5 kbit/s in-memory benchmark ceiling) |
+| Effective throughput | BPSK: ~5–6 byte/s acoustic; OFDM: ≈711 bit/s (16 tones), ≈1422 bit/s (32 tones) raw. Native-rate OFDM uses absolute frequencies in the 2-4 kHz band |
 
 Audio capture force-disables AGC, noise suppression, and echo cancellation; mic gain (1–20×) and playback volume sliders compensate manually.
 
@@ -66,9 +66,8 @@ Tests: `npm test` — 90 tests, 87 passing (3 pre-existing failures: Doppler ±H
 
 ## Known issues
 
-- **OFDM acoustic instability** — 13/13 OFDM tests pass in-memory, but over real audio frequency-selective per-tone phase rotation lands symbols in the wrong QPSK quadrant; pilot-phase correction and the cyclic prefix don't fix it. Candidate fixes: per-tone channel equalization trained on the sync burst, differential QPSK, or CP-autocorrelation timing recovery. See `STATE.md`.
-- **8-tone mode** — implemented in OFDMEngine, untested acoustically; sentinel byte-packing still assumes 4 tones.
-- **Throughput** — ~5 byte/s acoustic is the current floor-to-ceiling reality; fixed 3200 Hz modem rate is the bandwidth bottleneck.
+- **OFDM acoustic status** — 13/13 OFDM tests pass in-memory (modulation, demodulation, loopback, sync, cross-rate, hum immunity). Per-tone channel equalization is implemented. Acoustic testing with live mic/speaker pending (Task 9). See `STATE.md`.
+- **Throughput** — BPSK: ~5 byte/s acoustic; OFDM raw bitrates: 711 bps (16 tones), 1422 bps (32 tones). Acoustic OFDM throughput not yet measured.
 
 Fragile files — don't touch without careful testing: `src/modem/protocol/preamble.ts`, `src/modem/protocol/rxEngine.ts`, `src/modem/pilot.ts`, `src/audio/recorder.ts`.
 
