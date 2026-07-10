@@ -85,6 +85,12 @@ export class RxEngine {
   private ofdmAlignBuf: number[] = [];
   /** Samples still to discard so the window grid lands on a symbol boundary */
   private ofdmSkip = 0;
+  /** Windows processed since OFDM sync detection (sync-loss watchdog) */
+  private ofdmWindowsSinceDetect = 0;
+  /** Whether the scanner produced a frame since the last OFDM detection */
+  private ofdmFrameSeen = false;
+  /** Watchdog: reset to WAITING if no frame within this many windows (~13 s) */
+  private readonly OFDM_WATCHDOG_WINDOWS = 150;
 
   // PLL
   private pll: PilotPLL | null = null;
@@ -176,6 +182,7 @@ export class RxEngine {
 
     this.scanner.onFrame = (frame: Uint8Array) => {
       dlog('RX', { scanFrame: frame.length });
+      this.ofdmFrameSeen = true;
       this.processFrame(frame);
     };
   }
@@ -244,8 +251,21 @@ export class RxEngine {
           : 0;
 
         if (this.ofdmSyncFrames >= this.ofdmSyncMinFrames) {
+          // Validate before committing: a real sync burst has cyclic-prefix
+          // structure (high CP-correlation score); room noise that crosses
+          // the energy threshold does not. Rejecting here prevents training
+          // on noise and going deaf for the actual transmission.
+          const probe = this.findOfdmBlockStart(this.ofdmAlignBuf);
+          if (probe.score < 0.35) {
+            dlog('OFDM-SYNC', { falseTrigger: true, e: totalE, score: probe.score }, { level: 'warn' });
+            this.ofdmSyncFrames = 0;
+            return;
+          }
+
           // Signal detected! Enter FRAMES state.
           dlog('OFDM-SYNC', { detected: true, e: totalE });
+          this.ofdmWindowsSinceDetect = 0;
+          this.ofdmFrameSeen = false;
           this.state = RxState.FRAMES;
           this.fileData = [];
           this.framesReceived = 0;
@@ -262,7 +282,7 @@ export class RxEngine {
           // fires at an arbitrary offset; the CP only absorbs offsets within
           // its 16 samples, so without alignment ~94% of receptions straddle
           // symbol boundaries and demodulate garbage.
-          const { offset: boundary, score } = this.findOfdmBlockStart(this.ofdmAlignBuf);
+          const { offset: boundary, score } = probe;
           if (boundary >= 0) {
             const skip =
               (((boundary - this.ofdmAlignBuf.length) % this.sps) + this.sps) %
@@ -492,6 +512,20 @@ export class RxEngine {
     const bits: number[] = [];
 
     if (this.useOFDM && this.ofdmDemod) {
+      // Sync-loss watchdog: a false trigger (or missed frame) previously left
+      // the receiver stuck in FRAMES forever, deaf to the next transmission.
+      this.ofdmWindowsSinceDetect++;
+      if (!this.ofdmFrameSeen && this.ofdmWindowsSinceDetect > this.OFDM_WATCHDOG_WINDOWS) {
+        dlog('OFDM-SYNC', { watchdogReset: true, windows: this.ofdmWindowsSinceDetect }, { level: 'warn' });
+        this.state = RxState.WAITING;
+        this.ofdmSyncFrames = 0;
+        this.ofdmTrainingSymbols = 0;
+        this.ofdmDemod.resetTraining();
+        this.buf = [];
+        this.ofdmAlignBuf = [];
+        return;
+      }
+
       // OFDM training phase: use first N symbols of sync burst to train channel estimates
       if (this.ofdmTrainingSymbols < this.OFDM_TRAINING_SYMBOLS) {
         this.ofdmDemod.trainOnSyncSymbol(window);
