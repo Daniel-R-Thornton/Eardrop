@@ -1,66 +1,44 @@
 /**
  * OFDMEngine — OFDM/QPSK transmission engine for atomic frames.
- * Uses fixed 256-point IFFT/FFT (12.5 sym/s) matching the atomic frame
- * protocol's SPS. Tone count configurable.
+ *
+ * Native-rate: all timing is derived from OFDM_SYMBOL_MS + OFDM_CP_MS via
+ * ofdmSamples(), which yields integer window sizes at any hardware rate.
+ * Tone frequencies are absolute Hz on the 25 Hz grid (integer cycles per
+ * window ⇒ orthogonal at any sample rate). No FFT, no power-of-two constraint.
  */
-
-import { type ModemConfig, DEFAULT_CONFIG, TONE_OFFSETS } from '../types';
-import { OFDMQPSKModulator, type OFDMQPSKModulatorConfig } from '../modulation/OFDMQPSKModulator';
-import { makeToneOffsets, makeToneFrequencies } from '../../lib/math';
+import { ofdmSamples, ofdmToneFrequencies } from '../types';
+import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
 import { dlog } from '../../lib/debug/dlog';
 
-const FFT_SIZE = 256;
-/** Cyclic prefix length in samples — provides timing guard interval */
-const CP_LENGTH = 16;
-/** Total OFDM symbol length = FFT + CP */
-const SYM_LEN = FFT_SIZE + CP_LENGTH;
-
 export class OFDMEngine {
-  /** FFT size for OFDM — number of subcarriers (256 bins) */
-  static readonly FFT_SIZE = 256;
-  /** Cyclic prefix length in samples */
-  static readonly CP_LENGTH = 16;
-
-  private cfg: ModemConfig;
-  private ofdm: OFDMQPSKModulator;
-  private toneFreqs: Float32Array;
   private toneCount: number;
+  private toneFreqs: Float32Array;
+  private ofdm: OFDMQPSKModulator;
+  private pilotFreqHz: number;
 
-  constructor(cfg: Partial<ModemConfig> = {}) {
-    this.cfg = { ...DEFAULT_CONFIG, ...cfg };
-    this.toneCount = this.cfg.toneCount || 4;
-    if (this.toneCount % 4 !== 0) {
-      dlog('TX-OFDM', { badToneCount: this.toneCount, using: 4 }, { level: 'warn' });
-      this.toneCount = 4;
+  constructor(cfg: { sampleRate: number; toneCount?: number; pilotFreqHz?: number; pilotAmplitude?: number }) {
+    const toneCount = cfg.toneCount ?? 16;
+    this.toneCount = toneCount % 4 !== 0 ? 4 : toneCount;
+    if (toneCount % 4 !== 0) {
+      dlog('TX-OFDM', { badToneCount: toneCount, using: 4 }, { level: 'warn' });
     }
 
-    const offsets = makeToneOffsets(this.toneCount, 100, 100);
-    this.toneFreqs = makeToneFrequencies(this.cfg.pilotFreqHz, offsets);
+    const pilotFreqHz = cfg.pilotFreqHz ?? 1900;
+    const pilotAmplitude = cfg.pilotAmplitude ?? 2.0;
+    this.pilotFreqHz = pilotFreqHz;
 
-    // The pilot is the per-symbol phase/drift reference — it must not be
-    // buried under the data tones. Default cfg (0.4) was tuned for BPSK;
-    // with 8 QPSK tones (unit amplitude each) it measured ~10x weaker than
-    // the tones acoustically, making drift correction noise-dominated.
-    const ofdmPilotAmplitude = Math.max(this.cfg.pilotAmplitude, 2.0);
+    this.toneFreqs = ofdmToneFrequencies({ toneCount: this.toneCount });
 
-    const ofdmCfg: OFDMQPSKModulatorConfig = {
-      sampleRate: this.cfg.sampleRate,
-      toneCount: this.toneCount,
-      ifftSize: FFT_SIZE,
-      // IFFT raw peak = (toneCount*2 + pilotAmplitude*2) / FFT_SIZE for real-valued output.
-      // Scale to 0.95 so output fills [-0.95, 0.95] range.
-      amplitude: 0.95 / ((this.toneCount * 2 + ofdmPilotAmplitude * 2) / FFT_SIZE),
-      pilotFreqHz: this.cfg.pilotFreqHz,
-      pilotAmplitude: ofdmPilotAmplitude,
+    this.ofdm = new OFDMQPSKModulator({
+      sampleRate: cfg.sampleRate,
       toneFrequencies: this.toneFreqs,
-      cpLength: CP_LENGTH,
-    };
-    this.ofdm = new OFDMQPSKModulator(ofdmCfg);
+      pilotFreqHz,
+      pilotAmplitude,
+    });
+
     dlog('TX-OFDM', {
-      pilot: this.cfg.pilotFreqHz,
-      pilotBin: Math.round((this.cfg.pilotFreqHz * FFT_SIZE) / this.cfg.sampleRate),
+      pilot: pilotFreqHz,
       tones: Array.from(this.toneFreqs).map((f) => f.toFixed(1)),
-      bins: Array.from(this.toneFreqs).map((f) => Math.round((f * FFT_SIZE) / this.cfg.sampleRate)),
     });
   }
 
@@ -81,9 +59,7 @@ export class OFDMEngine {
   /**
    * Modulate a frame. Tones are grouped into 4-tone blocks; each block carries
    * one byte per OFDM symbol (upper nibble on the b0 bit lane, lower nibble on
-   * b1). 4 tones → 1 byte/symbol, 8 tones → 2 bytes/symbol. A trailing odd
-   * byte is padded with 0x00 — the frame is byte-exact from the sentinel, so
-   * pad bits are inert.
+   * b1). 4 tones → 1 byte/symbol, 8 tones → 2 bytes/symbol, 16 tones → 4 bytes/symbol.
    */
   modulateFrame(frame: Uint8Array): Float32Array {
     const blockCount = Math.max(1, Math.floor(this.toneCount / 4));
