@@ -85,6 +85,8 @@ export class RxEngine {
   private ofdmAlignBuf: number[] = [];
   /** Samples still to discard so the window grid lands on a symbol boundary */
   private ofdmSkip = 0;
+  /** EMA of waiting-state tone energy — adapts the sync threshold to mic gain */
+  private ofdmNoiseEma = 0;
   /** Windows processed since OFDM sync detection (sync-loss watchdog) */
   private ofdmWindowsSinceDetect = 0;
   /** Whether the scanner produced a frame since the last OFDM detection */
@@ -240,24 +242,37 @@ export class RxEngine {
           const iq = toneIQ(window, f, this.cfg.sampleRate);
           return acc + Math.hypot(iq.i, iq.q);
         }, 0);
+        // Adaptive threshold: the fixed value is meaningless across mic
+        // gains (at high gain the noise floor alone crosses it). Track the
+        // waiting-state energy and require 3x the floor.
+        const effThr = Math.max(this.ofdmSyncThreshold, 3 * this.ofdmNoiseEma);
+        if (totalE < effThr) {
+          this.ofdmNoiseEma = this.ofdmNoiseEma * 0.95 + totalE * 0.05;
+        }
         // Heartbeat while waiting: 1 line per 25 windows (~2/s)
         dlog(
           'OFDM-SYNC',
-          { e: totalE, thr: this.ofdmSyncThreshold, sync: this.ofdmSyncFrames },
+          { e: totalE, thr: effThr, sync: this.ofdmSyncFrames },
           { every: 25 },
         );
-        this.ofdmSyncFrames = totalE > this.ofdmSyncThreshold
-          ? this.ofdmSyncFrames + 1
-          : 0;
+        this.ofdmSyncFrames = totalE > effThr ? this.ofdmSyncFrames + 1 : 0;
 
         if (this.ofdmSyncFrames >= this.ofdmSyncMinFrames) {
           // Validate before committing: a real sync burst has cyclic-prefix
-          // structure (high CP-correlation score); room noise that crosses
-          // the energy threshold does not. Rejecting here prevents training
+          // structure — a HIGH score at ONE offset. Room noise has no CP
+          // structure (low score); periodic hum correlates at every offset
+          // (high score, low sharpness). Rejecting here prevents training
           // on noise and going deaf for the actual transmission.
           const probe = this.findOfdmBlockStart(this.ofdmAlignBuf);
-          if (probe.score < 0.35) {
-            dlog('OFDM-SYNC', { falseTrigger: true, e: totalE, score: probe.score }, { level: 'warn' });
+          // Sharpness: clean bursts measure ~1.7-1.9 (identical repeated
+          // symbols partially correlate at every offset); flat periodic hum
+          // measures ~1.0-1.3. The adaptive energy floor is the third layer.
+          if (probe.score < 0.35 || probe.sharpness < 1.5) {
+            dlog(
+              'OFDM-SYNC',
+              { falseTrigger: true, e: totalE, score: probe.score, sharp: probe.sharpness },
+              { level: 'warn' },
+            );
             this.ofdmSyncFrames = 0;
             return;
           }
@@ -712,12 +727,18 @@ export class RxEngine {
    * block start. Returns the offset in `recent` (0..sps-1), or -1 if no
    * confident peak.
    */
-  private findOfdmBlockStart(recent: number[]): { offset: number; score: number } {
+  private findOfdmBlockStart(recent: number[]): {
+    offset: number;
+    score: number;
+    sharpness: number;
+  } {
     const fft = this.ofdmFftSize;
     const cp = this.sps - fft;
-    if (recent.length < this.sps + cp) return { offset: -1, score: 0 };
+    if (recent.length < this.sps + cp) return { offset: -1, score: 0, sharpness: 0 };
     let bestOffset = -1;
     let bestScore = -Infinity;
+    let scoreSum = 0;
+    let scoreCount = 0;
     const maxOffset = Math.min(this.sps, recent.length - fft - cp);
     // Average the CP correlation over as many whole sync-symbol periods as
     // the buffer holds — one 16-sample window is noise-fragile.
@@ -736,14 +757,20 @@ export class RxEngine {
         }
       }
       const score = energy > 1e-9 ? corr / (energy / 2) : 0;
+      scoreSum += Math.abs(score);
+      scoreCount++;
       if (score > bestScore) {
         bestScore = score;
         bestOffset = offset;
       }
     }
-    // Always return the best offset — even a low-confidence peak beats an
-    // arbitrary grid (which is wrong 94% of the time). Caller logs the score.
-    return { offset: bestOffset, score: bestScore };
+    // Sharpness = peak vs average. A real sync burst correlates only at the
+    // true boundary (sharp peak). Periodic interference — e.g. 50 Hz mains
+    // hum, whose period divides the 256-sample lag exactly — correlates at
+    // EVERY offset, giving a high but flat score profile.
+    const meanScore = scoreCount > 0 ? scoreSum / scoreCount : 0;
+    const sharpness = meanScore > 1e-9 ? bestScore / meanScore : 0;
+    return { offset: bestOffset, score: bestScore, sharpness };
   }
 
   getState(): RxState {
