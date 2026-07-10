@@ -8,50 +8,63 @@ import { dlog } from '../lib/debug/dlog';
 
 export type SampleCallback = (sample: number) => void;
 
-/** AudioWorklet processor — 31-tap Hann-windowed sinc downsampler.
- *  Hardware rate (48000) → modem rate (3200) at 15:1 decimation.
- *  Quality comparable to browser's internal resampler. */
+/** AudioWorklet processor — configurable downsampler or pass-through.
+ *  `processorOptions.ratio` = 1: native-rate pass-through (no filtering).
+ *  ratio > 1: Hann-windowed sinc decimation from ctx rate to modem rate.
+ *  The default (15) downsamples 48000→3200 for legacy BPSK. */
 const WORKLET_SOURCE = `
-const RATIO = 15;
-const TAPS = 127;
-const HALF_TAPS = (TAPS - 1) / 2;
+// RATIO, TAPS, and coeffs are computed at construction time from processorOptions.
 const FILTER_VERSION = 'sinc127-v2';
 
-// Pre-compute Hann-windowed sinc coefficients for each polyphase offset.
-// Anti-alias cutoff at fs/(2*RATIO) = 1600 Hz requires sinc(t/RATIO) — the
-// previous code used sinc(t) with integer t, which is zero everywhere except
-// the center tap: an identity decimator with NO antialiasing. 127 taps at
-// 48 kHz gives a ~1.25 kHz transition band around the 1600 Hz cutoff.
-const coeffs = [];
-for (let phase = 0; phase < RATIO; phase++) {
-  const c = new Float32Array(TAPS);
-  let sum = 0;
-  for (let n = 0; n < TAPS; n++) {
-    const t = ((n - HALF_TAPS) - phase / RATIO) / RATIO;
-    if (t === 0) {
-      c[n] = 1.0;
-    } else {
-      c[n] = Math.sin(Math.PI * t) / (Math.PI * t);
+// Pre-compute Hann-windowed sinc coefficients for the given ratio.
+// Anti-alias cutoff at fs/(2*ratio). 127 taps at 48 kHz gives a ~1.25 kHz
+// transition band around the cutoff.
+function buildCoeffs(ratio) {
+  const taps = ratio === 1 ? 1 : 127;
+  const halfTaps = (taps - 1) / 2;
+  const coeffs = [];
+  for (let phase = 0; phase < ratio; phase++) {
+    const c = new Float32Array(taps);
+    let sum = 0;
+    for (let n = 0; n < taps; n++) {
+      const t = ((n - halfTaps) - phase / ratio) / ratio;
+      if (t === 0) {
+        c[n] = 1.0;
+      } else {
+        c[n] = Math.sin(Math.PI * t) / (Math.PI * t);
+      }
+      // Hann window — smooth rolloff, good stopband rejection
+      c[n] *= 0.5 * (1 - Math.cos(2 * Math.PI * n / (taps - 1)));
+      sum += c[n];
     }
-    // Hann window — smooth rolloff, good stopband rejection
-    c[n] *= 0.5 * (1 - Math.cos(2 * Math.PI * n / (TAPS - 1)));
-    sum += c[n];
+    // Normalize to unity DC gain so signal level is preserved
+    for (let n = 0; n < taps; n++) c[n] /= sum;
+    coeffs.push(c);
   }
-  // Normalize to unity DC gain so signal level is preserved
-  for (let n = 0; n < TAPS; n++) c[n] /= sum;
-  coeffs.push(c);
+  return coeffs;
 }
 
 class RecorderProcessor extends AudioWorkletProcessor {
-  // Circular buffer with power-of-2 size for fast modulo
-  mask = 127; // 128 slots
-  history = new Float32Array(128);
-  head = 0; // next write position
-  sampleCount = 0; // monotonically increasing, used only for decimation trigger
+  ratio = 15;
+  coeffs = null;
+  // Circular buffer (only used when ratio > 1)
+  mask = 127;
+  history = null;
+  head = 0;
+  sampleCount = 0;
   outBuf = new Float32Array(128);
   outIdx = 0;
 
-  constructor() { super(); }
+  constructor(options) {
+    super();
+    const ratio = (options && options.processorOptions && options.processorOptions.ratio) || 15;
+    this.ratio = ratio;
+    if (ratio > 1) {
+      this.coeffs = buildCoeffs(ratio);
+      this.history = new Float32Array(128);
+      this.mask = 127;
+    }
+  }
 
   process(inputs, _outputs) {
     const input = inputs[0];
@@ -59,6 +72,13 @@ class RecorderProcessor extends AudioWorkletProcessor {
     const channel = input[0];
     if (!channel || channel.length === 0) return true;
 
+    if (this.ratio === 1) {
+      // Pass-through: forward raw samples directly — no filtering
+      this.port.postMessage(new Float32Array(channel));
+      return true;
+    }
+
+    const coeffs = this.coeffs;
     for (let i = 0; i < channel.length; i++) {
       // Write to circular buffer
       this.history[this.head] = channel[i];
@@ -66,12 +86,12 @@ class RecorderProcessor extends AudioWorkletProcessor {
       this.sampleCount++;
 
       // Produce one output sample every RATIO input samples
-      if ((this.sampleCount % RATIO) === 0 && this.sampleCount >= TAPS * RATIO) {
+      if ((this.sampleCount % this.ratio) === 0 && this.sampleCount >= coeffs.length * this.ratio) {
         let sum = 0;
         const c = coeffs[0];
         // Read TAPS newest samples (head-1 = newest, head-TAPS = oldest)
         let pos = (this.head - 1) & this.mask;
-        for (let n = 0; n < TAPS; n++) {
+        for (let n = 0; n < c.length; n++) {
           sum += this.history[pos] * c[n];
           pos = (pos - 1) & this.mask;
         }
@@ -175,14 +195,20 @@ export class AudioRecorder {
     this.source = this.ctx.createMediaStreamSource(this.stream);
     this.onSample = onSample;
 
-    // AudioWorklet outputs at modem rate (3200Hz) — feed samples directly
-    this.workletNode = new AudioWorkletNode(this.ctx, 'recorder-processor');
+    // AudioWorklet: compute downsample ratio from ctx rate / modem rate.
+    // ratio === 1 means pass-through (native rate OFDM); ratio > 1 uses
+    // the Hann-sinc polyphase filter (legacy BPSK at 3200 Hz).
+    const workletRatio = Math.round(this.ctx.sampleRate / _modemRate);
+    const isNative = workletRatio === 1;
+    this.workletNode = new AudioWorkletNode(this.ctx, 'recorder-processor', {
+      processorOptions: { ratio: workletRatio },
+    });
     this.workletNode.port.onmessage = (e: MessageEvent<Float32Array>) => {
       if (!this.running) return;
       const samples = e.data;
       dbg.trace('recorder', 'Processing worklet buffer:', {
         samples: samples.length,
-        downscaledFrom: '48000 Hz → 3200 Hz',
+        rate: isNative ? 'native' : `${this.ctx.sampleRate}→${_modemRate}`,
       });
       let samplesProcessed = 0;
       for (let i = 0; i < samples.length; i++) {
@@ -204,7 +230,7 @@ export class AudioRecorder {
     silentGain.connect(this.ctx.destination);
 
     this.running = true;
-    dlog('REC', { running: true, worklet: 'sinc127-v2', gain: this.micGain, outRate: 3200 });
+    dlog('REC', { running: true, worklet: isNative ? 'native' : 'sinc127-v2', ratio: workletRatio, gain: this.micGain, outRate: isNative ? this.ctx.sampleRate : _modemRate });
   }
 
   stop() {
