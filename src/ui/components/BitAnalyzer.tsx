@@ -7,13 +7,12 @@
 
 import React, { useMemo } from 'react';
 import type { DecoderInfo } from '../Store';
+import { TONE_COLORS } from '../../modem/types';
 
 interface Props {
   debug: DecoderInfo | null;
   historyMax?: number;
 }
-
-const TONE_COLORS = ['#4a9eff', '#ff6b4a', '#5eead4', '#f472b6'];
 
 export function BitAnalyzer({ debug, historyMax = 8 }: Props) {
   // Extract bit pattern into per-tone display

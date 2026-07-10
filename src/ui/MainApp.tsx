@@ -15,6 +15,7 @@ import { Card } from './components/Card';
 import { Stat } from './components/Stat';
 import { MeterBar } from './components/MeterBar';
 import { ConstellationPlot } from './components/ConstellationPlot';
+import { PipelineStrip } from './components/PipelineStrip';
 import { debugLogger, STAGE } from '../modem/debug/debugger';
 import { TONE_COLORS, TONE_FREQUENCIES, formatSize } from './lib';
 
@@ -65,13 +66,11 @@ export function MainApp() {
     <div
       data-theme={s.theme}
       style={{
-        maxWidth: 1100,
+        width: '100%',
         margin: '0 auto',
         padding: '20px 16px',
-        fontFamily:
-          "-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Roboto, sans-serif",
+        fontFamily: 'var(--font-body)',
         color: 'var(--text)',
-        background: 'var(--bg)',
         minHeight: '100vh',
         transition: 'background 0.2s, color 0.2s',
       }}
@@ -81,58 +80,50 @@ export function MainApp() {
         style={{
           display: 'flex',
           justifyContent: 'space-between',
-          alignItems: 'flex-start',
-          marginBottom: 20,
+          alignItems: 'center',
+          gap: 12,
+          marginBottom: 14,
+          flexWrap: 'wrap',
         }}
       >
         <div>
-          <h1
-            style={{
-              fontSize: 32,
-              fontWeight: 700,
-              margin: 0,
-              letterSpacing: '-0.03em',
-              background: 'linear-gradient(135deg, #818cf8, #c084fc)',
-              WebkitBackgroundClip: 'text',
-              WebkitTextFillColor: 'transparent',
-            }}
-          >
-            Eardrop
+          <h1 className="ed-wordmark">
+            <span className="glyph">◢◤</span>
+            eardrop
           </h1>
-          <p style={{ color: '#6b7280', fontSize: 14, marginTop: 2 }}>
-            File transfer over audio · speaker → mic
-          </p>
+          <p className="ed-tagline">file transfer over sound · no network · speaker → mic</p>
         </div>
-        <button
-          onClick={() => setState({ theme: s.theme === 'dark' ? 'light' : 'dark' })}
-          className="theme-toggle"
-          title="Toggle theme"
-        >
-          {s.theme === 'dark' ? '☀' : '🌙'}
-        </button>
-        {/* Reset to defaults button */}
-        <button
-          onClick={() => {
-            // Stop listening if active
-            if (s.isListening) dispatch('eardrop-record');
-            // Reset the UI store to its defaults
-            resetState();
-          }}
-          className="reset-button"
-          title="Reset UI to defaults"
-          style={{
-            marginLeft: 8,
-            padding: '4px 8px',
-            background: '#f87171',
-            color: '#fff',
-            border: 'none',
-            borderRadius: 4,
-            cursor: 'pointer',
-          }}
-        >
-          Reset
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span className="ed-status-pill" data-live={s.isListening ? 'true' : 'false'}>
+            <span className="dot" />
+            {s.isPlaying
+              ? 'transmitting'
+              : s.isListening
+                ? (s.recvStatus?.msg ?? 'listening').replace(/^[^A-Za-z]*/, '') || 'listening'
+                : 'idle'}
+          </span>
+          <button
+            onClick={() => setState({ theme: s.theme === 'dark' ? 'light' : 'dark' })}
+            className="theme-toggle"
+            title="Toggle theme"
+          >
+            {s.theme === 'dark' ? '☀' : '🌙'}
+          </button>
+          <button
+            onClick={() => {
+              if (s.isListening) dispatch('eardrop-record');
+              resetState();
+            }}
+            className="ed-btn danger"
+            title="Reset UI to defaults"
+          >
+            reset
+          </button>
+        </div>
       </div>
+
+      {/* ═══ PIPELINE ═══ */}
+      <PipelineStrip />
 
       {/* ═══ TWO-COLUMN LAYOUT ═══ */}
       <div
@@ -356,6 +347,24 @@ export function MainApp() {
             </div>
             <div style={{ fontSize: 10, color: '#4b5563', marginTop: -4, marginBottom: 8 }}>
               {s.symbolsPerSec * s.toneCount} bit/s
+            </div>
+
+            {/* OFDM QPSK toggle */}
+            <div
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+                marginBottom: 8,
+              }}
+            >
+              <span style={{ fontSize: 12, color: '#6b7280' }}>OFDM QPSK (cyclic‑prefix)</span>
+              <input
+                type="checkbox"
+                checked={s.useOFDM}
+                onChange={(e) => setState({ useOFDM: e.target.checked })}
+                style={{ accentColor: '#ef4444', width: 18, height: 18 }}
+              />
             </div>
 
             {/* Pilot Freq */}
@@ -804,6 +813,11 @@ export function MainApp() {
               }}
             />
           </Card>
+
+          {/* Debug Toggles */}
+          <Card title="Debug Logs" accent="#6b7280" style={{ fontSize: 12 }}>
+            <DebugToggles />
+          </Card>
         </div>
       </div>
 
@@ -839,3 +853,119 @@ const btnSmall: React.CSSProperties = {
   fontSize: 12,
   fontWeight: 500,
 };
+
+// ─── Debug Toggles Component ───────────────────────────
+
+const DEBUG_CATEGORIES = [
+  'recorder',
+  'player',
+  'tx',
+  'rx',
+  'ofdm',
+  'preamble',
+  'channel',
+  'app',
+  'general',
+] as const;
+
+function DebugToggles() {
+  const [flags, setFlags] = useState<Record<string, boolean>>(() => {
+    const initial: Record<string, boolean> = {};
+    for (const cat of DEBUG_CATEGORIES) {
+      const stored = (() => {
+        try { return sessionStorage.getItem(`dbg_${cat}`); } catch { return null; }
+      })();
+      initial[cat] = stored !== null ? stored === '1' : false;
+    }
+    return initial;
+  });
+
+  const toggle = (cat: string) => {
+    const next = !flags[cat];
+    (window as any).debug?.set(cat, next);
+    setFlags((prev) => ({ ...prev, [cat]: next }));
+  };
+
+  const allOn = Object.values(flags).every(Boolean);
+  const toggleAll = () => {
+    const next = !allOn;
+    (window as any).debug?.all(next);
+    const updated: Record<string, boolean> = {};
+    for (const cat of DEBUG_CATEGORIES) updated[cat] = next;
+    setFlags(updated);
+  };
+
+  const categoryColor = (cat: string): string => {
+    const colors: Record<string, string> = {
+      recorder: '#34d399',
+      player: '#60a5fa',
+      tx: '#f59e0b',
+      rx: '#a78bfa',
+      ofdm: '#f472b6',
+      preamble: '#34d399',
+      channel: '#9ca3af',
+      app: '#6b7280',
+      general: '#6b7280',
+    };
+    return colors[cat] || '#6b7280';
+  };
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
+        <button
+          onClick={toggleAll}
+          style={{
+            fontSize: 11,
+            padding: '2px 8px',
+            border: '1px solid var(--border2)',
+            borderRadius: 4,
+            background: allOn ? 'rgba(52,211,153,0.15)' : 'rgba(107,114,128,0.15)',
+            color: allOn ? '#34d399' : '#6b7280',
+            cursor: 'pointer',
+          }}
+        >
+          {allOn ? 'All On' : 'All Off'}
+        </button>
+        <span style={{ fontSize: 11, color: '#6b7280', alignSelf: 'center' }}>
+          Click labels to toggle log output
+        </span>
+      </div>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+        {DEBUG_CATEGORIES.map((cat) => (
+          <label
+            key={cat}
+            onClick={() => toggle(cat)}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 4,
+              cursor: 'pointer',
+              padding: '3px 8px',
+              borderRadius: 12,
+              border: `1px solid ${categoryColor(cat)}40`,
+              background: flags[cat]
+                ? `${categoryColor(cat)}15`
+                : 'transparent',
+              opacity: flags[cat] ? 1 : 0.4,
+              fontSize: 12,
+              userSelect: 'none',
+              transition: 'all 0.15s',
+            }}
+          >
+            <span
+              style={{
+                width: 8,
+                height: 8,
+                borderRadius: '50%',
+                background: flags[cat] ? categoryColor(cat) : 'transparent',
+                border: flags[cat] ? 'none' : '1px solid #444',
+              }}
+            />
+            {cat}
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}

@@ -30,6 +30,12 @@ import { runSelfTest } from './controllers/selfTest';
 import { TONE_FREQUENCIES, formatPayloadHex } from './lib';
 import { detectToneEnergy } from '../lib/scan/index';
 import { resample } from '../lib/math/index';
+import { dlog, dlogInject, dlogSetMode } from '../lib/debug/dlog';
+
+// Main thread: clear-and-reprint the whole log as ONE console entry per update
+// so a single copy grabs the entire session. Worker lines arrive via 'dlog'
+// messages and merge into the same ring.
+dlogSetMode('redraw');
 
 // ─── Debug toggle keyboard shortcut ────────────────
 let debugVisible = false;
@@ -66,6 +72,7 @@ const encoderWorker = new Worker(new URL('../workers/encoder.worker.ts', import.
 const broadcastWorker = new Worker(new URL('../workers/broadcast.worker.ts', import.meta.url), {
   type: 'module',
 });
+(window as any).eardropWorker = broadcastWorker;
 
 // Map of encode task id → { resolve, reject }
 const encodeTasks = new Map<
@@ -117,6 +124,10 @@ let wasInFrame = false;
 broadcastWorker.onmessage = (e) => {
   const msg = e.data;
   switch (msg.type) {
+    case 'dlog':
+      // Worker log lines merge into the main-thread ring (single console entry)
+      dlogInject(msg.line);
+      break;
     case 'listening':
       setState({ recvStatus: { type: 'info', msg: 'Listener started — awaiting signal…' } });
       break;
@@ -264,6 +275,24 @@ async function refreshDeviceList() {
 // React calls this after mount
 (window as any).eardropRefreshDevices = refreshDeviceList;
 
+// ─── Auto-restart listener on OFDM setting changes ──
+let lastOfdmSettings = { useOFDM: false, symbolsPerSec: 50, toneCount: 4 };
+subscribe(() => {
+  const s = getState();
+  const cur = { useOFDM: s.useOFDM, symbolsPerSec: s.symbolsPerSec, toneCount: s.toneCount };
+  if (
+    isListening &&
+    (cur.useOFDM !== lastOfdmSettings.useOFDM ||
+      cur.symbolsPerSec !== lastOfdmSettings.symbolsPerSec ||
+      cur.toneCount !== lastOfdmSettings.toneCount)
+  ) {
+    dlog('OFDM-CONFIG', { restart: true });
+    stopListening();
+    // Re-start will happen on next send/record click
+  }
+  lastOfdmSettings = cur;
+});
+
 // ─── Custom Events from React ─────────────────────────
 
 // File selection
@@ -285,6 +314,7 @@ window.addEventListener('eardrop-send', (async () => {
       pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz,
       musical: getState().musicalMode,
       diversityMode: getState().diversityMode,
+      useOFDM: getState().useOFDM,
     };
     const { samples: playSamples, sampleRate: actualRate } = await transmitFileInWorker(
       selectedFile.name,
@@ -349,6 +379,7 @@ window.addEventListener('eardrop-send-test', (async () => {
     const cfg: any = {
       pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz,
       musical: getState().musicalMode,
+      useOFDM: getState().useOFDM,
     };
     const { samples: playSamples, sampleRate: actualRate } = await transmitFileInWorker(
       'hello.txt',
@@ -547,6 +578,8 @@ let micWatchdog: ReturnType<typeof setTimeout> | null = null;
 let recvSamples: number[] = [];
 let tickCount = 0;
 let isListening = false;
+/** Guard against concurrent start/stop racing */
+let recvStarting = false;
 
 function recvBuf(existing: Uint8Array[], chunk: Uint8Array) {
   existing.push(chunk);
@@ -624,6 +657,8 @@ function tryFinalize() {
 }
 
 async function startListening() {
+  if (recvStarting) { dlog('APP', { startListeningBusy: true }); return; }
+  recvStarting = true;
   try {
     isListening = true;
     recvSamples = [];
@@ -649,6 +684,7 @@ async function startListening() {
       ampThresholdRatio: getState().ampThresholdRatio ?? DEFAULT_CONFIG.ampThresholdRatio,
       syncStrongMultiplier: getState().syncStrongMultiplier ?? DEFAULT_CONFIG.syncStrongMultiplier,
       diversityMode: getState().diversityMode,
+      useOFDM: getState().useOFDM,
     };
     broadcastWorker.postMessage({
       type: 'startListening',
@@ -664,7 +700,7 @@ async function startListening() {
       if (g !== lastMicGain && recorder) {
         lastMicGain = g;
         recorder.setMicGain(g);
-        console.warn(`[MicGain] updated to ${g}×`);
+        dlog('APP', { micGain: g });
       }
     });
     unsubMicGain = unsub;
@@ -751,10 +787,13 @@ async function startListening() {
       isListening: false,
       recvStatus: { type: 'error', msg: `❌ Mic access: ${err.message}` },
     });
+  } finally {
+    recvStarting = false;
   }
 }
 
 function stopListening() {
+  recvStarting = false;
   isListening = false;
   if (micWatchdog) {
     clearTimeout(micWatchdog);
@@ -805,7 +844,7 @@ function dumpRxBuffer(durationSec = 2): { samples: Float32Array; rms: number; pe
 /** Transmit just the preamble + calibration, no data frames. */
 async function sendCalibrationOnly() {
   player.volume = getState().playbackVolume;
-  console.warn('━━━ [CAL-TEST] Starting calibration-only transmission ━━━');
+  dlog('CAL-TEST', { start: true });
   setState({ sendStatus: { type: 'info', msg: '🔊 Sending calibration only…' } });
   await refreshDeviceList();
   if (!isListening) await startListening();
@@ -813,10 +852,10 @@ async function sendCalibrationOnly() {
   // Wait a moment for noise profiling
   await new Promise((r) => setTimeout(r, 300));
   const noiseFloor = dumpRxBuffer(0.5);
-  console.warn(`[CAL-TEST] Pre-transmission noise floor: RMS=${noiseFloor.rms.toExponential(2)} peak=${noiseFloor.peak.toExponential(2)} (${noiseFloor.samples.length} samples)`);
+  dlog('CAL-TEST', { noiseRms: noiseFloor.rms, noisePeak: noiseFloor.peak, n: noiseFloor.samples.length });
 
   const pilotFreq = getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz;
-  const tx = new TxEngine({ pilotFreqHz: pilotFreq, symbolsPerSec: getState().symbolsPerSec, toneCount: getState().toneCount });
+  const tx = new TxEngine({ pilotFreqHz: pilotFreq, symbolsPerSec: getState().symbolsPerSec, toneCount: getState().toneCount, useOFDM: getState().useOFDM });
   const preamble = tx.transmitPreamble();
 
   let txPeak = 0;
@@ -827,9 +866,9 @@ async function sendCalibrationOnly() {
     if (v > txPeak) txPeak = v;
   }
   const txRms = Math.sqrt(txSumSq / preamble.length);
-  console.warn(`[CAL-TEST] TX preamble: ${preamble.length} samples, peak=${txPeak.toFixed(3)}, RMS=${txRms.toExponential(2)}, pilotFreq=${pilotFreq}Hz`);
+  dlog('CAL-TEST', { txSamples: preamble.length, txPeak, txRms, pilot: pilotFreq });
   // Show first 16 samples for waveform inspection
-  console.warn(`[CAL-TEST] TX first 16 samples: [${Array.from(preamble.slice(0, 16)).map((v) => v.toFixed(3)).join(', ')}]`);
+  dlog('CAL-TEST', { txHead: Array.from(preamble.slice(0, 8)).map((v) => v.toFixed(2)) });
 
   const silence = new Float32Array(Math.round(DEFAULT_CONFIG.sampleRate / getState().symbolsPerSec * 6));
   const full = new Float32Array(preamble.length + silence.length);
@@ -846,11 +885,11 @@ async function sendCalibrationOnly() {
 
   const rxDump = dumpRxBuffer(2);
   const newSampleCount = recvSamples.length - preCount;
-  console.warn(`[CAL-TEST] RX: ${newSampleCount} new samples received, peak=${rxDump.peak.toExponential(2)}, RMS=${rxDump.rms.toExponential(2)}`);
+  dlog('CAL-TEST', { rxSamples: newSampleCount, rxPeak: rxDump.peak, rxRms: rxDump.rms });
   if (rxDump.samples.length >= 16) {
-    console.warn(`[CAL-TEST] RX first 16 samples: [${Array.from(rxDump.samples.slice(0, 16)).map((v) => v.toFixed(3)).join(', ')}]`);
+    dlog('CAL-TEST', { rxHead: Array.from(rxDump.samples.slice(0, 8)).map((v) => v.toFixed(2)) });
   }
-  console.warn('━━━ [CAL-TEST] Done — check RxEngine logs above for warble/marker/calibration results ━━━');
+  dlog('CAL-TEST', { done: true });
 
   setState({ isPlaying: false, sendStatus: { type: 'success', msg: '✅ Calibration sent — check console' } });
 }
@@ -858,17 +897,17 @@ async function sendCalibrationOnly() {
 /** Transmit a single atomic frame (79 bytes) — tests sentinel detection. */
 async function sendSingleFrame() {
   player.volume = getState().playbackVolume;
-  console.warn('━━━ [FRAME-TEST] Starting single-frame transmission ━━━');
+  dlog('FRAME-TEST', { start: true });
   setState({ sendStatus: { type: 'info', msg: '🔊 Sending single frame…' } });
   await refreshDeviceList();
   if (!isListening) await startListening();
 
   await new Promise((r) => setTimeout(r, 300));
   const noiseFloor = dumpRxBuffer(0.5);
-  console.warn(`[FRAME-TEST] Pre-transmission noise floor: RMS=${noiseFloor.rms.toExponential(2)} peak=${noiseFloor.peak.toExponential(2)}`);
+  dlog('FRAME-TEST', { noiseRms: noiseFloor.rms, noisePeak: noiseFloor.peak });
 
   const pilotFreq = getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz;
-  const tx = new TxEngine({ pilotFreqHz: pilotFreq, symbolsPerSec: getState().symbolsPerSec, toneCount: getState().toneCount });
+  const tx = new TxEngine({ pilotFreqHz: pilotFreq, symbolsPerSec: getState().symbolsPerSec, toneCount: getState().toneCount, useOFDM: getState().useOFDM });
 
   // Build one header frame with known data
   const payload = new Uint8Array(40);
@@ -879,27 +918,51 @@ async function sendSingleFrame() {
   const header = { type: 0x01 as const, seqNum: 0, totalFrames: 1, crc: 0 };
   const rawFrame = encodeFrame(header, payload);
 
-  console.warn(`[FRAME-TEST] TX frame (${rawFrame.length}B): ${Array.from(rawFrame.slice(0, 24)).map((b) => b.toString(16).padStart(2, '0')).join(' ')}…`);
-  console.warn(`[FRAME-TEST] Expected sentinel: 0xE7 0x9F 0xE7 (bits: 11100111 10011111 11100111)`);
-  console.warn(`[FRAME-TEST] Expected first 4 frame symbols after sentinel: 0xFD 0x7F 0xD7 0xFF (upper nibbles of bytes 3-6)`);
+  dlog('FRAME-TEST', {
+    txBytes: rawFrame.length,
+    head: Array.from(rawFrame.slice(0, 12))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join(''),
+    sentinel: '0xE79FE7',
+  });
 
-  const frameAudio = tx.transmitFrame(header, payload);
+  // Generate frame audio: OFDM or BPSK depending on mode
+  const frameAudio = ((): Float32Array => {
+    if (getState().useOFDM && (tx as any).ofdmEngine) {
+      const rawFrame = encodeFrame(header, payload);
+      dlog('FRAME-TEST', { mode: 'ofdm' });
+      return (tx as any).ofdmEngine.modulateFrame(rawFrame);
+    }
+    return tx.transmitFrame(header, payload);
+  })();
+
   let txPeak = 0;
   for (let i = 0; i < frameAudio.length; i++) {
     const v = Math.abs(frameAudio[i]);
     if (v > txPeak) txPeak = v;
   }
-  console.warn(`[FRAME-TEST] TX frame audio: ${frameAudio.length} samples, peak=${txPeak.toFixed(3)}`);
+  dlog('FRAME-TEST', { txSamples: frameAudio.length, txPeak });
+
+  // Normalize frame audio if it's too quiet (HMR may cache old OFDM code)
+  if (txPeak > 0 && txPeak < 0.5) {
+    const boost = 0.9 / txPeak;
+    dlog('FRAME-TEST', { boost, wasPeak: txPeak });
+    for (let i = 0; i < frameAudio.length; i++) frameAudio[i] *= boost;
+    txPeak = 0.9;
+  }
 
   // Prepend preamble so RxEngine can sync
-  const preamble = tx.transmitPreamble();
+  // OFDM mode uses sync burst, BPSK mode uses warble preamble
+  const preamble = getState().useOFDM && (tx as any).ofdmEngine
+    ? (tx as any).ofdmEngine.generateSyncBurst(24)
+    : tx.transmitPreamble();
   const silence = new Float32Array(Math.round(DEFAULT_CONFIG.sampleRate / getState().symbolsPerSec * 6));
   const full = new Float32Array(preamble.length + frameAudio.length + silence.length);
   full.set(preamble, 0);
   full.set(frameAudio, preamble.length);
   full.set(silence, preamble.length + frameAudio.length);
 
-  console.warn(`[FRAME-TEST] Total TX: preamble=${preamble.length}samp + frame=${frameAudio.length}samp + silence=${silence.length}samp`);
+  dlog('FRAME-TEST', { preamble: preamble.length, frame: frameAudio.length, silence: silence.length });
 
   const preCount = recvSamples.length;
   setState({ isPlaying: true });
@@ -909,9 +972,13 @@ async function sendSingleFrame() {
   await new Promise((r) => setTimeout(r, 800));
   const rxDump = dumpRxBuffer(3);
   const newCount = recvSamples.length - preCount;
-  console.warn(`[FRAME-TEST] RX: ${newCount} new samples, peak=${rxDump.peak.toExponential(2)}, RMS=${rxDump.rms.toExponential(2)}`);
-  console.warn(`[FRAME-TEST] RX signal-to-noise: ${(20 * Math.log10(rxDump.rms / Math.max(noiseFloor.rms, 1e-12))).toFixed(1)}dB`);
-  console.warn('━━━ [FRAME-TEST] Done — check RxEngine logs for sentinel detection and frame decode ━━━');
+  dlog('FRAME-TEST', {
+    done: true,
+    rxSamples: newCount,
+    rxPeak: rxDump.peak,
+    rxRms: rxDump.rms,
+    snrDb: 20 * Math.log10(rxDump.rms / Math.max(noiseFloor.rms, 1e-12)),
+  });
 
   setState({ isPlaying: false, sendStatus: { type: 'success', msg: '✅ Single frame sent — check console' } });
 }
@@ -927,7 +994,7 @@ async function sendSentinelOnly() {
   await new Promise((r) => setTimeout(r, 300));
 
   const pilotFreq = getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz;
-  const tx = new TxEngine({ pilotFreqHz: pilotFreq, symbolsPerSec: getState().symbolsPerSec, toneCount: getState().toneCount });
+  const tx = new TxEngine({ pilotFreqHz: pilotFreq, symbolsPerSec: getState().symbolsPerSec, toneCount: getState().toneCount, useOFDM: getState().useOFDM });
 
   // Build the 24-bit sentinel 0xE79FE7 as 12 BPSK symbols (2 bits/symbol)
   // Actually use 4 tones = 4 bits/symbol = 6 symbols for 24 bits
@@ -1966,3 +2033,20 @@ window.addEventListener('eardrop-speed-sweep', (async () => {
 // ─── Init ─────────────────────────────────────────────
 
 console.log('🦻 Eardrop controller ready');
+
+// ─── Debug UI panel ───────────────────────────────────
+(window as any).debugUI = async (anchor?: string) => {
+  const { renderDebugPanel } = await import('../lib/debug');
+  const el = anchor ? document.querySelector(anchor) : document.getElementById('debug-panel');
+  if (el) {
+    renderDebugPanel(el as HTMLElement);
+  } else {
+    // Create a floating panel
+    const panel = document.createElement('div');
+    panel.id = 'dbg-panel';
+    panel.style.cssText = 'position:fixed;top:60px;right:12px;z-index:9999;';
+    document.body.appendChild(panel);
+    renderDebugPanel(panel);
+  }
+  console.log('[DEBUG] Debug UI panel rendered. Use window.debug.status() to see current toggles.');
+};

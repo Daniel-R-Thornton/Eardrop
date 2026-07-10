@@ -4,8 +4,8 @@
  */
 
 import React, { useEffect, useRef } from 'react';
+import { TONE_COLORS } from '../../modem/types';
 
-const TONE_COLORS = ['#4a9eff', '#ff6b4a', '#5eead4', '#f472b6'];
 const TONE_FREQS = [475, 525, 625, 775];
 
 interface DebugEntry {

@@ -69,6 +69,8 @@ export interface AppState {
   toneCount: number; // 2, 4, or 8
   /** Hail Mary diversity mode: all tones carry same bit for consensus */
   diversityMode: boolean;
+  /** Enable experimental OFDM/QPSK (cyclic‑prefix) path */
+  useOFDM: boolean;
   /** Symbols per second (baud rate) */
   symbolsPerSec: number;
   /** FFT spectrum data for waterfall display */
@@ -155,6 +157,7 @@ const defaultState: AppState = {
   sweepResults: null,
   toneCount: DEFAULT_CONFIG.toneCount,
   diversityMode: false,
+  useOFDM: false,
   symbolsPerSec: 50,
   fftSpectrum: null,
   rawPeak: 0,
@@ -206,6 +209,7 @@ function persistState(s: AppState): void {
       ampThresholdRatio: s.ampThresholdRatio,
       syncStrongMultiplier: s.syncStrongMultiplier,
       diversityMode: s.diversityMode,
+      useOFDM: s.useOFDM,
       symbolsPerSec: s.symbolsPerSec,
       micGain: s.micGain,
       playbackVolume: s.playbackVolume,

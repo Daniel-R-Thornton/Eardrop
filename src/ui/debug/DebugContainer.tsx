@@ -12,6 +12,8 @@ import { useDecoderState } from './hooks/useDecoderState';
 import { BitStreamPanel } from './panels/BitStreamPanel';
 import { SentinelScanPanel } from './panels/SentinelScanPanel';
 import { MicMonitorPanel } from './panels/MicMonitorPanel';
+import { TONE_COLORS } from '../../modem/types';
+import { dlogDump } from '../../lib/debug/dlog';
 
 interface WindowState {
   id: string;
@@ -98,12 +100,12 @@ export const DebugContainer: React.FC = () => {
           <div
             key={tone}
             style={{
-              background: '#0a0a14',
+              background: 'var(--canvas-bg, #0a0a14)',
               borderRadius: 4,
               padding: 2,
               textAlign: 'center',
               fontSize: 10,
-              color: ['#4a9eff', '#ff6b4a', '#5eead4', '#f472b6'][tone],
+              color: TONE_COLORS[tone],
             }}
           >
             {500 + tone * 200}Hz
@@ -145,8 +147,31 @@ export const DebugContainer: React.FC = () => {
   // ─── Sentinel Scan Panel ─────────────────────────
   const sentinelContent = <SentinelScanPanel />;
 
+  const [copied, setCopied] = useState(false);
+  const copyLog = useCallback(() => {
+    navigator.clipboard.writeText(dlogDump(500)).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    });
+  }, []);
+
   return (
     <>
+      {/* Debug toolbar — one-click session log export */}
+      <div
+        style={{
+          position: 'fixed',
+          top: 8,
+          right: 8,
+          zIndex: 5000,
+          display: 'flex',
+          gap: 6,
+        }}
+      >
+        <button className="ed-btn" onClick={copyLog} title="Copy the whole dlog session ring">
+          {copied ? '✓ copied' : '⧉ copy log'}
+        </button>
+      </div>
       {windows
         .filter((w) => w.visible)
         .map((w) => {

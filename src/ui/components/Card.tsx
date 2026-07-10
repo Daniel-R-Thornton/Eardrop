@@ -7,29 +7,12 @@ interface CardProps {
   style?: React.CSSProperties;
 }
 
-export function Card({ title, accent = '#6c6cff', children, style }: CardProps) {
+export function Card({ title, accent = 'var(--signal)', children, style }: CardProps) {
   return (
-    <div
-      style={{
-        background: 'var(--surface)',
-        borderRadius: 12,
-        border: '1px solid var(--border)',
-        overflow: 'hidden',
-        ...style,
-      }}
-    >
+    <div className="ed-card" style={style}>
       {title && (
-        <div
-          style={{
-            padding: '10px 16px',
-            fontSize: 13,
-            fontWeight: 600,
-            color: accent,
-            borderBottom: '1px solid var(--border)',
-            textTransform: 'uppercase',
-            letterSpacing: '0.05em',
-          }}
-        >
+        <div className="ed-card-title" style={{ '--accent': accent } as React.CSSProperties}>
+          <span className="tick" />
           {title}
         </div>
       )}

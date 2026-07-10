@@ -1,40 +1,70 @@
-/* Eardrop — Clean design system */
+/* ═══════════════════════════════════════════════════════════════════
+   Eardrop — bench-instrument design system
+   Dark: ink chassis + phosphor-green signal. Light: paper schematic.
+   Mono-forward type: this is a measurement tool, numbers are the UI.
+   ═══════════════════════════════════════════════════════════════════ */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-/* ── Dark theme (default) ── */
-:root, [data-theme="dark"] {
-  --bg: #05050f;
-  --surface: #0d0d1a;
-  --surface2: rgba(255,255,255,0.02);
-  --border: rgba(255,255,255,0.06);
-  --border2: rgba(255,255,255,0.1);
-  --text: #e5e7eb;
-  --text-muted: #6b7280;
-  --text-dim: #4b5563;
-  --input-bg: rgba(255,255,255,0.04);
-  --canvas-bg: rgba(0,0,0,0.4);
+:root {
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+  --font-body: var(--font-mono);
+
+  /* Signal accents (theme-stable) */
+  --signal: #2fe08d;
+  --signal-dim: rgba(47, 224, 141, 0.14);
+  --amber: #ffb454;
+  --amber-dim: rgba(255, 180, 84, 0.14);
+  --danger: #ff5c5c;
+  --danger-dim: rgba(255, 92, 92, 0.14);
+  --info: #4a9eff;
+  --info-dim: rgba(74, 158, 255, 0.14);
 }
 
-/* ── Light theme ── */
+/* ── Dark: instrument chassis ── */
+:root, [data-theme="dark"] {
+  --bg: #07090d;
+  --bg-grid: rgba(47, 224, 141, 0.03);
+  --surface: #0c1016;
+  --surface2: #10151d;
+  --border: #1b232e;
+  --border2: #2a3542;
+  --text: #d7e0d9;
+  --text-muted: #71807a;
+  --text-dim: #46524d;
+  --input-bg: #10151d;
+  --canvas-bg: #05070a;
+  --pill-on: var(--signal);
+}
+
+/* ── Light: paper schematic ── */
 [data-theme="light"] {
-  --bg: #f8f9fa;
-  --surface: #ffffff;
-  --surface2: rgba(0,0,0,0.02);
-  --border: rgba(0,0,0,0.08);
-  --border2: rgba(0,0,0,0.12);
-  --text: #1a1a2e;
-  --text-muted: #6b7280;
-  --text-dim: #9ca3af;
-  --input-bg: rgba(0,0,0,0.04);
-  --canvas-bg: rgba(0,0,0,0.06);
+  --bg: #f2efe7;
+  --bg-grid: rgba(28, 60, 44, 0.04);
+  --surface: #faf8f2;
+  --surface2: #eeeadf;
+  --border: #ddd6c6;
+  --border2: #c6bda7;
+  --text: #1d2a23;
+  --text-muted: #66705f;
+  --text-dim: #9aa192;
+  --input-bg: #eeeadf;
+  --canvas-bg: #e7e2d4;
+  --signal: #0f9d61;
+  --signal-dim: rgba(15, 157, 97, 0.12);
+  --pill-on: #0f9d61;
 }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, system-ui, sans-serif;
-  background: var(--bg);
+  font-family: var(--font-body);
+  font-size: 13px;
+  background:
+    linear-gradient(var(--bg-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px),
+    var(--bg);
+  background-size: 28px 28px, 28px 28px, auto;
   color: var(--text);
   min-height: 100vh;
-  line-height: 1.5;
+  line-height: 1.55;
   -webkit-font-smoothing: antialiased;
   transition: background 0.2s, color 0.2s;
 }
@@ -42,23 +72,169 @@ body {
 /* Scrollbar */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: rgba(128,128,128,0.2); border-radius: 3px; }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
 
 /* Range inputs */
-input[type="range"] { -webkit-appearance: none; height: 4px; border-radius: 2px; outline: none; background: var(--border); }
-input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: currentColor; cursor: pointer; }
+input[type="range"] { -webkit-appearance: none; height: 3px; border-radius: 2px; outline: none; background: var(--border2); }
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 13px; height: 13px; border-radius: 3px;
+  background: var(--signal); border: 1px solid var(--border2); cursor: pointer;
+}
 
-/* Button transitions */
-button { transition: all 0.15s ease; }
+/* Buttons */
+button { transition: all 0.15s ease; font-family: var(--font-mono); }
 button:hover:not(:disabled) { opacity: 0.85; }
-button:active:not(:disabled) { transform: scale(0.97); }
+button:active:not(:disabled) { transform: translateY(1px); }
+
+/* ── Header ── */
+.ed-wordmark {
+  font-family: var(--font-mono);
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--text);
+  margin: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.ed-wordmark .glyph { color: var(--signal); font-weight: 400; }
+.ed-tagline {
+  color: var(--text-muted);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  margin-top: 2px;
+}
+
+/* Status pill — live modem state */
+.ed-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  border: 1px solid var(--border2);
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.ed-status-pill .dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--text-dim);
+}
+.ed-status-pill[data-live="true"] { color: var(--signal); border-color: var(--signal); }
+.ed-status-pill[data-live="true"] .dot {
+  background: var(--signal);
+  animation: ed-pulse 1.4s ease-in-out infinite;
+}
+@keyframes ed-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--signal-dim); opacity: 1; }
+  50% { box-shadow: 0 0 0 5px var(--signal-dim); opacity: 0.6; }
+}
+
+/* ── Pipeline strip — how it works, live ── */
+.ed-pipeline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 9px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  margin-bottom: 12px;
+  font-size: 11px;
+}
+.ed-pipeline .lane {
+  color: var(--text-dim);
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  margin-right: 2px;
+}
+.ed-pipeline .stage {
+  padding: 3px 9px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.ed-pipeline .stage.active {
+  color: var(--signal);
+  border-color: var(--signal);
+  background: var(--signal-dim);
+  font-weight: 700;
+}
+.ed-pipeline .stage.done { color: var(--text); }
+.ed-pipeline .arrow { color: var(--text-dim); }
+.ed-pipeline .sep { flex-basis: 100%; height: 0; }
+@media (min-width: 900px) {
+  .ed-pipeline .sep { flex-basis: auto; width: 1px; height: 18px; background: var(--border2); margin: 0 10px; }
+}
+
+/* ── Cards ── */
+.ed-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.ed-card-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 14px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+}
+.ed-card-title .tick {
+  width: 8px; height: 8px; border-radius: 2px;
+  background: var(--accent, var(--signal));
+  flex-shrink: 0;
+}
+
+/* ── Status badge ── */
+.ed-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid transparent;
+}
+.ed-badge .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+.ed-badge[data-kind="info"]    { background: var(--info-dim);   color: var(--info); }
+.ed-badge[data-kind="success"] { background: var(--signal-dim); color: var(--signal); }
+.ed-badge[data-kind="error"]   { background: var(--danger-dim); color: var(--danger); }
+
+/* ── Small utility buttons ── */
+.ed-btn {
+  padding: 5px 12px;
+  border-radius: 7px;
+  border: 1px solid var(--border2);
+  background: var(--surface2);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+.ed-btn:hover { border-color: var(--signal); color: var(--signal); opacity: 1; }
+.ed-btn.danger:hover { border-color: var(--danger); color: var(--danger); }
 
 /* Theme toggle */
 .theme-toggle {
-  width: 36px; height: 36px; border-radius: 50%;
+  width: 34px; height: 34px; border-radius: 8px;
   border: 1px solid var(--border2); background: var(--surface);
-  color: var(--text-muted); font-size: 16px; cursor: pointer;
+  color: var(--text-muted); font-size: 15px; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
   transition: all 0.2s; flex-shrink: 0;
 }
-.theme-toggle:hover { border-color: var(--text-muted); color: var(--text); }
+.theme-toggle:hover { border-color: var(--signal); color: var(--signal); }
