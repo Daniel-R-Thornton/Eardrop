@@ -253,15 +253,19 @@ export class RxEngine {
           // fires at an arbitrary offset; the CP only absorbs offsets within
           // its 16 samples, so without alignment ~94% of receptions straddle
           // symbol boundaries and demodulate garbage.
-          const boundary = this.findOfdmBlockStart(this.ofdmAlignBuf);
+          const { offset: boundary, score } = this.findOfdmBlockStart(this.ofdmAlignBuf);
           if (boundary >= 0) {
             const skip =
               (((boundary - this.ofdmAlignBuf.length) % this.sps) + this.sps) %
               this.sps;
             this.ofdmSkip = skip;
-            dlog('OFDM-SYNC', { boundary, skip, aligned: true });
+            dlog(
+              'OFDM-SYNC',
+              { boundary, skip, score },
+              { level: score < 0.5 ? 'warn' : 'info' },
+            );
           } else {
-            dlog('OFDM-SYNC', { aligned: false }, { level: 'warn' });
+            dlog('OFDM-SYNC', { aligned: false, alignBuf: this.ofdmAlignBuf.length }, { level: 'warn' });
           }
           this.buf = [];
           this.ofdmAlignBuf = [];
@@ -664,12 +668,12 @@ export class RxEngine {
    * block start. Returns the offset in `recent` (0..sps-1), or -1 if no
    * confident peak.
    */
-  private findOfdmBlockStart(recent: number[]): number {
+  private findOfdmBlockStart(recent: number[]): { offset: number; score: number } {
     const fft = this.ofdmFftSize;
     const cp = this.sps - fft;
-    if (recent.length < this.sps + cp) return -1;
+    if (recent.length < this.sps + cp) return { offset: -1, score: 0 };
     let bestOffset = -1;
-    let bestScore = 0;
+    let bestScore = -Infinity;
     const maxOffset = Math.min(this.sps, recent.length - fft - cp);
     for (let offset = 0; offset < maxOffset; offset++) {
       let corr = 0;
@@ -686,7 +690,9 @@ export class RxEngine {
         bestOffset = offset;
       }
     }
-    return bestScore > 0.5 ? bestOffset : -1;
+    // Always return the best offset — even a low-confidence peak beats an
+    // arbitrary grid (which is wrong 94% of the time). Caller logs the score.
+    return { offset: bestOffset, score: bestScore };
   }
 
   getState(): RxState {
