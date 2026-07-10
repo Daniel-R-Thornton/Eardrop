@@ -13,7 +13,11 @@ export type SampleCallback = (sample: number) => void;
  *  Quality comparable to browser's internal resampler. */
 const WORKLET_SOURCE = `
 const RATIO = 15;
-const TAPS = 31;
+// 127 taps: a 31-tap sinc at 48 kHz has a ~1.4 kHz transition band, so the
+// passband ended near ~900 Hz and tones above bin 67 (837 Hz) arrived 20-100x
+// attenuated — that's what killed 8-tone OFDM acoustically. 127 taps pushes
+// the passband edge to ~1450 Hz (modem Nyquist is 1600 Hz).
+const TAPS = 127;
 const HALF_TAPS = (TAPS - 1) / 2;
 
 // Pre-compute Hann-windowed sinc coefficients for each polyphase offset

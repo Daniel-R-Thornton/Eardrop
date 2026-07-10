@@ -21,6 +21,13 @@ import { TONE_COLORS, TONE_FREQUENCIES, formatSize } from './lib';
 
 const GAP = 12;
 
+const TABS: Array<[string, string]> = [
+  ['transfer', 'transfer'],
+  ['config', 'config'],
+  ['scope', 'scope'],
+  ['logs', 'logs'],
+];
+
 // ═══════════════════════════════════════════════════════
 // MAIN APP
 // ═══════════════════════════════════════════════════════
@@ -35,6 +42,13 @@ export function MainApp() {
 
   const dispatch = (type: string, detail?: any) =>
     window.dispatchEvent(new CustomEvent(type, { detail }));
+
+  const [tab, setTab] = useState<string>(
+    () => localStorage.getItem('eardrop_tab') || 'transfer',
+  );
+  useEffect(() => {
+    localStorage.setItem('eardrop_tab', tab);
+  }, [tab]);
 
   const handleFile = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
@@ -125,11 +139,22 @@ export function MainApp() {
       {/* ═══ PIPELINE ═══ */}
       <PipelineStrip />
 
-      {/* ═══ TWO-COLUMN LAYOUT ═══ */}
-      <div
-        style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: GAP, alignItems: 'start' }}
-      >
-        {/* ── LEFT: Send, Receive, Config ── */}
+
+      {/* ═══ TABS ═══ */}
+      <div className="ed-tabs">
+        {TABS.map(([key, label]) => (
+          <button
+            key={key}
+            className={`ed-tab${tab === key ? ' active' : ''}`}
+            onClick={() => setTab(key)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* ═══ TRANSFER ═══ */}
+      <div style={{ display: tab === 'transfer' ? 'grid' : 'none', gridTemplateColumns: '1fr 1fr', gap: GAP, alignItems: 'start' }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: GAP }}>
           {/* Send */}
           <Card title="Send" accent="#818cf8">
@@ -198,6 +223,8 @@ export function MainApp() {
             {s.sendStatus && <StatusBadge {...s.sendStatus} />}
           </Card>
 
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: GAP }}>
           {/* Receive */}
           <Card title="Receive" accent="#34d399">
             <p style={{ color: '#6b7280', fontSize: 13, marginBottom: 10 }}>
@@ -270,6 +297,12 @@ export function MainApp() {
             )}
           </Card>
 
+        </div>
+      </div>
+
+      {/* ═══ CONFIG ═══ */}
+      <div style={{ display: tab === 'config' ? 'grid' : 'none', gridTemplateColumns: '1fr 1fr', gap: GAP, alignItems: 'start' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: GAP }}>
           {/* Config */}
           <Card title="Config" accent="#f59e0b">
             {/* Tone Count */}
@@ -500,9 +533,72 @@ export function MainApp() {
               </button>
             </div>
           </Card>
-        </div>
 
-        {/* ── RIGHT: Debug Dashboard ── */}
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: GAP }}>
+          {/* Actions */}
+          <Card title="Actions" accent="#f59e0b">
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              <button onClick={() => dispatch('eardrop-self-test')} style={btnSmall}>
+                Self-Test
+              </button>
+              <button onClick={() => dispatch('eardrop-send-test')} style={btnSmall}>
+                Send Test
+              </button>
+              <button onClick={() => dispatch('eardrop-calibration-test')} style={{ ...btnSmall, background: 'rgba(245,158,11,0.15)', color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)' }}>
+                Cal Only
+              </button>
+              <button onClick={() => dispatch('eardrop-single-frame')} style={{ ...btnSmall, background: 'rgba(245,158,11,0.15)', color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)' }}>
+                Single Frame
+              </button>
+              <button onClick={() => dispatch('eardrop-sentinel-only')} style={{ ...btnSmall, background: 'rgba(239,68,68,0.15)', color: '#ef4444', borderColor: 'rgba(239,68,68,0.3)' }}>
+                Sentinel Only
+              </button>
+              <button onClick={() => dispatch('eardrop-audio-validation')} style={{ ...btnSmall, background: 'rgba(34,197,94,0.15)', color: '#22c55e', borderColor: 'rgba(34,197,94,0.3)' }}>
+                Audio Check
+              </button>
+              <button onClick={() => dispatch('eardrop-full-sweep')} style={{ ...btnSmall, background: 'rgba(59,130,246,0.15)', color: '#3b82f6', borderColor: 'rgba(59,130,246,0.3)' }}>
+                Full Sweep
+              </button>
+              <button onClick={() => dispatch('eardrop-multi-tone')} style={{ ...btnSmall, background: 'rgba(168,85,247,0.15)', color: '#a855f7', borderColor: 'rgba(168,85,247,0.3)' }}>
+                Multi-Tone
+              </button>
+              <button onClick={() => dispatch('eardrop-interference')} style={{ ...btnSmall, background: 'rgba(236,72,153,0.15)', color: '#ec4899', borderColor: 'rgba(236,72,153,0.3)' }}>
+                Interference
+              </button>
+              <button onClick={() => dispatch('eardrop-fine-sweep')} style={{ ...btnSmall, background: 'rgba(20,184,166,0.15)', color: '#14b8a6', borderColor: 'rgba(20,184,166,0.3)' }}>
+                Fine Sweep
+              </button>
+              <button onClick={() => dispatch('eardrop-speed-sweep')} style={{ ...btnSmall, background: 'rgba(250,204,21,0.15)', color: '#facc15', borderColor: 'rgba(250,204,21,0.3)' }}>
+                Speed Sweep
+              </button>
+              <button onClick={() => dispatch('eardrop-combo-sweep')} style={{ ...btnSmall, background: 'rgba(249,115,22,0.15)', color: '#f97316', borderColor: 'rgba(249,115,22,0.3)' }}>
+                Combo Sweep
+              </button>
+              <button onClick={() => dispatch('eardrop-acoustic-speed')} style={{ ...btnSmall, background: 'rgba(220,38,38,0.15)', color: '#dc2626', borderColor: 'rgba(220,38,38,0.3)' }}>
+                Acoustic Speed
+              </button>
+              <button onClick={() => dispatch('eardrop-download-wav')} style={btnSmall}>
+                Download WAV
+              </button>
+            </div>
+            <div
+              id="selfTestResult"
+              style={{
+                fontSize: 11,
+                color: '#6b7280',
+                fontFamily: 'SF Mono, ui-monospace, monospace',
+                marginTop: 6,
+                minHeight: 16,
+              }}
+            />
+          </Card>
+
+        </div>
+      </div>
+
+      {/* ═══ SCOPE ═══ */}
+      <div style={{ display: tab === 'scope' ? 'grid' : 'none', gridTemplateColumns: '1fr 1fr', gap: GAP, alignItems: 'start' }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: GAP }}>
           {/* Decoder State */}
           <Card title="Decoder State" accent="#818cf8">
@@ -682,33 +778,6 @@ export function MainApp() {
             )}
           </Card>
 
-          {/* Constellation */}
-          <Card title="Constellation" accent="#c084fc">
-            <div style={{ display: 'flex', justifyContent: 'space-around' }}>
-              {[0, 1, 2, 3].map((t) => (
-                <ConstellationPlot
-                  key={t}
-                  iVal={debug?.relI[t] ?? 0}
-                  qVal={debug?.relQ[t] ?? 0}
-                  color={TONE_COLORS[t]}
-                  label={`T${t}`}
-                />
-              ))}
-            </div>
-          </Card>
-
-          {/* Modem Debug Scope */}
-          <Card title="Modem Scope — Phase + Energy" accent="#f472b6">
-            <ModemScope
-              trace={s.debugTrace}
-              energies={(s.debug?.energies || [0, 0, 0, 0]) as [number, number, number, number]}
-              relI={(s.debug?.relI || [0, 0, 0, 0]) as [number, number, number, number]}
-              relQ={(s.debug?.relQ || [0, 0, 0, 0]) as [number, number, number, number]}
-              inFrame={s.debug?.inFrame || false}
-              pilotFreq={s.debug?.pilotFreq || 0}
-              pilotAmp={s.debug?.pilotAmplitude || 0}
-            />
-          </Card>
 
           {/* Diagnostics */}
           {s.diagMessages.length > 0 && (
@@ -756,73 +825,38 @@ export function MainApp() {
             </Card>
           )}
 
-          {/* Actions */}
-          <Card title="Actions" accent="#f59e0b">
-            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-              <button onClick={() => dispatch('eardrop-self-test')} style={btnSmall}>
-                Self-Test
-              </button>
-              <button onClick={() => dispatch('eardrop-send-test')} style={btnSmall}>
-                Send Test
-              </button>
-              <button onClick={() => dispatch('eardrop-calibration-test')} style={{ ...btnSmall, background: 'rgba(245,158,11,0.15)', color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)' }}>
-                Cal Only
-              </button>
-              <button onClick={() => dispatch('eardrop-single-frame')} style={{ ...btnSmall, background: 'rgba(245,158,11,0.15)', color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)' }}>
-                Single Frame
-              </button>
-              <button onClick={() => dispatch('eardrop-sentinel-only')} style={{ ...btnSmall, background: 'rgba(239,68,68,0.15)', color: '#ef4444', borderColor: 'rgba(239,68,68,0.3)' }}>
-                Sentinel Only
-              </button>
-              <button onClick={() => dispatch('eardrop-audio-validation')} style={{ ...btnSmall, background: 'rgba(34,197,94,0.15)', color: '#22c55e', borderColor: 'rgba(34,197,94,0.3)' }}>
-                Audio Check
-              </button>
-              <button onClick={() => dispatch('eardrop-full-sweep')} style={{ ...btnSmall, background: 'rgba(59,130,246,0.15)', color: '#3b82f6', borderColor: 'rgba(59,130,246,0.3)' }}>
-                Full Sweep
-              </button>
-              <button onClick={() => dispatch('eardrop-multi-tone')} style={{ ...btnSmall, background: 'rgba(168,85,247,0.15)', color: '#a855f7', borderColor: 'rgba(168,85,247,0.3)' }}>
-                Multi-Tone
-              </button>
-              <button onClick={() => dispatch('eardrop-interference')} style={{ ...btnSmall, background: 'rgba(236,72,153,0.15)', color: '#ec4899', borderColor: 'rgba(236,72,153,0.3)' }}>
-                Interference
-              </button>
-              <button onClick={() => dispatch('eardrop-fine-sweep')} style={{ ...btnSmall, background: 'rgba(20,184,166,0.15)', color: '#14b8a6', borderColor: 'rgba(20,184,166,0.3)' }}>
-                Fine Sweep
-              </button>
-              <button onClick={() => dispatch('eardrop-speed-sweep')} style={{ ...btnSmall, background: 'rgba(250,204,21,0.15)', color: '#facc15', borderColor: 'rgba(250,204,21,0.3)' }}>
-                Speed Sweep
-              </button>
-              <button onClick={() => dispatch('eardrop-combo-sweep')} style={{ ...btnSmall, background: 'rgba(249,115,22,0.15)', color: '#f97316', borderColor: 'rgba(249,115,22,0.3)' }}>
-                Combo Sweep
-              </button>
-              <button onClick={() => dispatch('eardrop-acoustic-speed')} style={{ ...btnSmall, background: 'rgba(220,38,38,0.15)', color: '#dc2626', borderColor: 'rgba(220,38,38,0.3)' }}>
-                Acoustic Speed
-              </button>
-              <button onClick={() => dispatch('eardrop-download-wav')} style={btnSmall}>
-                Download WAV
-              </button>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: GAP }}>
+          {/* Constellation */}
+          <Card title="Constellation" accent="#c084fc">
+            <div style={{ display: 'flex', justifyContent: 'space-around' }}>
+              {[0, 1, 2, 3].map((t) => (
+                <ConstellationPlot
+                  key={t}
+                  iVal={debug?.relI[t] ?? 0}
+                  qVal={debug?.relQ[t] ?? 0}
+                  color={TONE_COLORS[t]}
+                  label={`T${t}`}
+                />
+              ))}
             </div>
-            <div
-              id="selfTestResult"
-              style={{
-                fontSize: 11,
-                color: '#6b7280',
-                fontFamily: 'SF Mono, ui-monospace, monospace',
-                marginTop: 6,
-                minHeight: 16,
-              }}
+          </Card>
+
+
+          {/* Modem Debug Scope */}
+          <Card title="Modem Scope — Phase + Energy" accent="#f472b6">
+            <ModemScope
+              trace={s.debugTrace}
+              energies={(s.debug?.energies || [0, 0, 0, 0]) as [number, number, number, number]}
+              relI={(s.debug?.relI || [0, 0, 0, 0]) as [number, number, number, number]}
+              relQ={(s.debug?.relQ || [0, 0, 0, 0]) as [number, number, number, number]}
+              inFrame={s.debug?.inFrame || false}
+              pilotFreq={s.debug?.pilotFreq || 0}
+              pilotAmp={s.debug?.pilotAmplitude || 0}
             />
           </Card>
 
-          {/* Debug Toggles */}
-          <Card title="Debug Logs" accent="#6b7280" style={{ fontSize: 12 }}>
-            <DebugToggles />
-          </Card>
-        </div>
-      </div>
 
-      {/* ═══ FULL-WIDTH: Spectrum + Waveform ═══ */}
-      <div style={{ marginTop: 16, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: GAP }}>
         <Card title="Spectrum — FFT + Waterfall" accent="#818cf8">
           <SpectrumAnalyzer
             spectrum={s.fftSpectrum}
@@ -831,9 +865,22 @@ export function MainApp() {
             sampleRate={3200}
           />
         </Card>
+
+
         <Card title="Waveform — RX (blue) / TX (orange)" accent="#6c6cff">
           <WaveformScope rxSamples={s.debugSamples} txSamples={s.txSamples} sampleRate={3200} />
         </Card>
+
+        </div>
+      </div>
+
+      {/* ═══ LOGS ═══ */}
+      <div style={{ display: tab === 'logs' ? 'block' : 'none' }}>
+          {/* Debug Toggles */}
+          <Card title="Debug Logs" accent="#6b7280" style={{ fontSize: 12 }}>
+            <DebugToggles />
+          </Card>
+
       </div>
     </div>
   );
