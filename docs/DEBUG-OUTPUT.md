@@ -25,16 +25,17 @@ High-frequency events are rate-limited at the call site (`every: N`).
 | Tag | Emitted by | Fields | Healthy values |
 |-----|-----------|--------|----------------|
 | `RX` | rxEngine | `pllPilot`, `scanFrame` | scanFrame=76 per received frame |
-| `OFDM-SYNC` | rxEngine WAITING | `e`, `thr`, `sync` (heartbeat, every 25 windows); `detected=true e=…`; `boundary`, `skip`, `aligned` | e > thr during burst; `aligned=true` — `aligned=false` (warn) means CP boundary search failed and decode will likely produce garbage |
+| `OFDM-SYNC` | rxEngine WAITING | `e`, `thr`, `sync` (heartbeat, every 25 windows); `detected=true e=…`; `boundary`, `skip`, `aligned` | e > thr during burst; `aligned=true` — `aligned=false` (warn) means CP boundary search failed and decode will likely produce garbage. `e` values are at hardware rate (typically 0.1–2.0 range, not the old 0.06 floor) |
 | `OFDM-TRAIN` | rxEngine + demodulator | `symbols`, `pilotAmp`, `h` (per-tone `amp@phase°`) | 12 symbols; tone amps within ~10× of each other |
 | `OFDM-DEMOD` | demodulator | `firstSym` — per-tone `t0:phase°/sym` for the first data symbol | equalized phases within ±20° of 0/90/180/270 |
 | `RX-SCAN` | SentinelScanner | `frame`,`expect` on hit; heartbeat `bits`, `sentinel=false`, `sr` every 8000 bits | sentinel should hit within ~1000 bits of data start; long `sentinel=false` streams = demod producing wrong bits |
 | `RX-FRAME` | rxEngine | `valid`, `type`, `seq`, `len`, `crcRx`, `crcCalc`; `dupHeader/dupPayload/dupTail` (diversity mode); `tail`, `assembled`, `size` | `valid=true`, crcRx == crcCalc |
-| `TX-OFDM` | txEngine/ofdmEngine | `enabled`, `tones`, `pilot`; `pilotBin`, `bins`; `syncBurst=24`; `frame`, `seq` | TX `bins` must equal RX `OFDM-SYNC` bins |
+| `TX-OFDM` | txEngine/ofdmEngine | `enabled`, `tones`, `pilot` (Hz); `syncBurst=24`; `frame`, `seq` | TX `tones` must equal RX `OFDM-SYNC` tones |
 | `TX-FRAME` | txEngine | `headerCrc` | — |
 | `WARBLE` / `PREAMBLE` / `CAL` / `GUARD` | rxEngine BPSK path | reject/corr, timeout/newThr, refs, absBits | `CAL refs`: 0° and 180° clusters clearly separated per tone |
 | `SCAN` | pilot scanner | `peak`, `ratio`, `top5` (every 200); `locked`, `amp`; `noiseFloorSamples` | `ratio` > 5 at lock |
-| `REC` | recorder | `start`, `ctxRate`, `ctxState`, `gain`, `device`; `running`, `worklet`, `outRate` | ctxRate=48000, outRate=3200 |
+| `RX-OFDM` | demodulator + rxEngine | `pilot`, `sps`, `tones` | sps = symSamples derived from sampleRate (e.g. 2160 at 48k) |
+| `REC` | recorder | `start`, `ctxRate`, `ctxState`, `gain`, `device`; `running`, `worklet`, `outRate` | ctxRate=48000, outRate=3200; `worklet: native` when ratio=1 (pass-through for OFDM native rate) |
 | `PLAY` | player | `rate`, `ms`, `n`, `peak`, `vol`, `device`; `autoNorm`; `clipped` (warn) | `clipped` should never appear |
 
 ## Self-test / block-protocol tags

@@ -224,6 +224,58 @@ This provides 3× redundancy at the cost of 3× transmission time. No voting/con
 
 ---
 
+## OFDM/QPSK Mode (Native-Rate)
+
+Time-domain OFDM with QPSK per subcarrier. Symbols are defined in milliseconds rather than samples, so the protocol adapts automatically to any hardware sample rate (48000 Hz, 44100 Hz, etc.).
+
+### Architecture
+
+- **Symbol length**: 40 ms + 5 ms cyclic prefix = 45 ms total
+- **Modulation**: Direct cosine synthesis at exact tone frequencies (no IFFT)
+- **Demodulation**: Goertzel / toneIQ bank at exact tone frequencies (no FFT)
+- **Tone grid**: Multiples of 25 Hz (1000 / 40 ms), guaranteeing orthogonality at any sample rate
+- **Pilot**: Continuous pilot at a fixed absolute frequency, used for per-tone channel equalization
+
+### Protocol Constants
+
+| Parameter | Value |
+|-----------|-------|
+| `OFDM_SYMBOL_MS` | 40 ms |
+| `OFDM_CP_MS` | 5 ms |
+| `ofdmPilotFreqHz` | 1900 Hz |
+| `ofdmPilotAmplitude` | 2.0 |
+| `ofdmToneSpacingHz` | 50 Hz |
+| `ofdmToneStartHz` | 2000 Hz |
+| `ofdmToneCount` default | 16 |
+| Sync burst | 24 symbols (~1.08 s) |
+| Raw bitrate (16 tones) | 711 bps |
+| Raw bitrate (32 tones) | 1422 bps |
+
+### Tone Grid
+
+Tones are at `2000 + n * 50` Hz for n = 0 … toneCount-1. With 16 tones: 2000, 2050, 2100, …, 2750 Hz. The pilot is at 1900 Hz, below the data band. All frequencies — pilot and tones — are exact multiples of 25 Hz for orthogonality with the 40 ms symbol.
+
+### Sync Burst
+
+24 identical symbols, all tones at QPSK 0° (I=+1, Q=0). The receiver detects the burst via total tone energy threshold and uses it to train per-tone channel equalization coefficients (amplitude + phase).
+
+### Frame Encoding
+
+Each OFDM symbol carries 2 bits per tone (QPSK) → `toneCount × 2` frame bits per symbol. Bit packing uses the same nibble-based scheme as BPSK (every 2 frame bits map to 1 byte), preserving sentinel scanner compatibility.
+
+### Demodulation & Equalization
+
+1. **Sync detection**: Total tone energy exceeds threshold → sync burst found
+2. **Training**: During the 24-symbol sync burst, measure per-tone complex response (I/Q centroid at the expected QPSK 0° constellation point)
+3. **Per-tone equalization**: For each data symbol, rotate the received I/Q by the negative of the trained phase and scale by inverse amplitude — this corrects frequency-selective phase rotation independently per tone
+4. **Hard decision**: Nearest QPSK constellation point after equalization
+
+### Sample Rate Adaptivity
+
+Symbol length in samples is `ceil(sampleRate * OFDM_SYMBOL_MS / 1000)` and CP in samples is `ceil(sampleRate * OFDM_CP_MS / 1000)`. At 48000 Hz: 1920-sample symbol + 240-sample CP = 2160 samples. At 44100 Hz: 1764 + 221 = 1985 samples. The Goertzel/toneIQ bank operates at the exact tone frequencies regardless of sample rate.
+
+---
+
 ## Test Coverage
 
 | Test File | Path | Tests |
