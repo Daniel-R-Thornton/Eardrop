@@ -18,11 +18,14 @@ import { type ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG } from '../types';
 import { PilotPLL, toneIQ, getDataToneFreqs } from '../pilot';
 import { decodeFrame, FRAME_SIZE, PAYLOAD_DATA_SIZE, RAW_HEADER_SIZE } from '../protocol/atomicFrame';
 import { SentinelScanner } from '../receiver/SentinelScanner';
+import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
+import { OFDMEngine } from '../protocol/ofdmEngine';
+import { makeToneOffsets, makeToneFrequencies } from '../../lib/math';
+import { dlog } from '../../lib/debug/dlog';
 
 // ─── Constants ───────────────────────────────────────
 
-/** Samples per symbol — atomic frame protocol uses fixed 256 SPS */
-const SPS = 256;
+/** Samples per symbol — set per-instance from symbol rate */
 const TONE_COUNT = 4;
 const ENERGY_THRESHOLD = 0.0003;
 
@@ -47,11 +50,39 @@ export interface ReceivedFile {
 // ─── RxEngine ────────────────────────────────────────
 
 export class RxEngine {
+  /** Toggle verbose logging (preamble, calibration, per-frame debug). Off by default. */
+  static verboseRxLogging = false;
+
+  /** Quiet log helper — only prints when RxEngine.verboseRxLogging is true */
+  private static rxLog(...args: any[]) {
+    if (RxEngine.verboseRxLogging) console.log(...args);
+  }
+
   private cfg: ModemConfig;
-  private sps = SPS;
+  private sps: number;
+  private ofdmFftSize = 256;
 
   // Demodulation buffer
   private buf: number[] = [];
+
+  // OFDM mode
+  private useOFDM: boolean = false;
+  private ofdmDemod: OFDMQPSKDemodulator | null = null;
+  private ofdmSyncFrames = 0;
+  /** Energy threshold for OFDM sync detection — based on total tone energy, not pilot-only */
+  private ofdmSyncMinFrames = 8;
+  private ofdmSyncThreshold = 0.06;
+  /** Count of OFDM sync symbols processed for channel training */
+  private ofdmTrainingSymbols = 0;
+  /** Detection (8) + boundary-alignment slack (1) + training (12) must fit in the 24-symbol sync burst */
+  private readonly OFDM_TRAINING_SYMBOLS = 12;
+
+  /** OFDM tone count (4 or 8 — multiples of 4 only) */
+  private ofdmToneCount = 4;
+  /** Rolling buffer of recent samples (2 OFDM symbols) for boundary search */
+  private ofdmAlignBuf: number[] = [];
+  /** Samples still to discard so the window grid lands on a symbol boundary */
+  private ofdmSkip = 0;
 
   // PLL
   private pll: PilotPLL | null = null;
@@ -116,13 +147,33 @@ export class RxEngine {
   private readonly WARBLE_CODE = 0xac94;
   private readonly WARBLE_CODE_THRESHOLD = 9;
 
-  constructor(cfg: Partial<ModemConfig> = {}) {
+  constructor(cfg: Partial<ModemConfig & { useOFDM?: boolean }> = {}) {
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
+    this.useOFDM = (cfg as any).useOFDM === true;
+
+    // Default SPS = 256 for atomic frame protocol (BPSK). OFDM may override.
+    this.sps = 256;
+    this.ofdmFftSize = 256;
+
     this.toneFreqs = getDataToneFreqs(this.cfg.pilotFreqHz, !!this.cfg.musical);
     this.scanner = new SentinelScanner();
 
+    // Initialize OFDM demodulator (256 FFT + 16 CP = 272 samples/symbol)
+    if (this.useOFDM) {
+      const demodToneFreqs = this.initOfdmDemod();
+      dlog('RX-OFDM', {
+        v: 'v4-eq-align',
+        pilot: this.cfg.pilotFreqHz,
+        cp: OFDMEngine.CP_LENGTH,
+        sps: this.sps,
+        bins: Array.from(demodToneFreqs).map((f) =>
+          Math.round((f * OFDMEngine.FFT_SIZE) / this.cfg.sampleRate),
+        ),
+      });
+    }
+
     this.scanner.onFrame = (frame: Uint8Array) => {
-      console.warn(`[RX] Frame received from scanner (${frame.length}B), processing...`);
+      dlog('RX', { scanFrame: frame.length });
       this.processFrame(frame);
     };
   }
@@ -138,12 +189,25 @@ export class RxEngine {
       this.pll = new PilotPLL(this.cfg.pilotFreqHz, 0, 0.05, {
         sampleRate: this.cfg.sampleRate,
       });
-      console.warn(`[RX] PLL init: pilotFreq=${this.cfg.pilotFreqHz}Hz`);
+      dlog('RX', { pllPilot: this.cfg.pilotFreqHz });
     }
 
     // Feed EVERY sample to the PLL for continuous phase tracking
     this.pll.update(sample);
     this.pilotAmplitude = this.pll.getAmplitude();
+
+    // ── OFDM symbol-boundary alignment ──
+    if (this.useOFDM) {
+      if (this.state === RxState.WAITING) {
+        // Keep the last 2 symbols of audio for the CP boundary search
+        this.ofdmAlignBuf.push(sample);
+        if (this.ofdmAlignBuf.length > 2 * this.sps) this.ofdmAlignBuf.shift();
+      }
+      if (this.ofdmSkip > 0) {
+        this.ofdmSkip--;
+        return;
+      }
+    }
 
     // ── Buffer samples and process by state ──
     this.buf.push(sample);
@@ -154,8 +218,58 @@ export class RxEngine {
     this.lastRawIQs = rawIQs; // Store for debug snapshot
     const totalE = rawIQs.reduce((a, r) => a + Math.hypot(r.i, r.q), 0);
 
-    // ── WAITING: detect warble — sustained energy at pilot±50Hz ──
+    // ── WAITING: detect sync (OFDM or warble) ──
     if (this.state === RxState.WAITING) {
+      // OFDM mode: detect energy at the tone frequencies (not just pilot).
+      // The sync burst has all 4 tones at QPSK 0°, so total tone energy is high.
+      if (this.useOFDM && this.ofdmDemod) {
+        const totalE = rawIQs.reduce((a, r) => a + Math.hypot(r.i, r.q), 0);
+        // Heartbeat while waiting: 1 line per 25 windows (~2/s)
+        dlog(
+          'OFDM-SYNC',
+          { e: totalE, thr: this.ofdmSyncThreshold, sync: this.ofdmSyncFrames },
+          { every: 25 },
+        );
+        this.ofdmSyncFrames = totalE > this.ofdmSyncThreshold
+          ? this.ofdmSyncFrames + 1
+          : 0;
+
+        if (this.ofdmSyncFrames >= this.ofdmSyncMinFrames) {
+          // Signal detected! Enter FRAMES state.
+          dlog('OFDM-SYNC', { detected: true, e: totalE });
+          this.state = RxState.FRAMES;
+          this.fileData = [];
+          this.framesReceived = 0;
+          this.receivedPayloadSeqs = new Set();
+          this.fileID = 0;
+          this.fileName = '';
+          this.fileSize = 0;
+          this.totalFrames = 0;
+          this.ofdmSyncFrames = 0;
+          this.ofdmTrainingSymbols = 0;
+          this.ofdmDemod?.resetTraining();
+
+          // Align the window grid to the TX symbol boundary. Energy detection
+          // fires at an arbitrary offset; the CP only absorbs offsets within
+          // its 16 samples, so without alignment ~94% of receptions straddle
+          // symbol boundaries and demodulate garbage.
+          const boundary = this.findOfdmBlockStart(this.ofdmAlignBuf);
+          if (boundary >= 0) {
+            const skip =
+              (((boundary - this.ofdmAlignBuf.length) % this.sps) + this.sps) %
+              this.sps;
+            this.ofdmSkip = skip;
+            dlog('OFDM-SYNC', { boundary, skip, aligned: true });
+          } else {
+            dlog('OFDM-SYNC', { aligned: false }, { level: 'warn' });
+          }
+          this.buf = [];
+          this.ofdmAlignBuf = [];
+        }
+        return;
+      }
+
+      // ── BPSK warble detection (existing path) ──
       // --- Track sub-frame warble energies FIRST for alternation check ---
       const qRatios: number[] = [0, 0, 0, 0];
       for (let q = 0; q < 4; q++) {
@@ -171,7 +285,6 @@ export class RxEngine {
       }
 
       // --- Warble code correlation ---
-      // Decode each sub-window as a bit: 0 = low freq dominant, 1 = high freq dominant
       for (let q = 0; q < 4; q++) {
         const bit = qRatios[q] > 1.0 ? 0 : 1;
         this.warbleCodeBits.push(bit);
@@ -210,11 +323,11 @@ export class RxEngine {
       if (isWarbleFrame) {
         this.warbleFrames++;
         if (this.warbleFrames === 1)
-          console.warn(
+          RxEngine.rxLog(
             `[WARBLE] frame 0 eLow=${eLow.toExponential(2)} eHigh=${eHigh.toExponential(2)} codeCorr=${bestCodeCorr}/16`,
           );
         if (this.warbleFrames === 2)
-          console.warn(
+          RxEngine.rxLog(
             `[WARBLE] frame 1 eLow=${eLow.toExponential(2)} eHigh=${eHigh.toExponential(2)} codeCorr=${bestCodeCorr}/16`,
           );
         if (this.warbleFrames >= 5) {
@@ -222,12 +335,10 @@ export class RxEngine {
           const codeOk =
             this.warbleCodeBits.length >= 16 && bestCodeCorr >= this.WARBLE_CODE_THRESHOLD;
           if (!codeOk) {
-            console.warn(
-              `[WARBLE] Final reject: codeCorr=${bestCodeCorr}/16 < ${this.WARBLE_CODE_THRESHOLD}`,
-            );
+            dlog('WARBLE', { reject: true, corr: bestCodeCorr, need: this.WARBLE_CODE_THRESHOLD });
             this.warbleFrames = 0;
           } else {
-            console.warn(
+            RxEngine.rxLog(
               `[WARBLE] Detected after ${this.warbleFrames} frames (codeCorr=${bestCodeCorr}/16)`,
             );
             this.state = RxState.PREAMBLE;
@@ -236,7 +347,7 @@ export class RxEngine {
         }
       } else {
         if (this.warbleFrames > 0 || (eTot > 0.01 && ratio < 3.0)) {
-          console.warn(
+          RxEngine.rxLog(
             `[WARBLE] reject: eTot=${eTot.toExponential(2)} codeCorr=${bestCodeCorr}/16 thr=${this.WARBLE_CODE_THRESHOLD} eLow=${eLow.toExponential(2)} eHigh=${eHigh.toExponential(2)}`,
           );
         }
@@ -255,9 +366,7 @@ export class RxEngine {
       if (this.preambleFrames > 80) {
         this.warbleTimeoutCount++;
         const newThreshold = 0.025 * Math.pow(1.5, this.warbleTimeoutCount);
-        console.warn(
-          `[PREAMBLE] Timeout #${this.warbleTimeoutCount}, raising threshold to ${newThreshold.toExponential(2)}`,
-        );
+        dlog('PREAMBLE', { timeout: this.warbleTimeoutCount, newThr: newThreshold });
         this.warbleThreshold = newThreshold;
         this.state = RxState.WAITING;
         this.warbleFrames = 0;
@@ -272,7 +381,7 @@ export class RxEngine {
       // Detect marker: all 4 tones ON produces distinctly high energy
       if (totalE > 0.15 && !this.markerSeen) {
         this.markerSeen = true;
-        console.warn(`[MARKER] E=${totalE.toExponential(2)} signs=[${signs}]`);
+        RxEngine.rxLog(`[MARKER] E=${totalE.toExponential(2)} signs=[${signs}]`);
         this.calFrameCount = 0;
         this.prevCalIQs = [];
         return;
@@ -281,7 +390,7 @@ export class RxEngine {
       if (this.markerSeen && this.calFrameCount < 16) {
         const gc = this.grayCodes[this.calFrameCount];
         const bits = [(gc >> 3) & 1, (gc >> 2) & 1, (gc >> 1) & 1, gc & 1];
-        console.warn(
+        RxEngine.rxLog(
           `[CAL] frame ${this.calFrameCount} gc=0x${gc.toString(2).padStart(4, '0')} bits=[${bits.join(',')}] I=${rawIQs.map((r) => r.i.toFixed(3)).join(',')}`,
         );
         // Accumulate this frame's I/Q per tone into the correct bit bucket
@@ -324,13 +433,18 @@ export class RxEngine {
               this.ref1Q[t] = cal1Q[t] / cnt1[t];
             }
           }
-          console.warn(
-            `[CAL] Refs: ${[0, 1, 2, 3].map((t) => `t${t}: 0°=(${this.ref0I[t].toFixed(3)},${this.ref0Q[t].toFixed(3)}) 180°=(${this.ref1I[t].toFixed(3)},${this.ref1Q[t].toFixed(3)})`).join(' | ')}`,
-          );
+          dlog('CAL', {
+            refs: [0, 1, 2, 3]
+              .map(
+                (t) =>
+                  `t${t}:${this.ref0I[t].toFixed(2)},${this.ref0Q[t].toFixed(2)}/${this.ref1I[t].toFixed(2)},${this.ref1Q[t].toFixed(2)}`,
+              )
+              .join(' '),
+          });
           // Initialize absolute phase state from last calibration frame
           const lastGc = this.grayCodes[this.prevCalIQs.length - 1];
           this.absBits = [(lastGc >> 3) & 1, (lastGc >> 2) & 1, (lastGc >> 1) & 1, lastGc & 1];
-          console.warn(`[CAL] Initial absBits: [${this.absBits.join(',')}]`);
+          dlog('CAL', { absBits: this.absBits.join('') });
           // Initialize differential BPSK from last calibration frame's I values
           const lastCal = this.prevCalIQs[this.prevCalIQs.length - 1];
           for (let t = 0; t < TONE_COUNT; t++) {
@@ -343,9 +457,9 @@ export class RxEngine {
       // After calibration: guard frames (pilot only)
       if (this.calFrameCount >= 16) {
         this.guardFrames++;
-        if (this.guardFrames === 1) console.warn('[GUARD] pilot only, waiting 2 frames...');
+        if (this.guardFrames === 1) dlog('GUARD', { waiting: 2 });
         if (this.guardFrames >= 2) {
-          console.warn('[FRAMES] entering data decode');
+          RxEngine.rxLog('[FRAMES] entering data decode');
           this.state = RxState.FRAMES;
           this.fileData = [];
           this.framesReceived = 0;
@@ -360,38 +474,77 @@ export class RxEngine {
       return;
     }
 
-    // ── Differential BPSK bit detection ──
-    // Compare each tone's I against the PREVIOUS frame's I.
-    // Bit=0 if same sign (no phase change), Bit=1 if opposite sign (phase flip).
-    // Differential BPSK using full I/Q dot product
-    // Error propagation is handled by the Hamming-distance sentinel scanner
+    // ── Bit detection: OFDM/QPSK path ──
     let frameBits = 0;
     const bits: number[] = [];
-    for (let t = 0; t < TONE_COUNT; t++) {
-      const prevI = this.prevFrameI[t];
-      const prevQ = this.prevFrameQ[t];
-      // DBPSK: dot product of consecutive frames
-      const dot = prevI * rawIQs[t].i + prevQ * rawIQs[t].q;
-      const diffBit = (prevI !== 0 || prevQ !== 0) && dot < 0 ? 1 : 0;
-      const dpskAbs = this.absBits[t] ^ diffBit;
 
-      // Centroid: nearest neighbor to cal references (use exclusively when DBPSK is unreliable)
-      const d0 = (rawIQs[t].i - this.ref0I[t]) ** 2 + (rawIQs[t].q - this.ref0Q[t]) ** 2;
-      const d1 = (rawIQs[t].i - this.ref1I[t]) ** 2 + (rawIQs[t].q - this.ref1Q[t]) ** 2;
-      const centAbs = d1 < d0 ? 1 : 0;
+    if (this.useOFDM && this.ofdmDemod) {
+      // OFDM training phase: use first N symbols of sync burst to train channel estimates
+      if (this.ofdmTrainingSymbols < this.OFDM_TRAINING_SYMBOLS) {
+        this.ofdmDemod.trainOnSyncSymbol(window);
+        this.ofdmTrainingSymbols++;
+        if (this.ofdmTrainingSymbols >= this.OFDM_TRAINING_SYMBOLS) {
+          dlog('OFDM-TRAIN', { done: true, symbols: this.ofdmTrainingSymbols });
+        }
+        return; // Don't process bits during training
+      }
 
-      // Use centroid when separation is clear, fall back to DBPSK otherwise.
-      // Lowered threshold from 3.0 to 1.3 — acoustic channel needs more aggressive centroid use.
-      const separation = Math.max(d0, d1) / Math.max(Math.min(d0, d1), 1e-12);
-      const confident = separation > 1.3;
-      const absBit = confident ? centAbs : dpskAbs;
-      this.absBits[t] = absBit;
+      // OFDM/QPSK demodulation — FFT + per-tone equalization + QPSK decode
+      const result = this.ofdmDemod.demodulate(window);
+      // Tones are grouped in 4-tone blocks; each block carries one byte
+      // (b0 lane = upper nibble, b1 lane = lower nibble — matches the BPSK
+      // frame-pair format consumed below). 8 tones → 2 bytes per symbol.
+      const blockCount = Math.max(1, Math.floor(this.ofdmToneCount / 4));
+      for (let blk = 0; blk < blockCount; blk++) {
+        let fbUpper = 0;
+        let fbLower = 0;
+        for (let j = 0; j < 4; j++) {
+          const bitIdx = (blk * 4 + j) * 2;
+          const b0 = result.bits[bitIdx] ?? 0;
+          const b1 = result.bits[bitIdx + 1] ?? 0;
+          fbUpper |= b0 << (7 - j * 2);
+          fbUpper |= 1 << (6 - j * 2);
+          fbLower |= b1 << (7 - j * 2);
+          fbLower |= 1 << (6 - j * 2);
+        }
+        this.bchBuf.push(fbUpper, fbLower);
+        this.bchBufCount += 2;
+        if (blk === 0) frameBits = fbUpper;
+      }
+      for (let t = 0; t < TONE_COUNT && t < result.toneIQ.length; t++) {
+        rawIQs[t] = result.toneIQ[t];
+      }
+      this.pilotAmplitude = result.pilotAmplitude;
+    } else {
+      // ── Differential BPSK bit detection ──
+      // Compare each tone's I against the PREVIOUS frame's I.
+      // Bit=0 if same sign (no phase change), Bit=1 if opposite sign (phase flip).
+      // Differential BPSK using full I/Q dot product
+      // Error propagation is handled by the Hamming-distance sentinel scanner
+      for (let t = 0; t < TONE_COUNT; t++) {
+        const prevI = this.prevFrameI[t];
+        const prevQ = this.prevFrameQ[t];
+        // DBPSK: dot product of consecutive frames
+        const dot = prevI * rawIQs[t].i + prevQ * rawIQs[t].q;
+        const diffBit = (prevI !== 0 || prevQ !== 0) && dot < 0 ? 1 : 0;
+        const dpskAbs = this.absBits[t] ^ diffBit;
 
-      bits.push(absBit);
-      frameBits |= absBit << (7 - t * 2);
-      frameBits |= 1 << (6 - t * 2);
-      this.prevFrameI[t] = rawIQs[t].i;
-      this.prevFrameQ[t] = rawIQs[t].q;
+        // Centroid: nearest neighbor to cal references
+        const d0 = (rawIQs[t].i - this.ref0I[t]) ** 2 + (rawIQs[t].q - this.ref0Q[t]) ** 2;
+        const d1 = (rawIQs[t].i - this.ref1I[t]) ** 2 + (rawIQs[t].q - this.ref1Q[t]) ** 2;
+        const centAbs = d1 < d0 ? 1 : 0;
+
+        const separation = Math.max(d0, d1) / Math.max(Math.min(d0, d1), 1e-12);
+        const confident = separation > 1.3;
+        const absBit = confident ? centAbs : dpskAbs;
+        this.absBits[t] = absBit;
+
+        bits.push(absBit);
+        frameBits |= absBit << (7 - t * 2);
+        frameBits |= 1 << (6 - t * 2);
+        this.prevFrameI[t] = rawIQs[t].i;
+        this.prevFrameQ[t] = rawIQs[t].q;
+      }
     }
 
     // Debug: first 5 frames — show centroid distances and decision mode
@@ -402,7 +555,7 @@ export class RxEngine {
         const sep = Math.max(d0, d1) / Math.max(Math.min(d0, d1), 1e-12);
         return `t${t}:${sep.toFixed(1)}x`;
       }).join(' ');
-      console.warn(`[RX] Centroid separations: ${sepInfo}`);
+      RxEngine.rxLog(`[RX] Centroid separations: ${sepInfo}`);
     }
 
     // Debug: first 5 frames with expected sentinel comparison, then periodic progress
@@ -433,38 +586,107 @@ export class RxEngine {
           .split('')
           .map((b, i) => (b === expStr[i] ? '✓' : '✗'))
           .join('');
-        console.warn(
+        RxEngine.rxLog(
           `[RX] Frame ${this.dbgFrameCount}: bits=0x${frameBits.toString(16).padStart(2, '0')} exp=${expectedStr} I=${rawIQs.map((r) => r.i.toFixed(3)).join(',')} got=[${absBitsStr}] want=[${expStr}] ${matchStr}`,
         );
       } else {
-        console.warn(
+        RxEngine.rxLog(
           `[RX] Frame ${this.dbgFrameCount}: bits=0x${frameBits.toString(16).padStart(2, '0')}`,
         );
       }
     } else if (this.dbgFrameCount % 50 === 0) {
-      console.warn(
+      RxEngine.rxLog(
         `[RX] Frame ${this.dbgFrameCount}: ${this.fileData.length}B assembled (${this.framesReceived} payload frames)`,
       );
     }
 
-    this.bchBuf.push(frameBits);
-    this.bchBufCount++;
-    if (this.bchBufCount >= 2) {
+    // Skip common bchBuf push in OFDM mode (OFDM branch already pushed)
+    if (!this.useOFDM) {
+      this.bchBuf.push(frameBits);
+      this.bchBufCount++;
+    }
+    // Consume frame-pair entries two at a time — 8-tone OFDM pushes 4 per
+    // symbol (2 blocks), so loop rather than taking a single pair.
+    while (this.bchBufCount >= 2) {
+      const upper = this.bchBuf.shift()!;
+      const lower = this.bchBuf.shift()!;
+      this.bchBufCount -= 2;
       const hi =
-        (((this.bchBuf[0] >> 7) & 1) << 3) |
-        (((this.bchBuf[0] >> 5) & 1) << 2) |
-        (((this.bchBuf[0] >> 3) & 1) << 1) |
-        ((this.bchBuf[0] >> 1) & 1);
+        (((upper >> 7) & 1) << 3) |
+        (((upper >> 5) & 1) << 2) |
+        (((upper >> 3) & 1) << 1) |
+        ((upper >> 1) & 1);
       const lo =
-        (((this.bchBuf[1] >> 7) & 1) << 3) |
-        (((this.bchBuf[1] >> 5) & 1) << 2) |
-        (((this.bchBuf[1] >> 3) & 1) << 1) |
-        ((this.bchBuf[1] >> 1) & 1);
+        (((lower >> 7) & 1) << 3) |
+        (((lower >> 5) & 1) << 2) |
+        (((lower >> 3) & 1) << 1) |
+        ((lower >> 1) & 1);
       const blockByte = (hi << 4) | lo;
       this.scanner.feedByte(blockByte);
-      this.bchBuf = [];
-      this.bchBufCount = 0;
     }
+  }
+
+  /**
+   * (Re)create the OFDM demodulator from config. Clamps toneCount to a
+   * multiple of 4 (block packing carries one byte per 4-tone block).
+   * Returns the demod tone frequencies for logging.
+   */
+  private initOfdmDemod(): Float32Array {
+    this.sps = OFDMEngine.FFT_SIZE + OFDMEngine.CP_LENGTH;
+    let ofdmToneCount = this.cfg.toneCount || 4;
+    if (ofdmToneCount % 4 !== 0) {
+      dlog('RX-OFDM', { badToneCount: ofdmToneCount, using: 4 }, { level: 'warn' });
+      ofdmToneCount = 4;
+    }
+    this.ofdmToneCount = ofdmToneCount;
+    let demodToneFreqs: Float32Array;
+    if (ofdmToneCount === 4) {
+      demodToneFreqs = new Float32Array(this.toneFreqs);
+    } else {
+      const offsets = makeToneOffsets(ofdmToneCount, 100, 100);
+      demodToneFreqs = makeToneFrequencies(this.cfg.pilotFreqHz, offsets);
+    }
+    this.ofdmDemod = new OFDMQPSKDemodulator({
+      sampleRate: this.cfg.sampleRate,
+      fftSize: OFDMEngine.FFT_SIZE,
+      toneCount: ofdmToneCount,
+      pilotFreqHz: this.cfg.pilotFreqHz,
+      toneFrequencies: demodToneFreqs,
+      cpLength: OFDMEngine.CP_LENGTH,
+    });
+    return demodToneFreqs;
+  }
+
+  /**
+   * Find the OFDM symbol boundary in recent audio via cyclic-prefix
+   * correlation: the first CP samples of a symbol equal its last CP samples,
+   * so corr(x[o..o+cp], x[o+fft..o+fft+cp]) peaks once per symbol at o =
+   * block start. Returns the offset in `recent` (0..sps-1), or -1 if no
+   * confident peak.
+   */
+  private findOfdmBlockStart(recent: number[]): number {
+    const fft = this.ofdmFftSize;
+    const cp = this.sps - fft;
+    if (recent.length < this.sps + cp) return -1;
+    let bestOffset = -1;
+    let bestScore = 0;
+    const maxOffset = Math.min(this.sps, recent.length - fft - cp);
+    for (let offset = 0; offset < maxOffset; offset++) {
+      let corr = 0;
+      let energy = 0;
+      for (let n = 0; n < cp; n++) {
+        const early = recent[offset + n];
+        const late = recent[offset + n + fft];
+        corr += early * late;
+        energy += early * early + late * late;
+      }
+      const score = energy > 1e-9 ? corr / (energy / 2) : 0;
+      if (score > bestScore) {
+        bestScore = score;
+        bestOffset = offset;
+      }
+    }
+    return bestScore > 0.5 ? bestOffset : -1;
   }
 
   getState(): RxState {
@@ -508,6 +730,11 @@ export class RxEngine {
     this.pll = null;
     this.pilotAmplitude = 0;
     this.samplesSeen = 0;
+    this.dbgFrameCount = 0;
+    // Re-create OFDM demod on reset
+    if (this.useOFDM) {
+      this.initOfdmDemod();
+    }
     this.fileData = [];
     this.framesReceived = 0;
     this.receivedPayloadSeqs = new Set();
@@ -515,6 +742,7 @@ export class RxEngine {
     this.fileSize = 0;
     this.totalFrames = 0;
     this.completedFile = null;
+    this.ofdmSyncFrames = 0;
     this.scanner.reset();
   }
 
@@ -533,37 +761,27 @@ export class RxEngine {
   }
 
   private processFrame(frame: Uint8Array): void {
-    // Log received CRC
-    const receivedCRC = (frame[5] << 8) | frame[6];
-    const computedCRC = this.computeCRC16(frame.slice(0, FRAME_SIZE - 2));
-    console.log(
-      `[RX] Received CRC: 0x${receivedCRC.toString(16).padStart(4, '0')}, Computed: 0x${computedCRC.toString(16).padStart(4, '0')}`,
-    );
-    // CRC bytes (little-endian)
-    const receivedCRCHigh = frame[5];
-    const receivedCRCLow = frame[6];
-    console.log(
-      `[RX-ENDIAN] CRC: 0x${receivedCRCHigh.toString(16).padStart(2, '0')} 0x${receivedCRCLow.toString(16).padStart(2, '0')}`,
-    );
-
+    // CRC validation happens inside decodeFrame (post-BCH). Raw frame bytes
+    // 5-6 are pre-decode and would be misleading to log against it.
     const decoded = decodeFrame(frame);
 
-    console.warn(
-      `[RX] processFrame: valid=${decoded.valid} type=${decoded.header?.type} payload=${decoded.payload?.length}B`,
-    );
+    dlog('RX-FRAME', {
+      valid: decoded.valid,
+      type: decoded.header ? `0x${decoded.header.type.toString(16).padStart(2, '0')}` : '?',
+      seq: decoded.header?.seqNum ?? -1,
+      len: decoded.payload?.length ?? 0,
+    });
     if (!decoded.valid) return;
 
     switch (decoded.header!.type) {
       case 0x01: // HEADER
-        console.warn('[RX] HEADER frame received');
         this.processHeader(decoded.payload);
         break;
       case 0x02: // PAYLOAD
-        console.warn(`[RX] PAYLOAD frame #${this.framesReceived + 1}`);
         this.processPayload(decoded.payload, decoded.header!.seqNum);
         break;
       case 0x03: // TAIL
-        console.warn(`[RX] TAIL frame — assembling ${this.fileData.length}/${this.fileSize}B file`);
+        dlog('RX-FRAME', { tail: true, assembled: this.fileData.length, size: this.fileSize });
         this.processTail();
         break;
     }
@@ -575,13 +793,10 @@ export class RxEngine {
   private processHeader(payload: Uint8Array): void {
     // Header payload format: [fileID:4B][totalSize:4B][nameLen:1B][name...]
     const fileID = (payload[0] << 24) | (payload[1] << 16) | (payload[2] << 8) | payload[3];
-    // File ID validation (little-endian)
-    const receivedFileID = (payload[0] << 24) | (payload[1] << 16) | (payload[2] << 8) | payload[3];
-    console.log(`[RX-ENDIAN] File ID: 0x${receivedFileID.toString(16)}`);
 
     // Duplicate header (diversity mode repetition) — ignore, keep existing state
     if (fileID === this.fileID && this.fileName !== '') {
-      console.warn('[RX] Duplicate header (diversity mode), skipping reset');
+      dlog('RX-FRAME', { dupHeader: true });
       return;
     }
 
@@ -608,7 +823,7 @@ export class RxEngine {
 
     // Skip duplicate payload frames (diversity mode repetition)
     if (this.receivedPayloadSeqs.has(seqNum)) {
-      console.warn(`[RX] Duplicate payload seq=${seqNum}, skipping`);
+      dlog('RX-FRAME', { dupPayload: seqNum });
       return;
     }
     this.receivedPayloadSeqs.add(seqNum);
@@ -627,7 +842,7 @@ export class RxEngine {
 
     // Already completed (duplicate tail from diversity mode)
     if (this.state === RxState.COMPLETE) {
-      console.warn('[RX] Duplicate tail frame (diversity mode), skipping');
+      dlog('RX-FRAME', { dupTail: true });
       return;
     }
 

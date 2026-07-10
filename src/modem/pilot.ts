@@ -2,6 +2,7 @@
  * PilotScanner + PilotPLL — Pilot frequency discovery and phase tracking.
  */
 import { TONE_OFFSETS } from './types';
+import { dlog } from '../lib/debug/dlog';
 
 function fftMagnitude(samples: number[], fftSize: number): Float64Array {
   const n = fftSize;
@@ -90,7 +91,7 @@ export class PilotScanner {
     this.noiseBuf.push(sample);
     if (this.noiseBuf.length >= target) {
       this.noiseLearned = true;
-      console.warn(`[SCAN] Noise floor learned (${target}samp)`);
+      dlog('SCAN', { noiseFloorSamples: target });
     }
   }
   hasNoiseProfile(): boolean {
@@ -138,7 +139,7 @@ export class PilotScanner {
     const median =
       results.map((r) => r.m).sort((a, b) => a - b)[Math.floor(results.length / 2)] || 1e-12;
     const ratio = bestM / Math.max(median, 1e-14);
-    console.warn(`[SCAN] Top 5: ${top5} | Peak: ${bestF}Hz ratio=${ratio.toFixed(1)}`);
+    dlog('SCAN', { peak: bestF, ratio, top5 }, { every: 200 });
 
     if (
       ratio >= (minSignalRatio || 5) &&
@@ -152,7 +153,7 @@ export class PilotScanner {
         confidence: Math.min(1, (ratio - (minSignalRatio || 5)) / 20),
       };
       this.done = true;
-      console.warn(`[SCAN] PILOT LOCKED: ${bestF}Hz amp=${bestM.toExponential(2)}`);
+      dlog('SCAN', { locked: bestF, amp: bestM });
     }
     return this.result;
   }

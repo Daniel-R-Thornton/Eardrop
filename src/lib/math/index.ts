@@ -155,6 +155,58 @@ export function clip(samples: Float32Array, min: number = -1, max: number = 1): 
 }
 
 /**
+ * Select the optimal FFT size and SPS for a given target symbol rate.
+ * Snaps to the nearest power-of-2 FFT size for clean OFDM.
+ *
+ * @param sampleRate - Audio sample rate (3200 Hz)
+ * @param targetSymPerSec - Desired symbol rate from UI (10, 25, 40, 50, 100)
+ * @returns Optimal { fft, sps, actualRate }
+ */
+export function selectOFDMFFT(
+  sampleRate: number,
+  targetSymPerSec: number,
+): { fft: number; sps: number; actualRate: number } {
+  const targetSPS = sampleRate / targetSymPerSec;
+  let sps = 256;
+  if (targetSPS <= 24) sps = 16;
+  else if (targetSPS <= 48) sps = 32;
+  else if (targetSPS <= 96) sps = 64;
+  else if (targetSPS <= 192) sps = 128;
+  else sps = 256;
+  return { fft: sps, sps, actualRate: sampleRate / sps };
+}
+
+/**
+ * Compute tone frequency offsets for N tones with given spacing.
+ * Returns N offsets starting from `baseOffset` Hz.
+ */
+export function makeToneOffsets(
+  toneCount: number,
+  spacingHz: number = 100,
+  baseOffset: number = 100,
+): Float32Array {
+  const offsets = new Float32Array(toneCount);
+  for (let t = 0; t < toneCount; t++) {
+    offsets[t] = baseOffset + t * spacingHz;
+  }
+  return offsets;
+}
+
+/**
+ * Compute absolute tone frequencies from pilot + offsets.
+ */
+export function makeToneFrequencies(
+  pilotFreqHz: number,
+  toneOffsets: Float32Array,
+): Float32Array {
+  const freqs = new Float32Array(toneOffsets.length);
+  for (let t = 0; t < toneOffsets.length; t++) {
+    freqs[t] = pilotFreqHz + toneOffsets[t];
+  }
+  return freqs;
+}
+
+/**
  * Apply gain (in dB) to samples.
  */
 export function applyGain(samples: Float32Array, gainDb: number): Float32Array {

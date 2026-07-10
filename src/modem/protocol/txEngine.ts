@@ -17,23 +17,33 @@ import { type ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG } from '../types';
 import { generatePreamble, type PreambleConfig } from '../protocol/preamble';
 import { encodeFrame, type AtomicHeader, FRAME_SIZE, PAYLOAD_DATA_SIZE } from '../protocol/atomicFrame';
 import { BPSKModulator, type BPSKModulatorConfig } from '../modulation/BPSKModulator';
+import { OFDMEngine } from './ofdmEngine';
+import { dlog } from '../../lib/debug/dlog';
+
 
 // ─── Constants ───────────────────────────────────────
 
-/** Samples per symbol — atomic frame protocol uses fixed 256 SPS */
-const SPS = 256;
+/** Number of data tones used in signaling */
 const TONE_COUNT = 4;
 
 // ─── TxEngine ────────────────────────────────────────
 
 export class TxEngine {
+  
   private cfg: ModemConfig;
   /** Absolute tone frequencies (pilot + offsets) */
   private toneFreqs: [number, number, number, number];
   /** Shared BPSK tone generator (phase accumulators, pilot, data tones) */
   private modulator: BPSKModulator;
+  /** OFDM engine for OFDM/QPSK frame modulation (enabled via useOFDM flag) */
+  private ofdmEngine: OFDMEngine | null = null;
+  /** Whether to use OFDM/QPSK for frame payloads */
+  private useOFDM = false;
 
-  constructor(cfg: Partial<ModemConfig> = {}) {
+  constructor(cfg: Partial<ModemConfig> & { useOFDM?: boolean } = {}) {
+    // Check for OFDM flag before merging into ModemConfig
+    this.useOFDM = (cfg as any).useOFDM === true;
+    
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
     const offsets = this.cfg.musical ? [87.5, 162.5, 287.5, 487.5] : TONE_OFFSETS;
     this.toneFreqs = [
@@ -52,10 +62,48 @@ export class TxEngine {
       toneFrequencies: new Float32Array(this.toneFreqs),
     };
     this.modulator = new BPSKModulator(modCfg);
+
+    // Initialize OFDM engine if OFDM mode is enabled
+    if (this.useOFDM) {
+      dlog('TX-OFDM', {
+        enabled: true,
+        tones: this.cfg.toneCount,
+        pilot: this.cfg.pilotFreqHz,
+      });
+
+      this.ofdmEngine = new OFDMEngine({
+        pilotFreqHz: this.cfg.pilotFreqHz,
+        musical: this.cfg.musical,
+        sampleRate: this.cfg.sampleRate,
+        pilotAmplitude: this.cfg.pilotAmplitude,
+        dataToneAmplitude: this.cfg.dataToneAmplitude,
+        toneCount: this.cfg.toneCount,
+        symbolsPerSec: this.cfg.symbolsPerSec,
+      });
+    }
   }
 
   reset(): void {
     this.modulator.reset();
+  }
+
+  /** Check whether OFDM mode is active */
+  isOFDM(): boolean {
+    return this.useOFDM;
+  }
+
+  /**
+   * Get symbol length in samples for the current modem configuration.
+   * Returns the number of samples that constitute one symbol for the
+   * active modulation scheme (BPSK or OFDM).
+   */
+  getSymbolLengthInSamples(): number {
+    if (this.useOFDM && this.ofdmEngine) {
+      // OFDM symbol = FFT size + cyclic prefix
+      return OFDMEngine.FFT_SIZE + OFDMEngine.CP_LENGTH; // 256 + 16 = 272
+    }
+    // BPSK symbol - maintain backward compatibility
+    return 256;
   }
 
   // ─── Public API ──────────────────────────────────────
@@ -66,8 +114,15 @@ export class TxEngine {
   transmitFile(fileName: string, data: Uint8Array): Float32Array {
     this.reset();
 
-    // 1. Generate preamble
-    const preamble = this.transmitPreamble();
+    // 1. Generate preamble (OFDM sync burst or BPSK warble preamble)
+    let preamble: Float32Array;
+    if (this.useOFDM && this.ofdmEngine) {
+      // OFDM sync burst: 24 repeated symbols with all tones at 0°
+      dlog('TX-OFDM', { syncBurst: 24 });
+      preamble = this.ofdmEngine.generateSyncBurst(24);
+    } else {
+      preamble = this.transmitPreamble();
+    }
 
     // 2. Build atomic frames
     const totalFrames = this.calcFrameCount(data.length);
@@ -75,9 +130,19 @@ export class TxEngine {
 
     const repeats = this.cfg.diversityMode ? 3 : 1;
 
+    // ── Helper: dispatch to BPSK or OFDM ──
+    const modulate = (header: AtomicHeader, payload: Uint8Array): Float32Array => {
+      if (this.useOFDM && this.ofdmEngine) {
+        dlog('TX-OFDM', { frame: `0x${header.type.toString(16)}`, seq: header.seqNum });
+        const frame = encodeFrame(header, payload);
+        return this.ofdmEngine.modulateFrame(frame);
+      }
+      return this.transmitFrame(header, payload);
+    };
+
     // Header frame (type 0x01) — repeat 3× if diversity mode
     const headerPayload = this.buildHeaderPayload(fileName, data.length);
-    const headerFrame = this.transmitFrame(
+    const headerFrame = modulate(
       {
         type: 0x01,
         seqNum: 0,
@@ -91,7 +156,7 @@ export class TxEngine {
     // Data frames (type 0x02) — repeat 3× if diversity mode
     const dataFrames = this.splitDataIntoFrames(data);
     for (let i = 0; i < dataFrames.length; i++) {
-      const frameAudio = this.transmitFrame(
+      const frameAudio = modulate(
         {
           type: 0x02,
           seqNum: 1 + i,
@@ -104,7 +169,7 @@ export class TxEngine {
     }
 
     // Tail frame (type 0x03)
-    const tailFrame = this.transmitFrame(
+    const tailFrame = modulate(
       {
         type: 0x03,
         seqNum: totalFrames - 1,
@@ -116,7 +181,7 @@ export class TxEngine {
     for (let r = 0; r < repeats; r++) frameAudios.push(tailFrame);
 
     // 3. Add tail silence
-    frameAudios.push(new Float32Array(SPS * 6));
+    frameAudios.push(new Float32Array(this.getSymbolLengthInSamples() * 6));
 
     // 4. Concatenate all audio segments
     const totalLen = frameAudios.reduce((a, b) => a + b.length, 0);
@@ -167,7 +232,7 @@ export class TxEngine {
 
     // Convert frame bytes to a bitstream
     const bits: number[] = [];
-    const framesPerByte = 8 / TONE_COUNT; // 2
+    const framesPerByte = 8 / TONE_COUNT; // 2 bits per tone
     for (const byte of frame) {
       for (let f = 0; f < framesPerByte; f++) {
         const shift = 8 - (f + 1) * TONE_COUNT;
@@ -178,26 +243,21 @@ export class TxEngine {
       }
     }
 
-    // Total symbols = bits.length / TONE_COUNT
+    
+    // BPSK fallback path (existing implementation)
     const totalSymbols = bits.length / TONE_COUNT;
-    const totalSamples = totalSymbols * SPS;
-
+    const totalSamples = totalSymbols * this.getSymbolLengthInSamples();
     const audio = new Float32Array(totalSamples);
     let bitIdx = 0;
-
     for (let sym = 0; sym < totalSymbols; sym++) {
-      // Read 4 bits for this symbol, set BPSK multipliers
       for (let t = 0; t < TONE_COUNT; t++) {
         const bit = bitIdx < bits.length ? bits[bitIdx++] : 0;
         this.modulator.bpskMul[t] = bit === 0 ? 1 : -1;
       }
-
-      // Generate SPS samples for this symbol
-      for (let s = 0; s < SPS; s++) {
-        audio[sym * SPS + s] = this.modulator.generateSample();
+      for (let s = 0; s < this.getSymbolLengthInSamples(); s++) {
+        audio[sym * this.getSymbolLengthInSamples() + s] = this.modulator.generateSample();
       }
     }
-
     return audio;
   }
 
@@ -223,10 +283,6 @@ export class TxEngine {
     payload[off++] = (hash >> 8) & 0xff;
     payload[off++] = hash & 0xff;
 
-    // File ID (little-endian)
-    console.log(
-      `[TX-ENDIAN] File ID: 0x${(hash >> 24).toString(16)} 0x${((hash >> 16) & 0xff).toString(16)} 0x${((hash >> 8) & 0xff).toString(16)} 0x${(hash & 0xff).toString(16)}`,
-    );
 
     // Total file size (4 bytes LE)
     payload[off++] = totalSize & 0xff;
@@ -250,11 +306,7 @@ export class TxEngine {
 
     // Compute CRC for entire payload (40 bytes)
     const crc = this.computeCRC16(payload);
-    console.log(`[TX] Header CRC: 0x${(crc >>> 0).toString(16).padStart(4, '0')}`);
-    // CRC (little-endian)
-    console.log(
-      `[TX-ENDIAN] CRC: 0x${(crc >> 8).toString(16).padStart(2, '0')} 0x${(crc & 0xff).toString(16).padStart(2, '0')}`,
-    );
+    dlog('TX-FRAME', { headerCrc: `0x${(crc >>> 0).toString(16).padStart(4, '0')}` });
 
     return payload;
   }

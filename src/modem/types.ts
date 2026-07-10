@@ -10,9 +10,11 @@
  */
 
 export interface ModemConfig {
-  /** Modem sample rate (3200 Hz) */
+  /** Modem sample rate in Hz (default: 3200 Hz for backward compatibility). 
+   *  Can be set to native audio rates (44100, 48000, etc.) for higher throughput.
+   */
   sampleRate: number;
-  /** Symbol rate (25 sym/s → 128 samples/symbol) */
+  /** Symbol rate (samples per symbol is derived from sampleRate and FFT size). */
   symbolsPerSec: number;
   /** Bits per frame (8 = 2 bits × 4 tones: amplitude + phase) */
   bitsPerFrame: number;
@@ -104,8 +106,17 @@ export function getDefaultToneFreqs(musical = false): [number, number, number, n
   return getToneFreqs(DEFAULT_CONFIG.pilotFreqHz, musical);
 }
 
-/** Tone colors for debug display (one per tone index) */
-export const TONE_COLORS = ['#4a9eff', '#ff6b4a', '#5eead4', '#f472b6'];
+/** Tone colors for debug display — spectral ramp, low → high frequency (8 tones) */
+export const TONE_COLORS = [
+  '#4a9eff', // t0 blue
+  '#35d0c5', // t1 teal
+  '#3dff88', // t2 green
+  '#b8e34a', // t3 lime
+  '#ffd23d', // t4 yellow
+  '#ff9838', // t5 orange
+  '#ff5c5c', // t6 red
+  '#e06bff', // t7 violet
+];
 
 /**
  * 16-bit warble code for preamble detection.

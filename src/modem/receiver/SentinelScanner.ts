@@ -10,6 +10,7 @@
  */
 
 import { FRAME_SIZE } from '../protocol/atomicFrame';
+import { dlog } from '../../lib/debug/dlog';
 
 export interface ByteLogEntry {
   byte: number;
@@ -102,7 +103,7 @@ export class SentinelScanner {
         for (let i = 0; i < this.buf.length && i < FRAME_SIZE - 3; i++) {
           fullFrame[3 + i] = this.buf[i];
         }
-        console.warn(`[RX-SCAN] Frame collected: ${this.buf.length}B (expect ${FRAME_SIZE - 3})`);
+        dlog('RX-SCAN', { frame: this.buf.length, expect: FRAME_SIZE - 3 });
         if (this.onFrame) {
           this.onFrame(fullFrame);
         }
@@ -119,11 +120,13 @@ export class SentinelScanner {
       }
     }
 
-    // Debug: log every 1000 bits scanned without hit
-    if (this.bitCount > 0 && this.bitCount % 1000 === 0 && !this.collecting) {
-      console.warn(
-        `[RX-SCAN] ${this.bitCount} bits scanned, no sentinel (sr=0x${this.shiftReg.toString(16)})`,
-      );
+    // Debug: heartbeat every 8000 bits scanned without a sentinel hit
+    if (this.bitCount > 0 && this.bitCount % 8000 === 0 && !this.collecting) {
+      dlog('RX-SCAN', {
+        bits: this.bitCount,
+        sentinel: false,
+        sr: `0x${this.shiftReg.toString(16)}`,
+      });
     }
   }
 

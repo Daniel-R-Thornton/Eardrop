@@ -1,7 +1,9 @@
 /**
  * src/modem/demodulation/index.ts
  * Barrel export for demodulation components.
- * (BPSKDemodulator extraction is future work — bit detection is currently
- * embedded in Decoder.feedSample() and RxEngine.feedSample().)
  */
-export {};
+export { OFDMQPSKDemodulator } from './OFDMQPSKDemodulator';
+export type {
+  OFDMQPSKDemodulatorConfig,
+  OFDMQPSKResult,
+} from './OFDMQPSKDemodulator';
