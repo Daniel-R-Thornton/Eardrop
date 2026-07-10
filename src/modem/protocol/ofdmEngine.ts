@@ -37,15 +37,21 @@ export class OFDMEngine {
     const offsets = makeToneOffsets(this.toneCount, 100, 100);
     this.toneFreqs = makeToneFrequencies(this.cfg.pilotFreqHz, offsets);
 
+    // The pilot is the per-symbol phase/drift reference — it must not be
+    // buried under the data tones. Default cfg (0.4) was tuned for BPSK;
+    // with 8 QPSK tones (unit amplitude each) it measured ~10x weaker than
+    // the tones acoustically, making drift correction noise-dominated.
+    const ofdmPilotAmplitude = Math.max(this.cfg.pilotAmplitude, 2.0);
+
     const ofdmCfg: OFDMQPSKModulatorConfig = {
       sampleRate: this.cfg.sampleRate,
       toneCount: this.toneCount,
       ifftSize: FFT_SIZE,
       // IFFT raw peak = (toneCount*2 + pilotAmplitude*2) / FFT_SIZE for real-valued output.
       // Scale to 0.95 so output fills [-0.95, 0.95] range.
-      amplitude: 0.95 / ((this.toneCount * 2 + this.cfg.pilotAmplitude * 2) / FFT_SIZE),
+      amplitude: 0.95 / ((this.toneCount * 2 + ofdmPilotAmplitude * 2) / FFT_SIZE),
       pilotFreqHz: this.cfg.pilotFreqHz,
-      pilotAmplitude: this.cfg.pilotAmplitude,
+      pilotAmplitude: ofdmPilotAmplitude,
       toneFrequencies: this.toneFreqs,
       cpLength: CP_LENGTH,
     };

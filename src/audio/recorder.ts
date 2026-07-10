@@ -13,19 +13,21 @@ export type SampleCallback = (sample: number) => void;
  *  Quality comparable to browser's internal resampler. */
 const WORKLET_SOURCE = `
 const RATIO = 15;
-// 127 taps: a 31-tap sinc at 48 kHz has a ~1.4 kHz transition band, so the
-// passband ended near ~900 Hz and tones above bin 67 (837 Hz) arrived 20-100x
-// attenuated — that's what killed 8-tone OFDM acoustically. 127 taps pushes
-// the passband edge to ~1450 Hz (modem Nyquist is 1600 Hz).
 const TAPS = 127;
 const HALF_TAPS = (TAPS - 1) / 2;
+const FILTER_VERSION = 'sinc127-v2';
 
-// Pre-compute Hann-windowed sinc coefficients for each polyphase offset
+// Pre-compute Hann-windowed sinc coefficients for each polyphase offset.
+// Anti-alias cutoff at fs/(2*RATIO) = 1600 Hz requires sinc(t/RATIO) — the
+// previous code used sinc(t) with integer t, which is zero everywhere except
+// the center tap: an identity decimator with NO antialiasing. 127 taps at
+// 48 kHz gives a ~1.25 kHz transition band around the 1600 Hz cutoff.
 const coeffs = [];
 for (let phase = 0; phase < RATIO; phase++) {
   const c = new Float32Array(TAPS);
+  let sum = 0;
   for (let n = 0; n < TAPS; n++) {
-    const t = (n - HALF_TAPS) - phase / RATIO;
+    const t = ((n - HALF_TAPS) - phase / RATIO) / RATIO;
     if (t === 0) {
       c[n] = 1.0;
     } else {
@@ -33,7 +35,10 @@ for (let phase = 0; phase < RATIO; phase++) {
     }
     // Hann window — smooth rolloff, good stopband rejection
     c[n] *= 0.5 * (1 - Math.cos(2 * Math.PI * n / (TAPS - 1)));
+    sum += c[n];
   }
+  // Normalize to unity DC gain so signal level is preserved
+  for (let n = 0; n < TAPS; n++) c[n] /= sum;
   coeffs.push(c);
 }
 
@@ -199,7 +204,7 @@ export class AudioRecorder {
     silentGain.connect(this.ctx.destination);
 
     this.running = true;
-    dlog('REC', { running: true, worklet: 'hann-sinc', gain: this.micGain, outRate: 3200 });
+    dlog('REC', { running: true, worklet: 'sinc127-v2', gain: this.micGain, outRate: 3200 });
   }
 
   stop() {
