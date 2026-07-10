@@ -118,8 +118,9 @@ export function applyHannWindow(samples: Float32Array): Float32Array {
 }
 
 /**
- * Resample audio using linear interpolation.
- * Suitable for simple decimation/interpolation without sophisticated filtering.
+ * Resample audio using windowed-sinc (Lanczos-3) interpolation.
+ * Quality suitable for cross-rate OFDM (e.g., 44.1k → 48k) with
+ * minimal aliasing and flat passband at the 2–4 kHz tone band.
  */
 export function resample(input: Float32Array, fromRate: number, toRate: number): Float32Array {
   if (fromRate === toRate) {
@@ -130,14 +131,25 @@ export function resample(input: Float32Array, fromRate: number, toRate: number):
   const outputLength = Math.round(input.length / ratio);
   const output = new Float32Array(outputLength);
 
+  // Lanczos-3 windowed sinc (3 lobes each side = 6-point kernel half-width)
+  const a = 3;
   for (let i = 0; i < outputLength; i++) {
     const srcIndex = i * ratio;
-    const floor = Math.floor(srcIndex);
-    const ceil = Math.min(floor + 1, input.length - 1);
-    const frac = srcIndex - floor;
-
-    // Linear interpolation
-    output[i] = input[floor] * (1 - frac) + input[ceil] * frac;
+    const f = srcIndex - Math.floor(srcIndex);
+    let sum = 0;
+    for (let k = -a; k < a; k++) {
+      const src = Math.floor(srcIndex) + k;
+      if (src < 0 || src >= input.length) continue;
+      const x = f - k;
+      if (x === 0) {
+        sum += input[src];
+      } else {
+        const sinc = Math.sin(Math.PI * x) / (Math.PI * x);
+        const lanczos = sinc * Math.sin(Math.PI * x / a) / (Math.PI * x / a);
+        sum += input[src] * lanczos;
+      }
+    }
+    output[i] = sum;
   }
 
   return output;
