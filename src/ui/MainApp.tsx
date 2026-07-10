@@ -17,6 +17,7 @@ import { MeterBar } from './components/MeterBar';
 import { ConstellationPlot } from './components/ConstellationPlot';
 import { PipelineStrip } from './components/PipelineStrip';
 import { debugLogger, STAGE } from '../modem/debug/debugger';
+import { OFDM_SYMBOL_MS, OFDM_CP_MS, OFDM_DEFAULTS } from '../modem/types';
 import { TONE_COLORS, TONE_FREQUENCIES, formatSize } from './lib';
 
 const GAP = 12;
@@ -49,6 +50,22 @@ export function MainApp() {
   useEffect(() => {
     localStorage.setItem('eardrop_tab', tab);
   }, [tab]);
+
+  // Auto-set OFDM-compatible defaults when switching to OFDM mode
+  useEffect(() => {
+    if (s.useOFDM) {
+      const updates: Partial<typeof s> = {};
+      if (s.pilotFreqHz < 1500) {
+        updates.pilotFreqHz = OFDM_DEFAULTS.pilotFreqHz;
+      }
+      if (s.toneCount < 8) {
+        updates.toneCount = OFDM_DEFAULTS.toneCount;
+      }
+      if (Object.keys(updates).length > 0) {
+        setState(updates);
+      }
+    }
+  }, [s.useOFDM]);
 
   const handleFile = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
@@ -327,9 +344,19 @@ export function MainApp() {
                   fontSize: 12,
                 }}
               >
-                <option value={2}>2 tones</option>
-                <option value={4}>4 tones</option>
-                <option value={8}>8 tones</option>
+                {s.useOFDM ? (
+                  <>
+                    <option value={8}>8 tones</option>
+                    <option value={16}>16 tones</option>
+                    <option value={32}>32 tones</option>
+                  </>
+                ) : (
+                  <>
+                    <option value={2}>2 tones</option>
+                    <option value={4}>4 tones</option>
+                    <option value={8}>8 tones</option>
+                  </>
+                )}
               </select>
             </div>
 
@@ -379,7 +406,9 @@ export function MainApp() {
               </select>
             </div>
             <div style={{ fontSize: 10, color: '#4b5563', marginTop: -4, marginBottom: 8 }}>
-              {s.symbolsPerSec * s.toneCount} bit/s
+              {s.useOFDM
+                ? `≈${Math.round(s.toneCount * 2 * (1000 / (OFDM_SYMBOL_MS + OFDM_CP_MS)))} bit/s raw`
+                : `${s.symbolsPerSec * s.toneCount} bit/s`}
             </div>
 
             {/* OFDM QPSK toggle */}
@@ -416,13 +445,15 @@ export function MainApp() {
               </div>
               <input
                 type="range"
-                min="37.5"
-                max="537.5"
+                min={s.useOFDM ? "500" : "37.5"}
+                max={s.useOFDM ? "4000" : "537.5"}
                 step="25"
                 value={s.pilotFreqHz}
                 onChange={(e) => {
                   const raw = parseFloat(e.target.value);
-                  const v = Math.round((raw - 12.5) / 25) * 25 + 12.5;
+                  const v = s.useOFDM
+                    ? Math.round(raw / 25) * 25
+                    : Math.round((raw - 12.5) / 25) * 25 + 12.5;
                   setState({ pilotFreqHz: v });
                   window.dispatchEvent(
                     new CustomEvent('eardrop-pilot-freq', { detail: { freq: v } }),
