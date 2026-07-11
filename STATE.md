@@ -1,8 +1,8 @@
 # Eardrop — State Summary
 
-**Branch**: `main`  
-**Last commit**: `455f379` — fix: add blocksDecoded/blocksCrcFailed to debug snapshot  
-**Date**: 2026-07-09
+**Branch**: `feat/ofdm-throughput-max`  
+**Last commit**: `16cde2c` — feat(ui): net OFDM bitrate readout, hide no-op symbol rate, default 32 tones  
+**Date**: 2026-07-11
 
 ---
 
@@ -18,28 +18,38 @@
 - AGC/noise suppression/echo cancellation force-disabled
 - Resampled playback via linear interpolation when output rate != modem rate
 
-### OFDM/QPSK (OFDM checkbox ON)
-- **Modulation**: Direct cosine synthesis, configurable tone count (default 16), QPSK per subcarrier, pilot at fixed 1900 Hz
-- **Symbol**: 40 ms + 5 ms cyclic prefix = 45 ms total (~22.22 sym/s at any hardware rate)
+### OFDM/QPSK (OFDM checkbox ON) — Throughput Max
+- **Modulation**: Direct cosine synthesis, configurable tone count (default 32), QPSK per subcarrier, pilot at 1900 Hz (OFDM-scaled 2.0 amplitude)
+- **Symbol**: 20 ms + 5 ms cyclic prefix = 25 ms total (~40 sym/s at any hardware rate)
 - **Demodulation**: Goertzel / toneIQ bank at exact tone frequencies with per-tone channel equalization (amplitude + phase correction trained on sync burst)
 - **Sample rate**: Native hardware rate (48000 / 44100 Hz) — no downsampling. Symbol adapts automatically to any sample rate via ceil(sampleRate * OFDM_SYMBOL_MS / 1000)
-- **Sync**: 24-symbol burst (~1.08 s at any rate), all tones QPSK 0°, detected via total tone energy threshold
-- **Tone grid**: 2000-2750 Hz at 50 Hz spacing (16 tones default), pilot at 1900 Hz. All frequencies are multiples of 25 Hz for orthogonality with the 40 ms symbol
+- **Sync**: 24-symbol burst (~600 ms), all tones QPSK 0°, detected via total tone energy threshold
+- **Tone grid**: 2000-3550 Hz at 50 Hz spacing (32 tones default), pilot at 1900 Hz. All frequencies are multiples of 50 Hz for orthogonality with the 20 ms symbol
+- **Frame format**: [SENTINEL 3B][BCH 24B][RS(52,40)×4 = 208B] = 235B carrying 160 payload B (68% payload density)
 - **Cross-rate**: Encode at 48000 Hz, decode at 44100 Hz — verified working
-- **In-memory**: All 13 tests pass (modulation, demodulation, loopback, sync, acoustic path, cross-rate, hum immunity)
-- **Acoustic testing pending**: Live mic/speaker verification (Task 9)
+- **Tuning**: All OFDM constants centralized in `OFDM_TUNING` in `types.ts`
 
 ### Key parameters (current)
 | Parameter | Default | Notes |
 |-----------|---------|-------|
 | Sample rate | Hardware rate | 48000 or 44100 Hz, no downsampling for OFDM |
-| Symbol length | 40 ms | Time-domain, adapts to any sample rate |
+| Symbol length | 20 ms | Time-domain, adapts to any sample rate |
 | CP length | 5 ms | ceil(sampleRate * 0.005) samples |
-| Tone spacing | 50 Hz | Multiples of 25 Hz for orthogonality |
-| Tone count | 16 | Configurable 8/16/32 |
-| Pilot freq | 1900 Hz | Below data band (2000-2750 Hz at 16 tones) |
-| Raw bitrate (16 tones) | 711 bps | 2 bits/tone × 16 tones / 0.045 s |
-| Raw bitrate (32 tones) | 1422 bps | 2 bits/tone × 32 tones / 0.045 s |
+| Tone spacing | 50 Hz | Multiples of 50 Hz for orthogonality |
+| Tone count | 32 | Configurable 8/16/32 |
+| Pilot freq | 1900 Hz | Below data band (2000-3550 Hz at 32 tones) |
+| Pilot amplitude | 2.0 (OFDM) | Previously used BPSK-scaled 0.4 — fixed |
+| Net payload rate (32 tones) | ~1707 bps (166 B/s) | 2000-byte file benchmark |
+| Raw bitrate (32 tones) | 2560 bps | 2 bits/tone × 32 tones / 0.025 s |
+
+### Throughput benchmark (2000-byte file, 48 kHz)
+
+| Config | 16 tones | 32 tones |
+|--------|----------|----------|
+| Baseline (45ms symbol, 79B frame) | 41.5 B/s | 80.8 B/s |
+| + 4 RS blocks (235B frame) | 48.6 B/s | 92.6 B/s |
+| + 20ms symbol (25ms total) | **87.4 B/s** | **166.7 B/s** |
+| Overall gain vs baseline | ×2.1 | ×2.1 |
 
 ### Code organization
 - `src/lib/` — 8 utility modules (math, encoding, crc, ecc, scan, protocol, debug, channel)
@@ -49,22 +59,24 @@
 - `src/ui/` — MainApp.tsx, Store.ts, components/, controllers/, debug/, lib/, styles/
 
 ### Tests
-- **90 tests total** (87 pass, 3 pre-existing failures)
-- **13 OFDM-specific tests** — all pass (modulation, demodulation, loopback, sync, full frame)
-- 3 failures: Doppler +2Hz, Doppler -1Hz, Full Stress (pipeline test, pre-existing)
+- **115 tests total** (112 pass, 3 pre-existing failures)
+- **All OFDM tests pass**: modulation, demodulation, loopback, sync, acoustic path, cross-rate, hum immunity, frame geometry V2, tuning invariants, pilot level, throughput benchmark
+- 3 pre-existing failures: Doppler +2Hz, Doppler -1Hz, Full Stress (BPSK pipeline test — do not chase)
 
 ---
 
 ## Known issues
 
 ### OFDM acoustic status
-- OFDM works perfectly in-memory (all 13 tests pass: modulation, demodulation, loopback, sync, acoustic path, cross-rate, hum immunity)
-- Per-tone channel equalization (amplitude + phase correction trained on sync burst) is implemented and verified in-memory
-- Acoustic testing with live mic/speaker not yet performed (blocked on Task 9)
+- OFDM works in-memory (all tests pass)
+- The pilot amplitude bug (buried pilot at 32 tones) is fixed — live acoustic path may now decode reliably at 32 tones
+- **Live acoustic testing with real speaker/mic not yet performed for the new timing** — this is the next step
 
 ### OFDM tone count > 16
-- 32-tone mode is configurable (1422 bps raw bitrate) but untested acoustically
-- The nibble-based bit packing in the sentinel scanner adapts automatically to any tone count (every 2 frame bits → 1 byte)
+- 32-tone mode is now the default. Tested in-memory with the fix for pilot amplitude.
+
+### Pre-existing BPSK pipeline failures
+- Doppler +2Hz, Doppler -1Hz, Full Stress — BPSK-specific, not related to OFDM changes
 
 ---
 
@@ -78,6 +90,7 @@
 - `src/modem/modulation/OFDMQPSKModulator.ts` — Direct cosine synthesis modulator (native-rate)
 - `src/modem/demodulation/OFDMQPSKDemodulator.ts` — Goertzel/toneIQ demod with per-tone channel equalization
 - `src/modem/protocol/ofdmEngine.ts` — TX engine (sync burst, frame modulation)
-- `src/modem/protocol/txEngine.ts` — TxEngine integration (useOFDM flag, OFDMEngine creation)
+- `src/modem/protocol/txEngine.ts` — TxEngine integration (OFDMEngine creation, pilot amplitude fix)
 - `src/modem/protocol/rxEngine.ts` — RxEngine integration (OFDM detection, demod path)
-- `src/modem/ofdm.ts` — Native-rate OFDM constants and tone frequency generation
+- `src/modem/protocol/atomicFrame.ts` — Frame geometry (4 RS blocks, 235B frame, 160B payload)
+- `src/modem/types.ts` — OFDM constants and tuning levers (OFDM_SYMBOL_MS, OFDM_TUNING, OFDM_DEFAULTS)

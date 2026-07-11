@@ -230,30 +230,32 @@ Time-domain OFDM with QPSK per subcarrier. Symbols are defined in milliseconds r
 
 ### Architecture
 
-- **Symbol length**: 40 ms + 5 ms cyclic prefix = 45 ms total
+- **Symbol length**: 20 ms + 5 ms cyclic prefix = 25 ms total
 - **Modulation**: Direct cosine synthesis at exact tone frequencies (no IFFT)
 - **Demodulation**: Goertzel / toneIQ bank at exact tone frequencies (no FFT)
-- **Tone grid**: Multiples of 25 Hz (1000 / 40 ms), guaranteeing orthogonality at any sample rate
+- **Tone grid**: Multiples of 50 Hz (1000 / 20 ms), guaranteeing orthogonality at any sample rate
 - **Pilot**: Continuous pilot at a fixed absolute frequency, used for per-tone channel equalization
 
 ### Protocol Constants
 
 | Parameter | Value |
 |-----------|-------|
-| `OFDM_SYMBOL_MS` | 40 ms |
+| `OFDM_SYMBOL_MS` | 20 ms |
 | `OFDM_CP_MS` | 5 ms |
 | `ofdmPilotFreqHz` | 1900 Hz |
 | `ofdmPilotAmplitude` | 2.0 |
 | `ofdmToneSpacingHz` | 50 Hz |
 | `ofdmToneStartHz` | 2000 Hz |
-| `ofdmToneCount` default | 16 |
-| Sync burst | 24 symbols (~1.08 s) |
-| Raw bitrate (16 tones) | 711 bps |
-| Raw bitrate (32 tones) | 1422 bps |
+| `ofdmToneCount` default | 32 |
+| Sync burst | 24 symbols (~600 ms) |
+| Raw bitrate (16 tones) | 1280 bps |
+| Raw bitrate (32 tones) | 2560 bps |
+| Net payload rate (32 tones) | ~1707 bps (166 B/s) |
+| Frame format | [SENTINEL 3B][BCH 24B][RS(52,40)×4 = 208B] = 235B |
 
 ### Tone Grid
 
-Tones are at `2000 + n * 50` Hz for n = 0 … toneCount-1. With 16 tones: 2000, 2050, 2100, …, 2750 Hz. The pilot is at 1900 Hz, below the data band. All frequencies — pilot and tones — are exact multiples of 25 Hz for orthogonality with the 40 ms symbol.
+Tones are at `2000 + n * 50` Hz for n = 0 … toneCount-1. With default 32 tones: 2000, 2050, 2100, …, 3550 Hz. The pilot is at 1900 Hz, below the data band. All frequencies — pilot and tones — are exact multiples of 50 Hz for orthogonality with the 20 ms symbol.
 
 ### Sync Burst
 
@@ -272,7 +274,7 @@ Each OFDM symbol carries 2 bits per tone (QPSK) → `toneCount × 2` frame bits 
 
 ### Sample Rate Adaptivity
 
-Symbol length in samples is `ceil(sampleRate * OFDM_SYMBOL_MS / 1000)` and CP in samples is `ceil(sampleRate * OFDM_CP_MS / 1000)`. At 48000 Hz: 1920-sample symbol + 240-sample CP = 2160 samples. At 44100 Hz: 1764 + 221 = 1985 samples. The Goertzel/toneIQ bank operates at the exact tone frequencies regardless of sample rate.
+Symbol length in samples is `ceil(sampleRate * OFDM_SYMBOL_MS / 1000)` and CP in samples is `ceil(sampleRate * OFDM_CP_MS / 1000)`. At 48000 Hz: 960-sample symbol + 240-sample CP = 1200 samples. At 44100 Hz: 882 + 221 = 1103 samples. The Goertzel/toneIQ bank operates at the exact tone frequencies regardless of sample rate.
 
 ---
 
