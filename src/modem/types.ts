@@ -177,7 +177,7 @@ export const OFDM_DEFAULTS = {
   pilotAmplitude: 2.0,
   toneStartHz: 2000,
   toneSpacingHz: 50,
-  toneCount: 16,
+  toneCount: 32,
 } as const;
 
 /**

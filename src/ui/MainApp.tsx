@@ -18,6 +18,7 @@ import { ConstellationPlot } from './components/ConstellationPlot';
 import { PipelineStrip } from './components/PipelineStrip';
 import { debugLogger, STAGE } from '../modem/debug/debugger';
 import { OFDM_SYMBOL_MS, OFDM_CP_MS, OFDM_DEFAULTS } from '../modem/types';
+import { FRAME_SIZE, PAYLOAD_DATA_SIZE } from '../modem/protocol/atomicFrame';
 import { TONE_COLORS, TONE_FREQUENCIES, formatSize } from './lib';
 
 const GAP = 12;
@@ -378,36 +379,44 @@ export function MainApp() {
               />
             </div>
 
-            {/* Symbol Rate */}
-            <div
-              style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                marginBottom: 8,
-              }}
-            >
-              <span style={{ fontSize: 12, color: '#6b7280' }}>Symbol Rate</span>
-              <select
-                value={s.symbolsPerSec}
-                onChange={(e) => setState({ symbolsPerSec: parseInt(e.target.value) })}
+            {!s.useOFDM && (
+              <div
                 style={{
-                  background: 'rgba(255,255,255,0.04)',
-                  color: '#e5e7eb',
-                  border: '1px solid rgba(255,255,255,0.1)',
-                  borderRadius: 5,
-                  padding: '3px 8px',
-                  fontSize: 12,
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  marginBottom: 8,
                 }}
               >
-                <option value={10}>10 sym/s</option>
-                <option value={25}>25 sym/s</option>
-                <option value={50}>50 sym/s</option>
-              </select>
-            </div>
+                <span style={{ fontSize: 12, color: '#6b7280' }}>Symbol Rate</span>
+                <select
+                  value={s.symbolsPerSec}
+                  onChange={(e) => setState({ symbolsPerSec: parseInt(e.target.value) })}
+                  style={{
+                    background: 'rgba(255,255,255,0.04)',
+                    color: '#e5e7eb',
+                    border: '1px solid rgba(255,255,255,0.1)',
+                    borderRadius: 5,
+                    padding: '3px 8px',
+                    fontSize: 12,
+                  }}
+                >
+                  <option value={10}>10 sym/s</option>
+                  <option value={25}>25 sym/s</option>
+                  <option value={50}>50 sym/s</option>
+                </select>
+              </div>
+            )}
             <div style={{ fontSize: 10, color: '#4b5563', marginTop: -4, marginBottom: 8 }}>
               {s.useOFDM
-                ? `≈${Math.round(s.toneCount * 2 * (1000 / (OFDM_SYMBOL_MS + OFDM_CP_MS)))} bit/s raw`
+                ? (() => {
+                    const symbolSec = (OFDM_SYMBOL_MS + OFDM_CP_MS) / 1000;
+                    const bytesPerSym = Math.max(1, Math.floor(s.toneCount / 4));
+                    const frameSyms = Math.ceil(FRAME_SIZE / bytesPerSym);
+                    const netBps = Math.round((PAYLOAD_DATA_SIZE * 8) / (frameSyms * symbolSec));
+                    const rawBps = Math.round((s.toneCount * 2) / symbolSec);
+                    return `≈${netBps} bit/s net (${rawBps} raw)`;
+                  })()
                 : `${s.symbolsPerSec * s.toneCount} bit/s`}
             </div>
 
