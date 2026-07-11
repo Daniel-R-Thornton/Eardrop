@@ -684,6 +684,30 @@ export class RxEngine {
     }
   }
 
+  /** Batch entry point — behaviorally identical to per-sample feeding. */
+  feedChunk(chunk: Float32Array): void {
+    for (let i = 0; i < chunk.length; i++) this.feedSample(chunk[i]);
+  }
+
+  /** Frame-assembly progress snapshot for telemetry. */
+  getProgress(): {
+    state: number;
+    framesReceived: number;
+    totalFrames: number;
+    fileName: string;
+    fileSize: number;
+    bytesAssembled: number;
+  } {
+    return {
+      state: this.state,
+      framesReceived: this.framesReceived,
+      totalFrames: this.totalFrames,
+      fileName: this.fileName,
+      fileSize: this.fileSize,
+      bytesAssembled: this.fileData.length,
+    };
+  }
+
   /**
    * (Re)create the OFDM demodulator from config. Clamps toneCount to a
    * multiple of 4 (block packing carries one byte per 4-tone block).
@@ -844,6 +868,8 @@ export class RxEngine {
       len: decoded.payload?.length ?? 0,
     });
     if (!decoded.valid) return;
+
+    if (decoded.header!.totalFrames > 0) this.totalFrames = decoded.header!.totalFrames;
 
     switch (decoded.header!.type) {
       case 0x01: // HEADER
