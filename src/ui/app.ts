@@ -67,55 +67,8 @@ let DEBUG = false;
 const _origLog = console.log;
 
 // ─── Workers ─────────────────────────────────────────
-
-const encoderWorker = new Worker(new URL('../workers/encoder.worker.ts', import.meta.url), {
-  type: 'module',
-});
-
-const broadcastWorker = new Worker(new URL('../workers/broadcast.worker.ts', import.meta.url), {
-  type: 'module',
-});
-(window as any).eardropWorker = broadcastWorker;
-
-// Map of encode task id → { resolve, reject }
-const encodeTasks = new Map<
-  number,
-  {
-    resolve: (s: { samples: Float32Array; sampleRate: number }) => void;
-    reject: (err: Error) => void;
-  }
->();
-let encodeIdCounter = 0;
-
-encoderWorker.onmessage = (e) => {
-  const msg = e.data;
-  const task = encodeTasks.get(msg.id);
-  if (!task) return;
-  encodeTasks.delete(msg.id);
-  if (msg.type === 'encoded') {
-    task.resolve({ samples: new Float32Array(msg.samples), sampleRate: msg.sampleRate });
-  } else if (msg.type === 'error') {
-    task.reject(new Error(msg.error));
-  }
-};
-
-function transmitFileInWorker(
-  fileName: string,
-  data: Uint8Array,
-  config?: Partial<typeof DEFAULT_CONFIG>,
-): Promise<{ samples: Float32Array; sampleRate: number }> {
-  return new Promise((resolve, reject) => {
-    const id = ++encodeIdCounter;
-    encodeTasks.set(id, { resolve, reject });
-    const copy = new Uint8Array(data);
-    encoderWorker.postMessage(
-      { type: 'transmitFile', id, fileName, data: copy, config },
-      { transfer: [copy.buffer] },
-    );
-  });
-}
-
-// ─── Broadcast Worker Messages ──────────────────────
+// Legacy broadcast/encoder workers removed in Task 6 of modem-worker-architecture.
+// All modem logic runs in the unified modem.worker.ts via ModemController.
 
 let decodedAccumulated: Uint8Array[] = [];
 let totalDecoded = 0;
@@ -123,105 +76,6 @@ let parsedPreamble: { preamble: import('../protocol').FilePreamble; consumed: nu
   null;
 let payloadCollected = 0;
 let wasInFrame = false;
-
-broadcastWorker.onmessage = (e) => {
-  const msg = e.data;
-  switch (msg.type) {
-    case 'dlog':
-      // Worker log lines merge into the main-thread ring (single console entry)
-      dlogInject(msg.line);
-      break;
-    case 'listening':
-      setState({ recvStatus: { type: 'info', msg: 'Listener started — awaiting signal…' } });
-      break;
-    case 'stopped':
-      setState({ recvStatus: { type: 'info', msg: 'Listener stopped' } });
-      break;
-    case 'fileComplete': {
-      const data = new Uint8Array(msg.data);
-      if (getState().diversityMode) {
-      // Accumulate copies for majority voting
-        if (!diversityCopies[msg.fileName]) diversityCopies[msg.fileName] = [];
-        diversityCopies[msg.fileName].push(data);
-        const n = diversityCopies[msg.fileName].length;
-        setState({ recvStatus: { type: 'info', msg: `📦 Copy ${n}/3 of "${msg.fileName}"` } });
-        if (n >= 3) {
-        // Bit-by-bit majority vote across 3 copies
-          const len = Math.max(...diversityCopies[msg.fileName].map((b) => b.length));
-          const voted = new Uint8Array(len);
-          for (let i = 0; i < len; i++) {
-            let ones = 0,
-              zeros = 0;
-            for (const copy of diversityCopies[msg.fileName]) {
-              if (i < copy.length) {
-                for (let b = 0; b < 8; b++) {
-                  if ((copy[i] >> b) & 1) ones++;
-                  else zeros++;
-                }
-              }
-            }
-            voted[i] = ones > zeros ? 0xff : 0x00;
-            // Per-byte majority vote instead of per-bit
-            const byteVotes: number[] = [];
-            for (const copy of diversityCopies[msg.fileName]) {
-              if (i < copy.length) byteVotes.push(copy[i]);
-            }
-            byteVotes.sort((a, b) => {
-              const ca = byteVotes.filter((v) => v === a).length;
-              const cb = byteVotes.filter((v) => v === b).length;
-              return cb - ca;
-            });
-            voted[i] = byteVotes[0];
-          }
-          delete diversityCopies[msg.fileName];
-          setState({
-            recvStatus: {
-              type: 'success',
-              msg: `✅ Majority vote: "${msg.fileName}" (${voted.length}B)`,
-            },
-          });
-          const blob = new Blob([voted], { type: 'application/octet-stream' });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = msg.fileName;
-          a.click();
-          URL.revokeObjectURL(url);
-        }
-      } else {
-        setState({
-          recvStatus: { type: 'success', msg: `✅ Received "${msg.fileName}" (${data.length}B)` },
-        });
-        const blob = new Blob([data], { type: 'application/octet-stream' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = msg.fileName;
-        a.click();
-        URL.revokeObjectURL(url);
-      }
-      break;
-    }
-    case 'decoderState': {
-      const stateNames = ['WAITING', 'CALIBRATION', 'HEADER', 'DATA', 'COMPLETE'];
-      const label = stateNames[msg.state] ?? `STATE(${msg.state})`;
-      setState({ recvStatus: { type: 'info', msg: `📡 ${label}` } });
-      break;
-    }
-    case 'debugDecoderState': {
-      // Forward to global store + custom event for debug panels
-      setState({ debug: msg.snapshot });
-      window.dispatchEvent(new CustomEvent('eardrop-decoder-state', {
-        detail: { type: 'decoderState', snapshot: msg.snapshot },
-      }));
-      break;
-    }
-      break;
-    case 'debugSentinelScan':
-      setState({ sentinelScan: msg.history });
-      break;
-  }
-};
 
 // ─── DOM refs (acquired lazily — React creates these) ──
 let inputSelect: HTMLSelectElement | null = null;
@@ -489,13 +343,8 @@ window.addEventListener('eardrop-download-wav', (() => {
   });
 }) as EventListener);
 
-// Live threshold adjustment — forward to broadcast worker
-window.addEventListener('eardrop-thresholds', ((e: CustomEvent) => {
-  broadcastWorker.postMessage({
-    type: 'updateThresholds',
-    ampRatio: e.detail.ampRatio,
-    syncMul: e.detail.syncMul,
-  });
+// Live threshold adjustment — legacy, superseded by unified worker
+window.addEventListener('eardrop-thresholds', (() => {
 }) as EventListener);
 
 // Acoustic sweep
@@ -820,7 +669,6 @@ function stopListening() {
     clearInterval(recvTimer);
     recvTimer = null;
   }
-  broadcastWorker.postMessage({ type: 'stopListening' });
   setState({ isListening: false, recvStatus: { type: 'info', msg: '⏸ Stopped' } });
 }
 
@@ -1895,11 +1743,7 @@ async function runAcousticSpeedSweep() {
     const totalSamples = audio.length;
     const durationSec = totalSamples / sampleRate;
 
-    // Reset RxEngine by cycling listening
-    broadcastWorker.postMessage({ type: 'stopListening' });
-    await new Promise((r) => setTimeout(r, 100));
-    broadcastWorker.postMessage({ type: 'startListening', config: cfg });
-    await new Promise((r) => setTimeout(r, 200));
+    // RxEngine is already running via modem worker — feed cycles naturally
 
     const preCount = recvSamples.length;
     setState({ isPlaying: true });
@@ -1929,10 +1773,18 @@ async function runAcousticSpeedSweep() {
   setState({ sendStatus: { type: 'success', msg: `✅ Sweep done — ${rates.length} rates tested` } });
 
   // Restart listening for normal use
-  broadcastWorker.postMessage({ type: 'stopListening' });
+  modem.stopListening();
   await new Promise((r) => setTimeout(r, 100));
-  const listenCfg = { ...DEFAULT_CONFIG, pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz };
-  broadcastWorker.postMessage({ type: 'startListening', config: listenCfg });
+  modem.configure(buildModemConfig({
+    useOFDM: getState().useOFDM,
+    pilotFreqHz: getState().pilotFreqHz,
+    toneCount: getState().toneCount,
+    symbolsPerSec: getState().symbolsPerSec,
+    musicalMode: getState().musicalMode,
+    diversityMode: getState().diversityMode,
+    hwSampleRate: audioCtx.sampleRate,
+  }));
+  await modem.startListening(getState().micGain, getState().selectedInputId || undefined);
 }
 
 window.addEventListener('eardrop-acoustic-speed', (async () => {
