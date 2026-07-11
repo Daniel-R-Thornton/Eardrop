@@ -318,6 +318,8 @@ window.addEventListener('eardrop-send', (async () => {
       diversityMode: getState().diversityMode,
       useOFDM: getState().useOFDM,
       sampleRate: getState().useOFDM ? audioCtx.sampleRate : DEFAULT_CONFIG.sampleRate,
+      symbolsPerSec: getState().symbolsPerSec,
+      toneCount: getState().toneCount,
     };
     const { samples: playSamples, sampleRate: actualRate } = await transmitFileInWorker(
       selectedFile.name,
@@ -384,6 +386,8 @@ window.addEventListener('eardrop-send-test', (async () => {
       musical: getState().musicalMode,
       useOFDM: getState().useOFDM,
       sampleRate: getState().useOFDM ? audioCtx.sampleRate : DEFAULT_CONFIG.sampleRate,
+      symbolsPerSec: getState().symbolsPerSec,
+      toneCount: getState().toneCount,
     };
     const { samples: playSamples, sampleRate: actualRate } = await transmitFileInWorker(
       'hello.txt',
