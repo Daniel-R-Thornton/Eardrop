@@ -6,7 +6,7 @@
 import { dbg } from '../lib/debug';
 import { dlog } from '../lib/debug/dlog';
 
-export type SampleCallback = (sample: number) => void;
+export type ChunkCallback = (chunk: Float32Array) => void;
 
 /** AudioWorklet processor — configurable downsampler or pass-through.
  *  `processorOptions.ratio` = 1: native-rate pass-through (no filtering).
@@ -122,7 +122,7 @@ export class AudioRecorder {
   private workletNode: AudioWorkletNode | null = null;
   private ctx: AudioContext;
   private running = false;
-  private onSample: SampleCallback | null = null;
+  private onChunk: ChunkCallback | null = null;
   /** Reference to the live GainNode for dynamic mic gain adjustment */
   private micBoostNode: GainNode | null = null;
 
@@ -144,7 +144,7 @@ export class AudioRecorder {
     }
   }
 
-  async start(_modemRate: number, onSample: SampleCallback, deviceId?: string): Promise<void> {
+  async start(_modemRate: number, onChunk: ChunkCallback, deviceId?: string): Promise<void> {
     if (this.running) return;
     this.micBoostNode = null;
 
@@ -193,7 +193,7 @@ export class AudioRecorder {
     this.stream = await navigator.mediaDevices.getUserMedia(constraints);
 
     this.source = this.ctx.createMediaStreamSource(this.stream);
-    this.onSample = onSample;
+    this.onChunk = onChunk;
 
     // AudioWorklet: compute downsample ratio from ctx rate / modem rate.
     // ratio === 1 means pass-through (native rate OFDM); ratio > 1 uses
@@ -205,17 +205,7 @@ export class AudioRecorder {
     });
     this.workletNode.port.onmessage = (e: MessageEvent<Float32Array>) => {
       if (!this.running) return;
-      const samples = e.data;
-      dbg.trace('recorder', 'Processing worklet buffer:', {
-        samples: samples.length,
-        rate: isNative ? 'native' : `${this.ctx.sampleRate}→${_modemRate}`,
-      });
-      let samplesProcessed = 0;
-      for (let i = 0; i < samples.length; i++) {
-        this.onSample!(samples[i]);
-        samplesProcessed++;
-      }
-      dbg.trace('recorder', '✅ Processed worklet chunk:', samplesProcessed, 'samples');
+      this.onChunk!(e.data);
     };
 
     // Connect: mic → gain boost → worklet → silent destination
@@ -252,7 +242,7 @@ export class AudioRecorder {
       this.stream.getTracks().forEach((t) => t.stop());
       this.stream = null;
     }
-    this.onSample = null;
+    this.onChunk = null;
     this.running = false;
     console.log('[Recorder] ✅ stopped');
   }
