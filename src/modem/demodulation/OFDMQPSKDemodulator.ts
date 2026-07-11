@@ -10,7 +10,7 @@
  * of bin indices.
  */
 import { toneIQ } from '../pilot';
-import { ofdmSamples } from '../types';
+import { ofdmSamples, OFDM_TUNING } from '../types';
 import { dlog } from '../../lib/debug/dlog';
 
 export interface OFDMQPSKDemodulatorConfig {
@@ -38,7 +38,7 @@ export class OFDMQPSKDemodulator {
   private pilotChannelEstIm = 0;
   private trained = false;
   private trainingSymbols = 0;
-  private readonly TRAINING_SYMBOLS = 12;
+  private readonly TRAINING_SYMBOLS = OFDM_TUNING.trainingSymbols;
   private diagCount = 0;
 
   /** Window sizes computed once from sampleRate */

@@ -19,7 +19,7 @@ import { PilotPLL, toneIQ, getDataToneFreqs } from '../pilot';
 import { decodeFrame, FRAME_SIZE, PAYLOAD_DATA_SIZE, RAW_HEADER_SIZE } from '../protocol/atomicFrame';
 import { SentinelScanner } from '../receiver/SentinelScanner';
 import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
-import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_SYMBOL_MS, OFDM_CP_MS } from '../types';
+import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_SYMBOL_MS, OFDM_CP_MS, OFDM_TUNING } from '../types';
 import { dlog } from '../../lib/debug/dlog';
 
 // ─── Constants ───────────────────────────────────────
@@ -68,12 +68,12 @@ export class RxEngine {
   private ofdmDemod: OFDMQPSKDemodulator | null = null;
   private ofdmSyncFrames = 0;
   /** Energy threshold for OFDM sync detection — based on total tone energy, not pilot-only */
-  private ofdmSyncMinFrames = 8;
+  private ofdmSyncMinFrames = OFDM_TUNING.syncMinFrames;
   private ofdmSyncThreshold = 0.06;
   /** Count of OFDM sync symbols processed for channel training */
   private ofdmTrainingSymbols = 0;
-  /** Detection (8) + boundary-alignment slack (1) + training (12) must fit in the 24-symbol sync burst */
-  private readonly OFDM_TRAINING_SYMBOLS = 12;
+  /** Detection (syncMinFrames) + boundary-alignment slack (1) + training (trainingSymbols) must fit in sync burst */
+  private readonly OFDM_TRAINING_SYMBOLS = OFDM_TUNING.trainingSymbols;
 
   /** OFDM tone count (4 or 8 — multiples of 4 only) */
   private ofdmToneCount = 4;

@@ -180,6 +180,23 @@ export const OFDM_DEFAULTS = {
   toneCount: 16,
 } as const;
 
+/**
+ * OFDM tuning levers — every knob that trades robustness for speed, in one
+ * place. Invariant: syncBurstSymbols >= syncMinFrames + 2 + trainingSymbols
+ * (detection consumes syncMinFrames windows, boundary alignment can skip up
+ * to ~1 symbol, and training needs trainingSymbols full sync symbols).
+ */
+export const OFDM_TUNING = {
+  /** TX: repeated all-zero-phase symbols prepended to every transmission */
+  syncBurstSymbols: 24,
+  /** RX: sync symbols consumed to train per-tone channel estimates */
+  trainingSymbols: 12,
+  /** RX: consecutive above-threshold windows required to declare sync */
+  syncMinFrames: 8,
+  /** TX: trailing silence symbols after the tail frame */
+  tailSilenceSymbols: 6,
+} as const;
+
 export function ofdmToneFrequencies(opts: {
   toneCount: number;
   startHz?: number;
