@@ -26,18 +26,24 @@ import { crc32 } from '../../crc32';
 
 // ─── Constants ───────────────────────────────────────
 
-/** Total frame size on the wire (bytes) */
-export const FRAME_SIZE = 79;
+/** RS blocks packed into one frame — the frame-size lever (1 = legacy 79B) */
+export const PAYLOAD_BLOCKS = 4;
+/** Data bytes carried by one RS(52,40) block */
+export const RS_BLOCK_DATA = 40;
+/** Wire bytes of one RS(52,40) block */
+export const RS_BLOCK_SIZE = 52;
 /** Sentinel bytes (3) */
 export const SENTINEL_SIZE = 3;
 /** BCH(63,30) × 3 header size (bytes) */
 export const BCH_HEADER_SIZE = 24;
-/** RS(52,40) payload+parity size (bytes) */
-export const RS_PAYLOAD_SIZE = 52;
+/** RS payload+parity size (bytes) */
+export const RS_PAYLOAD_SIZE = RS_BLOCK_SIZE * PAYLOAD_BLOCKS;
 /** Raw (unencoded) header size (bytes) */
 export const RAW_HEADER_SIZE = 9;
 /** Payload data size before RS encoding (bytes) */
-export const PAYLOAD_DATA_SIZE = 40;
+export const PAYLOAD_DATA_SIZE = RS_BLOCK_DATA * PAYLOAD_BLOCKS;
+/** Total frame size on the wire (bytes) */
+export const FRAME_SIZE = SENTINEL_SIZE + BCH_HEADER_SIZE + RS_PAYLOAD_SIZE;
 
 const SENTINEL_BYTES = new Uint8Array([0xe7, 0x9f, 0xe7]);
 
@@ -165,7 +171,7 @@ function decodeBCHHeader(encoded: Uint8Array): Uint8Array {
 // ─── Public API ──────────────────────────────────────
 
 /**
- * Encode a frame: header + 40-byte payload → 79-byte wire frame.
+ * Encode a frame: header + payload → wire frame (235 bytes with 4 RS blocks).
  */
 export function encodeFrame(header: AtomicHeader, payload: Uint8Array): Uint8Array {
   // 1. Pack 5 header field bytes
@@ -185,20 +191,25 @@ export function encodeFrame(header: AtomicHeader, payload: Uint8Array): Uint8Arr
   // 3. BCH(63,30) × 3 encode header → 24 bytes
   const bchHeader = encodeBCHHeader(wireHeader);
 
-  // 4. RS(52,40) encode payload → 52 bytes
-  const rsPayload = rsEncode(payload.slice(0, PAYLOAD_DATA_SIZE));
+  // 4. Normalize payload to exactly PAYLOAD_DATA_SIZE (zero-pad at the END —
+  // rsEncode pads short input at the FRONT, which would misplace bytes)
+  const fullPayload = new Uint8Array(PAYLOAD_DATA_SIZE);
+  fullPayload.set(payload.slice(0, PAYLOAD_DATA_SIZE), 0);
 
-  // 5. Assemble frame
+  // 5. RS(52,40) encode each 40-byte chunk and assemble the frame
   const frame = new Uint8Array(FRAME_SIZE);
   frame.set(SENTINEL_BYTES, 0);
   frame.set(bchHeader, SENTINEL_SIZE);
-  frame.set(rsPayload, SENTINEL_SIZE + BCH_HEADER_SIZE);
+  for (let b = 0; b < PAYLOAD_BLOCKS; b++) {
+    const chunk = fullPayload.slice(b * RS_BLOCK_DATA, (b + 1) * RS_BLOCK_DATA);
+    frame.set(rsEncode(chunk), SENTINEL_SIZE + BCH_HEADER_SIZE + b * RS_BLOCK_SIZE);
+  }
 
   return frame;
 }
 
 /**
- * Decode a 79-byte frame. Returns header + payload + validity.
+ * Decode a frame. Returns header + payload + validity.
  */
 export function decodeFrame(frame: Uint8Array): DecodedFrame {
   if (frame.length < FRAME_SIZE) {
@@ -227,13 +238,19 @@ export function decodeFrame(frame: Uint8Array): DecodedFrame {
   const maskedExpected = (expectedCrc & 0xfcffffff) >>> 0;
   const crcOk = maskedExpected === header.crc;
 
-  // 5. RS(52,40) decode payload
+  // 5. RS(52,40) decode each block
   const rsStart = SENTINEL_SIZE + BCH_HEADER_SIZE;
-  const rsResult = rsDecode(frame.slice(rsStart, rsStart + RS_PAYLOAD_SIZE));
+  const payload = new Uint8Array(PAYLOAD_DATA_SIZE);
+  let allBlocksValid = true;
+  for (let b = 0; b < PAYLOAD_BLOCKS; b++) {
+    const rsResult = rsDecode(
+      frame.slice(rsStart + b * RS_BLOCK_SIZE, rsStart + (b + 1) * RS_BLOCK_SIZE),
+    );
+    payload.set(rsResult.data.slice(0, RS_BLOCK_DATA), b * RS_BLOCK_DATA);
+    if (!rsResult.valid || rsResult.errors < 0) allBlocksValid = false;
+  }
 
   // 6. Return result
-  const payload = rsResult.data.slice(0, PAYLOAD_DATA_SIZE);
-  const valid = crcOk && rsResult.valid && rsResult.errors >= 0;
-
+  const valid = crcOk && allBlocksValid;
   return { header, payload, valid };
 }

@@ -62,6 +62,6 @@ for (const toneCount of [16, 32]) {
       `[BENCH] tones=${toneCount} payloadBytes=${payloadBytes} audioSec=${audioSec.toFixed(2)} rate=${rate.toFixed(1)} B/s`,
     );
     // Floor guards against silent regression; raise it as levers land.
-    expect(rate).toBeGreaterThan(toneCount === 32 ? 60 : 30);
+    expect(rate).toBeGreaterThan(toneCount === 32 ? 85 : 45);
   });
 }

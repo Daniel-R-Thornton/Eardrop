@@ -10,7 +10,7 @@ import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
 import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
 import { toneIQ } from '../pilot';
 import { OFDMEngine } from '../protocol/ofdmEngine';
-import { encodeFrame } from '../protocol/atomicFrame';
+import { encodeFrame, FRAME_SIZE } from '../protocol/atomicFrame';
 import { RxEngine } from '../protocol/rxEngine';
 import { resample } from '../../lib/math';
 
@@ -115,8 +115,8 @@ test('engine @48k/16 tones: 2 bytes per symbol, sync burst sized in time', () =>
   const engine = new OFDMEngine({ sampleRate: 48000, toneCount: 16 });
   const { symSamples } = ofdmSamples(48000);
   const frame = encodeFrame({ type: 0x01, seqNum: 0, totalFrames: 1, crc: 0 }, new Uint8Array(40));
-  const audio = engine.modulateFrame(frame); // 79 bytes / 4 blocks = 20 symbols
-  expect(audio.length).toBe(Math.ceil(79 / 4) * symSamples);
+  const audio = engine.modulateFrame(frame); // FRAME_SIZE bytes / 4 blocks = N symbols
+  expect(audio.length).toBe(Math.ceil(FRAME_SIZE / 4) * symSamples);
   expect(engine.generateSyncBurst(24).length).toBe(24 * symSamples);
 });
 
