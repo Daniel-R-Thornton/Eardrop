@@ -20,6 +20,7 @@ import { debugLogger, STAGE } from '../modem/debug/debugger';
 import { OFDM_SYMBOL_MS, OFDM_CP_MS, OFDM_DEFAULTS } from '../modem/types';
 import { FRAME_SIZE, PAYLOAD_DATA_SIZE } from '../modem/protocol/atomicFrame';
 import { TONE_COLORS, TONE_FREQUENCIES, formatSize } from './lib';
+import { useTelemetry } from './telemetryStore';
 
 const GAP = 12;
 
@@ -899,9 +900,9 @@ export function MainApp() {
 
         <Card title="Spectrum — FFT + Waterfall" accent="#818cf8">
           <SpectrumAnalyzer
-            spectrum={s.fftSpectrum}
-            rawPeak={s.rawPeak}
-            noiseFloorDb={s.noiseFloorDb}
+            spectrum={useTelemetry((t) => t?.spectrum ?? null)}
+            rawPeak={useTelemetry((t) => t?.peak ?? 0)}
+            noiseFloorDb={useTelemetry((t) => t?.rmsDb ?? -80)}
             sampleRate={3200}
           />
         </Card>
