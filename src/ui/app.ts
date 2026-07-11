@@ -31,6 +31,8 @@ import { TONE_FREQUENCIES, formatPayloadHex } from './lib';
 import { detectToneEnergy } from '../lib/scan/index';
 import { resample } from '../lib/math/index';
 import { dlog, dlogInject, dlogSetMode } from '../lib/debug/dlog';
+import { ModemController } from './controllers/modemController';
+import { buildModemConfig } from './controllers/buildModemConfig';
 
 // Main thread: clear-and-reprint the whole log as ONE console entry per update
 // so a single copy grabs the entire session. Worker lines arrive via 'dlog'
@@ -253,6 +255,21 @@ const audioCtx = new AudioContext();
 const viz = new Visualizer();
 const player = new AudioPlayer(audioCtx);
 
+const modem = new ModemController(audioCtx);
+modem.on('fileComplete', (ev) => {
+  const data = new Uint8Array(ev.data);
+  const blob = new Blob([data]);
+  const url = URL.createObjectURL(blob);
+  setState({ recvStatus: { type: 'success', msg: `✅ Received ${ev.fileName}` } });
+  setState({
+    receivedFiles: [
+      ...getState().receivedFiles,
+      { name: ev.fileName, url, size: data.length },
+    ],
+  });
+});
+modem.on('dlog', (ev) => dlogInject(ev.line));
+
 dlog('APP', { hwRate: audioCtx.sampleRate });
 
 // ─── Device Enumeration ───────────────────────────────
@@ -312,19 +329,18 @@ window.addEventListener('eardrop-send', (async () => {
     const raw = new Uint8Array(await selectedFile.arrayBuffer());
     showTxPayload(raw, selectedFile.name);
 
-    const cfg: any = {
-      pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz,
-      musical: getState().musicalMode,
-      diversityMode: getState().diversityMode,
+    modem.configure(buildModemConfig({
       useOFDM: getState().useOFDM,
-      sampleRate: getState().useOFDM ? audioCtx.sampleRate : DEFAULT_CONFIG.sampleRate,
-      symbolsPerSec: getState().symbolsPerSec,
+      pilotFreqHz: getState().pilotFreqHz,
       toneCount: getState().toneCount,
-    };
-    const { samples: playSamples, sampleRate: actualRate } = await transmitFileInWorker(
+      symbolsPerSec: getState().symbolsPerSec,
+      musicalMode: getState().musicalMode,
+      diversityMode: getState().diversityMode,
+      hwSampleRate: audioCtx.sampleRate,
+    }));
+    const { samples: playSamples, sampleRate: actualRate } = await modem.encodeFile(
       selectedFile.name,
       raw,
-      cfg,
     );
     setState({ sendStatus: { type: 'info', msg: `Playing ${selectedFile.name}…` } });
     setState({ isPlaying: true });
@@ -381,18 +397,18 @@ window.addEventListener('eardrop-send-test', (async () => {
   showTxPayload(raw, 'hello.txt');
   setState({ sendStatus: { type: 'info', msg: '📤 Sending test…' } });
   try {
-    const cfg: any = {
-      pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz,
-      musical: getState().musicalMode,
+    modem.configure(buildModemConfig({
       useOFDM: getState().useOFDM,
-      sampleRate: getState().useOFDM ? audioCtx.sampleRate : DEFAULT_CONFIG.sampleRate,
-      symbolsPerSec: getState().symbolsPerSec,
+      pilotFreqHz: getState().pilotFreqHz,
       toneCount: getState().toneCount,
-    };
-    const { samples: playSamples, sampleRate: actualRate } = await transmitFileInWorker(
+      symbolsPerSec: getState().symbolsPerSec,
+      musicalMode: getState().musicalMode,
+      diversityMode: getState().diversityMode,
+      hwSampleRate: audioCtx.sampleRate,
+    }));
+    const { samples: playSamples, sampleRate: actualRate } = await modem.encodeFile(
       'hello.txt',
       raw,
-      cfg,
     );
     await player.play(
       playSamples,
@@ -682,48 +698,28 @@ async function startListening() {
       progress: 0,
     });
 
-    const listenCfg = {
-      ...DEFAULT_CONFIG,
-      sampleRate: getState().useOFDM ? audioCtx.sampleRate : DEFAULT_CONFIG.sampleRate,
-      pilotFreqHz: getState().pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz,
-      musical: getState().musicalMode,
-      toneCount: getState().toneCount || DEFAULT_CONFIG.toneCount,
-      bitsPerFrame: (getState().toneCount || DEFAULT_CONFIG.toneCount) * 2,
-      symbolsPerSec: getState().symbolsPerSec || DEFAULT_CONFIG.symbolsPerSec,
-      ampThresholdRatio: getState().ampThresholdRatio ?? DEFAULT_CONFIG.ampThresholdRatio,
-      syncStrongMultiplier: getState().syncStrongMultiplier ?? DEFAULT_CONFIG.syncStrongMultiplier,
-      diversityMode: getState().diversityMode,
+    const cfg = buildModemConfig({
       useOFDM: getState().useOFDM,
-    };
-    broadcastWorker.postMessage({
-      type: 'startListening',
-      config: listenCfg,
-      fastSync: fastSyncCb?.checked ?? false,
+      pilotFreqHz: getState().pilotFreqHz,
+      toneCount: getState().toneCount,
+      symbolsPerSec: getState().symbolsPerSec,
+      musicalMode: getState().musicalMode,
+      diversityMode: getState().diversityMode,
+      hwSampleRate: audioCtx.sampleRate,
     });
-    recorder = new AudioRecorder(audioCtx, getState().micGain);
+    modem.configure(cfg);
+    await modem.startListening(getState().micGain, getState().selectedInputId || undefined);
 
     // Sync mic gain slider → live GainNode while listening
     let lastMicGain = getState().micGain;
     const unsub = subscribe(() => {
       const g = getState().micGain;
-      if (g !== lastMicGain && recorder) {
+      if (g !== lastMicGain) {
         lastMicGain = g;
-        recorder.setMicGain(g);
-        dlog('APP', { micGain: g });
+        modem.setMicGain(g);
       }
     });
     unsubMicGain = unsub;
-    const modemRate = getState().useOFDM ? audioCtx.sampleRate : DEFAULT_CONFIG.sampleRate;
-
-    const onChunk = (chunk: Float32Array) => {
-      for (let i = 0; i < chunk.length; i++) {
-        broadcastWorker.postMessage({ type: 'feedSample', sample: chunk[i] });
-        recvSamples.push(chunk[i]);
-      }
-      if (recvSamples.length > modemRate * 10)
-        recvSamples.splice(0, recvSamples.length - modemRate * 5);
-    };
-    await recorder.start(modemRate, onChunk, getState().selectedInputId || undefined);
 
     micWatchdog = setTimeout(() => {
       if (recvSamples.length === 0) {
@@ -750,8 +746,9 @@ async function startListening() {
       for (const s of buf) sumSq += s * s;
       const rms = Math.sqrt(sumSq / buf.length);
       const rmsDb = rms > 0.0001 ? 20 * Math.log10(rms) : -80;
+      const modRate = audioCtx.sampleRate;
       const energies = TONE_FREQUENCIES.map((f) =>
-        detectToneEnergy(new Float32Array(buf), f, modemRate),
+        detectToneEnergy(new Float32Array(buf), f, modRate),
       );
       // FFT spectrum (every tick, 100ms)
       const ftBins = 64;
@@ -761,7 +758,7 @@ async function startListening() {
         let si = 0,
           co = 0;
         for (let i = 0; i < buf.length; i++) {
-          const ph = (2 * Math.PI * f * i) / modemRate;
+          const ph = (2 * Math.PI * f * i) / audioCtx.sampleRate;
           si += buf[i] * Math.sin(ph);
           co += buf[i] * Math.cos(ph);
         }
@@ -812,6 +809,7 @@ function stopListening() {
   }
   recorder?.stop();
   recorder = null;
+  modem.stopListening();
   if (unsubMicGain) {
     unsubMicGain();
     unsubMicGain = null;
