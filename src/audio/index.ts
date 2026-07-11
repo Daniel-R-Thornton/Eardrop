@@ -5,4 +5,4 @@ export { AudioPlayer } from './player';
 export { AudioRecorder } from './recorder';
 export { enumerateDevices, populateSelect } from './devices';
 export type { DeviceInfo, DeviceList } from './devices';
-export type { SampleCallback } from './recorder';
+export type { ChunkCallback } from './recorder';

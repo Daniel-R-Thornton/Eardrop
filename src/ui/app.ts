@@ -715,13 +715,15 @@ async function startListening() {
     unsubMicGain = unsub;
     const modemRate = getState().useOFDM ? audioCtx.sampleRate : DEFAULT_CONFIG.sampleRate;
 
-    const feedSample = (s: number) => {
-      broadcastWorker.postMessage({ type: 'feedSample', sample: s });
-      recvSamples.push(s);
+    const onChunk = (chunk: Float32Array) => {
+      for (let i = 0; i < chunk.length; i++) {
+        broadcastWorker.postMessage({ type: 'feedSample', sample: chunk[i] });
+        recvSamples.push(chunk[i]);
+      }
       if (recvSamples.length > modemRate * 10)
         recvSamples.splice(0, recvSamples.length - modemRate * 5);
     };
-    await recorder.start(modemRate, feedSample, getState().selectedInputId || undefined);
+    await recorder.start(modemRate, onChunk, getState().selectedInputId || undefined);
 
     micWatchdog = setTimeout(() => {
       if (recvSamples.length === 0) {
