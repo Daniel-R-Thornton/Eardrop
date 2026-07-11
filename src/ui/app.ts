@@ -20,7 +20,7 @@ import { bch3116Encode } from '../modem/ecc/ecc';
 import { AudioPlayer } from '../audio/player';
 import { AudioRecorder } from '../audio/recorder';
 import { Visualizer } from '../modem/debug/visualizer';
-import { DEFAULT_CONFIG, TONE_COLORS } from '../modem/types';
+import { DEFAULT_CONFIG, TONE_COLORS, OFDM_TUNING } from '../modem/types';
 import { enumerateDevices, populateSelect } from '../audio/devices';
 import { TxEngine } from '../modem/protocol/txEngine';
 import { encodeFrame } from '../modem/protocol/atomicFrame';
@@ -967,7 +967,7 @@ async function sendSingleFrame() {
   // Prepend preamble so RxEngine can sync
   // OFDM mode uses sync burst, BPSK mode uses warble preamble
   const preamble = getState().useOFDM && (tx as any).ofdmEngine
-    ? (tx as any).ofdmEngine.generateSyncBurst(24)
+    ? (tx as any).ofdmEngine.generateSyncBurst(OFDM_TUNING.syncBurstSymbols)
     : tx.transmitPreamble();
   const silence = new Float32Array(Math.round(modemRate / getState().symbolsPerSec * 6));
   const full = new Float32Array(preamble.length + frameAudio.length + silence.length);

@@ -13,7 +13,7 @@
  * peak-normalized to [-1, 1].
  */
 
-import { type ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG, ofdmSamples, OFDM_DEFAULTS } from '../types';
+import { type ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG, ofdmSamples, OFDM_DEFAULTS, OFDM_TUNING } from '../types';
 import { generatePreamble, type PreambleConfig } from '../protocol/preamble';
 import { encodeFrame, type AtomicHeader, FRAME_SIZE, PAYLOAD_DATA_SIZE } from '../protocol/atomicFrame';
 import { BPSKModulator, type BPSKModulatorConfig } from '../modulation/BPSKModulator';
@@ -118,9 +118,9 @@ export class TxEngine {
     // 1. Generate preamble (OFDM sync burst or BPSK warble preamble)
     let preamble: Float32Array;
     if (this.useOFDM && this.ofdmEngine) {
-      // OFDM sync burst: 24 repeated symbols with all tones at 0°
-      dlog('TX-OFDM', { syncBurst: 24 });
-      preamble = this.ofdmEngine.generateSyncBurst(24);
+      // OFDM sync burst: repeated symbols with all tones at 0°
+      dlog('TX-OFDM', { syncBurst: OFDM_TUNING.syncBurstSymbols });
+      preamble = this.ofdmEngine.generateSyncBurst(OFDM_TUNING.syncBurstSymbols);
     } else {
       preamble = this.transmitPreamble();
     }
@@ -182,7 +182,7 @@ export class TxEngine {
     for (let r = 0; r < repeats; r++) frameAudios.push(tailFrame);
 
     // 3. Add tail silence
-    frameAudios.push(new Float32Array(this.getSymbolLengthInSamples() * 6));
+    frameAudios.push(new Float32Array(this.getSymbolLengthInSamples() * OFDM_TUNING.tailSilenceSymbols));
 
     // 4. Concatenate all audio segments
     const totalLen = frameAudios.reduce((a, b) => a + b.length, 0);
