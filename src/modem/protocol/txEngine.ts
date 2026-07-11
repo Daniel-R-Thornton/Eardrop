@@ -13,7 +13,7 @@
  * peak-normalized to [-1, 1].
  */
 
-import { type ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG, ofdmSamples } from '../types';
+import { type ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG, ofdmSamples, OFDM_DEFAULTS } from '../types';
 import { generatePreamble, type PreambleConfig } from '../protocol/preamble';
 import { encodeFrame, type AtomicHeader, FRAME_SIZE, PAYLOAD_DATA_SIZE } from '../protocol/atomicFrame';
 import { BPSKModulator, type BPSKModulatorConfig } from '../modulation/BPSKModulator';
@@ -74,7 +74,10 @@ export class TxEngine {
       this.ofdmEngine = new OFDMEngine({
         pilotFreqHz: this.cfg.pilotFreqHz,
         sampleRate: this.cfg.sampleRate,
-        pilotAmplitude: this.cfg.pilotAmplitude,
+        // BPSK's pilotAmplitude (0.4) is scaled for 4 tones; OFDM peak-
+        // normalizes pilot + N unit tones together, so the pilot needs the
+        // OFDM-scaled value or it vanishes at high tone counts.
+        pilotAmplitude: OFDM_DEFAULTS.pilotAmplitude,
         toneCount: this.cfg.toneCount,
       });
     }
