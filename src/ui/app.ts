@@ -33,6 +33,7 @@ import { resample } from '../lib/math/index';
 import { dlog, dlogInject, dlogSetMode } from '../lib/debug/dlog';
 import { ModemController } from './controllers/modemController';
 import { buildModemConfig } from './controllers/buildModemConfig';
+import { setTelemetry } from './telemetryStore';
 
 // Main thread: clear-and-reprint the whole log as ONE console entry per update
 // so a single copy grabs the entire session. Worker lines arrive via 'dlog'
@@ -269,6 +270,7 @@ modem.on('fileComplete', (ev) => {
   });
 });
 modem.on('dlog', (ev) => dlogInject(ev.line));
+modem.on('telemetry', (ev) => setTelemetry(ev.telemetry));
 
 dlog('APP', { hwRate: audioCtx.sampleRate });
 

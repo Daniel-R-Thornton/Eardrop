@@ -236,8 +236,15 @@ export function getState(): AppState {
 
 export function setState(update: Partial<AppState>): void {
   state = { ...state, ...update };
-  // After every state change, persist the configuration part.
-  persistState(state);
+  // Only persist when a persisted config key actually changed.
+  const persistedKeys: Array<keyof AppState> = [
+    'toneCount', 'pilotFreqHz', 'musicalMode', 'ampThresholdRatio',
+    'syncStrongMultiplier', 'diversityMode', 'useOFDM', 'symbolsPerSec',
+    'micGain', 'playbackVolume', 'selectedInputId', 'selectedOutputId', 'theme',
+  ];
+  if (persistedKeys.some((k) => k in update)) {
+    persistState(state);
+  }
   listeners.forEach((fn) => fn());
 }
 
