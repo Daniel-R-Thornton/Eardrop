@@ -6,7 +6,7 @@
  * Tone frequencies are absolute Hz on the 25 Hz grid (integer cycles per
  * window ⇒ orthogonal at any sample rate). No FFT, no power-of-two constraint.
  */
-import { ofdmSamples, ofdmToneFrequencies } from '../types';
+import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS } from '../types';
 import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
 import { dlog } from '../../lib/debug/dlog';
 
@@ -17,7 +17,7 @@ export class OFDMEngine {
   private pilotFreqHz: number;
 
   constructor(cfg: { sampleRate: number; toneCount?: number; pilotFreqHz?: number; pilotAmplitude?: number }) {
-    const toneCount = cfg.toneCount ?? 16;
+    const toneCount = cfg.toneCount ?? OFDM_DEFAULTS.toneCount;
     this.toneCount = toneCount % 4 !== 0 ? 4 : toneCount;
     if (toneCount % 4 !== 0) {
       dlog('TX-OFDM', { badToneCount: toneCount, using: 4 }, { level: 'warn' });
