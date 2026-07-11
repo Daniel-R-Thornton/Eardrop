@@ -158,7 +158,7 @@ export const DEFAULT_CONFIG: ModemConfig = {
 };
 
 /** OFDM symbol timing — defined in TIME so any hardware rate works. */
-export const OFDM_SYMBOL_MS = 40; // FFT-equivalent window: 25 Hz tone grid
+export const OFDM_SYMBOL_MS = 20; // FFT-equivalent window: 50 Hz tone grid
 export const OFDM_CP_MS = 5; // cyclic prefix / timing guard
 
 export function ofdmSamples(sampleRate: number): {

@@ -15,8 +15,8 @@ import { RxEngine } from '../protocol/rxEngine';
 import { resample } from '../../lib/math';
 
 test('ofdmSamples derives integer windows at both common hardware rates', () => {
-  expect(ofdmSamples(48000)).toEqual({ fftSamples: 1920, cpSamples: 240, symSamples: 2160 });
-  expect(ofdmSamples(44100)).toEqual({ fftSamples: 1764, cpSamples: 221, symSamples: 1985 });
+  expect(ofdmSamples(48000)).toEqual({ fftSamples: 960, cpSamples: 240, symSamples: 1200 });
+  expect(ofdmSamples(44100)).toEqual({ fftSamples: 882, cpSamples: 221, symSamples: 1103 });
 });
 
 test('tone frequencies are absolute, on the symbol-duration grid', () => {
@@ -24,7 +24,7 @@ test('tone frequencies are absolute, on the symbol-duration grid', () => {
   expect(freqs.length).toBe(16);
   expect(freqs[0]).toBe(2000);
   expect(freqs[15]).toBe(2750);
-  const grid = 1000 / OFDM_SYMBOL_MS; // 25 Hz
+  const grid = 1000 / OFDM_SYMBOL_MS; // 50 Hz
   for (const f of freqs) expect(f % grid).toBe(0);
 });
 
@@ -68,14 +68,15 @@ for (const rate of [48000, 44100]) {
   });
 }
 
-test('cross-tone leakage below -30 dB (orthogonality on the 25 Hz grid)', () => {
-  const mod = makeMod(48000, 4); // tones 2000..2150
+test('cross-tone leakage below -30 dB (orthogonality on the 50 Hz grid)', () => {
+  const mod = makeMod(48000, 4); // tones 2000,2050,2100,2150
   mod.setSymbols([0, 0, 0, 0]);
   const { fftSamples, cpSamples } = ofdmSamples(48000);
   const audio = mod.generateSymbol();
   const win = [...audio.slice(cpSamples, cpSamples + fftSamples)];
   const on = toneIQ(win, 2000, 48000);
-  const off = toneIQ(win, 2025, 48000); // grid neighbour, not transmitted
+  // On a 50 Hz grid, the next untransmitted grid neighbor is 1950 Hz
+  const off = toneIQ(win, 1950, 48000);
   const ratio = Math.hypot(off.i, off.q) / Math.hypot(on.i, on.q);
   expect(ratio).toBeLessThan(0.03);
 });
@@ -115,7 +116,7 @@ test('engine @48k/16 tones: 2 bytes per symbol, sync burst sized in time', () =>
   const engine = new OFDMEngine({ sampleRate: 48000, toneCount: 16 });
   const { symSamples } = ofdmSamples(48000);
   const frame = encodeFrame({ type: 0x01, seqNum: 0, totalFrames: 1, crc: 0 }, new Uint8Array(40));
-  const audio = engine.modulateFrame(frame); // FRAME_SIZE bytes / 4 blocks = N symbols
+  const audio = engine.modulateFrame(frame);
   expect(audio.length).toBe(Math.ceil(FRAME_SIZE / 4) * symSamples);
   expect(engine.generateSyncBurst(24).length).toBe(24 * symSamples);
 });
