@@ -12,6 +12,7 @@
  */
 
 const RING_MAX = 500;
+const MAX_LINE_LEN = 200; // auto-break long lines at field boundaries
 const ring: string[] = [];
 const rateCounters = new Map<string, number>();
 const disabledTags = new Set<string>();
@@ -81,7 +82,7 @@ export function dlogSetTagEnabled(tag: string, enabled: boolean): void {
   }
 }
 
-/** Emit one `[TAG] k=v ...` line. Returns the line (or null if suppressed). */
+/** Emit `[TAG] k=v ...` line(s), auto-breaking at MAX_LINE_LEN (200). Returns the formatted text (or null if suppressed). */
 export function dlog(
   tag: string,
   fields: Record<string, unknown>,
@@ -95,36 +96,67 @@ export function dlog(
     if ((count - 1) % opts.every !== 0) return null;
   }
 
-  const body = Object.entries(fields)
-    .map(([key, value]) => `${key}=${dlogFmt(value)}`)
-    .join(' ');
+  const pairs = Object.entries(fields).map(([key, value]) => `${key}=${dlogFmt(value)}`);
   const level = opts.level ?? 'info';
-  // Severity markers survive the single-entry redraw dump
   const marker = level === 'error' ? '!! ' : level === 'warn' ? '! ' : '';
-  const line = `${marker}[${tag}] ${body}`;
+  const prefix = `${marker}[${tag}] `;
 
-  ring.push(line);
-  if (ring.length > RING_MAX) ring.shift();
+  // Build line(s), auto-breaking at field boundaries when exceeding MAX_LINE_LEN.
+  // When a single field value is too long even on a fresh line, break it at spaces.
+  const lines: string[] = [];
+  let cur = prefix;
+
+  function flush(): void {
+    lines.push(cur);
+    cur = prefix;
+  }
+
+  for (const pair of pairs) {
+    const sep = cur === prefix ? '' : ' ';
+    if (cur.length + sep.length + pair.length <= MAX_LINE_LEN) {
+      cur += sep + pair;
+      continue;
+    }
+    // Won't fit on current line.
+    if (cur !== prefix) flush();
+
+    // If pair still won't fit even on a fresh line, break it at spaces.
+    if (pair.length + prefix.length > MAX_LINE_LEN) {
+      // Emit whatever fits from the pair's words onto cur, flush when full.
+      const words = pair.split(' ');
+      for (const w of words) {
+        const wSep = cur === prefix ? '' : ' ';
+        if (cur.length + wSep.length + w.length > MAX_LINE_LEN && cur !== prefix) {
+          flush();
+        }
+        cur += (cur === prefix ? '' : ' ') + w;
+      }
+    } else {
+      cur += sep + pair;
+    }
+  }
+  if (cur !== prefix) lines.push(cur);
+
+  if (lines.length === 0) return null;
+
+  // Push all lines into the ring buffer
+  for (const l of lines) {
+    ring.push(l);
+    if (ring.length > RING_MAX) ring.shift();
+  }
 
   if (mode === 'forward' && forwardCb) {
-    forwardCb(line);
-    return line;
+    for (const l of lines) forwardCb(l);
+    return lines.join('\n');
   }
   if (mode === 'redraw') {
     scheduleRedraw();
-    return line;
+    return lines.join('\n');
   }
 
-  if (level === 'error') {
-    console.error(line);
-  } else if (level === 'warn') {
-    console.warn(line);
-  } else if (level === 'debug') {
-    console.debug(line);
-  } else {
-    console.log(line);
-  }
-  return line;
+  const logFn = level === 'error' ? console.error : level === 'warn' ? console.warn : level === 'debug' ? console.debug : console.log;
+  for (const l of lines) logFn(l);
+  return lines.join('\n');
 }
 
 /** Last `count` emitted lines, newline-joined — paste-ready for LLM analysis. */
