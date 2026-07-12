@@ -900,10 +900,10 @@ export class RxEngine {
 
     const totalSize =
       (payload[4] | (payload[5] << 8) | (payload[6] << 16) | (payload[7] << 24)) >>> 0;
-    const nameLen = Math.min(payload[8] & 0xff, 31);
+    const nameLen = Math.min(payload[8] & 0xff, PAYLOAD_DATA_SIZE - 9);
 
     let name = '';
-    for (let i = 0; i < nameLen && i < PAYLOAD_DATA_SIZE - 9; i++) {
+    for (let i = 0; i < nameLen; i++) {
       const c = payload[9 + i];
       if (c >= 0x20 && c <= 0x7e) name += String.fromCharCode(c);
     }
