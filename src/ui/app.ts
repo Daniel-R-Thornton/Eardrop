@@ -198,13 +198,13 @@ window.addEventListener('eardrop-send', (async () => {
       selectedFile.name,
       raw,
     );
-    setState({ sendStatus: { type: 'info', msg: `Playing ${selectedFile.name}…` } });
-    setState({ isPlaying: true });
+    setState({ isPlaying: true, progress: 0 });
     const cleanPlay = getState().musicalMode;
-    await player.play(playSamples, actualRate, getState().selectedOutputId || undefined, cleanPlay);
+    await playWithProgress(playSamples, actualRate, getState().selectedOutputId || undefined, cleanPlay);
     setState({
       isSending: false,
       isPlaying: false,
+      progress: 100,
       sendStatus: { type: 'success', msg: `✅ Sent ${selectedFile.name}` },
     });
   } catch (err: any) {
@@ -224,6 +224,34 @@ window.addEventListener('eardrop-record', (async () => {
   }
   await startListening();
 }) as EventListener);
+
+/** Play audio with progress tracking and ETA display. */
+async function playWithProgress(
+  samples: Float32Array,
+  sampleRate: number,
+  deviceId?: string,
+  clean = false,
+): Promise<void> {
+  const durationSec = samples.length / sampleRate;
+  const startTime = Date.now();
+  const interval = setInterval(() => {
+    const elapsedSec = (Date.now() - startTime) / 1000;
+    const pct = Math.min(99, Math.round((elapsedSec / durationSec) * 100));
+    const remainingSec = Math.max(0, durationSec - elapsedSec);
+    setState({
+      progress: pct,
+      sendStatus: {
+        type: 'info',
+        msg: `📤 ${pct}% · ${remainingSec < 60 ? `${remainingSec.toFixed(0)}s` : `${(remainingSec / 60).toFixed(1)}m`} remaining`,
+      },
+    });
+  }, 200);
+  try {
+    await player.play(samples, sampleRate, deviceId, clean);
+  } finally {
+    clearInterval(interval);
+  }
+}
 
 // Debug toggle — enable/disable verbose console logging
 window.addEventListener('eardrop-toggle-debug', ((e: CustomEvent) => {
@@ -266,13 +294,14 @@ window.addEventListener('eardrop-send-test', (async () => {
       'hello.txt',
       raw,
     );
-    await player.play(
+    setState({ isPlaying: true, progress: 0 });
+    await playWithProgress(
       playSamples,
       actualRate,
       getState().selectedOutputId || undefined,
       getState().musicalMode,
     );
-    setState({ sendStatus: { type: 'success', msg: '✅ Test sent' } });
+    setState({ progress: 100, sendStatus: { type: 'success', msg: '✅ Test sent' } });
   } catch (err: any) {
     setState({ sendStatus: { type: 'error', msg: `❌ ${err.message}` } });
   }
