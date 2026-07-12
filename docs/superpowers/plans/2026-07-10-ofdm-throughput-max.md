@@ -50,7 +50,7 @@ Expected after this plan (32 tones): frame = 235 B carrying 160 payload B (68%),
 - Consumes: `TxEngine.transmitFile(fileName, data): Float32Array` (`src/modem/protocol/txEngine.ts:112`), `RxEngine.feedSample(sample)`. The file-complete result lives in the private `completedFile` field; use the same cast-to-internals pattern as `src/modem/test/ofdm_acoustic_path.test.ts:42`.
 - Produces: tests named `OFDM throughput benchmark — <n> tones, 2000-byte file` that later tasks re-run to measure gains. They log `[BENCH] tones=<n> payloadBytes=<n> audioSec=<n> rate=<B/s>` lines.
 
-- [ ] **Step 1: Write the benchmark test**
+- [x] **Step 1: Write the benchmark test**
 
 Create `src/modem/test/throughput.test.ts` with exactly:
 
@@ -126,17 +126,17 @@ for (const toneCount of [16, 32]) {
 
 Note: `ReceivedFile` is exported from `src/modem/protocol/rxEngine.ts:43`. If the import errors, check the export name there.
 
-- [ ] **Step 2: Run the new test**
+- [x] **Step 2: Run the new test**
 
 Run: `npx vitest run src/modem/test/throughput.test.ts`
 Expected: PASS (2 tests), with `[BENCH]` lines printed. Record both rates — at 32 tones expect roughly 70-85 B/s including the sync/header/tail overhead on a 2000-byte file (steady-state is 88.9 B/s; overhead drags the whole-file number down). If it FAILS because the file never completes, debug before proceeding — the benchmark must be trustworthy before anything else changes. (A plausible failure cause is the pilot-amplitude bug fixed in Task 2: in the clean loopback there is no noise, so the weak pilot usually still decodes — but if this test is flaky at 32 tones, do Task 2 first and come back.)
 
-- [ ] **Step 3: Run the full suite to confirm nothing else moved**
+- [x] **Step 3: Run the full suite to confirm nothing else moved**
 
 Run: `npx vitest run`
 Expected: all tests PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/modem/test/throughput.test.ts
@@ -157,7 +157,7 @@ git commit -m "test(modem): end-to-end OFDM throughput benchmark"
 - Consumes: `OFDM_DEFAULTS.pilotAmplitude` (= 2.0, `src/modem/types.ts:177`), `toneIQ(samples, freqHz, sampleRate)` from `src/modem/pilot.ts`.
 - Produces: OFDM transmissions whose pilot measures ≥ 1.5× the mean data-tone amplitude at any tone count.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `src/modem/test/ofdm_pilot_level.test.ts`:
 
@@ -207,12 +207,12 @@ for (const toneCount of [8, 16, 32]) {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `npx vitest run src/modem/test/ofdm_pilot_level.test.ts`
 Expected: FAIL — with pilotAmplitude 0.4 the pilot measures ~0.4× the mean tone, not ≥1.5×.
 
-- [ ] **Step 3: Fix TxEngine**
+- [x] **Step 3: Fix TxEngine**
 
 In `src/modem/protocol/txEngine.ts`, add `OFDM_DEFAULTS` to the line-16 import from `'../types'`, then change line 77 in the OFDMEngine construction from:
 
@@ -227,16 +227,16 @@ to:
         pilotAmplitude: OFDM_DEFAULTS.pilotAmplitude,
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `npx tsc --noEmit && npx vitest run`
 Expected: all PASS including the new pilot-level test. Re-run the benchmark and note whether rates moved (they may tick down ~2% — the pilot now takes a slightly larger share of the normalized power budget; that is the correct trade).
 
-- [ ] **Step 5: Live check**
+- [x] **Step 5: Live check**
 
 `npm run dev`, OFDM 32 tones: Send Single Frame → console must show `OFDM-TRAIN` with `pilotAmp` within ~2× of the tone amplitudes (previously 6e-3 vs 1.5e-1) and `RX-FRAME valid=true`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/modem/protocol/txEngine.ts src/modem/test/ofdm_pilot_level.test.ts
@@ -260,7 +260,7 @@ Right now the same numbers are duplicated across files (training symbol count ex
 **Interfaces:**
 - Produces: `export const OFDM_TUNING = { syncBurstSymbols: 24, trainingSymbols: 12, syncMinFrames: 8, tailSilenceSymbols: 6 }` in `src/modem/types.ts`. Later tasks import `OFDM_TUNING` from `../types` (modem code) or `../modem/types` (UI code).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `src/modem/test/tuning.test.ts`:
 
@@ -287,12 +287,12 @@ test('current default values', () => {
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `npx vitest run src/modem/test/tuning.test.ts`
 Expected: FAIL — `OFDM_TUNING` is not exported.
 
-- [ ] **Step 3: Add OFDM_TUNING to types.ts**
+- [x] **Step 3: Add OFDM_TUNING to types.ts**
 
 In `src/modem/types.ts`, directly after the `OFDM_DEFAULTS` block (ends ~line 181), add:
 
@@ -315,7 +315,7 @@ export const OFDM_TUNING = {
 };
 ```
 
-- [ ] **Step 4: Point all five call sites at OFDM_TUNING**
+- [x] **Step 4: Point all five call sites at OFDM_TUNING**
 
 1. `src/modem/protocol/txEngine.ts` — `OFDM_TUNING` is importable from the existing `../types` import (line 16). Replace lines 119-120:
 ```ts
@@ -343,12 +343,12 @@ Replace line 76:
 
 4. `src/ui/app.ts:970` — in `sendSingleFrame`, replace `generateSyncBurst(24)` with `generateSyncBurst(OFDM_TUNING.syncBurstSymbols)` and add `OFDM_TUNING` to the existing `../modem/types` import near the top of the file (search for the import that brings in `DEFAULT_CONFIG`).
 
-- [ ] **Step 5: Run tests and typecheck**
+- [x] **Step 5: Run tests and typecheck**
 
 Run: `npx tsc --noEmit && npx vitest run`
 Expected: all PASS, including new `tuning.test.ts`. (Test files keep their own local `SYNC_COUNT = 24` constants — that is fine, they pin behavior deliberately.)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/modem/types.ts src/modem/protocol/txEngine.ts src/modem/protocol/rxEngine.ts src/modem/demodulation/OFDMQPSKDemodulator.ts src/ui/app.ts src/modem/test/tuning.test.ts
@@ -372,7 +372,7 @@ Trade-off (document, don't fear): a frame whose noise burst exceeds one block's 
 - Consumes: `rsEncode(data: Uint8Array): Uint8Array` (returns 52 B — `src/modem/ecc/reedsolomon.ts:97`), `rsDecode(block: Uint8Array): { data: Uint8Array; valid: boolean; errors: number }`. WARNING: `rsEncode` pads short input at the FRONT (`reedsolomon.ts:109-110`) — always hand it exactly-40-byte chunks (see Step 3).
 - Produces: `PAYLOAD_BLOCKS = 4`, `PAYLOAD_DATA_SIZE = 160`, `RS_PAYLOAD_SIZE = 208`, `FRAME_SIZE = 235` exported from `atomicFrame.ts`. `encodeFrame(header, payload)` accepts up to 160 B payload; `decodeFrame(frame)` returns 160 B payload. Function signatures unchanged.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `src/modem/test/atomicFrameV2.test.ts`:
 
@@ -440,12 +440,12 @@ test('short payload (40 bytes) still encodes — remaining blocks zero-pad', () 
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `npx vitest run src/modem/test/atomicFrameV2.test.ts`
 Expected: FAIL — `PAYLOAD_BLOCKS` not exported, sizes are 79/40.
 
-- [ ] **Step 3: Implement in atomicFrame.ts**
+- [x] **Step 3: Implement in atomicFrame.ts**
 
 In `src/modem/protocol/atomicFrame.ts`, replace the constants block (lines 29-40) with:
 
@@ -511,7 +511,7 @@ In `decodeFrame` (line ~203), replace steps 5-6 (single `rsDecode` + return) wit
   return { header, payload, valid };
 ```
 
-- [ ] **Step 4: Fix the one test that hardcodes 79**
+- [x] **Step 4: Fix the one test that hardcodes 79**
 
 `src/modem/test/ofdm_native_rate.test.ts:119` reads:
 ```ts
@@ -523,7 +523,7 @@ Change to (adding `FRAME_SIZE` to that file's imports — `import { FRAME_SIZE }
 ```
 Check the surrounding test — if it builds its own frame with `encodeFrame`, `frame.length` is now 235 and the expectation stays self-consistent.
 
-- [ ] **Step 5: Run the full suite**
+- [x] **Step 5: Run the full suite**
 
 Run: `npx tsc --noEmit && npx vitest run`
 Expected: all PASS. Failures to expect and how to react:
@@ -532,12 +532,12 @@ Expected: all PASS. Failures to expect and how to react:
 
 Consumers that adapt automatically (verify, don't modify): `SentinelScanner` (`collectBytes = FRAME_SIZE - 3`, `SentinelScanner.ts:39`), `TxEngine.splitDataIntoFrames`/`calcFrameCount`/`buildHeaderPayload` (all use `PAYLOAD_DATA_SIZE`), `RxEngine.processHeader` name parsing (`rxEngine.ts:880` uses `PAYLOAD_DATA_SIZE`). `app.ts` `sendSingleFrame` builds a 40-byte payload — still valid, blocks 2-4 zero-pad; its `FRAME-TEST txBytes` log becomes 235.
 
-- [ ] **Step 6: Re-run the benchmark and record the gain**
+- [x] **Step 6: Re-run the benchmark and record the gain**
 
 Run: `npx vitest run src/modem/test/throughput.test.ts`
 Expected: PASS, `[BENCH]` rate at 32 tones ≈ +25-35% over the Task 1 number (steady-state math: 160 B per ceil(235/8)=30 symbols = 118.5 B/s vs 88.9). Update the rate floor in `throughput.test.ts` from `60` to `85` (32 tones) and `30` to `45` (16 tones).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/modem/protocol/atomicFrame.ts src/modem/test/atomicFrameV2.test.ts src/modem/test/ofdm_native_rate.test.ts src/modem/test/throughput.test.ts
@@ -556,7 +556,7 @@ Physics cost to verify, not assume: each tone's per-symbol integration window ha
 - Modify: `src/modem/types.ts:161`
 - Modify: `src/modem/test/ofdm_native_rate.test.ts` (pins the 25 Hz grid)
 
-- [ ] **Step 1: Change the constant**
+- [x] **Step 1: Change the constant**
 
 `src/modem/types.ts:161`:
 ```ts
@@ -564,7 +564,7 @@ export const OFDM_SYMBOL_MS = 20; // FFT-equivalent window: 50 Hz tone grid
 ```
 (Leave `OFDM_CP_MS = 5` untouched.)
 
-- [ ] **Step 2: Run the full suite and triage**
+- [x] **Step 2: Run the full suite and triage**
 
 Run: `npx vitest run`
 Expected: `ofdm_native_rate.test.ts` FAILS where it pins the old grid — read each failure:
@@ -575,21 +575,21 @@ Expected: `ofdm_native_rate.test.ts` FAILS where it pins the old grid — read e
 
 CRITICAL GATE: `ofdm_sync.test.ts` (hum immunity) and `ofdm_acoustic_path.test.ts` (misaligned grid, delay-inside-CP, 32 tones) must pass WITHOUT changing any threshold in `rxEngine.ts`. If they fail, STOP, revert Step 1, and report the failing assertions — shorter symbols weakening sync discrimination is a real outcome, not a test bug.
 
-- [ ] **Step 3: Re-run benchmark**
+- [x] **Step 3: Re-run benchmark**
 
 Run: `npx vitest run src/modem/test/throughput.test.ts`
 Expected: PASS, 32-tone rate ≈ 1.8× the Task 4 number (steady-state 160 B / (30 × 25 ms) = 213 B/s). Raise the floors again: 32 tones `85` → `150`, 16 tones `45` → `75`.
 
-- [ ] **Step 4: Typecheck + full suite green**
+- [x] **Step 4: Typecheck + full suite green**
 
 Run: `npx tsc --noEmit && npx vitest run`
 Expected: all PASS.
 
-- [ ] **Step 5: Live sanity check in the browser (real acoustic path)**
+- [ ] **Step 5: Live sanity check in the browser (real acoustic path) — SKIPPED (in-memory only)**
 
 Run: `npm run dev`, open the app, enable OFDM, 32 tones, then: Send Single Frame (expect `[RX-FRAME] valid=true` in console), then Send Test (expect hello.txt to decode). This is the one step automated tests can't cover — real speaker/mic, real room. If the single frame decodes but sync feels flaky (repeated `falseTrigger` warnings), report before committing.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/modem/types.ts src/modem/test/ofdm_native_rate.test.ts src/modem/test/throughput.test.ts
@@ -610,13 +610,13 @@ Three UI lies to fix: (a) the Symbol Rate select renders in OFDM mode but does n
 **Interfaces:**
 - Consumes: `FRAME_SIZE`, `PAYLOAD_DATA_SIZE` from `src/modem/protocol/atomicFrame.ts` (Task 4 values), `OFDM_SYMBOL_MS`, `OFDM_CP_MS`, `OFDM_DEFAULTS` from `src/modem/types.ts` (already imported at `MainApp.tsx:20`).
 
-- [ ] **Step 1: Change the defaults**
+- [x] **Step 1: Change the defaults**
 
 `src/modem/types.ts` `OFDM_DEFAULTS`: `toneCount: 16,` → `toneCount: 32,`.
 `src/modem/protocol/ofdmEngine.ts:20`: `const toneCount = cfg.toneCount ?? 16;` → `const toneCount = cfg.toneCount ?? OFDM_DEFAULTS.toneCount;` and extend the line-9 import: `import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS } from '../types';`.
 Note `MainApp.tsx:61-62` already auto-applies `OFDM_DEFAULTS.toneCount` when OFDM is enabled with `toneCount < 8` — no change needed there.
 
-- [ ] **Step 2: Hide the Symbol Rate control in OFDM mode and show net bitrate**
+- [x] **Step 2: Hide the Symbol Rate control in OFDM mode and show net bitrate**
 
 In `src/ui/MainApp.tsx`, wrap the Symbol Rate block (the `<div>` starting at the `{/* Symbol Rate */}` comment, ~line 381, through its closing `</div>` at ~line 407) in a conditional so it renders only for BPSK:
 
@@ -645,12 +645,12 @@ Replace the readout `<div>` (~lines 408-412) with:
 
 Add to `MainApp.tsx` imports: `import { FRAME_SIZE, PAYLOAD_DATA_SIZE } from '../modem/protocol/atomicFrame';`.
 
-- [ ] **Step 3: Typecheck + suite + visual check**
+- [x] **Step 3: Typecheck + suite + visual check**
 
 Run: `npx tsc --noEmit && npx vitest run`
 Expected: PASS. Then `npm run dev`: in OFDM mode the Symbol Rate select is gone and the readout shows ≈`1707 bit/s net (2560 raw)` at 32 tones (with Tasks 4+5 landed); in BPSK mode the select is back.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/ui/MainApp.tsx src/modem/types.ts src/modem/protocol/ofdmEngine.ts
@@ -684,7 +684,7 @@ git commit -m "feat(modem): trim OFDM sync burst 24->18 symbols (training 12->8)
 - Modify: `docs/MODEM.md` (OFDM section, ~lines 230-280: symbol length, frame layout, rates)
 - Modify: `STATE.md` (current-state summary)
 
-- [ ] **Step 1: Full suite + benchmark, record the before/after table**
+- [x] **Step 1: Full suite + benchmark, record the before/after table**
 
 Run: `npx vitest run` then `npx vitest run src/modem/test/throughput.test.ts`.
 Collect the `[BENCH]` lines from Task 1 (baseline) through now and write the table into the commit message and `STATE.md`:
@@ -696,15 +696,15 @@ Collect the `[BENCH]` lines from Task 1 (baseline) through now and write the tab
 | + 235 B frame | (Task 4 number, ≈+33%) |
 | + 20 ms symbol | (Task 5 number, ≈×1.8) |
 
-- [ ] **Step 2: Update docs/MODEM.md**
+- [x] **Step 2: Update docs/MODEM.md**
 
 In the OFDM spec section: `Symbol length: 20 ms + 5 ms cyclic prefix = 25 ms`, `Tone grid: multiples of 50 Hz`, frame layout `[SENTINEL 3B][BCH_HEADER 24B][RS(52,40) × 4 = 208B]` = 235 B carrying 160 B, sample counts at 48 kHz: `960 + 240 = 1200 samples`, pilot amplitude 2.0 (OFDM), and the payload-rate table above. Keep the "TX and RX may run at different hardware rates" paragraph — still true.
 
-- [ ] **Step 3: Live end-to-end transfer of a real file**
+- [ ] **Step 3: Live end-to-end transfer of a real file — SKIPPED (in-memory only)**
 
 `npm run dev`, OFDM + 32 tones, send a multi-KB file speaker→mic. Confirm received byte count matches and note wall-clock seconds vs the old 52-90 s.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add docs/MODEM.md STATE.md

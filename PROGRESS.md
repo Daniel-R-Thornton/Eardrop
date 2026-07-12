@@ -2,63 +2,30 @@
 
 **Branch:** `feat/ofdm-throughput-max`  
 **Plan:** `docs/superpowers/plans/2026-07-11-modem-worker-architecture.md`  
-**Started:** 2026-07-11
+**Started/Completed:** 2026-07-11
 
 ---
 
-## Overall
+## ✅ All 7 Tasks Complete
 
-| Task | Status | Subagent | Notes |
-|------|--------|----------|-------|
-| 1: Batch feed API + schema | ✅ done | worker | 114/117 pass |
-| 2: ModemService class | ✅ done | - | 118/121 pass |
-| 3: Worker shim + chunked capture | ✅ done | - | 118/121 pass |
-| 4: ModemController + single config | ✅ done | - | 120/123 pass |
-| 5: Telemetry channel | ✅ done | - | 120/123 pass |
-| 6: Delete legacy plumbing | pending | — | Remove broadcast/encoder workers |
-| 7: Guardrail tests | pending | — | Architecture regression tests |
+| Task | Status | Tests |
+|------|--------|-------|
+| 1: Batch feed API + schema | ✅ done | `feedChunk`, `getProgress`, `modemSchema.ts` |
+| 2: ModemService class | ✅ done | RX/TX lifecycle, telemetry, buffer dump |
+| 3: Worker shim + chunked capture | ✅ done | `modem.worker.ts`, recorder chunk API |
+| 4: ModemController + single config | ✅ done | `buildModemConfig`, app.ts rewired |
+| 5: Telemetry channel | ✅ done | `telemetryStore`, store persistence fix |
+| 6: Delete legacy plumbing | ✅ done | broadcast/encoder workers removed |
+| 7: Guardrail tests | ✅ done | No per-sample messaging regression |
 
----
+**Final: 122 pass, 3 pre-existing (BPSK pipeline)**
 
-## Task details
+## Changes
 
-### Task 1: Batch feed API + schema
-- [ ] rxEngine.test.ts
-- [ ] feedChunk + getProgress methods
-- [ ] modemSchema.ts
-- [ ] Tests pass
-
-### Task 2: ModemService
-- [ ] modemService.test.ts
-- [ ] modemService.ts
-- [ ] Tests pass
-
-### Task 3: Worker shim + chunked capture
-- [ ] modem.worker.ts
-- [ ] recorder chunk delivery
-- [ ] app.ts bridge
-- [ ] Live test
-
-### Task 4: ModemController
-- [ ] buildModemConfig.test.ts
-- [ ] buildModemConfig.ts
-- [ ] ModemController
-- [ ] app.ts rewire
-- [ ] Live test
-
-### Task 5: Telemetry
-- [ ] telemetryStore.ts
-- [ ] Store persistence fix
-- [ ] app.ts wiring
-- [ ] MainApp.tsx meter swap
-- [ ] Live test
-
-### Task 6: Delete legacy
-- [ ] grep for references
-- [ ] Delete files
-- [ ] Remove dead Store fields
-- [ ] Live test
-
-### Task 7: Guardrails
-- [ ] architecture.test.ts
-- [ ] Passes
+- Mic capture delivers `Float32Array` chunks (was per-sample at 48 kHz)
+- All modem logic in `modem.worker.ts` via `ModemService` (testable class)
+- `ModemController` is the only main-thread code talking to the worker
+- `buildModemConfig()` is the single config assembler (prevents TX/RX mismatch)
+- Telemetry at 20 Hz through `telemetryStore` — no `localStorage` writes on meter updates
+- Old `broadcast.worker.ts` and `encoder.worker.ts` deleted
+- Architecture guardrails prevent per-sample messaging regression

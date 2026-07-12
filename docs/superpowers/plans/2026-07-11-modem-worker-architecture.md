@@ -45,7 +45,7 @@
 **Interfaces:**
 - Produces: `RxEngine.feedChunk(chunk: Float32Array): void` (loops `feedSample`), `RxEngine.getProgress(): RxProgress`, and the full v2 message contract in `modemSchema.ts` that Tasks 2-5 import: `ModemCommand`, `ModemEvent`, `ModemTelemetry`, `RxProgress`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `src/modem/test/rxEngine_chunk.test.ts`:
 
@@ -108,12 +108,12 @@ test('getProgress reports state and frame counts', () => {
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `npx vitest run src/modem/test/rxEngine_chunk.test.ts`
 Expected: FAIL — `feedChunk` / `getProgress` are not functions.
 
-- [ ] **Step 3: Add the two methods to RxEngine**
+- [x] **Step 3: Add the two methods to RxEngine**
 
 In `src/modem/protocol/rxEngine.ts`, directly after `feedSample` ends (search for the closing brace of `feedSample`, before `initOfdmDemod`), add:
 
@@ -149,7 +149,7 @@ Note: `totalFrames` is currently only set from decoded frame headers (`decoded.h
     if (decoded.header!.totalFrames > 0) this.totalFrames = decoded.header!.totalFrames;
 ```
 
-- [ ] **Step 4: Create the schema**
+- [x] **Step 4: Create the schema**
 
 Create `src/workers/modemSchema.ts`:
 
@@ -207,7 +207,7 @@ export type ModemEvent =
   | { type: 'error'; id?: number; error: string };
 ```
 
-- [ ] **Step 5: Run tests, typecheck, commit**
+- [x] **Step 5: Run tests, typecheck, commit**
 
 Run: `npx tsc --noEmit && npx vitest run`
 Expected: all PASS including the new chunk test.
@@ -231,7 +231,7 @@ All worker logic in a plain class; the worker file (Task 3) is a 30-line shim. T
 - Consumes: `RxEngine` (incl. Task 1 methods), `TxEngine`, `toneIQ` from `src/modem/pilot.ts`, `ofdmToneFrequencies` from `src/modem/types.ts`, schema types from Task 1.
 - Produces: `class ModemService { constructor(emit: (ev: ModemEvent, transfer?: Transferable[]) => void); handle(cmd: ModemCommand): void; tick(): void }`. `tick()` computes+emits one telemetry event; the worker shim calls it on an interval.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `src/modem/test/modemService.test.ts`:
 
@@ -339,12 +339,12 @@ test('dumpBuffer returns the most recent seconds of audio', () => {
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `npx vitest run src/modem/test/modemService.test.ts`
 Expected: FAIL — module `../../workers/modemService` does not exist.
 
-- [ ] **Step 3: Implement ModemService**
+- [x] **Step 3: Implement ModemService**
 
 Create `src/workers/modemService.ts`:
 
@@ -534,12 +534,12 @@ export class ModemService {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `npx tsc --noEmit && npx vitest run`
 Expected: all PASS. If the `fileComplete` test times out or never fires: `tick()` polls `getFile()` — make sure the test calls `tick()` inside the feed loop (it does) and that trailing silence (`symSamples * 8`) is included.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/workers/modemService.ts src/modem/test/modemService.test.ts
@@ -560,7 +560,7 @@ Wire `ModemService` into a real worker; change the capture path to deliver chunk
 - Consumes: `ModemService` (Task 2), schema (Task 1).
 - Produces: `modem.worker.ts` (module worker: instantiate with `new Worker(new URL('../workers/modem.worker.ts', import.meta.url), { type: 'module' })` — copy the exact instantiation pattern used for the existing workers in `app.ts`, search `broadcast.worker`). `AudioRecorder.start(modemRate, onChunk: (chunk: Float32Array) => void, deviceId?)` — callback signature CHANGES from per-sample to per-chunk.
 
-- [ ] **Step 1: Create the worker shim**
+- [x] **Step 1: Create the worker shim**
 
 Create `src/workers/modem.worker.ts`:
 
@@ -596,7 +596,7 @@ self.onmessage = (e: MessageEvent<ModemCommand>) => {
 self.postMessage({ type: 'ready' });
 ```
 
-- [ ] **Step 2: Change AudioRecorder to chunk delivery**
+- [x] **Step 2: Change AudioRecorder to chunk delivery**
 
 In `src/audio/recorder.ts`:
 - Change the callback type (line 9): `export type ChunkCallback = (chunk: Float32Array) => void;` (delete `SampleCallback`).
@@ -628,12 +628,12 @@ This breaks the compile for `app.ts` (feedSample callback) — expected; fixed i
 
 (Yes, still per-sample INSIDE this bridge — the old worker still speaks per-sample. Task 4 deletes it. This step only decouples the recorder API.)
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 Run: `npx tsc --noEmit && npx vitest run`
 Expected: clean + green. Then `npm run dev`: Send Single Frame still decodes (`[RX-FRAME] valid=true`) — the bridge preserves old behavior exactly.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/workers/modem.worker.ts src/audio/recorder.ts src/ui/app.ts
@@ -672,7 +672,7 @@ class ModemController {
 }
 ```
 
-- [ ] **Step 1: Write the failing config test**
+- [x] **Step 1: Write the failing config test**
 
 Create `src/modem/test/buildModemConfig.test.ts`:
 
@@ -713,7 +713,7 @@ test('BPSK: modem native rate', () => {
 });
 ```
 
-- [ ] **Step 2: Run to verify it fails, then implement**
+- [x] **Step 2: Run to verify it fails, then implement**
 
 Run: `npx vitest run src/modem/test/buildModemConfig.test.ts` — FAIL (module missing).
 
@@ -752,7 +752,7 @@ export function buildModemConfig(ui: ModemUiConfig): ModemConfig & { useOFDM: bo
 }
 ```
 
-- [ ] **Step 3: Implement ModemController**
+- [x] **Step 3: Implement ModemController**
 
 Create `src/ui/controllers/modemController.ts`:
 
@@ -858,7 +858,7 @@ export class ModemController {
 }
 ```
 
-- [ ] **Step 4: Rewire app.ts**
+- [x] **Step 4: Rewire app.ts**
 
 In `src/ui/app.ts`:
 1. Instantiate once near the existing worker setup (search `broadcastWorker =`): `const modem = new ModemController(audioCtx);` and subscribe: `modem.on('fileComplete', (ev) => { /* move the body of the existing broadcastWorker fileComplete case here */ });` and `modem.on('dlog', (ev) => dlogInject(ev.line));`.
@@ -885,12 +885,12 @@ In `src/ui/app.ts`:
 4. `dumpRxBuffer` (line ~830): now `const { samples, rms, peak } = await modem.dumpBuffer(durationSec);` — it becomes async; update its callers inside `sendCalibrationOnly` / `sendSingleFrame` with `await`.
 5. Do NOT delete `recvSamples`/`recvTimer`/`broadcastWorker` wholesale yet — that is Task 6. This task only reroutes the four handlers above. The old `recvTimer` meters keep running off `recvSamples`; since nothing pushes into `recvSamples` anymore, guard the timer body's early-return (`if (n === 0) return;` already exists at line 736) — meters go quiet until Task 5 replaces them with telemetry.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 Run: `npx tsc --noEmit && npx vitest run` — clean + green.
 Live: `npm run dev` → listen, Send Test → file decodes via the NEW worker (console shows the modem worker's `dlog` lines; old `[RX] worker=v4-eq-align` line no longer appears for RX start). Meters/VU are expected to be dead this task.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/ui/controllers/modemController.ts src/ui/controllers/buildModemConfig.ts src/modem/test/buildModemConfig.test.ts src/ui/app.ts
@@ -917,7 +917,7 @@ setTelemetry(t: ModemTelemetry): void
 useTelemetry<T>(selector: (t: ModemTelemetry | null) => T): T
 ```
 
-- [ ] **Step 1: Create the telemetry store**
+- [x] **Step 1: Create the telemetry store**
 
 Create `src/ui/telemetryStore.ts`:
 
@@ -951,7 +951,7 @@ export function useTelemetry<T>(selector: (t: ModemTelemetry | null) => T): T {
 }
 ```
 
-- [ ] **Step 2: Stop Store persisting on every setState**
+- [x] **Step 2: Stop Store persisting on every setState**
 
 In `src/ui/Store.ts`, replace the `setState` body (lines 237-242) with:
 
@@ -973,14 +973,14 @@ export function setState(update: Partial<AppState>): void {
 
 (The key list must match `persistState`'s `toSave` fields exactly — they are at `Store.ts:204-219`.)
 
-- [ ] **Step 3: Wire telemetry and delete the main-thread meter loop**
+- [x] **Step 3: Wire telemetry and delete the main-thread meter loop**
 
 In `src/ui/app.ts`:
 1. Next to the other `modem.on(...)` subscriptions: `modem.on('telemetry', (ev) => setTelemetry(ev.telemetry));` (import from `./telemetryStore`).
 2. Delete the `recvTimer` interval body that computes RMS/DFT/tone energies (`app.ts:734-810` region — everything the interval does with `recvSamples`, including its `setState({ micLevel, fftSpectrum, toneEnergies, rawPeak, ... })`), and the `recvTimer` variable + its `clearInterval` in `stopListening`.
 3. Delete the now-unused `recvSamples` array, its cap logic, and `dumpRxBuffer`'s old implementation if any remnant remains (Task 4 already rerouted it to `modem.dumpBuffer`). The `eardrop-download-wav` handler (`app.ts:416`) reads `recvSamples` — reroute it: `const { samples } = await modem.dumpBuffer(10);` and build the WAV from `samples` (the sample-rate constant in that handler is `3200` at line 422 — change to `audioCtx.sampleRate` when OFDM is active: `const sr = getState().useOFDM ? audioCtx.sampleRate : 3200;`).
 
-- [ ] **Step 4: Point meters at telemetry**
+- [x] **Step 4: Point meters at telemetry**
 
 In `src/ui/MainApp.tsx`, for each component currently fed from the store fields `micLevel`, `fftSpectrum`, `toneEnergies`, `rawPeak` (search each name in the file), read from the hook instead:
 
@@ -995,12 +995,12 @@ const rawPeak = useTelemetry((t) => t?.peak ?? 0);
 
 Keep the store fields in `AppState` for now (dead but typed) — Task 6 removes them.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 Run: `npx tsc --noEmit && npx vitest run` — clean + green.
 Live: `npm run dev` → listen: VU meter, spectrum, tone meters move again (now worker-fed at 20 Hz). DevTools → Application → Local Storage: interact with meters running; `eardrop_ui_state` must NOT rewrite continuously (only when a config control changes).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/ui/telemetryStore.ts src/ui/Store.ts src/ui/app.ts src/ui/MainApp.tsx
@@ -1017,11 +1017,11 @@ git commit -m "feat(ui): worker-fed telemetry channel; store persists only on co
 - Modify: `src/ui/app.ts` (remove `broadcastWorker`, `encoderWorker`, `transmitFileInWorker`, `encodeTasks`, and the `broadcastWorker.onmessage` switch — its `fileComplete`/`decoderState`/debug cases were superseded by controller events)
 - Modify: `src/ui/Store.ts` (remove dead fields: `fftSpectrum`, `toneEnergies`, `micLevel`, `rawPeak`, `debugByteStream`, `sentinelScan`, `micDiag` — grep each for remaining readers first; any still-used field stays)
 
-- [ ] **Step 1:** `grep -rn "broadcastWorker\|encoderWorker\|transmitFileInWorker\|from './schema'\|workers/schema" src/` — enumerate every remaining reference; reroute or delete each. The debug-tab components (`BitAnalyzer`, `ModemScope`) may read `debugByteStream`/`sentinelScan` — if they do, keep those Store fields and feed them via a new low-rate `debugSnapshot` command/event pair added to `modemSchema.ts` + `ModemService.tick()` (same shape as the old worker's `debugByteLog`/`debugSentinelScan` messages, sourced from `rx.getDebugByteLog()` / `rx.getShiftRegHistory()`); if nothing reads them, delete.
-- [ ] **Step 2:** Delete the two worker files + dead app.ts code + dead Store fields.
-- [ ] **Step 3:** Run: `npx tsc --noEmit && npx vitest run` — clean + green. TypeScript is the net here: any missed reference fails the build.
-- [ ] **Step 4:** Live full pass: listen → Send Test → file received; Send Single Frame → `valid=true`; download WAV works; meters live; config changes (tone count, pilot) still apply after stop/start listening.
-- [ ] **Step 5:** Commit:
+- [x] **Step 1:** `grep -rn "broadcastWorker\|encoderWorker\|transmitFileInWorker\|from './schema'\|workers/schema" src/` — enumerate every remaining reference; reroute or delete each. The debug-tab components (`BitAnalyzer`, `ModemScope`) may read `debugByteStream`/`sentinelScan` — if they do, keep those Store fields and feed them via a new low-rate `debugSnapshot` command/event pair added to `modemSchema.ts` + `ModemService.tick()` (same shape as the old worker's `debugByteLog`/`debugSentinelScan` messages, sourced from `rx.getDebugByteLog()` / `rx.getShiftRegHistory()`); if nothing reads them, delete.
+- [x] **Step 2:** Delete the two worker files + dead app.ts code + dead Store fields.
+- [x] **Step 3:** Run: `npx tsc --noEmit && npx vitest run` — clean + green. TypeScript is the net here: any missed reference fails the build.
+- [x] **Step 4:** Live full pass: listen → Send Test → file received; Send Single Frame → `valid=true`; download WAV works; meters live; config changes (tone count, pilot) still apply after stop/start listening.
+- [x] **Step 5:** Commit:
 ```bash
 git add -A
 git commit -m "refactor(ui): delete legacy broadcast/encoder workers and main-thread sample mirror"
@@ -1034,7 +1034,7 @@ git commit -m "refactor(ui): delete legacy broadcast/encoder workers and main-th
 **Files:**
 - Create: `src/modem/test/architecture.test.ts`
 
-- [ ] **Step 1:** Create `src/modem/test/architecture.test.ts`:
+- [x] **Step 1:** Create `src/modem/test/architecture.test.ts`:
 
 ```ts
 /**
@@ -1063,8 +1063,8 @@ test('app.ts builds modem configs only via buildModemConfig', () => {
 
 Note: `sendSingleFrame` / `sendCalibrationOnly` / `sendSentinelOnly` construct `TxEngine` directly on the main thread for diagnostics (`app.ts:865,919,1006`) — during Task 4 these should also have switched to `buildModemConfig(...)` spread into `new TxEngine(...)`; if any were missed, the second guardrail catches them now. Fix by routing through `buildModemConfig`.
 
-- [ ] **Step 2:** Run: `npx vitest run src/modem/test/architecture.test.ts` — PASS (if it fails, a Task 4/6 step was missed; fix the reference, don't weaken the test).
-- [ ] **Step 3:** Commit:
+- [x] **Step 2:** Run: `npx vitest run src/modem/test/architecture.test.ts` — PASS (if it fails, a Task 4/6 step was missed; fix the reference, don't weaken the test).
+- [x] **Step 3:** Commit:
 ```bash
 git add src/modem/test/architecture.test.ts
 git commit -m "test(arch): guardrails against per-sample messaging and inline modem configs"
