@@ -57,8 +57,8 @@ export class BitWriter {
    * Write an array of bytes.
    */
   writeBytes(bytes: Uint8Array): void {
-    for (let i = 0; i < bytes.length; i++) {
-      this.writeByte(bytes[i]);
+    for (const element of bytes) {
+      this.writeByte(element);
     }
   }
 
@@ -91,7 +91,7 @@ export class BitWriter {
  * Safe bit reader for extracting bits from byte streams.
  */
 export class BitReader {
-  private bytes: Uint8Array;
+  private readonly bytes: Uint8Array;
   private byteIndex: number = 0;
   private bitPosition: number = 0; // 0-7
 

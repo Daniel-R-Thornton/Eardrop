@@ -72,8 +72,8 @@ export function generatePreamble(cfg: PreambleConfig): Float32Array {
   const grayCodes = [0, 1, 3, 2, 6, 7, 5, 4, 12, 13, 15, 14, 10, 11, 9, 8];
   const calFrameSamps = 256;
   const bpskMul = (bit: number) => (bit === 0 ? 1 : -1);
-  for (let gf = 0; gf < grayCodes.length; gf++) {
-    const gc = grayCodes[gf];
+  for (const element of grayCodes) {
+    const gc = element;
     const bits = [(gc >> 3) & 1, (gc >> 2) & 1, (gc >> 1) & 1, gc & 1];
     for (let i = 0; i < calFrameSamps; i++) {
       let s = 0;

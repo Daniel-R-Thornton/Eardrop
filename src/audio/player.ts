@@ -117,13 +117,13 @@ export class AudioPlayer {
   }
 
   /** Calculate peak amplitude [-1, +1] */
-  private calculatePeak(samples: Float32Array): { value: number; } {
+  private calculatePeak(samples: Float32Array): { value: number } {
     let max = 0;
-    for (let i = 0; i < samples.length; i++) {
-      const abs = Math.abs(samples[i]);
+    for (const element of samples) {
+      const abs = Math.abs(element);
       if (abs > max) max = abs;
     }
-    return { value: parseFloat(max.toFixed(4)) };
+    return { value: Number.parseFloat(max.toFixed(4)) };
   }
 
   /** Close context only if we own it (wasn't shared) */

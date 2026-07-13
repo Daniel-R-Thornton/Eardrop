@@ -17,7 +17,7 @@ export interface ChannelEffect {
  * Additive White Gaussian Noise.
  */
 export class AdditiveNoise implements ChannelEffect {
-  private sigma: number; // Noise standard deviation
+  private readonly sigma: number; // Noise standard deviation
   private seed: number;
 
   constructor(snrDb: number = 10) {
@@ -58,7 +58,7 @@ export class AdditiveNoise implements ChannelEffect {
  * Amplitude clipping (nonlinearity).
  */
 export class Clipping implements ChannelEffect {
-  private threshold: number;
+  private readonly threshold: number;
 
   constructor(threshold: number = 0.9) {
     this.threshold = threshold;
@@ -82,8 +82,8 @@ export class Clipping implements ChannelEffect {
  * Frequency-selective fading (simple notch filter).
  */
 export class ChannelFading implements ChannelEffect {
-  private fadeFreq: number;
-  private fadeDepth: number;
+  private readonly fadeFreq: number;
+  private readonly fadeDepth: number;
 
   constructor(fadeFreq: number = 1000, fadeDepth: number = 0.5) {
     this.fadeFreq = fadeFreq;
@@ -115,7 +115,7 @@ export class ChannelFading implements ChannelEffect {
  * Sampling timing jitter (sample clock instability).
  */
 export class TimingJitter implements ChannelEffect {
-  private jitterAmount: number;
+  private readonly jitterAmount: number;
   private seed: number;
 
   constructor(jitterAmount: number = 0.01) {
@@ -156,7 +156,7 @@ export class TimingJitter implements ChannelEffect {
  * Compose multiple channel effects in sequence.
  */
 export class ChannelSimulator {
-  private effects: ChannelEffect[] = [];
+  private readonly effects: ChannelEffect[] = [];
 
   addEffect(effect: ChannelEffect): this {
     this.effects.push(effect);
