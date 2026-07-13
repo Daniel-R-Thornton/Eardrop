@@ -32,10 +32,10 @@ export class CRC32 {
    * @returns CRC-32 value (unsigned 32-bit)
    */
   static compute(data: Uint8Array): number {
-    if (!this.table) this.table = this.buildTable();
+    this.table ??= this.buildTable();
     let c = 0xffffffff;
-    for (let i = 0; i < data.length; i++) {
-      c = this.table[(c ^ data[i]) & 0xff] ^ (c >>> 8);
+    for (const element of data) {
+      c = this.table[(c ^ element) & 0xff] ^ (c >>> 8);
     }
     return (c ^ 0xffffffff) >>> 0;
   }

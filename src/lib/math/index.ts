@@ -33,8 +33,8 @@ export function linearToDb(linear: number): number {
 export function calculateRMS(buffer: Float32Array): number {
   if (buffer.length === 0) return 0;
   let sumSquares = 0;
-  for (let i = 0; i < buffer.length; i++) {
-    const x = buffer[i];
+  for (const element of buffer) {
+    const x = element;
     sumSquares += x * x;
   }
   return Math.sqrt(sumSquares / buffer.length);
@@ -55,8 +55,8 @@ export function rmsToDb(rms: number): number {
 export function normalizeAmplitude(samples: Float32Array, targetPeak: number = 0.9): Float32Array {
   // Find peak
   let peak = 0;
-  for (let i = 0; i < samples.length; i++) {
-    peak = Math.max(peak, Math.abs(samples[i]));
+  for (const element of samples) {
+    peak = Math.max(peak, Math.abs(element));
   }
 
   if (peak === 0) {
@@ -145,7 +145,7 @@ export function resample(input: Float32Array, fromRate: number, toRate: number):
         sum += input[src];
       } else {
         const sinc = Math.sin(Math.PI * x) / (Math.PI * x);
-        const lanczos = sinc * Math.sin(Math.PI * x / a) / (Math.PI * x / a);
+        const lanczos = (sinc * Math.sin((Math.PI * x) / a)) / ((Math.PI * x) / a);
         sum += input[src] * lanczos;
       }
     }
@@ -207,10 +207,7 @@ export function makeToneOffsets(
 /**
  * Compute absolute tone frequencies from pilot + offsets.
  */
-export function makeToneFrequencies(
-  pilotFreqHz: number,
-  toneOffsets: Float32Array,
-): Float32Array {
+export function makeToneFrequencies(pilotFreqHz: number, toneOffsets: Float32Array): Float32Array {
   const freqs = new Float32Array(toneOffsets.length);
   for (let t = 0; t < toneOffsets.length; t++) {
     freqs[t] = pilotFreqHz + toneOffsets[t];

@@ -30,7 +30,7 @@ export interface EccSuggestion {
 }
 
 export class ChannelProfiler {
-  private sampleRate: number;
+  private readonly sampleRate: number;
   private sweepBuffer: number[] = [];
   private response: FrequencyResponse | null = null;
   private sweepCollected = false;
@@ -38,7 +38,7 @@ export class ChannelProfiler {
   /** Expected sweep parameters (set by feedSweepSamples) */
   private sweepStartFreq = 200;
   private sweepEndFreq = 1200;
-  private sweepDuration = 0.2; // 200ms
+  private readonly sweepDuration = 0.2; // 200ms
   private expectedSamples = 640; // 200ms at 3200 Hz
 
   constructor(sampleRate: number) {
@@ -59,9 +59,9 @@ export class ChannelProfiler {
     this.sweepEndFreq = sweepEndFreq;
     this.expectedSamples = Math.floor(this.sampleRate * 0.2);
 
-    for (let i = 0; i < samples.length; i++) {
+    for (const element of samples) {
       if (!this.sweepCollected) {
-        this.sweepBuffer.push(samples[i]);
+        this.sweepBuffer.push(element);
         if (this.sweepBuffer.length >= this.expectedSamples) {
           this.sweepCollected = true;
           this.response = this.computeResponse();
