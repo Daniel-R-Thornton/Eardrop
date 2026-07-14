@@ -109,6 +109,8 @@ export interface AppState {
   playbackVolume: number;
   /** Mic pre-amp gain (1-20, default 1) */
   micGain: number;
+  /** When true, play the WAV audio out loud while feeding it through the decoder */
+  playWavDuringDecode: boolean;
 }
 
 const defaultDecoder: DecoderInfo = {
@@ -170,6 +172,7 @@ const defaultState: AppState = {
   micDiag: null,
   playbackVolume: 2,
   micGain: 1,
+  playWavDuringDecode: false,
 };
 
 // ─── Store ────────────────────────────────────────────

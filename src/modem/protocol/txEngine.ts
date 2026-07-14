@@ -115,12 +115,22 @@ export class TxEngine {
   transmitFile(fileName: string, data: Uint8Array): Float32Array {
     this.reset();
 
-    // 1. Generate preamble (OFDM sync burst or BPSK warble preamble)
+    // 1. Generate preamble: chirp (sync) + training symbols (channel est)
     let preamble: Float32Array;
     if (this.useOFDM && this.ofdmEngine) {
-      // OFDM sync burst: repeated symbols with all tones at 0°
-      dlog('TX-OFDM', { syncBurst: OFDM_TUNING.syncBurstSymbols });
-      preamble = this.ofdmEngine.generateSyncBurst(OFDM_TUNING.syncBurstSymbols);
+      const syncCount = OFDM_TUNING.syncBurstSymbols;
+      const trainCount = OFDM_TUNING.trainingSymbols;
+      const { chirp } = this.ofdmEngine.generateChirpBurst(syncCount);
+      const training = this.ofdmEngine.generateTrainingSymbols(trainCount);
+      const combined = new Float32Array(chirp.length + training.length);
+      combined.set(chirp, 0);
+      combined.set(training, chirp.length);
+      preamble = combined;
+      dlog('TX-OFDM', {
+        chirpSamples: chirp.length,
+        trainingSymbols: trainCount,
+        preambleMs: Math.round((combined.length / (this.cfg.sampleRate || 48000)) * 1000),
+      });
     } else {
       preamble = this.transmitPreamble();
     }

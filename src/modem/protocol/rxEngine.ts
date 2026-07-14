@@ -20,6 +20,7 @@ import { decodeFrame, FRAME_SIZE, PAYLOAD_DATA_SIZE, RAW_HEADER_SIZE } from '../
 import { SentinelScanner } from '../receiver/SentinelScanner';
 import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
 import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_SYMBOL_MS, OFDM_CP_MS, OFDM_TUNING } from '../types';
+import { generateChirp, chirpCorrelate, type ChirpConfig } from './chirp';
 import { dlog } from '../../lib/debug/dlog';
 
 // ─── Constants ───────────────────────────────────────
@@ -79,12 +80,31 @@ export class RxEngine {
   private ofdmToneCount = 4;
   /** OFDM demod tone frequencies — used for sync-energy detection too */
   private ofdmToneFreqs: Float32Array = new Float32Array(0);
+  /** Chirp detection: template (generated once from config) */
+  private chirpTemplate: Float32Array = new Float32Array(0);
+  /** Chirp detection: rolling buffer for cross-correlation */
+  private chirpBuf: number[] = [];
+  /** Chirp detection: span Hz around pilot */
+  private chirpSpanHz = 200;
+  /** Chirp correlation throttle — run once per sps samples (not every sample) */
+  private chirpRan = false;
+  private chirpTick = 0;
+  /** Set when chirp correlation fires — triggers CP boundary check in WAITING */
+  private chirpDetected = false;
   /** Rolling buffer of recent samples (2 OFDM symbols) for boundary search */
   private ofdmAlignBuf: number[] = [];
   /** Samples still to discard so the window grid lands on a symbol boundary */
   private ofdmSkip = 0;
   /** EMA of waiting-state tone energy — adapts the sync threshold to mic gain */
-  private ofdmNoiseEma = 0;
+  // Seed at 0.08 so the first windows don't false-trigger on room noise
+  // (typical e=0.2-0.3). Asymmetric update:
+  //   - Fast decay (α=0.20) when energy drops below ema
+  //   - Slow rise (α=0.05) when ambient noise increases up to 5× ema
+  //   - Freeze at >5× ema (sync burst, typically 10-30× noise)
+  // 0.07 → 5×=0.35. Test signals at e=0.403 still freeze (detect),
+  // room noise at 0.2-0.3 slow-rises to ~0.3 (thr≈0.9, suppressed).
+  private ofdmNoiseEma = 0.07;
+  private readonly OFDM_EMA_SEED = 0.07;
   /** Windows processed since OFDM sync detection (sync-loss watchdog) */
   private ofdmWindowsSinceDetect = 0;
   /** Whether the scanner produced a frame since the last OFDM detection */
@@ -219,6 +239,58 @@ export class RxEngine {
 
     // ── Buffer samples and process by state ──
     this.buf.push(sample);
+
+    // Chirp detector (OFDM only): accumulate every sample for cross-correlation.
+    // Only active in WAITING state — once we enter FRAMES, the chirp is done.
+    if (this.useOFDM && this.chirpTemplate.length > 0 && this.state === RxState.WAITING) {
+      this.chirpBuf.push(sample);
+      if (this.chirpBuf.length > this.chirpTemplate.length + this.sps * 2) {
+        this.chirpBuf.shift();
+      }
+      // Run correlation when buffer is large enough; retry every sps samples
+      // so the chirp can be detected even if it arrives with acoustic delay.
+      this.chirpTick++;
+      if (this.chirpBuf.length >= this.chirpTemplate.length + this.sps
+          && this.chirpTick >= this.sps && !this.chirpRan) {
+        this.chirpTick = 0;
+        this.chirpRan = true;
+        // Decimate 4:1 for performance.
+        const ds = 4;
+        const sigDec = new Float32Array(Math.ceil(this.chirpBuf.length / ds));
+        for (let i = 0; i < sigDec.length; i++) sigDec[i] = this.chirpBuf[i * ds];
+        const tplDec = new Float32Array(Math.ceil(this.chirpTemplate.length / ds));
+        for (let i = 0; i < tplDec.length; i++) tplDec[i] = this.chirpTemplate[i * ds];
+        const { peakValue, peakIndex } = chirpCorrelate(sigDec, tplDec);
+        // Normalised threshold: correlation / (template_len × signal_rms).
+        const tplEnergy = tplDec.reduce((s, v) => s + v * v, 0);
+        const sigRms = Math.sqrt(sigDec.reduce((s, v) => s + v * v, 0) / sigDec.length);
+        const normScore = sigRms > 0 && tplEnergy > 0
+          ? peakValue / (tplDec.length * sigRms)
+          : 0;
+        if (normScore > 0.15 && peakIndex >= 0) {
+          dlog('OFDM-SYNC', { chirp: true, norm: normScore, peak: peakValue, idx: peakIndex });
+          // Flag chirp detected — let the existing CP correlation path
+          // (running on ofdmAlignBuf which fills with training OFDM symbols)
+          // handle boundary alignment. This reuses the proven ±1-sample
+          // CP correlation instead of custom buffer slicing.
+          this.chirpDetected = true;
+          this.chirpBuf = [];
+          this.chirpTick = 0;
+          this.chirpRan = false;
+          // Suppress energy-based sync: chirp wins, no dual detection
+          this.ofdmSyncFrames = 0;
+          this.ofdmDemod!.resetTraining();
+        } else {
+          // Score too low — reset and retry on fresh data.
+          dlog('OFDM-SYNC', { chirpMiss: true, norm: normScore, peak: peakValue });
+          this.chirpRan = false;
+          this.chirpTick = 0;
+          // Shift the buffer to drop old data, giving new samples a chance
+          this.chirpBuf = this.chirpBuf.slice(-this.chirpTemplate.length);
+        }
+      }
+    }
+
     if (this.buf.length < this.sps) return;
     const window = this.buf.slice(0, this.sps);
     this.buf.splice(0, this.sps);
@@ -228,9 +300,35 @@ export class RxEngine {
 
     // ── WAITING: detect sync (OFDM or warble) ──
     if (this.state === RxState.WAITING) {
+      // ── Chirp → CP handoff: chirp correlation fired; training OFDM
+      //    symbols are already accumulating in ofdmAlignBuf. Run the
+      //    proven CP boundary check (same as energy-sync path).
+      if (this.chirpDetected && this.useOFDM && this.ofdmAlignBuf.length >= this.sps * 2) {
+        const probe = this.findOfdmBlockStart(this.ofdmAlignBuf);
+        if (probe.offset >= 0 && probe.score >= 0.35 && probe.sharpness >= 1.5) {
+          this.chirpDetected = false;
+          // buf is pre-filled with the aligned tail below, so no additional
+          // ofdmSkip is needed here — that would double-shift the phase
+          // (a non-sps-multiple sample offset shows up as a linear phase
+          // ramp across subcarriers and corrupts every OFDM symbol).
+          this.buf = this.ofdmAlignBuf.slice(probe.offset);
+          this.ofdmAlignBuf = [];
+          this.ofdmSyncFrames = 0;
+          this.state = RxState.FRAMES;
+          this.ofdmFrameSeen = false;
+          this.ofdmTrainingSymbols = 0;
+          this.ofdmDemod!.resetTraining();
+          dlog('OFDM-SYNC', { chirpHandoff: true, boundary: probe.offset, score: probe.score });
+          return;
+        } else {
+          // Probe failed - log for diagnostics
+          dlog('OFDM-SYNC', { chirpProbeFail: true, score: probe.score, sharpness: probe.sharpness, offset: probe.offset, bufLen: this.ofdmAlignBuf.length });
+        }
+      }
+
       // OFDM mode: detect energy at the tone frequencies (not just pilot).
       // The sync burst has all 4 tones at QPSK 0°, so total tone energy is high.
-      if (this.useOFDM && this.ofdmDemod) {
+      if (this.useOFDM && this.ofdmDemod && !this.chirpDetected) {
         // Measure energy at the actual OFDM tone frequencies — this.toneFreqs
         // are the BPSK tones, which only partially overlap the OFDM bins and
         // made detection marginal (fired barely above threshold).
@@ -241,10 +339,18 @@ export class RxEngine {
         // Adaptive threshold: the fixed value is meaningless across mic
         // gains (at high gain the noise floor alone crosses it). Track the
         // waiting-state energy and require 3x the floor.
-        const effThr = Math.max(this.ofdmSyncThreshold, 3 * this.ofdmNoiseEma);
-        if (totalE < effThr) {
+        // Asymmetric noise-floor tracking:
+        //   - Fast decay when energy drops (α=0.20)
+        //   - Slow rise when ambient noise increases (α=0.05)
+        //   - Freeze when energy jumps >5× (sync burst — don't pollute floor).
+        //     5× (not 2×) so sustained noise above the seed can still adapt
+        //     the EMA upward; sync bursts are typically 10-30× noise.
+        if (totalE < this.ofdmNoiseEma) {
+          this.ofdmNoiseEma = this.ofdmNoiseEma * 0.8 + totalE * 0.2;
+        } else if (totalE < 5 * this.ofdmNoiseEma) {
           this.ofdmNoiseEma = this.ofdmNoiseEma * 0.95 + totalE * 0.05;
         }
+        const effThr = Math.max(this.ofdmSyncThreshold, 3 * this.ofdmNoiseEma);
         // Heartbeat while waiting: 1 line per 25 windows (~2/s)
         dlog(
           'OFDM-SYNC',
@@ -270,6 +376,7 @@ export class RxEngine {
               { level: 'warn' },
             );
             this.ofdmSyncFrames = 0;
+            this.ofdmNoiseEma = this.OFDM_EMA_SEED;
             return;
           }
 
@@ -530,6 +637,7 @@ export class RxEngine {
         dlog('OFDM-SYNC', { watchdogReset: true, windows: this.ofdmWindowsSinceDetect }, { level: 'warn' });
         this.state = RxState.WAITING;
         this.ofdmSyncFrames = 0;
+        this.ofdmNoiseEma = this.OFDM_EMA_SEED;
         this.ofdmTrainingSymbols = 0;
         this.ofdmDemod.resetTraining();
         this.buf = [];
@@ -722,13 +830,23 @@ export class RxEngine {
       ofdmToneCount = 4;
     }
     this.ofdmToneCount = ofdmToneCount;
-    const demodToneFreqs = ofdmToneFrequencies({ toneCount: ofdmToneCount });
+    const demodToneFreqs = ofdmToneFrequencies({ toneCount: ofdmToneCount, pilotFreqHz: this.cfg.pilotFreqHz });
     this.ofdmToneFreqs = demodToneFreqs;
     this.ofdmDemod = new OFDMQPSKDemodulator({
       sampleRate: this.cfg.sampleRate,
       toneFrequencies: demodToneFreqs,
       pilotFreqHz: this.cfg.pilotFreqHz,
     });
+    // Pre-compute chirp template for sync detection
+    const chirpDurationSec = (OFDM_TUNING.syncBurstSymbols * symSamples) / this.cfg.sampleRate;
+    const halfSpan = this.chirpSpanHz / 2;
+    const chirpCfg: ChirpConfig = {
+      fStart: this.cfg.pilotFreqHz - halfSpan,
+      fEnd: this.cfg.pilotFreqHz + halfSpan,
+      durationSec: chirpDurationSec,
+      sampleRate: this.cfg.sampleRate,
+    };
+    this.chirpTemplate = generateChirp(chirpCfg);
     return demodToneFreqs;
   }
 
@@ -839,6 +957,10 @@ export class RxEngine {
     this.totalFrames = 0;
     this.completedFile = null;
     this.ofdmSyncFrames = 0;
+    this.chirpRan = false;
+    this.chirpTick = 0;
+    this.chirpDetected = false;
+    this.chirpBuf = [];
     this.scanner.reset();
   }
 

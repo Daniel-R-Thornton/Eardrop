@@ -2,7 +2,7 @@
 
 **Branch**: `feat/ofdm-throughput-max`  
 **Last commit**: `16cde2c` — feat(ui): net OFDM bitrate readout, hide no-op symbol rate, default 32 tones  
-**Date**: 2026-07-11
+**Date**: 2026-07-13
 
 ---
 
@@ -22,8 +22,13 @@
 - **Modulation**: Direct cosine synthesis, configurable tone count (default 32), QPSK per subcarrier, pilot at 1900 Hz (OFDM-scaled 2.0 amplitude)
 - **Symbol**: 20 ms + 5 ms cyclic prefix = 25 ms total (~40 sym/s at any hardware rate)
 - **Demodulation**: Goertzel / toneIQ bank at exact tone frequencies with per-tone channel equalization (amplitude + phase correction trained on sync burst)
-- **Sample rate**: Native hardware rate (48000 / 44100 Hz) — no downsampling. Symbol adapts automatically to any sample rate via ceil(sampleRate * OFDM_SYMBOL_MS / 1000)
-- **Sync**: 24-symbol burst (~600 ms), all tones QPSK 0°, detected via total tone energy threshold
+- **Sample rate**: Native hardware rate (48000 / 44100 Hz) — no downsampling. Symbol adapts automatically to any sample rate via `Math.round(sampleRate * OFDM_SYMBOL_MS / 1000)`
+- **Sync**: 24-symbol burst (~600 ms), all tones QPSK 0°, detected via total tone energy threshold with adaptive noise floor
+- **Boundary alignment**: CP-based correlation at sync time finds symbol-boundary offset; deviation from a sharp peak profile rejects noise false triggers
+- **Timing**: **Sync-once-then-coast** — no per-symbol timing tracking. The 5 ms CP (240 samples at 48 kHz) absorbs clock drift. At 50 ppm worst case, ~100 s before drift exceeds CP
+- **Drift correction**: Pilot-referenced phase rotation per symbol (common phase error via `driftPerHz = pilotDrift / pilotFreqHz`), does not adjust window stride
+- **Channel tracking**: Decision-directed per-tone amplitude + phase update (leaky integrator, α = 0.003) after each hard decision
+- **Sync-loss watchdog**: Resets to WAITING if no frame seen for ~15 seconds
 - **Tone grid**: 2000-3550 Hz at 50 Hz spacing (32 tones default), pilot at 1900 Hz. All frequencies are multiples of 50 Hz for orthogonality with the 20 ms symbol
 - **Frame format**: [SENTINEL 3B][BCH 24B][RS(52,40)×4 = 208B] = 235B carrying 160 payload B (68% payload density)
 - **Cross-rate**: Encode at 48000 Hz, decode at 44100 Hz — verified working
@@ -34,9 +39,9 @@
 |-----------|---------|-------|
 | Sample rate | Hardware rate | 48000 or 44100 Hz, no downsampling for OFDM |
 | Symbol length | 20 ms | Time-domain, adapts to any sample rate |
-| CP length | 5 ms | ceil(sampleRate * 0.005) samples |
+| CP length | 5 ms | Math.round(sampleRate * 0.005) samples |
 | Tone spacing | 50 Hz | Multiples of 50 Hz for orthogonality |
-| Tone count | 32 | Configurable 8/16/32 |
+| Tone count | 32 | Configurable 8/16/32 (must be multiple of 4) |
 | Pilot freq | 1900 Hz | Below data band (2000-3550 Hz at 32 tones) |
 | Pilot amplitude | 2.0 (OFDM) | Previously used BPSK-scaled 0.4 — fixed |
 | Net payload rate (32 tones) | ~1707 bps (166 B/s) | 2000-byte file benchmark |
@@ -55,12 +60,12 @@
 - `src/lib/` — 8 utility modules (math, encoding, crc, ecc, scan, protocol, debug, channel)
 - `src/modem/` — modulation/, demodulation/, protocol/, dsp/, ecc/, pilot/, receiver/, channel/, debug/, test/
 - `src/audio/` — dsp/, browser/, player.ts, recorder.ts, devices.ts
-- `src/workers/` — encoder.worker.ts, broadcast.worker.ts, schema.ts
-- `src/ui/` — MainApp.tsx, Store.ts, components/, controllers/, debug/, lib/, styles/
+- `src/workers/` — modem.worker.ts, modemService.ts, modemSchema.ts, encoder.worker.ts, broadcast.worker.ts
+- `src/ui/` — app.ts, Store.ts, controllers/, debug/, lib/, styles/
 
 ### Tests
-- **115 tests total** (112 pass, 3 pre-existing failures)
-- **All OFDM tests pass**: modulation, demodulation, loopback, sync, acoustic path, cross-rate, hum immunity, frame geometry V2, tuning invariants, pilot level, throughput benchmark
+- **127 tests total** (124 pass, 3 pre-existing failures)
+- **All OFDM tests pass**: modulation, demodulation, loopback, sync, acoustic path, cross-rate, hum immunity, frame geometry V2, tuning invariants, pilot level, throughput benchmark, channel drift
 - 3 pre-existing failures: Doppler +2Hz, Doppler -1Hz, Full Stress (BPSK pipeline test — do not chase)
 
 ---
@@ -71,6 +76,11 @@
 - OFDM works in-memory (all tests pass)
 - The pilot amplitude bug (buried pilot at 32 tones) is fixed — live acoustic path may now decode reliably at 32 tones
 - **Live acoustic testing with real speaker/mic not yet performed for the new timing** — this is the next step
+
+### OFDM timing architecture note
+- The OFDM receiver uses **sync-once-then-coast** timing: initial CP correlation aligns the window grid, then consumes symbols at a fixed stride with no per-symbol timing tracking
+- The 5 ms CP (240 samples at 48 kHz) provides sufficient guard for typical sub-60-second file transfers
+- For long-duration transfers, a future FLL/timing-error-detector would be needed
 
 ### OFDM tone count > 16
 - 32-tone mode is now the default. Tested in-memory with the fix for pilot amplitude.

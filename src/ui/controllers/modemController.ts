@@ -96,4 +96,13 @@ export class ModemController {
       this.post({ type: 'dumpBuffer', id, seconds });
     });
   }
+
+  /** Feed pre-recorded samples into the receiver pipeline (no mic needed).
+   *  Sends startRx automatically so the RxEngine is ready to process. */
+  feedSamples(samples: Float32Array): void {
+    this.post({ type: 'startRx' });
+    // Transfer the entire buffer as one chunk; the worker handles chunking internally.
+    const owned = new Float32Array(samples);
+    this.worker.postMessage({ type: 'feedChunk', samples: owned.buffer }, [owned.buffer]);
+  }
 }

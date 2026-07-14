@@ -54,7 +54,14 @@ export class ModemService {
       case 'feedChunk': {
         const chunk = new Float32Array(cmd.samples);
         this.pushRing(chunk);
-        this.rx?.feedChunk(chunk);
+        // Guard against RxEngine exceptions that would silently kill
+        // the worker. Log and continue — the caller's watchdog will
+        // notice the gap if processing taps out.
+        try {
+          this.rx?.feedChunk(chunk);
+        } catch (err) {
+          console.error('[MODEM] RxEngine.feedChunk exception:', (err as Error).message, 'len:', chunk.length);
+        }
         break;
       }
       case 'encodeFile': {
@@ -156,7 +163,7 @@ export class ModemService {
     }
 
     const toneFreqs = this.config!.useOFDM
-      ? ofdmToneFrequencies({ toneCount: this.config!.toneCount })
+      ? ofdmToneFrequencies({ toneCount: this.config!.toneCount, pilotFreqHz: this.config!.pilotFreqHz })
       : new Float32Array(0);
     const toneEnergies: number[] = [];
     for (const f of toneFreqs) {

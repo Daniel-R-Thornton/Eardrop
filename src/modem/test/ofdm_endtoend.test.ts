@@ -8,7 +8,7 @@ import { encodeFrame } from '../protocol/atomicFrame';
 import { ofdmSamples, ofdmToneFrequencies } from '../types';
 
 const PILOT_FREQ = 1900;
-const TONE_FREQS = ofdmToneFrequencies({ toneCount: 4 });
+const TONE_FREQS = ofdmToneFrequencies({ toneCount: 4, pilotFreqHz: PILOT_FREQ });
 const SAMPLE_RATE = 48000;
 const { symSamples: SYM_LEN } = ofdmSamples(SAMPLE_RATE);
 const SYNC_COUNT = 24;
