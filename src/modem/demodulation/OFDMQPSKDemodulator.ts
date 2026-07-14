@@ -179,21 +179,26 @@ export class OFDMQPSKDemodulator {
         eqRe = rawRe * corrCos - rawIm * corrSin;
         eqIm = rawRe * corrSin + rawIm * corrCos;
 
-        // ── decision-directed channel tracking (no confidence gate) ──
-        // Always update; very small α ensures wrong decisions don't accumulate
-        // while tracking real channel drift. In a static channel, updates are
-        // near-zero (ratio ≈ channelEst), so quantization noise is negligible.
+        // ── decision-directed channel tracking (confidence-gated) ──
+        // Only update on confident decisions (within 22.5° of the nearest
+        // QPSK point) — otherwise a single noisy symbol nudges channelEst
+        // toward the wrong constellation point and, with no gate, later
+        // frames in the same burst inherit and compound that error.
         if (this.trackingAlpha > 0) {
           let normPh = Math.atan2(eqIm, eqRe);
           if (normPh < 0) normPh += 2 * Math.PI;
           const sym = Math.round(normPh / (Math.PI / 2)) % 4;
           const nearestAngle = sym * (Math.PI / 2) + Math.PI / 4;
-          const expRe = Math.cos(nearestAngle);
-          const expIm = Math.sin(nearestAngle);
-          const ratioRe = rawRe * expRe + rawIm * expIm;
-          const ratioIm = rawIm * expRe - rawRe * expIm;
-          this.channelEstRe[t] += this.trackingAlpha * (ratioRe - this.channelEstRe[t]);
-          this.channelEstIm[t] += this.trackingAlpha * (ratioIm - this.channelEstIm[t]);
+          const phaseError = Math.abs(normPh - nearestAngle);
+          const wrappedError = phaseError > Math.PI ? 2 * Math.PI - phaseError : phaseError;
+          if (wrappedError < Math.PI / 8) {
+            const expRe = Math.cos(nearestAngle);
+            const expIm = Math.sin(nearestAngle);
+            const ratioRe = rawRe * expRe + rawIm * expIm;
+            const ratioIm = rawIm * expRe - rawRe * expIm;
+            this.channelEstRe[t] += this.trackingAlpha * (ratioRe - this.channelEstRe[t]);
+            this.channelEstIm[t] += this.trackingAlpha * (ratioIm - this.channelEstIm[t]);
+          }
         }
         // ── end tracking ──
 

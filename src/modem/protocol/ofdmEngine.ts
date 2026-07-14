@@ -5,9 +5,13 @@
  * ofdmSamples(), which yields integer window sizes at any hardware rate.
  * Tone frequencies are absolute Hz on the 25 Hz grid (integer cycles per
  * window ⇒ orthogonal at any sample rate). No FFT, no power-of-two constraint.
+ *
+ * Sync burst: chirped pilot (LFM sweep) for frequency-diversity timing.
+ * Training: standard OFDM all-zero symbols for per-tone channel estimation.
  */
 import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS } from '../types';
 import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
+import { generateChirp, type ChirpConfig } from './chirp';
 import { dlog } from '../../lib/debug/dlog';
 
 export class OFDMEngine {
@@ -15,8 +19,18 @@ export class OFDMEngine {
   private toneFreqs: Float32Array;
   private ofdm: OFDMQPSKModulator;
   private pilotFreqHz: number;
+  private sampleRate: number;
+  private symSamples: number;
+  /** Chirp span (Hz) around pilot; sweep goes pilot±span/2 */
+  private chirpSpanHz: number;
 
-  constructor(cfg: { sampleRate: number; toneCount?: number; pilotFreqHz?: number; pilotAmplitude?: number }) {
+  constructor(cfg: {
+    sampleRate: number;
+    toneCount?: number;
+    pilotFreqHz?: number;
+    pilotAmplitude?: number;
+    chirpSpanHz?: number;
+  }) {
     const toneCount = cfg.toneCount ?? OFDM_DEFAULTS.toneCount;
     this.toneCount = toneCount % 4 !== 0 ? 4 : toneCount;
     if (toneCount % 4 !== 0) {
@@ -26,8 +40,12 @@ export class OFDMEngine {
     const pilotFreqHz = cfg.pilotFreqHz ?? 1900;
     const pilotAmplitude = cfg.pilotAmplitude ?? 2.0;
     this.pilotFreqHz = pilotFreqHz;
+    this.sampleRate = cfg.sampleRate;
+    this.chirpSpanHz = cfg.chirpSpanHz ?? 200;
+    const { symSamples } = ofdmSamples(cfg.sampleRate);
+    this.symSamples = symSamples;
 
-    this.toneFreqs = ofdmToneFrequencies({ toneCount: this.toneCount });
+    this.toneFreqs = ofdmToneFrequencies({ toneCount: this.toneCount, pilotFreqHz });
 
     this.ofdm = new OFDMQPSKModulator({
       sampleRate: cfg.sampleRate,
@@ -40,6 +58,30 @@ export class OFDMEngine {
       pilot: pilotFreqHz,
       tones: Array.from(this.toneFreqs).map((f) => f.toFixed(1)),
     });
+  }
+
+  /** Chirped sync burst — linear sweep across chirpSpanHz for timing detection. */
+  generateChirpBurst(symbolCount: number): { chirp: Float32Array; chirpCfg: ChirpConfig } {
+    const durationSec = (symbolCount * this.symSamples) / this.sampleRate;
+    const halfSpan = this.chirpSpanHz / 2;
+    const chirpCfg: ChirpConfig = {
+      fStart: this.pilotFreqHz - halfSpan,
+      fEnd: this.pilotFreqHz + halfSpan,
+      durationSec,
+      sampleRate: this.sampleRate,
+    };
+    const chirp = generateChirp(chirpCfg);
+    dlog('TX-OFDM', {
+      chirp: `${chirpCfg.fStart}-${chirpCfg.fEnd}Hz`,
+      durMs: Math.round(durationSec * 1000),
+      samples: chirp.length,
+    });
+    return { chirp, chirpCfg };
+  }
+
+  /** Training symbols — standard OFDM with all tones at QPSK 0° for channel estimation. */
+  generateTrainingSymbols(count: number): Float32Array {
+    return this.generateSyncBurst(count);
   }
 
   generateSyncBurst(count: number): Float32Array {

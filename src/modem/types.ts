@@ -199,12 +199,14 @@ export const OFDM_TUNING = {
 
 export function ofdmToneFrequencies(opts: {
   toneCount: number;
+  pilotFreqHz?: number;
   startHz?: number;
   spacingHz?: number;
 }): Float32Array {
+  const pilot = opts.pilotFreqHz ?? 0;
   const start = opts.startHz ?? OFDM_DEFAULTS.toneStartHz;
   const spacing = opts.spacingHz ?? OFDM_DEFAULTS.toneSpacingHz;
   const freqs = new Float32Array(opts.toneCount);
-  for (let t = 0; t < opts.toneCount; t++) freqs[t] = start + t * spacing;
+  for (let t = 0; t < opts.toneCount; t++) freqs[t] = pilot + start + t * spacing;
   return freqs;
 }

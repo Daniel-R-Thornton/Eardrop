@@ -240,6 +240,25 @@ export function MainApp() {
               </button>
             )}
             {s.sendStatus && <StatusBadge {...s.sendStatus} />}
+            {s.selectedFile && (
+              <button
+                onClick={() => dispatch('eardrop-export-wav')}
+                style={{
+                  width: '100%',
+                  marginTop: 8,
+                  padding: '8px 0',
+                  border: 'none',
+                  borderRadius: 8,
+                  fontSize: 13,
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  background: '#f59e0b',
+                  color: '#fff',
+                }}
+              >
+                Export as WAV
+              </button>
+            )}
           </Card>
 
         </div>
@@ -249,6 +268,33 @@ export function MainApp() {
             <p style={{ color: '#6b7280', fontSize: 13, marginBottom: 10 }}>
               Place sender speaker near mic.
             </p>
+            <label style={{
+              display: 'flex', alignItems: 'center', gap: 6,
+              fontSize: 12, color: '#6b7280', cursor: 'pointer',
+              marginTop: 6, marginBottom: 4,
+            }}>
+              <input type="checkbox" checked={s.playWavDuringDecode}
+                onChange={() => setState({ playWavDuringDecode: !s.playWavDuringDecode })} />
+              play WAV while decoding
+            </label>
+            <button
+              onClick={() => dispatch('eardrop-load-wav')}
+              style={{
+                width: '100%',
+                marginTop: 6,
+                padding: '8px 0',
+                border: 'none',
+                borderRadius: 8,
+                fontSize: 13,
+                fontWeight: 600,
+                cursor: 'pointer',
+                background: '#8b5cf6',
+                color: '#fff',
+                transition: 'all .15s',
+              }}
+            >
+              From WAV (raw)
+            </button>
             <button
               onClick={() => dispatch('eardrop-record')}
               style={{

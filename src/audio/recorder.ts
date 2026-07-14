@@ -203,9 +203,23 @@ export class AudioRecorder {
     this.workletNode = new AudioWorkletNode(this.ctx, 'recorder-processor', {
       processorOptions: { ratio: workletRatio },
     });
+    // ── AudioWorklet message port: handle both normal data and Chrome’s
+    //    occasional "message channel closed" bug that kills the processor.
+    //    Log the error so it shows up in the debug dump — the existing
+    //    micWatchdog (1500 ms silence) will trigger recovery naturally.
     this.workletNode.port.onmessage = (e: MessageEvent<Float32Array>) => {
       if (!this.running) return;
       this.onChunk!(e.data);
+    };
+    // AudioWorkletNode.onmessageerror: catches Chrome's occasional
+    // cross-context port teardown errors that would otherwise go silent.
+    this.workletNode.port.onmessageerror = () => {
+      dlog('REC-ERR', { source: 'worklet-msg-error' });
+    };
+    // AudioWorkletNode.onprocessorerror: catches unhandled exceptions
+    // thrown inside the AudioWorkletProcessor (e.g. NaN, OOM).
+    this.workletNode.onprocessorerror = () => {
+      dlog('REC-ERR', { source: 'worklet-processor' });
     };
 
     // Connect: mic → gain boost → worklet → silent destination
@@ -227,6 +241,8 @@ export class AudioRecorder {
     console.log('[Recorder] ⏹ Stopping recording...');
     if (this.workletNode) {
       this.workletNode.port.onmessage = null;
+      this.workletNode.port.onmessageerror = null;
+      this.workletNode.onprocessorerror = null;
       this.workletNode.disconnect();
       this.workletNode = null;
     }

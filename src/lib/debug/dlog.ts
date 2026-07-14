@@ -32,27 +32,57 @@ let mode: DlogMode = 'lines';
 let forwardCb: ((line: string) => void) | null = null;
 let redrawPending = false;
 
+/** Lines from ring that have already been emitted as a console entry */
+let redrawEmitted = 0;
+/** Lines per console entry — Chrome wraps single entries > ~50 lines */
+const REDRAW_BATCH = 100;
+
 export function dlogSetMode(next: DlogMode, onForward?: (line: string) => void): void {
   mode = next;
   forwardCb = onForward ?? null;
 }
 
-/** Throttled clear-and-reprint: whole ring as one console entry. */
+/**
+ * Emit only NEW lines since the last batch as a fresh console entry.
+ * The old entries stay visible in the console — no console.clear().
+ * Each batch gets its own log so Chrome doesn't collapse them under
+ * a "show more" toggle.
+ */
+function flushBatch(): void {
+  redrawPending = false;
+  const batch = ring.slice(redrawEmitted);
+  if (batch.length === 0) return;
+  while (batch.length > 0) {
+    const chunk = batch.splice(0, REDRAW_BATCH);
+    const fromLine = redrawEmitted + 1;
+    const toLine = redrawEmitted + chunk.length;
+    redrawEmitted += chunk.length;
+    console.log(
+      `━━ eardrop log (lines ${fromLine}-${toLine} of ${ring.length}) ━━\n${chunk.join('\n')}`,
+    );
+  }
+}
+
 function scheduleRedraw(): void {
   if (redrawPending) return;
   redrawPending = true;
-  setTimeout(() => {
-    redrawPending = false;
-    console.clear();
-    console.log(`━━ eardrop log (${ring.length} lines, newest last) ━━\n${ring.join('\n')}`);
-  }, 250);
+  setTimeout(flushBatch, 250);
 }
 
 /** Add a line produced in another context (e.g. worker) to this ring. */
 export function dlogInject(line: string): void {
-  ring.push(line);
-  if (ring.length > RING_MAX) ring.shift();
+  ringPush(line);
   if (mode === 'redraw') scheduleRedraw();
+}
+
+/** Push to ring, evicting oldest when full. Adjusts redrawEmitted so
+ *  incremental flushes stay aligned after ring shifts. */
+function ringPush(line: string): void {
+  ring.push(line);
+  if (ring.length > RING_MAX) {
+    ring.shift();
+    if (redrawEmitted > 0) redrawEmitted--;
+  }
 }
 
 export interface DlogOptions {
@@ -141,8 +171,7 @@ export function dlog(
 
   // Push all lines into the ring buffer
   for (const l of lines) {
-    ring.push(l);
-    if (ring.length > RING_MAX) ring.shift();
+    ringPush(l);
   }
 
   if (mode === 'forward' && forwardCb) {
@@ -168,4 +197,5 @@ export function dlogDump(count = 200): string {
 export function dlogReset(): void {
   ring.length = 0;
   rateCounters.clear();
+  redrawEmitted = 0;
 }

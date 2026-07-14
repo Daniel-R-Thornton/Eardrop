@@ -80,3 +80,39 @@ Analysis:
 ### PLL
 - `phase_std`: Standard deviation of phase error. <0.1 rad is good.
 - `lock_quality`: 0-1. >0.9 is locked. <0.5 means PLL is losing lock.
+
+---
+
+## OFDM/QPSK Debug Tags (Production Path)
+
+For live OFDM transfers, the debug output uses `dlog()` tags documented in
+`DEBUG-OUTPUT.md`. The key OFDM tags:
+
+| Tag | Emitted by | Fields | Healthy values |
+|-----|-----------|--------|----------------|
+| `OFDM-SYNC` | rxEngine WAITING | `e` (tone energy), `thr` (threshold), `sync` (consecutive windows); `detected`; `boundary`, `skip`, `score` | e > thr during burst; `detected=true`; `boundary >= 0`, `score > 0.35` |
+| `OFDM-TRAIN` | rxEngine + demod | `symbols` (trained), `pilotAmp`, `h` (per-tone amp@phase) | 12 symbols; tone amps within ~10× |
+| `OFDM-DEMOD` | demod (first symbol) | `firstSym` per-tone phase°/QPSK symbol | Phases within ±20° of 0/90/180/270 |
+| `RX-FRAME` | rxEngine | `valid`, `type`, `seq`, `len` | `valid=true` |
+| `TX-OFDM` | ofdmEngine | `tones` (frequencies), `pilot`, `syncBurst` | TX tones = RX OFDM-SYNC tones |
+
+### Example OFDM Analysis Prompt
+
+```
+I have debug output from an OFDM/QPSK acoustic file transfer.
+
+[OFDM-SYNC] detected=true e=1.23 thr=0.18 boundary=47 score=0.82 sharp=1.9
+[OFDM-TRAIN] symbols=12 pilotAmp=1.95 h=1.2e+0@-3 9.8e-1@-5 1.1e+0@+2 1.0e+0@-1 ...
+[OFDM-DEMOD] firstSym=t0:45°/1 t1:92°/2 t2:178°/2 t3:271°/3 ...
+[RX-FRAME] valid=true type=0x01 seq=0 len=160
+
+Questions:
+1. What does the equalized phase spread tell you about the channel?
+2. The pilot amplitude is 1.95 vs expected 2.0 — is the amplitude estimation accurate?
+3. Any sign of frequency-selective fading in the per-tone channel estimates?
+```
+
+### Reference
+
+Full tag reference (including heartbeat, rate-limiting rules, and healthy-value
+ranges): see `docs/DEBUG-OUTPUT.md`.

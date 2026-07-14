@@ -29,13 +29,13 @@ An experimental **OFDM/QPSK mode** (native-rate, 40 ms symbol + 5 ms CP, Goertze
 | Parameter | Value |
 |-----------|-------|
 | Sample rate (modem) | Hardware rate (48 kHz / 44.1 kHz); OFDM uses native rate, BPSK uses Hann-sinc AudioWorklet downsampler to 3200 Hz |
-| Symbol rate | 25 sym/s (BPSK) · ~22.22 sym/s (OFDM, 40 ms + 5 ms CP) |
+| Symbol rate | 25 sym/s (BPSK) · ~40 sym/s (OFDM, 20 ms + 5 ms CP) |
 | Data tones | 2 / 4 / 8, configurable |
-| Pilot frequency | Configurable via UI slider (default 487.5 Hz, ~600 Hz measured optimal) |
+| Pilot frequency | Configurable via UI slider (default 600 Hz for BPSK, 1900 Hz for OFDM) |
 | Framing | 79-byte atomic frames, Hamming-distance sentinel scanning |
 | ECC | BCH(63,30) × 3 header + RS(52,40) payload, soft-decision |
 | Diversity ("hail mary") mode | Optional 3× frame repetition for noisy channels |
-| Effective throughput | BPSK: ~5–6 byte/s acoustic; OFDM: ≈711 bit/s (16 tones), ≈1422 bit/s (32 tones) raw. Native-rate OFDM uses absolute frequencies in the 2-4 kHz band |
+| Effective throughput | BPSK: ~5–6 byte/s acoustic; OFDM: 1280 bps raw (16 tones), 2560 bps raw (32 tones). Native-rate OFDM uses absolute frequencies in the 2-4 kHz band |
 
 Audio capture force-disables AGC, noise suppression, and echo cancellation; mic gain (1–20×) and playback volume sliders compensate manually.
 
@@ -62,12 +62,12 @@ src/
 └── ui/        ← MainApp, Store, components, controllers, debug panels
 ```
 
-Tests: `npm test` — 90 tests, 87 passing (3 pre-existing failures: Doppler ±Hz, Full Stress).
+Tests: `npm test` — 124 pass, 3 fail out of 127 total (3 pre-existing failures: Doppler ±Hz, Full Stress — BPSK-only, do not chase).
 
 ## Known issues
 
-- **OFDM acoustic status** — 13/13 OFDM tests pass in-memory (modulation, demodulation, loopback, sync, cross-rate, hum immunity). Per-tone channel equalization is implemented. Acoustic testing with live mic/speaker pending (Task 9). See `STATE.md`.
-- **Throughput** — BPSK: ~5 byte/s acoustic; OFDM raw bitrates: 711 bps (16 tones), 1422 bps (32 tones). Acoustic OFDM throughput not yet measured.
+- **OFDM acoustic status** — All OFDM tests pass in-memory (modulation, demodulation, loopback, sync, cross-rate, hum immunity, channel drift, frame geometry V2, tuning invariants, pilot level, throughput benchmark). Acoustic testing with live mic/speaker pending. See `STATE.md`.
+- **Throughput** — BPSK: ~5–6 byte/s acoustic; OFDM benchmark (48 kHz): 87 B/s net (16 tones), 167 B/s net (32 tones). Acoustic OFDM throughput not yet measured.
 
 Fragile files — don't touch without careful testing: `src/modem/protocol/preamble.ts`, `src/modem/protocol/rxEngine.ts`, `src/modem/pilot.ts`, `src/audio/recorder.ts`.
 

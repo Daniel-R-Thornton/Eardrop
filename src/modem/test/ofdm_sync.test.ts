@@ -10,7 +10,7 @@ import { ofdmSamples, ofdmToneFrequencies } from '../types';
 const SAMPLE_RATE = 48000;
 const { symSamples: SYM_LEN } = ofdmSamples(SAMPLE_RATE);
 const PILOT_FREQ = 1900;
-const TONE_FREQS = ofdmToneFrequencies({ toneCount: 4 });
+const TONE_FREQS = ofdmToneFrequencies({ toneCount: 4, pilotFreqHz: PILOT_FREQ });
 const SYNC_COUNT = 24;
 
 function nibbleBits(byte: number): number[] {
