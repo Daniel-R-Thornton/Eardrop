@@ -1,8 +1,8 @@
 # Eardrop — State Summary
 
-**Branch**: `feat/ofdm-throughput-max`  
-**Last commit**: `16cde2c` — feat(ui): net OFDM bitrate readout, hide no-op symbol rate, default 32 tones  
-**Date**: 2026-07-13
+**Branch**: `main`  
+**Last commit**: `4571f6c` — feat: add Export to WAV and From WAV buttons with play-while-decode option  
+**Date**: 2026-07-14
 
 ---
 
@@ -60,13 +60,16 @@
 - `src/lib/` — 8 utility modules (math, encoding, crc, ecc, scan, protocol, debug, channel)
 - `src/modem/` — modulation/, demodulation/, protocol/, dsp/, ecc/, pilot/, receiver/, channel/, debug/, test/
 - `src/audio/` — dsp/, browser/, player.ts, recorder.ts, devices.ts
-- `src/workers/` — modem.worker.ts, modemService.ts, modemSchema.ts, encoder.worker.ts, broadcast.worker.ts
+- `src/workers/` — modem.worker.ts, modemService.ts, modemSchema.ts
 - `src/ui/` — app.ts, Store.ts, controllers/, debug/, lib/, styles/
+
+> **Note**: Legacy `encoder.worker.ts` and `broadcast.worker.ts` were removed in favor of unified `modem.worker.ts` + `ModemService` (see `PROGRESS.md`).
 
 ### Tests
 - **127 tests total** (124 pass, 3 pre-existing failures)
 - **All OFDM tests pass**: modulation, demodulation, loopback, sync, acoustic path, cross-rate, hum immunity, frame geometry V2, tuning invariants, pilot level, throughput benchmark, channel drift
 - 3 pre-existing failures: Doppler +2Hz, Doppler -1Hz, Full Stress (BPSK pipeline test — do not chase)
+- Architecture guardrails prevent per-sample messaging regression and inline modem configs
 
 ---
 

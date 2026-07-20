@@ -1,263 +1,155 @@
 # API Reference
 
+This document summarizes the main interfaces that the current UI and worker use.
+
 ## `ModemConfig` (`src/modem/types.ts`)
 
-```typescript
+```ts
 interface ModemConfig {
-  sampleRate: number;                // 3200 (modem native; OFDM uses hardware rate)
-  symbolsPerSec: number;             // 25
-  bitsPerFrame: number;              // 8
-
-  pilotEnabled: boolean;             // true
-  pilotFreqHz: number;               // 600
-  musical: boolean;                  // false
-  pilotAmplitude: number;            // 0.4
-
-  dataToneAmplitude: number;         // 0.5
-  amplitudeThresholdRatio: number;   // 0.3
-  toneCount: number;                 // 4 (2, 4; also sets default OFDM tone count)
-  diversityMode: boolean;            // false (3× repetition)
-
-  syncSymbols: number;               // 10
-  sentinel: number;                  // unused
-
-  squawkIntervalSymbols: number;     // 32
-  squawkSymbols: number;             // 8
-
-  eccScheme: 'hamming74' | 'bch3116'; // 'bch3116'
-  interleaveDepth: number;           // 8
-
-  payloadBlockSymbols: number;       // 32
+  sampleRate: number;
+  symbolsPerSec: number;
+  bitsPerFrame: number;
+  pilotEnabled: boolean;
+  pilotFreqHz: number;
+  musical: boolean;
+  pilotAmplitude: number;
+  dataToneAmplitude: number;
+  amplitudeThresholdRatio: number;
+  toneCount: number;
+  diversityMode: boolean;
+  syncSymbols: number;
+  sentinel: number;
+  squawkIntervalSymbols: number;
+  squawkSymbols: number;
+  eccScheme: 'hamming74' | 'bch3116';
+  interleaveDepth: number;
+  payloadBlockSymbols: number;
 }
 ```
 
-Constants:
-- `TONE_OFFSETS`: `[100, 200, 300, 400]` (100 Hz spacing)
-- `MUSICAL_OFFSETS`: `[87.5, 162.5, 287.5, 487.5]`
-- `WARBLE_CODE`: `0xAC94` (16-bit preamble detection code)
-- `WARBLE_CODE_THRESHOLD`: `12` (minimum matching bits out of 16)
-- `DEFAULT_CONFIG`: All defaults above
+Key helpers and constants:
 
-Helpers:
-- `getToneFreqs(pilotFreqHz, musical?) → [f0, f1, f2, f3]`
-- `getDataToneFreqs(pilotFreqHz, musical?) → [f0, f1, f2, f3]`
-- `getOffsets(musical?) → [o0, o1, o2, o3]`
+- `DEFAULT_CONFIG` — BPSK-era defaults used as the base config.
+- `TONE_OFFSETS` — `[100, 200, 300, 400]` for the default BPSK layout.
+- `OFDM_SYMBOL_MS` / `OFDM_CP_MS` — 20 ms and 5 ms for the native-rate OFDM path.
+- `OFDM_DEFAULTS` — `pilotFreqHz: 1900`, `pilotAmplitude: 2.0`, `toneCount: 32`.
+- `OFDM_TUNING` — sync burst, training, threshold, and tail-silence tuning values.
+- `ofdmSamples(sampleRate)` — returns `{ fftSamples, cpSamples, symSamples }`.
+- `ofdmToneFrequencies(...)` — returns the absolute OFDM tone frequencies.
 
-### OFDM Constants (`src/modem/types.ts`)
+## `buildModemConfig` (`src/ui/controllers/buildModemConfig.ts`)
 
-```typescript
-const OFDM_SYMBOL_MS = 20;    // ms per OFDM symbol (no CP)
-const OFDM_CP_MS = 5;         // ms cyclic prefix
-
-const OFDM_DEFAULTS = {
-  pilotFreqHz: 1900,
-  pilotAmplitude: 2.0,
-  toneStartHz: 2000,
-  toneSpacingHz: 50,
-  toneCount: 32,
-};
-
-const OFDM_TUNING = {
-  syncBurstSymbols: 24,
-  trainingSymbols: 12,
-  syncMinFrames: 8,
-  tailSilenceSymbols: 6,
-};
+```ts
+function buildModemConfig(ui: ModemUiConfig): ModemConfig & { useOFDM: boolean }
 ```
 
-Helpers:
-- `ofdmSamples(sampleRate) → { fftSamples, cpSamples, symSamples }` — compute integer window sizes for any hardware rate
-- `ofdmToneFrequencies({ toneCount, startHz?, spacingHz? }) → Float32Array` — compute absolute tone frequencies on the 50 Hz grid
+This is the single UI-to-worker config builder. It snaps the OFDM pilot to the hardware-rate bin grid and sets the sample rate to the hardware rate when OFDM is enabled.
 
----
+## `toneIQ` / `PilotPLL` (`src/modem/pilot.ts`)
 
-## `PhaseAcc` (`src/modem/dsp/oscillator.ts`)
-
-```typescript
-class PhaseAcc {
-  advance(freqHz: number, sampleRate: number): number
-  reset(): void
-}
+```ts
+function toneIQ(samples: readonly number[], toneFreq: number, sampleRate: number)
 ```
 
-Shared sin-then-increment oscillator. `advance()` returns `sin(2π · phase)` at the current phase, then increments. Used by all tone generation paths (BPSKModulator, OFDMQPSKModulator, preamble).
+Computes the complex I/Q correlation of a window against a single tone frequency. The current OFDM demodulator uses this in its tone-energy and channel-estimation logic.
 
----
-
-## `toneIQ` (`src/modem/pilot.ts`)
-
-```typescript
-function toneIQ(
-  samples: readonly number[],
-  toneFreq: number,
-  sampleRate: number
-): { i: number; q: number }
-```
-
-Goertzel-style sin/cos correlation over a sample window. Computes raw I/Q at a single frequency. Matches the `sin(ωn)` reference of `PhaseAcc`.
-
-Also exported from `src/modem/pilot/index.ts` along with:
-- `getDataToneFreqs(pilotFreqHz, musical?) → [f0, f1, f2, f3]`
-
----
-
-## `PilotPLL` (`src/modem/pilot.ts`)
-
-```typescript
+```ts
 class PilotPLL {
-  constructor(freq: number, initialPhase: number, initialAmplitude: number, cfg?: Partial<PLLConfig>)
-
   update(sample: number): void
   getAmplitude(): number
   getPhase(): number
   getFrequency(): number
-  getSinRef(): number
-  getCosRef(): number
   rotateToPilotRef(rawI: number, rawQ: number): { i: number; q: number }
-  setFrequency(f: number): void
-}
-
-interface PLLConfig {
-  Kp: number          // 0.1
-  Ki: number          // 0.01
-  sampleRate: number  // 3200
 }
 ```
 
-Second-order PLL. Used for amplitude tracking in the BPSK path; phase rotation is not needed since the phase contract ensures consistent I signs across all tones.
+Used by the BPSK receive path for pilot tracking and phase reference maintenance.
 
----
+## `TxEngine` (`src/modem/protocol/txEngine.ts`)
 
-## `Encoder` (`src/modem/protocol/encoder.ts`) — Self-Test Path
-
-```typescript
-class Encoder {
-  constructor(cfg?: Partial<ModemConfig>)
-  encode(data: Uint8Array): Float32Array
-  encodeFramedBlocks(blockBytes: Uint8Array): Float32Array
-  encodeToOutputRate(data: Uint8Array, outputRate: number): Float32Array
-  onDone(cb: () => void): void
-}
-```
-
-Generates leader (pilot-only) → sync (all tones ON) → calibrate (one tone at a time) → data (self-framing blocks). Uses `PhaseAcc` oscillator. SPS=128. BCH(31,16) ECC applied via `encode()`; `encodeFramedBlocks()` accepts pre-ECC bytes.
-
-## `Decoder` (`src/modem/protocol/decoder.ts`) — Self-Test Path
-
-```typescript
-class Decoder {
-  constructor(cfg?: Partial<ModemConfig>)
-
-  feedSample(sample: number): void
-  reset(): void
-  flush(): Uint8Array
-
-  hasData(): boolean
-  getProgress(): number
-  getNoiseFloor(): [number, number, number, number]
-  getPilotFreq(): number
-  getPilotAmplitude(): number
-
-  onFrame: ((data: Uint8Array) => void) | null
-
-  // Debug
-  debugLog: DecoderDebugInfo[]
-  logging: boolean
-  fastSync: boolean
-  framedDecoder: FramedBlockDecoder
-  blockProcessor: BlockProcessor
-}
-```
-
-Preamble detection via frame counting (leader → sync → calibrate → data). BPSK bit detection via raw I sign with global calibration flip. `FramedBlockDecoder` scans bits for sentinel patterns and emits validated blocks.
-
----
-
-## `TxEngine` (`src/modem/protocol/txEngine.ts`) — Production Path
-
-```typescript
+```ts
 class TxEngine {
-  constructor(cfg?: Partial<ModemConfig>)
+  constructor(cfg?: Partial<ModemConfig> & { useOFDM?: boolean })
   transmitFile(fileName: string, data: Uint8Array): Float32Array
-  transmitFrame(header: AtomicHeader, payload: Uint8Array): Float32Array
   reset(): void
+  isOFDM(): boolean
 }
 ```
 
-Generates BPSK warble preamble + atomic frames. Supports diversity mode (3× repetition). SPS=256. For OFDM, wraps `OFDMEngine` internally when `useOFDM: true` in config — generates sync burst + V2 atomic frames at native sample rate.
+The production transmitter. It builds the preamble, atomic frames, and the appropriate waveform for either BPSK or OFDM.
 
-## `RxEngine` (`src/modem/protocol/rxEngine.ts`) — Production Path
+## `RxEngine` (`src/modem/protocol/rxEngine.ts`)
 
-```typescript
+```ts
 class RxEngine {
-  constructor(cfg?: Partial<ModemConfig>)
+  constructor(cfg?: Partial<ModemConfig> & { useOFDM?: boolean })
   feedSample(sample: number): void
   feedChunk(chunk: Float32Array): void
   getFile(): ReceivedFile | null
-  getState(): RxState
-  getProgress(): { state, framesReceived, totalFrames, fileName, fileSize, bytesAssembled }
+  getProgress(): { state; framesReceived; totalFrames; fileName; fileSize; bytesAssembled }
   reset(): void
-  getDebugSnapshot(): DebugSnapshot
-  getDebugByteLog(): Array<{ byte, phase, bitOffset }>
-  getShiftRegHistory(): Array<{ bit, shiftReg, matched, phase }>
-}
-
-interface ReceivedFile {
-  fileName: string
-  data: Uint8Array
-  totalBytes: number
-}
-
-enum RxState {
-  WAITING, PREAMBLE, FRAMES, COMPLETE, ERROR
 }
 ```
 
-**BPSK mode**: State machine: WAITING (warble detection) → PREAMBLE (marker, Gray code calibration, guard) → FRAMES (DBPSK + sentinel scanning) → COMPLETE (file ready). SPS=256.
+The production receiver. It supports the BPSK preamble/calibration path and the OFDM sync/training/frame-decoding path.
 
-**OFDM mode**: WAITING (tone energy sync detection + CP correlation alignment) → FRAMES (OFDMQPSKDemodulator training → QPSK decode → nibble packing → sentinel scanner) → COMPLETE.
+## `OFDMEngine` (`src/modem/protocol/ofdmEngine.ts`)
 
----
-
-## `OFDMEngine` (`src/modem/protocol/ofdmEngine.ts`) — OFDM TX
-
-```typescript
+```ts
 class OFDMEngine {
   constructor(cfg: { sampleRate: number; toneCount?: number; pilotFreqHz?: number; pilotAmplitude?: number })
-
   generateSyncBurst(count?: number): Float32Array
   modulateFrame(frame: Uint8Array): Float32Array
 }
 ```
 
-Native-rate OFDM transmitter. All timing derived from `OFDM_SYMBOL_MS` + `OFDM_CP_MS` via `ofdmSamples()`. Uses direct cosine synthesis (`OFDMQPSKModulator`). Tones grouped into 4-tone blocks — each block carries one byte per symbol.
+Creates the native-rate OFDM sync burst and modulates atomic frames into audio.
 
----
+## `OFDMQPSKModulator` / `OFDMQPSKDemodulator`
 
-## `OFDMQPSKModulator` (`src/modem/modulation/OFDMQPSKModulator.ts`)
-
-```typescript
+```ts
 class OFDMQPSKModulator {
   constructor(config: { sampleRate: number; toneFrequencies: Float32Array; pilotFreqHz: number; pilotAmplitude: number })
-
   setSymbols(symbols: number[]): void
   generateSymbol(): Float32Array
 }
 ```
 
-Direct cosine synthesis for one OFDM symbol. Each tone is modulated by `cos(φ)` — QPSK mapped to 2-bit symbols (b0=I, b1=Q). The symbol includes the cyclic prefix (last CP samples prepended).
-
----
-
-## `OFDMQPSKDemodulator` (`src/modem/demodulation/OFDMQPSKDemodulator.ts`)
-
-```typescript
+```ts
 class OFDMQPSKDemodulator {
-  constructor(config: {
-    sampleRate: number;
-    toneFrequencies: Float32Array;
-    pilotFreqHz: number;
-    trackingAlpha?: number;  // 0.003 default
+  constructor(config: { sampleRate: number; toneFrequencies: Float32Array; pilotFreqHz: number; trackingAlpha?: number })
+}
+```
+
+These two classes are the OFDM transmit and receive backend used by the production path.
+
+## `ModemService` / worker schema (`src/workers/modemService.ts`, `src/workers/modemSchema.ts`)
+
+```ts
+type ModemCommand =
+  | { type: 'configure'; config: ModemConfig & { useOFDM?: boolean } }
+  | { type: 'startRx' }
+  | { type: 'stopRx' }
+  | { type: 'feedChunk'; samples: ArrayBuffer }
+  | { type: 'encodeFile'; id: number; fileName: string; data: ArrayBuffer }
+  | { type: 'dumpBuffer'; id: number; seconds: number }
+  | { type: 'setVerboseLogging'; enabled: boolean };
+```
+
+```ts
+type ModemEvent =
+  | { type: 'configured' }
+  | { type: 'rxStarted' }
+  | { type: 'rxStopped' }
+  | { type: 'telemetry'; telemetry: ModemTelemetry }
+  | { type: 'fileComplete'; fileName: string; data: ArrayBuffer }
+  | { type: 'encoded'; id: number; samples: ArrayBuffer; sampleRate: number }
+  | { type: 'bufferDump'; id: number; samples: ArrayBuffer; rms: number; peak: number }
+  | { type: 'dlog'; line: string }
+  | { type: 'error'; id?: number; error: string };
+```
+
+These are the worker-facing message types used by the UI and the browser worker.
   })
 
   resetTraining(): void
