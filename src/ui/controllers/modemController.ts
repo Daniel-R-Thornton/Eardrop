@@ -85,6 +85,18 @@ export class ModemController {
     });
   }
 
+  demoEncode(fileName: string, data: Uint8Array): Promise<import('../../modem/protocol/captureTypes').Run> {
+    return new Promise((resolve, reject) => {
+      const id = this.nextId++;
+      this.pending.set(id, (ev) => {
+        if (ev.type === 'demoEncoded') resolve(ev.run);
+        else reject(new Error((ev as { error?: string }).error ?? 'demoEncode failed'));
+      });
+      const copy = new Uint8Array(data);
+      this.post({ type: 'demoEncode', id, fileName, data: copy.buffer }, [copy.buffer]);
+    });
+  }
+
   dumpBuffer(seconds: number): Promise<{ samples: Float32Array; rms: number; peak: number }> {
     return new Promise((resolve) => {
       const id = this.nextId++;

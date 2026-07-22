@@ -35,6 +35,7 @@ export type ModemCommand =
   | { type: 'stopRx' }
   | { type: 'feedChunk'; samples: ArrayBuffer } // Float32Array buffer, transferred
   | { type: 'encodeFile'; id: number; fileName: string; data: ArrayBuffer }
+  | { type: 'demoEncode'; id: number; fileName: string; data: ArrayBuffer }
   | { type: 'dumpBuffer'; id: number; seconds: number }
   | { type: 'setVerboseLogging'; enabled: boolean };
 
@@ -46,6 +47,7 @@ export type ModemEvent =
   | { type: 'telemetry'; telemetry: ModemTelemetry }
   | { type: 'fileComplete'; fileName: string; data: ArrayBuffer }
   | { type: 'encoded'; id: number; samples: ArrayBuffer; sampleRate: number }
+  | { type: 'demoEncoded'; id: number; run: import('../modem/protocol/captureTypes').Run }
   | { type: 'bufferDump'; id: number; samples: ArrayBuffer; rms: number; peak: number }
   | { type: 'dlog'; line: string }
   | { type: 'error'; id?: number; error: string };

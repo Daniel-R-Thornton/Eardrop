@@ -4,6 +4,7 @@
  */
 import { RxEngine } from '../modem/protocol/rxEngine';
 import { TxEngine } from '../modem/protocol/txEngine';
+import { captureTransmit } from '../modem/protocol/txCapture';
 import { toneIQ } from '../modem/pilot';
 import { DEFAULT_CONFIG, ofdmToneFrequencies, type ModemConfig } from '../modem/types';
 import type { ModemCommand, ModemEvent, ModemTelemetry } from './modemSchema';
@@ -73,6 +74,16 @@ export class ModemService {
             { type: 'encoded', id: cmd.id, samples: samples.buffer as ArrayBuffer, sampleRate: this.config.sampleRate },
             [samples.buffer as ArrayBuffer],
           );
+        } catch (err) {
+          this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
+        }
+        break;
+      }
+      case 'demoEncode': {
+        if (!this.config) { this.emit({ type: 'error', id: cmd.id, error: 'demoEncode before configure' }); return; }
+        try {
+          const run = captureTransmit(this.config as any, cmd.fileName, new Uint8Array(cmd.data));
+          this.emit({ type: 'demoEncoded', id: cmd.id, run });
         } catch (err) {
           this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
         }
