@@ -6,13 +6,13 @@
 
 import React from 'react';
 import { createRoot } from 'react-dom/client';
-import { MainApp } from './MainApp';
+import { BenchApp } from './BenchApp';
 import './app'; // boot the background controller (workers, audio, events)
 import '../style.css';
 
 const root = document.getElementById('root');
 if (root) {
-  createRoot(root).render(React.createElement(MainApp));
+  createRoot(root).render(React.createElement(BenchApp));
 } else {
   console.error('[Eardrop] #root not found');
 }
