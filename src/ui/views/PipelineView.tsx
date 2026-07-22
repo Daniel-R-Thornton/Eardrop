@@ -86,57 +86,44 @@ export function PipelineView({ run, frameIndex, stageIndex }: PipelineViewProps)
     }
   };
 
-  const pct = STAGES.length > 1 ? (stageIndex / (STAGES.length - 1)) * 100 : 0;
-
   return (
-    <div style={{ position: 'relative' }}>
-      {/* frame-in-flight token */}
-      {bundle && (
-        <div
-          style={{
-            position: 'absolute',
-            top: -10,
-            left: `calc(${pct}% - 30px)`,
-            transition: 'left 0.35s cubic-bezier(.4,0,.2,1)',
-            background: T.phosphor,
-            color: T.screenBg,
-            fontFamily: T.mono,
-            fontSize: 10,
-            fontWeight: 700,
-            padding: '2px 8px',
-            borderRadius: 10,
-            zIndex: 2,
-            whiteSpace: 'nowrap',
-            boxShadow: `0 0 8px ${T.phosphor}`,
-          }}
-        >
-          ▸ {bundle.frameKind}#{bundle.frameIndex}
-        </div>
-      )}
-      <div style={{ display: 'flex', gap: 8, overflowX: 'auto', paddingTop: 12, alignItems: 'stretch' }}>
-        {STAGES.map((stage, i) => {
-          const active = i === stageIndex;
-          return (
-            <div
-              key={stage}
-              style={{
-                flex: '0 0 auto',
-                border: `1px solid ${active ? T.phosphor : 'transparent'}`,
-                borderRadius: T.radius,
-                boxShadow: active ? `0 0 10px ${T.phosphorDim}` : 'none',
-                transition: 'border-color .2s, box-shadow .2s',
-              }}
-            >
-              <Panel title={STAGE_LABELS[stage] ?? stage.toUpperCase()}>
-                <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 2 }}>
-                  <LED on={active} />
-                </div>
-                {renderStage(stage)}
-              </Panel>
-            </div>
-          );
-        })}
-      </div>
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'stretch' }}>
+      {STAGES.map((stage, i) => {
+        const active = i === stageIndex;
+        const done = bundle && i < stageIndex;
+        return (
+          <div
+            key={stage}
+            style={{
+              flex: `1 1 ${SW}px`,
+              maxWidth: SW + 40,
+              border: `2px solid ${active ? T.phosphor : 'transparent'}`,
+              borderRadius: T.radius,
+              boxShadow: active ? `0 0 14px ${T.phosphor}` : 'none',
+              opacity: bundle && !active && !done ? 0.55 : 1,
+              transition: 'border-color .2s, box-shadow .2s, opacity .2s',
+            }}
+          >
+            <Panel title={`${i + 1}. ${STAGE_LABELS[stage] ?? stage.toUpperCase()}`}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4, minHeight: 16 }}>
+                {active && bundle ? (
+                  <span
+                    style={{
+                      background: T.phosphor, color: T.screenBg, fontFamily: T.mono,
+                      fontSize: 10, fontWeight: 700, padding: '1px 7px', borderRadius: 9,
+                      boxShadow: `0 0 8px ${T.phosphor}`,
+                    }}
+                  >
+                    ▸ {bundle.frameKind}#{bundle.frameIndex}
+                  </span>
+                ) : <span />}
+                <LED on={active} />
+              </div>
+              {renderStage(stage)}
+            </Panel>
+          </div>
+        );
+      })}
     </div>
   );
 }
