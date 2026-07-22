@@ -10,6 +10,7 @@ import { usePipelinePlayhead } from './views/usePipelinePlayhead';
 import { PipelineView } from './views/PipelineView';
 import { FrameTimeline } from './views/FrameTimeline';
 import { RxPipeline } from './views/RxPipeline';
+import { PresentationMode } from './views/PresentationMode';
 import { SettingsPanel } from './views/SettingsPanel';
 import { TxPanel } from './views/TxPanel';
 import { Panel } from './components/instrument/Panel';
@@ -26,6 +27,7 @@ export function BenchApp() {
   const s = useStore((x) => x);
   const ph = usePipelinePlayhead(s.demoRun, s.demoSpeed);
   const [enlargeFocused, setEnlargeFocused] = useState(false);
+  const [presenting, setPresenting] = useState(false);
 
   // Mirror playhead position into the Store so any panel can read it.
   useEffect(() => {
@@ -73,9 +75,26 @@ export function BenchApp() {
           <h1 style={{ margin: 0, fontSize: 22, letterSpacing: 2, fontWeight: 800 }}>◢◤ EARDROP</h1>
           <span style={{ fontSize: 11, opacity: 0.7 }}>signal bench · sound ↔ data</span>
         </div>
-        <LED on={s.isPlaying || s.isListening} label={s.isPlaying ? 'TX' : s.isListening ? 'RX' : 'IDLE'} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <button
+            onClick={() => setPresenting((p) => !p)}
+            style={{
+              fontFamily: T.mono, fontSize: 12, padding: '5px 12px', borderRadius: T.radius, cursor: 'pointer',
+              border: `1px solid ${presenting ? T.phosphor : T.panelEdge}`,
+              background: presenting ? T.phosphorDim : 'rgba(0,0,0,0.04)',
+              color: presenting ? T.phosphor : T.panelInk,
+            }}
+          >
+            {presenting ? '◱ bench' : '▶ presentation'}
+          </button>
+          <LED on={s.isPlaying || s.isListening} label={s.isPlaying ? 'TX' : s.isListening ? 'RX' : 'IDLE'} />
+        </div>
       </div>
 
+      {presenting && <PresentationMode onExit={() => setPresenting(false)} />}
+
+      {!presenting && (
+      <>
       {/* transport */}
       <div style={{ marginBottom: 12 }}>
         <FrameTimeline
@@ -113,6 +132,8 @@ export function BenchApp() {
       <Panel title="RECEIVE">
         <RxPipeline />
       </Panel>
+      </>
+      )}
     </div>
   );
 }
