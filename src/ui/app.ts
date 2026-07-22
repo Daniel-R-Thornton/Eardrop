@@ -143,6 +143,10 @@ window.addEventListener('eardrop-file', ((e: CustomEvent) => {
 // actually transmit the same payload as audio (so you hear it + the RX side
 // receives it), just like the test-send.
 window.addEventListener('eardrop-demo-encode', (async () => {
+  // Real acoustic loopback: mic ON, play out the speaker, decode what the mic
+  // actually hears. NO software shortcut — the sound genuinely carries the data.
+  await refreshDeviceList();
+  if (!isListening) await startListening();
   modem.configure(
     buildModemConfig({
       useOFDM: getState().useOFDM,
@@ -157,15 +161,13 @@ window.addEventListener('eardrop-demo-encode', (async () => {
   showTxPayload(DEMO_PAYLOAD.bytes, DEMO_PAYLOAD.name);
   setState({ sendStatus: { type: 'info', msg: '📤 Demo…' } });
   try {
-    // 1. Capture per-frame stage bundles → drives the pipeline animation.
+    // Capture per-frame stage bundles → drives the pipeline animation (display only).
     const run = await modem.demoEncode(DEMO_PAYLOAD.name, DEMO_PAYLOAD.bytes);
     setState({ demoRun: run, demoFrameIndex: 0, demoStageIndex: 0 });
-    // 2. Encode the same payload to audio samples.
+    // Encode + play out the speaker. The mic (startListening above) hears it and
+    // the RxEngine decodes it in real time — the file only arrives if the real
+    // acoustic transmission decodes.
     const { samples, sampleRate } = await modem.encodeFile(DEMO_PAYLOAD.name, DEMO_PAYLOAD.bytes);
-    // 3. Software loopback: feed the clean samples straight into the decoder so
-    //    the file ALWAYS comes through (independent of the noisy acoustic path).
-    modem.feedSamples(samples);
-    // 4. Also play it out loud for effect (parallel — doesn't gate the decode).
     setState({ isPlaying: true, progress: 0 });
     await playWithProgress(
       samples,
@@ -173,7 +175,7 @@ window.addEventListener('eardrop-demo-encode', (async () => {
       getState().selectedOutputId || undefined,
       getState().musicalMode,
     );
-    setState({ progress: 100, sendStatus: { type: 'success', msg: '✅ Demo sent' } });
+    setState({ progress: 100, sendStatus: { type: 'success', msg: '✅ Demo played — listening for decode' } });
   } catch (err: any) {
     setState({ isPlaying: false, sendStatus: { type: 'error', msg: `❌ demo: ${err.message}` } });
   }
