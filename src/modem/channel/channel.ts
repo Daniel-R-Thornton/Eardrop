@@ -102,9 +102,6 @@ export class Channel {
   private stats: ChannelStats;
   private sampleRate: number;
 
-  /** Phase accumulator for Doppler and phase noise */
-  private dopplerPhase = 0;
-
   /** Low-pass filter state (1-pole) */
   private lpState = 0;
 
@@ -134,7 +131,6 @@ export class Channel {
 
   /** Reset internal state (PLL, filters) for new transmission */
   reset(): void {
-    this.dopplerPhase = 0;
     this.lpState = 0;
     this.prevPhaseNoise = 0;
     this.ampModPhase = 0;
@@ -147,6 +143,48 @@ export class Channel {
   }
 
   /**
+   * Apply a Doppler / carrier frequency offset as a true single-sideband
+   * frequency translation: y = s·cos(θ) − ŝ·sin(θ), where ŝ is the Hilbert
+   * transform (quadrature) of s and θ = 2π·f_d·t.
+   *
+   * A plain `s·cos(θ)` is amplitude modulation, not a frequency shift — it
+   * creates mirror sidebands and nulls the signal whenever cos(θ)→0. Using the
+   * analytic signal shifts the whole spectrum by f_d with no mirror image.
+   */
+  private applyDopplerShift(input: Float32Array, dopplerHz: number, sr: number): Float32Array {
+    const n = input.length;
+
+    // Windowed FIR Hilbert transformer (odd length → integer group delay).
+    const L = 65;
+    const delay = (L - 1) / 2;
+    const h = new Float32Array(L);
+    for (let k = 0; k < L; k++) {
+      const m = k - delay;
+      // Ideal Hilbert: 2/(πm) for odd m, 0 for even m (and at m=0).
+      const ideal = m !== 0 && m % 2 !== 0 ? 2 / (Math.PI * m) : 0;
+      // Hamming window
+      const w = 0.54 - 0.46 * Math.cos((2 * Math.PI * k) / (L - 1));
+      h[k] = ideal * w;
+    }
+
+    const out = new Float32Array(n);
+    const w = (2 * Math.PI * dopplerHz) / sr;
+    for (let i = 0; i < n; i++) {
+      // In-phase = input delayed by `delay` (matches the Hilbert group delay).
+      const inPhase = i - delay >= 0 ? input[i - delay] : 0;
+      // Quadrature = Hilbert FIR applied around sample i.
+      let quad = 0;
+      for (let k = 0; k < L; k++) {
+        const idx = i - k;
+        if (idx >= 0 && idx < n) quad += h[k] * input[idx];
+      }
+      const theta = w * i;
+      out[i] = inPhase * Math.cos(theta) - quad * Math.sin(theta);
+    }
+    return out;
+  }
+
+  /**
    * Process audio through the channel simulator.
    * @param input — Encoder output PCM samples
    * @returns — Decoder input PCM samples (with impairments)
@@ -156,6 +194,10 @@ export class Channel {
     const n = input.length;
     const output = new Float32Array(n);
     const { cfg, sampleRate: sr } = this;
+
+    // Doppler / carrier offset is a true frequency translation applied up front,
+    // then the remaining impairments run on the shifted signal.
+    const src = cfg.dopplerHz !== 0 ? this.applyDopplerShift(input, cfg.dopplerHz, sr) : input;
 
     // Pre-compute noise RMS level from signal RMS
     let signalRms = 0;
@@ -185,7 +227,7 @@ export class Channel {
     }
 
     for (let i = 0; i < n; i++) {
-      let s = input[i];
+      let s = src[i];
 
       // 1. Attenuation
       if (cfg.attenuation !== 1.0) {
@@ -203,15 +245,8 @@ export class Channel {
         if (this.ampModPhase >= 1.0) this.ampModPhase -= 1.0;
       }
 
-      // 3. Frequency shift (Doppler) — rotate sample by accumulating phase offset
-      if (cfg.dopplerHz !== 0) {
-        this.dopplerPhase += cfg.dopplerHz / sr;
-        if (this.dopplerPhase >= 1.0) this.dopplerPhase -= 1.0;
-        if (this.dopplerPhase < 0) this.dopplerPhase += 1.0;
-        const theta = 2 * Math.PI * this.dopplerPhase;
-        // Simple rotation: s * cos(theta) — this is a rough FM approximation
-        s *= Math.cos(theta);
-      }
+      // 3. Frequency shift (Doppler) — applied as SSB translation before the
+      //    loop (see applyDopplerShift + `src` above).
 
       // 4. Phase noise
       if (cfg.phaseNoiseStd > 0) {
