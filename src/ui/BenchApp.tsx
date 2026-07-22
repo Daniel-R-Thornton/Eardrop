@@ -18,6 +18,10 @@ import { T } from './theme/labaccent/tokens';
 import { OFDM_DEFAULTS } from '../modem/types';
 import './theme/labaccent/labaccent.css';
 
+/** Acoustically-reliable OFDM pilot — tones land ~5-7 kHz, which survives a real
+ *  speaker->mic path far better than the 1900 Hz codebase default. */
+const ACOUSTIC_OFDM_PILOT_HZ = 3150;
+
 export function BenchApp() {
   const s = useStore((x) => x);
   const ph = usePipelinePlayhead(s.demoRun, s.demoSpeed);
@@ -43,7 +47,9 @@ export function BenchApp() {
   useEffect(() => {
     if (!s.useOFDM) return;
     const updates: { pilotFreqHz?: number; toneCount?: number } = {};
-    if (s.pilotFreqHz < 1500) updates.pilotFreqHz = OFDM_DEFAULTS.pilotFreqHz;
+    // 3150 Hz puts the OFDM tones up around 5-7 kHz, which carries far more
+    // reliably over a real speaker->mic path than the lower 1900 Hz default.
+    if (s.pilotFreqHz < 1500) updates.pilotFreqHz = ACOUSTIC_OFDM_PILOT_HZ;
     if (s.toneCount < 8) updates.toneCount = OFDM_DEFAULTS.toneCount;
     if (Object.keys(updates).length) setState(updates);
     // eslint-disable-next-line react-hooks/exhaustive-deps
