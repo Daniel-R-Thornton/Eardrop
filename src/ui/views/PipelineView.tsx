@@ -15,6 +15,7 @@ import { EccView } from '../components/protocol/EccView';
 import { Constellation } from '../components/scopes/Constellation';
 import { MultiTrace } from '../components/scopes/MultiTrace';
 import { Trace } from '../components/scopes/Trace';
+import { ToneMap } from '../components/scopes/ToneMap';
 
 const STAGE_LABELS: Record<string, string> = {
   payload: 'PAYLOAD',
@@ -112,7 +113,10 @@ export function PipelineView({ run, frameIndex, stageIndex, enlarge = false }: P
         const more = bundle.toneWaves.length - shown.length;
         return (
           <div>
-            <MultiTrace traces={traces} width={w} height={h} />
+            <ToneMap pilotHz={bundle.pilotFreqHz} toneFreqsHz={bundle.toneFreqsHz} width={w} height={54} />
+            <div style={{ marginTop: 4 }}>
+              <MultiTrace traces={traces} width={w} height={h} />
+            </div>
             {more > 0 && (
               <div style={{ fontFamily: T.mono, fontSize: 10, color: T.panelInk, opacity: 0.6, marginTop: 2 }}>
                 +{more} more tones ({bundle.toneWaves.length} total)

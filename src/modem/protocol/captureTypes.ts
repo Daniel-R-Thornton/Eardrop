@@ -17,6 +17,8 @@ export interface StageBundle {
   eccScheme: string;             // 'bch3116' | 'rs' | ...
   correctionCapacity: number;    // correctable bytes/bits (informational)
   symbols: { i: number; q: number }[];
+  pilotFreqHz: number;           // pilot tone frequency
+  toneFreqsHz: number[];         // absolute data-tone frequencies (pilot + offsets)
   toneWaves: Float32Array[];     // one per data tone
   pilotWave: Float32Array;
   combined: Float32Array;

@@ -125,6 +125,8 @@ export function captureTransmit(
       eccScheme: 'bch3116+rs',
       correctionCapacity: 8,
       symbols,
+      pilotFreqHz: pilotHz,
+      toneFreqsHz: toneFreqs,
       toneWaves: toneWaves.map(head),
       pilotWave: head(pilotWave),
       combined: head(combined),

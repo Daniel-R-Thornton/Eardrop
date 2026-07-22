@@ -113,6 +113,8 @@ export function makeFixtureRun(): Run {
         { i: -0.3, q: 0.6 },
         { i: 0.1, q: -0.4 },
       ],
+      pilotFreqHz: 1900,
+      toneFreqsHz: [2000, 2050],
       toneWaves: waveforms.toneWaves,
       pilotWave: waveforms.pilotWave,
       combined: waveforms.combined,
