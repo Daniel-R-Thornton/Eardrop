@@ -143,8 +143,6 @@ window.addEventListener('eardrop-file', ((e: CustomEvent) => {
 // actually transmit the same payload as audio (so you hear it + the RX side
 // receives it), just like the test-send.
 window.addEventListener('eardrop-demo-encode', (async () => {
-  await refreshDeviceList();
-  if (!isListening) await startListening();
   modem.configure(
     buildModemConfig({
       useOFDM: getState().useOFDM,
@@ -162,8 +160,12 @@ window.addEventListener('eardrop-demo-encode', (async () => {
     // 1. Capture per-frame stage bundles → drives the pipeline animation.
     const run = await modem.demoEncode(DEMO_PAYLOAD.name, DEMO_PAYLOAD.bytes);
     setState({ demoRun: run, demoFrameIndex: 0, demoStageIndex: 0 });
-    // 2. Encode + play the same payload as real audio → you hear it, RX decodes it.
+    // 2. Encode the same payload to audio samples.
     const { samples, sampleRate } = await modem.encodeFile(DEMO_PAYLOAD.name, DEMO_PAYLOAD.bytes);
+    // 3. Software loopback: feed the clean samples straight into the decoder so
+    //    the file ALWAYS comes through (independent of the noisy acoustic path).
+    modem.feedSamples(samples);
+    // 4. Also play it out loud for effect (parallel — doesn't gate the decode).
     setState({ isPlaying: true, progress: 0 });
     await playWithProgress(
       samples,
