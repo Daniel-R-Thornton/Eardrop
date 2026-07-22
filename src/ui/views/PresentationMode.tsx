@@ -7,7 +7,6 @@
  */
 import { useMemo, useState, type CSSProperties } from 'react';
 import { Screen } from '../components/instrument/Screen';
-import { Constellation } from '../components/scopes/Constellation';
 import { T, TONE_TRACE } from '../theme/labaccent/tokens';
 
 const SR = 16000;         // teaching sample rate
@@ -139,6 +138,25 @@ export function PresentationMode({ onExit }: { onExit: () => void }) {
     ctx.stroke();
   };
 
+  // ─── I/Q constellation, one dot per tone in its own colour ───
+  const drawIQ = (ctx: CanvasRenderingContext2D, w: number, h: number) => {
+    const cx = w / 2; const cy = h / 2; const s = Math.min(w, h) * 0.34;
+    // axes
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx, 6); ctx.lineTo(cx, h - 6); ctx.moveTo(6, cy); ctx.lineTo(w - 6, cy); ctx.stroke();
+    ctx.fillStyle = 'rgba(210,210,200,0.5)'; ctx.font = `9px ${T.mono}`;
+    ctx.fillText('I', w - 12, cy - 4); ctx.fillText('Q', cx + 4, 12);
+    const dot = (i: number, q: number, color: string, label: string) => {
+      const x = cx + i * s; const y = cy - q * s;
+      ctx.fillStyle = color;
+      ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.fill();
+      ctx.font = `10px ${T.mono}`;
+      ctx.fillText(label, x + 8, y + 3);
+    };
+    tones.forEach((t, i) => { if (t.on) { const p = qpsk(t.b0, t.b1); dot(p.i, p.q, TONE_TRACE[i], `${TONE_HZ[i]}`); } });
+    if (pilotOn) dot(1, 0, '#ff5a3c', 'pilot');
+  };
+
   // ─── FFT the decoder sees ───
   const drawFft = (ctx: CanvasRenderingContext2D, w: number, h: number) => {
     let peak = 0; for (let b = 0; b < fft.length; b++) peak = Math.max(peak, fft[b]);
@@ -230,8 +248,8 @@ export function PresentationMode({ onExit }: { onExit: () => void }) {
       {/* I/Q + FFT */}
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
         <div style={{ ...panel, flex: '0 0 auto' }}>
-          <div style={title}>I / Q (QPSK)</div>
-          <Constellation points={tones.filter((t) => t.on).map((t) => qpsk(t.b0, t.b1))} width={240} height={240} />
+          <div style={title}>I / Q (QPSK) — coloured per tone</div>
+          <Screen width={240} height={240} draw={drawIQ} grid={false} />
         </div>
         <div style={{ ...panel, flex: '1 1 400px' }}>
           <div style={title}>FFT — what the decoder sees (peaks = tones)</div>
