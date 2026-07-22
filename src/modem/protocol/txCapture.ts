@@ -23,15 +23,11 @@ import {
 } from './atomicFrame';
 import type { FrameField, StageBundle, Run } from './captureTypes';
 
-const MAX_POINTS = 2048;
-
-/** Stride-downsample a Float32Array to at most MAX_POINTS. */
-function downsample(x: Float32Array): Float32Array {
-  if (x.length <= MAX_POINTS) return x;
-  const stride = Math.ceil(x.length / MAX_POINTS);
-  const out = new Float32Array(Math.ceil(x.length / stride));
-  for (let i = 0, j = 0; i < x.length; i += stride, j++) out[j] = x[i];
-  return out;
+/** Display window: first N full-resolution samples so real oscillations are
+ *  visible (downsampling a multi-second multi-tone frame aliases into mush). */
+const WINDOW_SAMPLES = 700;
+function head(x: Float32Array): Float32Array {
+  return x.length <= WINDOW_SAMPLES ? x : x.slice(0, WINDOW_SAMPLES);
 }
 
 function fieldMap(wire: Uint8Array): FrameField[] {
@@ -129,11 +125,11 @@ export function captureTransmit(
       eccScheme: 'bch3116+rs',
       correctionCapacity: 8,
       symbols,
-      toneWaves: toneWaves.map(downsample),
-      pilotWave: downsample(pilotWave),
-      combined: downsample(combined),
-      preamble: frameIndex === 0 ? downsample(combined.subarray(0, samplesPerSymbol)) : new Float32Array(0),
-      txFinal: downsample(combined),
+      toneWaves: toneWaves.map(head),
+      pilotWave: head(pilotWave),
+      combined: head(combined),
+      preamble: frameIndex === 0 ? head(combined.subarray(0, samplesPerSymbol)) : new Float32Array(0),
+      txFinal: head(combined),
       sampleRate: sr,
     });
   });

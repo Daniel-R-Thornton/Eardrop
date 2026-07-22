@@ -2,6 +2,7 @@
  * RxView.tsx — the receive side: live mic scopes + decoded output.
  */
 import { useStore } from '../Store';
+import { useTelemetry } from '../telemetryStore';
 import { T } from '../theme/labaccent/tokens';
 import { Panel } from '../components/instrument/Panel';
 import { Button } from '../components/instrument/Button';
@@ -17,14 +18,21 @@ const H = 100;
 
 export function RxView() {
   const s = useStore((x) => x);
-  const spectrum = s.fftSpectrum ?? EMPTY;
+  // Worker telemetry ticks during ANY RX (live mic AND the DEMO software
+  // loopback), so drive the spectrum/tone scopes from it; fall back to the
+  // mic-loop Store fields when telemetry is absent.
+  const tel = useTelemetry((t) => t);
+  const spectrum = tel?.spectrum ?? s.fftSpectrum ?? EMPTY;
+  const maxHz = tel?.spectrumMaxHz ?? 4000;
+  const toneEnergies = tel?.toneEnergies ?? s.toneEnergies;
+  const micDb = tel?.rmsDb ?? s.micLevel;
   const mic = s.debugSamples ?? EMPTY;
 
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, alignItems: 'start' }}>
       <Panel title="MIC IN">
         <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-          <span style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk }}>{s.micLevel.toFixed(0)} dB</span>
+          <span style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk }}>{micDb.toFixed(0)} dB</span>
           <LED on={s.isListening} label={s.isListening ? 'LIVE' : 'IDLE'} />
         </div>
         <Trace data={mic} color={T.cyan} width={W} height={H} />
@@ -34,14 +42,14 @@ export function RxView() {
       </Panel>
 
       <Panel title="SPECTRUM">
-        <Spectrum bins={spectrum} maxHz={4000} width={W} height={H} />
+        <Spectrum bins={spectrum} maxHz={maxHz} width={W} height={H} />
         <div style={{ marginTop: 6 }}>
           <Waterfall bins={spectrum} width={W} height={70} />
         </div>
       </Panel>
 
       <Panel title="TONE ENERGY">
-        <ToneBars energies={s.toneEnergies} width={W} height={H} />
+        <ToneBars energies={toneEnergies} width={W} height={H} />
       </Panel>
 
       <Panel title="DECODED FILES">

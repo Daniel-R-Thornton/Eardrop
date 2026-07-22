@@ -3,8 +3,9 @@
  * hero and the RX view. Owns the pipeline playhead and mirrors its state + the
  * chosen speed into the Store.
  */
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useStore, setState } from './Store';
+import { Toggle } from './components/instrument/Toggle';
 import { usePipelinePlayhead } from './views/usePipelinePlayhead';
 import { PipelineView } from './views/PipelineView';
 import { FrameTimeline } from './views/FrameTimeline';
@@ -20,6 +21,7 @@ import './theme/labaccent/labaccent.css';
 export function BenchApp() {
   const s = useStore((x) => x);
   const ph = usePipelinePlayhead(s.demoRun, s.demoSpeed);
+  const [enlargeFocused, setEnlargeFocused] = useState(false);
 
   // Mirror playhead position into the Store so any panel can read it.
   useEffect(() => {
@@ -88,7 +90,10 @@ export function BenchApp() {
       {/* pipeline hero */}
       <div style={{ marginBottom: 12 }}>
         <Panel title="SIGNAL PIPELINE">
-          <PipelineView run={s.demoRun} frameIndex={ph.frameIndex} stageIndex={ph.stageIndex} />
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 6 }}>
+            <Toggle label="enlarge focused stage" checked={enlargeFocused} onChange={setEnlargeFocused} />
+          </div>
+          <PipelineView run={s.demoRun} frameIndex={ph.frameIndex} stageIndex={ph.stageIndex} enlarge={enlargeFocused} />
         </Panel>
       </div>
 

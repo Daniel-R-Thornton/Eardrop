@@ -34,19 +34,21 @@ export interface PipelineViewProps {
   run: Run | null;
   frameIndex: number;
   stageIndex: number;
+  /** Enlarge the currently-active stage panel. */
+  enlarge?: boolean;
 }
 
-export function PipelineView({ run, frameIndex, stageIndex }: PipelineViewProps) {
+export function PipelineView({ run, frameIndex, stageIndex, enlarge = false }: PipelineViewProps) {
   const bundle = run?.frames[frameIndex] ?? null;
 
-  const renderStage = (stage: string) => {
+  const renderStage = (stage: string, w: number, h: number) => {
     if (!bundle) {
-      return <div style={{ width: SW, height: SH, opacity: 0.3 }} />;
+      return <div style={{ width: w, height: h, opacity: 0.3 }} />;
     }
     switch (stage) {
       case 'payload':
         return (
-          <div style={{ width: SW }}>
+          <div style={{ width: w }}>
             {bundle.payloadBytes.length === 0 ? (
               <div style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk, opacity: 0.6, padding: '8px 0' }}>
                 no payload — {bundle.frameKind} frame (metadata only)
@@ -60,10 +62,10 @@ export function PipelineView({ run, frameIndex, stageIndex }: PipelineViewProps)
           </div>
         );
       case 'frame':
-        return <div style={{ width: SW }}><FrameAnatomy fields={bundle.frameFields} /></div>;
+        return <div style={{ width: w }}><FrameAnatomy fields={bundle.frameFields} /></div>;
       case 'ecc':
         return (
-          <div style={{ width: SW }}>
+          <div style={{ width: w }}>
             <EccView
               before={bundle.eccBefore}
               after={bundle.eccAfter}
@@ -73,7 +75,7 @@ export function PipelineView({ run, frameIndex, stageIndex }: PipelineViewProps)
           </div>
         );
       case 'symbols':
-        return <Constellation points={bundle.symbols} width={SW} height={SH} />;
+        return <Constellation points={bundle.symbols} width={w} height={h} />;
       case 'channels': {
         // 32 tones won't fit legibly — show the first few + the pilot.
         const MAX_SHOWN = 6;
@@ -87,7 +89,7 @@ export function PipelineView({ run, frameIndex, stageIndex }: PipelineViewProps)
         const more = bundle.toneWaves.length - shown.length;
         return (
           <div>
-            <MultiTrace traces={traces} width={SW} height={SH} />
+            <MultiTrace traces={traces} width={w} height={h} />
             {more > 0 && (
               <div style={{ fontFamily: T.mono, fontSize: 10, color: T.panelInk, opacity: 0.6, marginTop: 2 }}>
                 +{more} more tones ({bundle.toneWaves.length} total)
@@ -97,11 +99,11 @@ export function PipelineView({ run, frameIndex, stageIndex }: PipelineViewProps)
         );
       }
       case 'combined':
-        return <Trace data={bundle.combined} width={SW} height={SH} />;
+        return <Trace data={bundle.combined} width={w} height={h} />;
       case 'sync':
-        return <Trace data={bundle.preamble.length ? bundle.preamble : bundle.combined} color={T.cyan} width={SW} height={SH} />;
+        return <Trace data={bundle.preamble.length ? bundle.preamble : bundle.combined} color={T.cyan} width={w} height={h} />;
       case 'txout':
-        return <Trace data={bundle.txFinal} color={T.phosphor} width={SW} height={SH} />;
+        return <Trace data={bundle.txFinal} color={T.phosphor} width={w} height={h} />;
       default:
         return null;
     }
@@ -111,16 +113,19 @@ export function PipelineView({ run, frameIndex, stageIndex }: PipelineViewProps)
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'stretch' }}>
       {STAGES.map((stage, i) => {
         const active = i === stageIndex;
+        const big = active && enlarge;
+        const w = big ? Math.round(SW * 1.7) : SW;
+        const h = big ? Math.round(SH * 1.7) : SH;
         return (
           <div
             key={stage}
             style={{
-              flex: `1 1 ${SW}px`,
-              maxWidth: SW + 40,
+              flex: `1 1 ${w}px`,
+              maxWidth: w + 40,
               border: `2px solid ${active ? T.phosphor : T.panelEdge}`,
               borderRadius: T.radius,
               boxShadow: active ? `0 0 14px ${T.phosphor}` : 'none',
-              transition: 'border-color .2s, box-shadow .2s',
+              transition: 'border-color .2s, box-shadow .2s, flex-basis .2s',
             }}
           >
             <Panel title={`${i + 1}. ${STAGE_LABELS[stage] ?? stage.toUpperCase()}`}>
@@ -138,7 +143,7 @@ export function PipelineView({ run, frameIndex, stageIndex }: PipelineViewProps)
                 ) : <span />}
                 <LED on={active} />
               </div>
-              {renderStage(stage)}
+              {renderStage(stage, w, h)}
             </Panel>
           </div>
         );
