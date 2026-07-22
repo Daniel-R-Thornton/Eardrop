@@ -10,6 +10,7 @@ import { PipelineView } from './views/PipelineView';
 import { FrameTimeline } from './views/FrameTimeline';
 import { RxView } from './views/RxView';
 import { SettingsPanel } from './views/SettingsPanel';
+import { TxPanel } from './views/TxPanel';
 import { Panel } from './components/instrument/Panel';
 import { LED } from './components/instrument/LED';
 import { T } from './theme/labaccent/tokens';
@@ -69,9 +70,12 @@ export function BenchApp() {
         </Panel>
       </div>
 
-      {/* settings + rx */}
-      <div style={{ display: 'grid', gridTemplateColumns: '260px 1fr', gap: 12, alignItems: 'start' }}>
-        <SettingsPanel />
+      {/* tx + settings + rx */}
+      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gap: 12, alignItems: 'start' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <TxPanel />
+          <SettingsPanel />
+        </div>
         <RxView />
       </div>
     </div>

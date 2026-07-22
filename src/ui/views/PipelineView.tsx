@@ -27,8 +27,8 @@ const STAGE_LABELS: Record<string, string> = {
   txout: 'TX OUT',
 };
 
-const SW = 240;
-const SH = 96;
+const SW = 340;
+const SH = 180;
 
 export interface PipelineViewProps {
   run: Run | null;

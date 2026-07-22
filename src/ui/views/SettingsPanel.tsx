@@ -49,17 +49,20 @@ export function SettingsPanel() {
         <Toggle
           label="OFDM mode"
           checked={s.useOFDM}
-          onChange={(v) => setState({ useOFDM: v })}
+          onChange={(v) => setState({
+            useOFDM: v,
+            // OFDM needs >=8 tones; BPSK caps at 8. Snap to a valid value on switch.
+            toneCount: v ? Math.max(8, s.toneCount) : Math.min(8, s.toneCount),
+          })}
         />
         <Select
           label="TONES"
           value={String(s.toneCount)}
           onChange={(v) => setState({ toneCount: parseInt(v, 10) })}
-          options={[
-            { value: '2', label: '2 tones' },
-            { value: '4', label: '4 tones' },
-            { value: '8', label: '8 tones' },
-          ]}
+          options={(s.useOFDM
+            ? [8, 16, 32]
+            : [2, 4, 8]
+          ).map((n) => ({ value: String(n), label: `${n} tones` }))}
         />
         <Slider
           label="PILOT" unit="Hz"
