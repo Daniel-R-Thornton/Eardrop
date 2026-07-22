@@ -11,7 +11,7 @@
  */
 
 import type { ModemConfig } from '../types';
-import { TONE_OFFSETS, DEFAULT_CONFIG } from '../types';
+import { TONE_OFFSETS, DEFAULT_CONFIG, ofdmToneFrequencies } from '../types';
 import {
   encodeFrame,
   FRAME_SIZE,
@@ -67,7 +67,11 @@ export function captureTransmit(
   const sr = config.sampleRate ?? DEFAULT_CONFIG.sampleRate;
   const toneCount = config.toneCount ?? 4;
   const pilotHz = config.pilotFreqHz ?? DEFAULT_CONFIG.pilotFreqHz;
-  const toneFreqs = TONE_OFFSETS.slice(0, toneCount).map((o) => pilotHz + o);
+  // OFDM lays tones at pilot + startHz + k*spacing (up to 32); BPSK uses the
+  // fixed 4 relative offsets. Match the real encoder so the TONE MAP is accurate.
+  const toneFreqs = config.useOFDM
+    ? Array.from(ofdmToneFrequencies({ toneCount, pilotFreqHz: pilotHz }))
+    : TONE_OFFSETS.slice(0, toneCount).map((o) => pilotHz + o);
   const samplesPerSymbol = 256;
 
   // Split payload into PAYLOAD_DATA_SIZE chunks -> one data frame each.

@@ -1,8 +1,9 @@
 /**
  * RxPipeline.tsx — the receive side as a mirror of the TX pipeline: incoming
- * audio → sync → channel/equalise → spectrum → demod → bits → ECC → file.
- * Driven by the live decoder state (Store.debug) + worker telemetry, so it
- * reflects the real decode as it happens (DEMO loopback or acoustic LISTEN).
+ * audio → sync → channel/equalise → spectrum → decode → assemble → file.
+ * Driven by live worker telemetry (level, pilot amplitude, tone energy,
+ * spectrum, decode progress) + received files, so it reflects the real decode
+ * as it happens (DEMO software loopback or acoustic LISTEN).
  */
 import type { ReactNode } from 'react';
 import { useStore } from '../Store';
@@ -15,7 +16,6 @@ import { Trace } from '../components/scopes/Trace';
 import { Spectrum } from '../components/scopes/Spectrum';
 import { Waterfall } from '../components/scopes/Waterfall';
 import { ToneBars } from '../components/scopes/ToneBars';
-import { Constellation } from '../components/scopes/Constellation';
 
 const EMPTY = new Float32Array(0);
 const W = 240;
@@ -48,17 +48,20 @@ function Stage({ n, title, active, children }: { n: number; title: string; activ
   );
 }
 
+const RX_STATE_LABELS: Record<number, string> = { 0: 'idle', 1: 'searching', 2: 'sync', 3: 'training', 4: 'receiving', 5: 'done' };
+
 export function RxPipeline() {
   const s = useStore((x) => x);
   const tel = useTelemetry((t) => t);
-  const d = s.debug;
   const spectrum = tel?.spectrum ?? s.fftSpectrum ?? EMPTY;
   const maxHz = tel?.spectrumMaxHz ?? 4000;
   const tones = tel?.toneEnergies ?? s.toneEnergies;
   const micDb = tel?.rmsDb ?? s.micLevel;
+  const pilotAmp = tel?.pilotAmplitude ?? 0;
+  const prog = tel?.progress;
   const mic = s.debugSamples ?? EMPTY;
-  const points = d ? d.relI.map((i, k) => ({ i, q: d.relQ[k] ?? 0 })) : [];
   const listening = s.isListening;
+  const synced = pilotAmp > 0.02;
 
   return (
     <div>
@@ -74,17 +77,14 @@ export function RxPipeline() {
           <Trace data={mic} color={T.cyan} width={W} height={H} />
         </Stage>
 
-        <Stage n={2} title="SYNC" active={!!d?.inFrame}>
-          <Row k="pilot" v={d?.pilotFreq ? `${d.pilotFreq.toFixed(0)} Hz` : '—'} hot={!!d?.pilotFreq} />
-          <Row k="pilot amp" v={d ? d.pilotAmplitude.toFixed(3) : '—'} />
-          <Row k="sync run" v={d ? String(d.consecutiveSync) : '—'} />
-          <Row k="in frame" v={d?.inFrame ? 'YES' : 'no'} hot={!!d?.inFrame} />
+        <Stage n={2} title="SYNC" active={synced}>
+          <Row k="pilot amp" v={pilotAmp.toFixed(3)} hot={synced} />
+          <Row k="state" v={prog ? (RX_STATE_LABELS[prog.state] ?? String(prog.state)) : '—'} hot={synced} />
+          <Row k="locked" v={synced ? 'YES' : 'no'} hot={synced} />
         </Stage>
 
-        <Stage n={3} title="CHANNEL / EQ">
-          <Row k="SNR" v={d ? `${d.signalToNoise.toFixed(1)} dB` : '—'} hot={(d?.signalToNoise ?? 0) > 6} />
-          <Row k="noise floor" v={d ? d.noiseAvg.toFixed(3) : '—'} />
-          <ToneBars energies={tones} width={W} height={H - 20} />
+        <Stage n={3} title="CHANNEL / TONES">
+          <ToneBars energies={tones} width={W} height={H} />
         </Stage>
 
         <Stage n={4} title="SPECTRUM">
@@ -92,21 +92,16 @@ export function RxPipeline() {
           <div style={{ marginTop: 3 }}><Waterfall bins={spectrum} width={W} height={40} /></div>
         </Stage>
 
-        <Stage n={5} title="DEMOD">
-          <Constellation points={points} width={W} height={H} />
+        <Stage n={5} title="DECODE FRAMES" active={!!prog && prog.framesReceived > 0}>
+          <Row k="frames" v={prog ? `${prog.framesReceived}/${prog.totalFrames || '?'}` : '—'} hot={(prog?.framesReceived ?? 0) > 0} />
+          <Row k="file" v={prog?.fileName || '—'} />
         </Stage>
 
-        <Stage n={6} title="BITS">
-          <Row k="bit pattern" v={d ? `0b${(d.bitPattern >>> 0).toString(2).padStart(4, '0')}` : '—'} />
-          <Row k="bits collected" v={d ? String(d.bitsCollected) : '—'} />
+        <Stage n={6} title="ASSEMBLE" active={!!prog && prog.bytesAssembled > 0}>
+          <Row k="bytes" v={prog ? `${prog.bytesAssembled}${prog.fileSize ? '/' + prog.fileSize : ''} B` : '—'} hot={(prog?.bytesAssembled ?? 0) > 0} />
         </Stage>
 
-        <Stage n={7} title="DEFRAME / ECC">
-          <Row k="blocks decoded" v={d ? String(d.blocksDecoded) : '—'} hot={(d?.blocksDecoded ?? 0) > 0} />
-          <Row k="crc failed" v={d ? String(d.blocksCrcFailed) : '—'} hot={(d?.blocksCrcFailed ?? 0) > 0} />
-        </Stage>
-
-        <Stage n={8} title="FILE OUT" active={s.receivedFiles.length > 0}>
+        <Stage n={7} title="FILE OUT" active={s.receivedFiles.length > 0}>
           {s.receivedFiles.length === 0 ? (
             <div style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk, opacity: 0.6 }}>(nothing received yet)</div>
           ) : (
