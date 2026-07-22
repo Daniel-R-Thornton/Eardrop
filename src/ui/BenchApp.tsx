@@ -9,7 +9,7 @@ import { Toggle } from './components/instrument/Toggle';
 import { usePipelinePlayhead } from './views/usePipelinePlayhead';
 import { PipelineView } from './views/PipelineView';
 import { FrameTimeline } from './views/FrameTimeline';
-import { RxView } from './views/RxView';
+import { RxPipeline } from './views/RxPipeline';
 import { SettingsPanel } from './views/SettingsPanel';
 import { TxPanel } from './views/TxPanel';
 import { Panel } from './components/instrument/Panel';
@@ -97,14 +97,16 @@ export function BenchApp() {
         </Panel>
       </div>
 
-      {/* tx + settings + rx */}
-      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gap: 12, alignItems: 'start' }}>
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <TxPanel />
-          <SettingsPanel />
-        </div>
-        <RxView />
+      {/* tx + settings */}
+      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gap: 12, alignItems: 'start', marginBottom: 12 }}>
+        <TxPanel />
+        <SettingsPanel />
       </div>
+
+      {/* rx decode pipeline */}
+      <Panel title="RECEIVE">
+        <RxPipeline />
+      </Panel>
     </div>
   );
 }
