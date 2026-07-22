@@ -33,6 +33,7 @@ import { dlog, dlogInject, dlogSetMode } from '../lib/debug/dlog';
 import { ModemController } from './controllers/modemController';
 import { buildModemConfig } from './controllers/buildModemConfig';
 import { setTelemetry } from './telemetryStore';
+import { DEMO_PAYLOAD } from './demoPayload';
 
 // Main thread: clear-and-reprint the whole log as ONE console entry per update
 // so a single copy grabs the entire session. Worker lines arrive via 'dlog'
@@ -136,6 +137,27 @@ subscribe(() => {
 // File selection
 window.addEventListener('eardrop-file', ((e: CustomEvent) => {
   selectedFile = e.detail.file;
+}) as EventListener);
+
+// Demo encode — capture the in-mem payload's per-frame stage bundles for the pipeline view
+window.addEventListener('eardrop-demo-encode', (async () => {
+  modem.configure(
+    buildModemConfig({
+      useOFDM: getState().useOFDM,
+      pilotFreqHz: getState().pilotFreqHz,
+      toneCount: getState().toneCount,
+      symbolsPerSec: getState().symbolsPerSec,
+      musicalMode: getState().musicalMode,
+      diversityMode: getState().diversityMode,
+      hwSampleRate: audioCtx.sampleRate,
+    }),
+  );
+  try {
+    const run = await modem.demoEncode(DEMO_PAYLOAD.name, DEMO_PAYLOAD.bytes);
+    setState({ demoRun: run, demoFrameIndex: 0, demoStageIndex: 0 });
+  } catch (err: any) {
+    setState({ sendStatus: { type: 'error', msg: `❌ demo: ${err.message}` } });
+  }
 }) as EventListener);
 
 // Send
