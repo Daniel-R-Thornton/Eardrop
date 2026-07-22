@@ -40,6 +40,15 @@ export interface PipelineViewProps {
 
 export function PipelineView({ run, frameIndex, stageIndex, enlarge = false }: PipelineViewProps) {
   const bundle = run?.frames[frameIndex] ?? null;
+  const dataFrames = run?.frames.filter((f) => f.frameKind === 'data').length ?? 0;
+  const totalBytes = run?.frames.reduce((n, f) => n + f.payloadBytes.length, 0) ?? 0;
+
+  const metaRow = (k: string, v: string) => (
+    <div style={{ display: 'flex', justifyContent: 'space-between', fontFamily: T.mono, fontSize: 11, padding: '1px 0' }}>
+      <span style={{ color: T.panelInk, opacity: 0.7 }}>{k}</span>
+      <span style={{ color: T.phosphor }}>{v}</span>
+    </div>
+  );
 
   const renderStage = (stage: string, w: number, h: number) => {
     if (!bundle) {
@@ -49,12 +58,26 @@ export function PipelineView({ run, frameIndex, stageIndex, enlarge = false }: P
       case 'payload':
         return (
           <div style={{ width: w }}>
-            {bundle.payloadBytes.length === 0 ? (
-              <div style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk, opacity: 0.6, padding: '8px 0' }}>
-                no payload — {bundle.frameKind} frame (metadata only)
+            {bundle.frameKind === 'header' ? (
+              <div>
+                <div style={{ fontFamily: T.mono, fontSize: 11, color: T.amber, marginBottom: 4 }}>HEADER — file metadata</div>
+                {metaRow('file', run?.fileName ?? '—')}
+                {metaRow('size', `${totalBytes} B`)}
+                {metaRow('data frames', String(dataFrames))}
+                {metaRow('total frames', String(run?.frames.length ?? 0))}
+              </div>
+            ) : bundle.frameKind === 'eof' ? (
+              <div>
+                <div style={{ fontFamily: T.mono, fontSize: 11, color: T.amber, marginBottom: 4 }}>EOF — end of transmission</div>
+                {metaRow('bytes sent', `${totalBytes} B`)}
+                {metaRow('frames', String(run?.frames.length ?? 0))}
+                {metaRow('marker', '0x03')}
               </div>
             ) : (
               <>
+                <div style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk, opacity: 0.7, marginBottom: 2 }}>
+                  DATA · frame {bundle.frameIndex} · {bundle.payloadBytes.length} B
+                </div>
                 <ByteMap bytes={bundle.payloadBytes} />
                 <BitStream bytes={bundle.payloadBytes} max={128} />
               </>
