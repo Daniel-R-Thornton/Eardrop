@@ -25,6 +25,15 @@ export function BenchApp() {
     setState({ demoFrameIndex: ph.frameIndex, demoStageIndex: ph.stageIndex });
   }, [ph.frameIndex, ph.stageIndex]);
 
+  // When a fresh capture arrives, walk the pipeline automatically (unless stepping).
+  useEffect(() => {
+    if (s.demoRun && s.demoSpeed !== 'step') {
+      ph.reset();
+      ph.play();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [s.demoRun]);
+
   const dispatch = (type: string) => window.dispatchEvent(new CustomEvent(type));
 
   return (

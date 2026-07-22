@@ -139,8 +139,12 @@ window.addEventListener('eardrop-file', ((e: CustomEvent) => {
   selectedFile = e.detail.file;
 }) as EventListener);
 
-// Demo encode — capture the in-mem payload's per-frame stage bundles for the pipeline view
+// Demo — the full experience: capture the pipeline stages for the visual AND
+// actually transmit the same payload as audio (so you hear it + the RX side
+// receives it), just like the test-send.
 window.addEventListener('eardrop-demo-encode', (async () => {
+  await refreshDeviceList();
+  if (!isListening) await startListening();
   modem.configure(
     buildModemConfig({
       useOFDM: getState().useOFDM,
@@ -152,11 +156,24 @@ window.addEventListener('eardrop-demo-encode', (async () => {
       hwSampleRate: audioCtx.sampleRate,
     }),
   );
+  showTxPayload(DEMO_PAYLOAD.bytes, DEMO_PAYLOAD.name);
+  setState({ sendStatus: { type: 'info', msg: '📤 Demo…' } });
   try {
+    // 1. Capture per-frame stage bundles → drives the pipeline animation.
     const run = await modem.demoEncode(DEMO_PAYLOAD.name, DEMO_PAYLOAD.bytes);
     setState({ demoRun: run, demoFrameIndex: 0, demoStageIndex: 0 });
+    // 2. Encode + play the same payload as real audio → you hear it, RX decodes it.
+    const { samples, sampleRate } = await modem.encodeFile(DEMO_PAYLOAD.name, DEMO_PAYLOAD.bytes);
+    setState({ isPlaying: true, progress: 0 });
+    await playWithProgress(
+      samples,
+      sampleRate,
+      getState().selectedOutputId || undefined,
+      getState().musicalMode,
+    );
+    setState({ progress: 100, sendStatus: { type: 'success', msg: '✅ Demo sent' } });
   } catch (err: any) {
-    setState({ sendStatus: { type: 'error', msg: `❌ demo: ${err.message}` } });
+    setState({ isPlaying: false, sendStatus: { type: 'error', msg: `❌ demo: ${err.message}` } });
   }
 }) as EventListener);
 
