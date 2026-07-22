@@ -111,18 +111,16 @@ export function PipelineView({ run, frameIndex, stageIndex }: PipelineViewProps)
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'stretch' }}>
       {STAGES.map((stage, i) => {
         const active = i === stageIndex;
-        const done = bundle && i < stageIndex;
         return (
           <div
             key={stage}
             style={{
               flex: `1 1 ${SW}px`,
               maxWidth: SW + 40,
-              border: `2px solid ${active ? T.phosphor : 'transparent'}`,
+              border: `2px solid ${active ? T.phosphor : T.panelEdge}`,
               borderRadius: T.radius,
               boxShadow: active ? `0 0 14px ${T.phosphor}` : 'none',
-              opacity: bundle && !active && !done ? 0.55 : 1,
-              transition: 'border-color .2s, box-shadow .2s, opacity .2s',
+              transition: 'border-color .2s, box-shadow .2s',
             }}
           >
             <Panel title={`${i + 1}. ${STAGE_LABELS[stage] ?? stage.toUpperCase()}`}>

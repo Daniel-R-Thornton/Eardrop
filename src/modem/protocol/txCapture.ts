@@ -109,7 +109,14 @@ export function captureTransmit(
       maxLen,
     );
 
-    const symbols = bits.slice(0, 64).map((bit) => ({ i: bit ? -1 : 1, q: 0 }));
+    // QPSK: pair consecutive bits into a 4-quadrant point (jittered so
+    // overlapping points are visible as a cloud on the constellation).
+    const symbols: { i: number; q: number }[] = [];
+    for (let k = 0; k + 1 < bits.length && symbols.length < 96; k += 2) {
+      const jx = ((k * 37) % 13) / 130 - 0.05;
+      const jy = ((k * 19) % 13) / 130 - 0.05;
+      symbols.push({ i: (bits[k] ? -1 : 1) + jx, q: (bits[k + 1] ? -1 : 1) + jy });
+    }
 
     totalSamples += combined.length;
     frames.push({
