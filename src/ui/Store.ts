@@ -5,6 +5,7 @@
 
 import { useSyncExternalStore } from 'react';
 import { DEFAULT_CONFIG } from '../modem/types';
+import type { Run } from '../modem/protocol/captureTypes';
 
 // ─── State Shape ──────────────────────────────────────
 
@@ -111,6 +112,14 @@ export interface AppState {
   micGain: number;
   /** When true, play the WAV audio out loud while feeding it through the decoder */
   playWavDuringDecode: boolean;
+  /** Captured demo-encode run (per-frame stage bundles) for the pipeline view */
+  demoRun: Run | null;
+  /** Pipeline playback pace */
+  demoSpeed: 'realtime' | 'slow' | 'step';
+  /** Which captured frame the pipeline is focused on */
+  demoFrameIndex: number;
+  /** Which pipeline stage is currently highlighted */
+  demoStageIndex: number;
 }
 
 const defaultDecoder: DecoderInfo = {
@@ -173,6 +182,10 @@ const defaultState: AppState = {
   playbackVolume: 2,
   micGain: 1,
   playWavDuringDecode: false,
+  demoRun: null,
+  demoSpeed: 'slow',
+  demoFrameIndex: 0,
+  demoStageIndex: 0,
 };
 
 // ─── Store ────────────────────────────────────────────
