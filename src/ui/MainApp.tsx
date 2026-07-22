@@ -58,6 +58,11 @@ export function MainApp() {
     md?.addEventListener?.('devicechange', refreshDevices);
     return () => md?.removeEventListener?.('devicechange', refreshDevices);
   }, [refreshDevices]);
+  // Device labels are blank until mic permission is granted; re-enumerate once
+  // listening starts so the real hardware names replace the "Mic N" fallbacks.
+  useEffect(() => {
+    if (s.isListening) refreshDevices();
+  }, [s.isListening, refreshDevices]);
 
   const dispatch = (type: string, detail?: any) =>
     window.dispatchEvent(new CustomEvent(type, { detail }));
