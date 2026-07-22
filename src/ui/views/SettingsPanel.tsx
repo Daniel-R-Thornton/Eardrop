@@ -51,8 +51,9 @@ export function SettingsPanel() {
           checked={s.useOFDM}
           onChange={(v) => setState({
             useOFDM: v,
-            // OFDM needs >=8 tones; BPSK caps at 8. Snap to a valid value on switch.
-            toneCount: v ? Math.max(8, s.toneCount) : Math.min(8, s.toneCount),
+            // BPSK caps tones at 8; OFDM auto-snap (pilot + tones) is handled by
+            // the effect in BenchApp so it also corrects a bad persisted state.
+            ...(v ? {} : { toneCount: Math.min(8, s.toneCount) }),
           })}
         />
         <Select

@@ -14,6 +14,7 @@ import { TxPanel } from './views/TxPanel';
 import { Panel } from './components/instrument/Panel';
 import { LED } from './components/instrument/LED';
 import { T } from './theme/labaccent/tokens';
+import { OFDM_DEFAULTS } from '../modem/types';
 import './theme/labaccent/labaccent.css';
 
 export function BenchApp() {
@@ -33,6 +34,18 @@ export function BenchApp() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.demoRun]);
+
+  // OFDM needs a pilot up in its band and >=8 tones — snap defaults when OFDM is
+  // on (also corrects a stale persisted config, e.g. a BPSK pilot at 600/700 Hz
+  // that never decodes). Mirrors the modem's OFDM_DEFAULTS.
+  useEffect(() => {
+    if (!s.useOFDM) return;
+    const updates: { pilotFreqHz?: number; toneCount?: number } = {};
+    if (s.pilotFreqHz < 1500) updates.pilotFreqHz = OFDM_DEFAULTS.pilotFreqHz;
+    if (s.toneCount < 8) updates.toneCount = OFDM_DEFAULTS.toneCount;
+    if (Object.keys(updates).length) setState(updates);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [s.useOFDM]);
 
   const dispatch = (type: string) => window.dispatchEvent(new CustomEvent(type));
 
