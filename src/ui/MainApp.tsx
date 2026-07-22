@@ -19,6 +19,7 @@ import { OFDM_SYMBOL_MS, OFDM_CP_MS, OFDM_DEFAULTS } from '../modem/types';
 import { FRAME_SIZE, PAYLOAD_DATA_SIZE } from '../modem/protocol/atomicFrame';
 import { TONE_COLORS, TONE_FREQUENCIES, formatSize } from './lib';
 import { useTelemetry } from './telemetryStore';
+import { enumerateDevices, type DeviceInfo } from '../audio';
 
 const GAP = 12;
 
@@ -37,9 +38,26 @@ export function MainApp() {
   const s = useStore((x) => x);
   const {debug} = s;
 
-  useEffect(() => {
-    (window as any).eardropRefreshDevices?.();
+  // Audio device lists — React-owned state (populating the <select> imperatively
+  // from app.ts fails: React reconciliation wipes the appended <option>s on every
+  // store-driven re-render).
+  const [inputs, setInputs] = useState<DeviceInfo[]>([]);
+  const [outputs, setOutputs] = useState<DeviceInfo[]>([]);
+  const refreshDevices = useCallback(async () => {
+    try {
+      const { inputs: ins, outputs: outs } = await enumerateDevices();
+      setInputs(ins);
+      setOutputs(outs);
+    } catch {
+      /* enumeration/permission failed — keep default entries */
+    }
   }, []);
+  useEffect(() => {
+    refreshDevices();
+    const md = navigator.mediaDevices;
+    md?.addEventListener?.('devicechange', refreshDevices);
+    return () => md?.removeEventListener?.('devicechange', refreshDevices);
+  }, [refreshDevices]);
 
   const dispatch = (type: string, detail?: any) =>
     window.dispatchEvent(new CustomEvent(type, { detail }));
@@ -177,8 +195,9 @@ export function MainApp() {
           <Card title="Audio Devices" accent="#34d399">
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               <select
-                id="inputSelect"
                 title="Microphone (input)"
+                value={s.selectedInputId}
+                onChange={(e) => setState({ selectedInputId: e.target.value })}
                 style={{
                   flex: 1,
                   background: 'rgba(255,255,255,0.04)',
@@ -190,10 +209,18 @@ export function MainApp() {
                 }}
               >
                 <option value="">Default Mic</option>
+                {inputs
+                  .filter((d) => d.id !== 'default' && d.id !== 'communications')
+                  .map((d) => (
+                    <option key={d.id} value={d.id}>
+                      {d.label}
+                    </option>
+                  ))}
               </select>
               <select
-                id="outputSelect"
                 title="Speaker (output) — Chromium only"
+                value={s.selectedOutputId}
+                onChange={(e) => setState({ selectedOutputId: e.target.value })}
                 style={{
                   flex: 1,
                   background: 'rgba(255,255,255,0.04)',
@@ -205,10 +232,17 @@ export function MainApp() {
                 }}
               >
                 <option value="">Default Speaker</option>
+                {outputs
+                  .filter((d) => d.id !== 'default' && d.id !== 'communications')
+                  .map((d) => (
+                    <option key={d.id} value={d.id}>
+                      {d.label}
+                    </option>
+                  ))}
               </select>
               <button
-                id="refreshDevices"
                 title="Refresh device list"
+                onClick={refreshDevices}
                 style={{
                   padding: '4px 8px',
                   border: '1px solid rgba(255,255,255,0.1)',

@@ -20,7 +20,7 @@ import { AudioPlayer } from '../audio/player';
 import { type AudioRecorder } from '../audio/recorder';
 import { Visualizer } from '../modem/debug/visualizer';
 import { DEFAULT_CONFIG, OFDM_TUNING } from '../modem/types';
-import { enumerateDevices, populateSelect } from '../audio/devices';
+import { enumerateDevices } from '../audio/devices';
 import { TxEngine } from '../modem/protocol/txEngine';
 import { encodeFrame } from '../modem/protocol/atomicFrame';
 import { tryParsePreamble, verifyPayload } from '../protocol';
@@ -76,30 +76,6 @@ let parsedPreamble: { preamble: import('../protocol').FilePreamble; consumed: nu
 let payloadCollected = 0;
 let wasInFrame = false;
 
-// ─── DOM refs (acquired lazily — React creates these) ──
-let inputSelect: HTMLSelectElement | null = null;
-let outputSelect: HTMLSelectElement | null = null;
-let refreshBtn: HTMLButtonElement | null = null;
-let fastSyncCb: HTMLInputElement | null = null;
-
-function getDeviceRefs() {
-  if (!inputSelect) {
-    inputSelect = document.getElementById('inputSelect') as HTMLSelectElement;
-    outputSelect = document.getElementById('outputSelect') as HTMLSelectElement;
-    refreshBtn = document.getElementById('refreshDevices') as HTMLButtonElement;
-    fastSyncCb = document.getElementById('fastSyncCb') as HTMLInputElement;
-    refreshBtn?.addEventListener('click', refreshDeviceList);
-    inputSelect.addEventListener('change', () => {
-      const id = inputSelect!.value;
-      setState({ selectedInputId: id });
-    });
-    outputSelect.addEventListener('change', () => {
-      const id = outputSelect!.value;
-      setState({ selectedOutputId: id });
-    });
-  }
-}
-
 // ─── State ────────────────────────────────────────────
 
 let selectedFile: File | null = null;
@@ -125,21 +101,17 @@ modem.on('telemetry', (ev) => setTelemetry(ev.telemetry));
 dlog('APP', { hwRate: audioCtx.sampleRate });
 
 // ─── Device Enumeration ───────────────────────────────
+// The device dropdowns are rendered and populated by React (MainApp). Here we
+// only prime the mic permission before send/record so device labels resolve and
+// the selected deviceId can be honoured.
 
 async function refreshDeviceList() {
-  getDeviceRefs();
-  if (!inputSelect || !outputSelect) return;
   try {
-    const { inputs, outputs } = await enumerateDevices();
-    populateSelect(inputSelect, inputs, getState().selectedInputId, 'Default Mic');
-    populateSelect(outputSelect, outputs, getState().selectedOutputId, 'Default Speaker');
+    await enumerateDevices();
   } catch {
-    /* silent */
+    /* permission denied — recorder falls back to the default device */
   }
 }
-
-// React calls this after mount
-(window as any).eardropRefreshDevices = refreshDeviceList;
 
 // ─── Auto-restart listener on OFDM setting changes ──
 let lastOfdmSettings = { useOFDM: false, symbolsPerSec: 50, toneCount: 4 };
