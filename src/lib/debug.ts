@@ -148,7 +148,7 @@ export function renderDebugPanel(parentEl: HTMLElement): void {
         const on = stored === '1';
         enabled[cat] = on;
         // Update checkbox state after we've created them
-        const cb = container.querySelector(`input[type="checkbox"]`) as HTMLInputElement | null;
+        const cb = container.querySelector('input[type="checkbox"]') as HTMLInputElement | null;
         // We need to match by category — use a data attribute
       }
     }

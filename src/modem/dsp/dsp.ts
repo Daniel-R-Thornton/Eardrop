@@ -93,7 +93,7 @@ export class DSP {
       s1 = 0,
       s2 = 0;
     for (let i = 0; i < n; i++) {
-      // eslint-disable-next-line no-useless-assignment -- Goertzel IIR: s0 is intermediate, s1/s2 hold final state
+       
       s0 = samples[i] + coeff * s1 - s2;
       s2 = s1;
       s1 = s0;

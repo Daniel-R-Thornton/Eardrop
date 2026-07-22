@@ -57,7 +57,7 @@ for (const toneCount of [16, 32]) {
     expect(Array.from(received!.data)).toEqual(Array.from(makePayload(payloadBytes)));
 
     const rate = payloadBytes / audioSec;
-    // eslint-disable-next-line no-console
+     
     console.log(
       `[BENCH] tones=${toneCount} payloadBytes=${payloadBytes} audioSec=${audioSec.toFixed(2)} rate=${rate.toFixed(1)} B/s`,
     );

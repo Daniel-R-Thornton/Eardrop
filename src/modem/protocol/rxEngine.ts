@@ -805,7 +805,7 @@ export class RxEngine {
     fileName: string;
     fileSize: number;
     bytesAssembled: number;
-  } {
+    } {
     return {
       state: this.state,
       framesReceived: this.framesReceived,

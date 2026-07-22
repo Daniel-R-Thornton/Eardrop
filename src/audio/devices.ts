@@ -43,14 +43,25 @@ export async function enumerateDevices(): Promise<DeviceList> {
   return { inputs, outputs };
 }
 
-/** Populate a <select> with device options */
+/** Populate a <select> with device options, keeping a "System Default" entry */
 export function populateSelect(
   select: HTMLSelectElement,
   devices: DeviceInfo[],
   selectedId: string,
+  defaultLabel = 'System Default',
 ) {
   select.innerHTML = '';
+
+  // Always offer the OS default (value '' → recorder/player fall back to default device)
+  const def = document.createElement('option');
+  def.value = '';
+  def.textContent = defaultLabel;
+  if (!selectedId) def.selected = true;
+  select.appendChild(def);
+
   for (const dev of devices) {
+    // Skip the browser's own 'default'/'communications' pseudo-devices — the '' entry covers them
+    if (dev.id === 'default' || dev.id === 'communications') continue;
     const opt = document.createElement('option');
     opt.value = dev.id;
     opt.textContent = dev.label;

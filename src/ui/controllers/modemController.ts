@@ -24,7 +24,7 @@ export class ModemController {
     });
     this.worker.onmessage = (e: MessageEvent<ModemEvent>) => {
       const ev = e.data;
-      const id = (ev as { id?: number }).id;
+      const {id} = (ev as { id?: number });
       if (id !== undefined && this.pending.has(id)) {
         this.pending.get(id)!(ev);
         this.pending.delete(id);

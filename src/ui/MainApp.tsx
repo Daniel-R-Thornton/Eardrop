@@ -3,9 +3,8 @@
  * Apple-inspired design: clean cards, tight typography, visible debug.
  */
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useStore, setState, resetState } from './Store';
-import { ToneMeter } from './components/ToneMeter';
 import { BitAnalyzer } from './components/BitAnalyzer';
 import { WaveformScope } from './components/WaveformScope';
 import { SpectrumAnalyzer } from './components/SpectrumAnalyzer';
@@ -16,7 +15,6 @@ import { Stat } from './components/Stat';
 import { MeterBar } from './components/MeterBar';
 import { ConstellationPlot } from './components/ConstellationPlot';
 import { PipelineStrip } from './components/PipelineStrip';
-import { debugLogger, STAGE } from '../modem/debug/debugger';
 import { OFDM_SYMBOL_MS, OFDM_CP_MS, OFDM_DEFAULTS } from '../modem/types';
 import { FRAME_SIZE, PAYLOAD_DATA_SIZE } from '../modem/protocol/atomicFrame';
 import { TONE_COLORS, TONE_FREQUENCIES, formatSize } from './lib';
@@ -175,6 +173,56 @@ export function MainApp() {
       {/* ═══ TRANSFER ═══ */}
       <div style={{ display: tab === 'transfer' ? 'grid' : 'none', gridTemplateColumns: '1fr 1fr', gap: GAP, alignItems: 'start' }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: GAP }}>
+          {/* Audio Devices */}
+          <Card title="Audio Devices" accent="#34d399">
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <select
+                id="inputSelect"
+                title="Microphone (input)"
+                style={{
+                  flex: 1,
+                  background: 'rgba(255,255,255,0.04)',
+                  color: '#e5e7eb',
+                  border: '1px solid rgba(255,255,255,0.1)',
+                  borderRadius: 5,
+                  padding: '4px 6px',
+                  fontSize: 11,
+                }}
+              >
+                <option value="">Default Mic</option>
+              </select>
+              <select
+                id="outputSelect"
+                title="Speaker (output) — Chromium only"
+                style={{
+                  flex: 1,
+                  background: 'rgba(255,255,255,0.04)',
+                  color: '#e5e7eb',
+                  border: '1px solid rgba(255,255,255,0.1)',
+                  borderRadius: 5,
+                  padding: '4px 6px',
+                  fontSize: 11,
+                }}
+              >
+                <option value="">Default Speaker</option>
+              </select>
+              <button
+                id="refreshDevices"
+                title="Refresh device list"
+                style={{
+                  padding: '4px 8px',
+                  border: '1px solid rgba(255,255,255,0.1)',
+                  borderRadius: 5,
+                  background: 'rgba(255,255,255,0.04)',
+                  color: '#6b7280',
+                  cursor: 'pointer',
+                  fontSize: 11,
+                }}
+              >
+                ↻
+              </button>
+            </div>
+          </Card>
           {/* Send */}
           <Card title="Send" accent="#818cf8">
             <div
@@ -457,13 +505,13 @@ export function MainApp() {
             <div style={{ fontSize: 10, color: '#4b5563', marginTop: -4, marginBottom: 8 }}>
               {s.useOFDM
                 ? (() => {
-                    const symbolSec = (OFDM_SYMBOL_MS + OFDM_CP_MS) / 1000;
-                    const bytesPerSym = Math.max(1, Math.floor(s.toneCount / 4));
-                    const frameSyms = Math.ceil(FRAME_SIZE / bytesPerSym);
-                    const netBps = Math.round((PAYLOAD_DATA_SIZE * 8) / (frameSyms * symbolSec));
-                    const rawBps = Math.round((s.toneCount * 2) / symbolSec);
-                    return `≈${netBps} bit/s net (${rawBps} raw)`;
-                  })()
+                  const symbolSec = (OFDM_SYMBOL_MS + OFDM_CP_MS) / 1000;
+                  const bytesPerSym = Math.max(1, Math.floor(s.toneCount / 4));
+                  const frameSyms = Math.ceil(FRAME_SIZE / bytesPerSym);
+                  const netBps = Math.round((PAYLOAD_DATA_SIZE * 8) / (frameSyms * symbolSec));
+                  const rawBps = Math.round((s.toneCount * 2) / symbolSec);
+                  return `≈${netBps} bit/s net (${rawBps} raw)`;
+                })()
                 : `${s.symbolsPerSec * s.toneCount} bit/s`}
             </div>
 
@@ -501,8 +549,8 @@ export function MainApp() {
               </div>
               <input
                 type="range"
-                min={s.useOFDM ? "500" : "37.5"}
-                max={s.useOFDM ? "4000" : "537.5"}
+                min={s.useOFDM ? '500' : '37.5'}
+                max={s.useOFDM ? '4000' : '537.5'}
                 step="25"
                 value={s.pilotFreqHz}
                 onChange={(e) => {
@@ -574,51 +622,6 @@ export function MainApp() {
                 style={{ width: '100%' }} />
             </div>
 
-            {/* Audio Devices */}
-            <div style={{ display: 'flex', gap: 8, marginTop: 6 }}>
-              <select
-                id="inputSelect"
-                style={{
-                  flex: 1,
-                  background: 'rgba(255,255,255,0.04)',
-                  color: '#e5e7eb',
-                  border: '1px solid rgba(255,255,255,0.1)',
-                  borderRadius: 5,
-                  padding: '4px 6px',
-                  fontSize: 11,
-                }}
-              >
-                <option value="">Default Mic</option>
-              </select>
-              <select
-                id="outputSelect"
-                style={{
-                  flex: 1,
-                  background: 'rgba(255,255,255,0.04)',
-                  color: '#e5e7eb',
-                  border: '1px solid rgba(255,255,255,0.1)',
-                  borderRadius: 5,
-                  padding: '4px 6px',
-                  fontSize: 11,
-                }}
-              >
-                <option value="">Default Speaker</option>
-              </select>
-              <button
-                id="refreshDevices"
-                style={{
-                  padding: '4px 8px',
-                  border: '1px solid rgba(255,255,255,0.1)',
-                  borderRadius: 5,
-                  background: 'rgba(255,255,255,0.04)',
-                  color: '#6b7280',
-                  cursor: 'pointer',
-                  fontSize: 11,
-                }}
-              >
-                ↻
-              </button>
-            </div>
           </Card>
 
         </div>
@@ -944,29 +947,29 @@ export function MainApp() {
           </Card>
 
 
-        <Card title="Spectrum — FFT + Waterfall" accent="#818cf8">
-          <SpectrumAnalyzer
-            spectrum={useTelemetry((t) => t?.spectrum ?? null)}
-            rawPeak={useTelemetry((t) => t?.peak ?? 0)}
-            noiseFloorDb={useTelemetry((t) => t?.rmsDb ?? -80)}
-            sampleRate={3200}
-          />
-        </Card>
+          <Card title="Spectrum — FFT + Waterfall" accent="#818cf8">
+            <SpectrumAnalyzer
+              spectrum={useTelemetry((t) => t?.spectrum ?? null)}
+              rawPeak={useTelemetry((t) => t?.peak ?? 0)}
+              noiseFloorDb={useTelemetry((t) => t?.rmsDb ?? -80)}
+              sampleRate={3200}
+            />
+          </Card>
 
 
-        <Card title="Waveform — RX (blue) / TX (orange)" accent="#6c6cff">
-          <WaveformScope rxSamples={s.debugSamples} txSamples={s.txSamples} sampleRate={3200} />
-        </Card>
+          <Card title="Waveform — RX (blue) / TX (orange)" accent="#6c6cff">
+            <WaveformScope rxSamples={s.debugSamples} txSamples={s.txSamples} sampleRate={3200} />
+          </Card>
 
         </div>
       </div>
 
       {/* ═══ LOGS ═══ */}
       <div style={{ display: tab === 'logs' ? 'block' : 'none' }}>
-          {/* Debug Toggles */}
-          <Card title="Debug Logs" accent="#6b7280" style={{ fontSize: 12 }}>
-            <DebugToggles />
-          </Card>
+        {/* Debug Toggles */}
+        <Card title="Debug Logs" accent="#6b7280" style={{ fontSize: 12 }}>
+          <DebugToggles />
+        </Card>
 
       </div>
     </div>
