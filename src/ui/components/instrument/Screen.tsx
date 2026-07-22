@@ -17,7 +17,8 @@ export function Screen({ width, height, draw, grid = true }: ScreenProps) {
     const dpr = window.devicePixelRatio || 1;
     cv.width = width * dpr;
     cv.height = height * dpr;
-    const ctx = cv.getContext('2d')!;
+    const ctx = cv.getContext('2d');
+    if (!ctx) return; // no 2D context (e.g. jsdom without node-canvas) — nothing to draw
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = T.screenBg;
     ctx.fillRect(0, 0, width, height);
