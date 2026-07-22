@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { Run } from '../../modem/protocol/captureTypes';
 
 /**
  * usePipelinePlayhead.ts — Pipeline playhead hook for advancing through
@@ -62,7 +63,7 @@ export interface UsePipelinePlayheadReturn {
  * @param speed - 'realtime' (~180ms per stage), 'slow' (~900ms), or 'step' (manual)
  */
 export function usePipelinePlayhead(
-  run: { frameCount?: number } | null | undefined,
+  run: Run | null | undefined,
   speed: 'realtime' | 'slow' | 'step'
 ): UsePipelinePlayheadReturn {
   const [frameIndex, setFrameIndex] = useState(0);
@@ -100,7 +101,7 @@ export function usePipelinePlayhead(
       return;
     }
 
-    const frameCountVal = run?.frameCount ?? 1;
+    const frameCountVal = run?.frames.length ?? 1;
 
     const timerId = window.setInterval(() => {
       const newState = nextStage(
@@ -117,20 +118,20 @@ export function usePipelinePlayhead(
     return () => {
       clearInterval(timerId);
     };
-  }, [playing, speed, getInterval, run?.frameCount]);
+  }, [playing, speed, getInterval, run?.frames.length]);
 
   const play = useCallback(() => setPlaying(true), []);
   const pause = useCallback(() => setPlaying(false), []);
 
   const step = useCallback(() => {
-    const frameCountVal = run?.frameCount ?? 1;
+    const frameCountVal = run?.frames.length ?? 1;
     const newState = nextStage(
       { frameIndex, stageIndex },
       frameCountVal
     );
     setFrameIndex(newState.frameIndex);
     setStageIndex(newState.stageIndex);
-  }, [frameIndex, stageIndex, run?.frameCount]);
+  }, [frameIndex, stageIndex, run?.frames.length]);
 
   const reset = useCallback(() => {
     setFrameIndex(0);
