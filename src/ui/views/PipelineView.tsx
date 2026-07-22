@@ -47,8 +47,16 @@ export function PipelineView({ run, frameIndex, stageIndex }: PipelineViewProps)
       case 'payload':
         return (
           <div style={{ width: SW }}>
-            <ByteMap bytes={bundle.payloadBytes} />
-            <BitStream bytes={bundle.payloadBytes} max={128} />
+            {bundle.payloadBytes.length === 0 ? (
+              <div style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk, opacity: 0.6, padding: '8px 0' }}>
+                no payload — {bundle.frameKind} frame (metadata only)
+              </div>
+            ) : (
+              <>
+                <ByteMap bytes={bundle.payloadBytes} />
+                <BitStream bytes={bundle.payloadBytes} max={128} />
+              </>
+            )}
           </div>
         );
       case 'frame':
@@ -67,13 +75,26 @@ export function PipelineView({ run, frameIndex, stageIndex }: PipelineViewProps)
       case 'symbols':
         return <Constellation points={bundle.symbols} width={SW} height={SH} />;
       case 'channels': {
-        const traces = bundle.toneWaves.map((data, i) => ({
+        // 32 tones won't fit legibly — show the first few + the pilot.
+        const MAX_SHOWN = 6;
+        const shown = bundle.toneWaves.slice(0, MAX_SHOWN);
+        const traces = shown.map((data, i) => ({
           data,
           color: TONE_TRACE[i % TONE_TRACE.length],
           label: `CH${i + 1}`,
         }));
         traces.push({ data: bundle.pilotWave, color: T.amber, label: 'PILOT' });
-        return <MultiTrace traces={traces} width={SW} height={SH} />;
+        const more = bundle.toneWaves.length - shown.length;
+        return (
+          <div>
+            <MultiTrace traces={traces} width={SW} height={SH} />
+            {more > 0 && (
+              <div style={{ fontFamily: T.mono, fontSize: 10, color: T.panelInk, opacity: 0.6, marginTop: 2 }}>
+                +{more} more tones ({bundle.toneWaves.length} total)
+              </div>
+            )}
+          </div>
+        );
       }
       case 'combined':
         return <Trace data={bundle.combined} width={SW} height={SH} />;
