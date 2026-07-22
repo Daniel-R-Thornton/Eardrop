@@ -61,6 +61,7 @@ export function PresentationMode({ onExit }: { onExit: () => void }) {
   ]);
   const [pilotOn, setPilotOn] = useState(true);
   const [step, setStep] = useState(2);
+  const [decIdx, setDecIdx] = useState(0); // which tone to decode; -1 = pilot
 
   const set = (i: number, patch: Partial<ToneState>) =>
     setTones((ts) => ts.map((t, k) => (k === i ? { ...t, ...patch } : t)));
@@ -155,6 +156,64 @@ export function PresentationMode({ onExit }: { onExit: () => void }) {
     };
     tones.forEach((t, i) => { if (t.on) { const p = qpsk(t.b0, t.b1); dot(p.i, p.q, TONE_TRACE[i], `${TONE_HZ[i]}`); } });
     if (pilotOn) dot(1, 0, '#ff5a3c', 'pilot');
+  };
+
+  // ─── DECODE: correlate the combined signal against reference cos/sin ───
+  // I = 2/N Σ r·cos ,  Q = -2/N Σ r·sin  (scaled back up by the tone count that
+  // was averaged into `combined`). Orthogonality means other tones cancel.
+  const decFreq = decIdx < 0 ? PILOT_HZ : TONE_HZ[decIdx];
+  const decColor = decIdx < 0 ? '#ff5a3c' : TONE_TRACE[decIdx];
+  const dec = useMemo(() => {
+    const cosRef = new Float32Array(N);
+    const sinRef = new Float32Array(N);
+    const prodI = new Float32Array(N);
+    const prodQ = new Float32Array(N);
+    let sI = 0; let sQ = 0;
+    for (let n = 0; n < N; n++) {
+      const a = (2 * Math.PI * decFreq * n) / SR;
+      cosRef[n] = Math.cos(a);
+      sinRef[n] = Math.sin(a);
+      prodI[n] = combined[n] * cosRef[n];
+      prodQ[n] = combined[n] * sinRef[n];
+      sI += prodI[n];
+      sQ += prodQ[n];
+    }
+    const scale = Math.max(1, layers.length);
+    return { cosRef, sinRef, prodI, prodQ, I: (2 / N) * sI * scale, Q: -(2 / N) * sQ * scale };
+  }, [combined, decFreq, layers.length]);
+
+  // draw a reference wave + the product (shaded), so the net area = I or Q
+  const drawMix = (ref: Float32Array, prod: Float32Array, area: number) => (ctx: CanvasRenderingContext2D, w: number, h: number) => {
+    const mid = h / 2;
+    // reference (dim)
+    ctx.strokeStyle = 'rgba(210,210,200,0.35)'; ctx.lineWidth = 1; ctx.beginPath();
+    for (let i = 0; i < ref.length; i++) { const x = (i / (ref.length - 1)) * w; const y = mid - ref[i] * (mid - 4); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+    ctx.stroke();
+    // product, shaded to baseline (its net area is the correlation)
+    let peak = 0; for (let i = 0; i < prod.length; i++) peak = Math.max(peak, Math.abs(prod[i]));
+    const g = peak > 1e-4 ? (mid - 4) / peak : 1;
+    ctx.beginPath(); ctx.moveTo(0, mid);
+    for (let i = 0; i < prod.length; i++) { const x = (i / (prod.length - 1)) * w; ctx.lineTo(x, mid - prod[i] * g); }
+    ctx.lineTo(w, mid); ctx.closePath();
+    ctx.fillStyle = area >= 0 ? 'rgba(60,255,122,0.35)' : 'rgba(255,90,60,0.35)';
+    ctx.fill();
+    ctx.strokeStyle = decColor; ctx.lineWidth = 1.5; ctx.beginPath();
+    for (let i = 0; i < prod.length; i++) { const x = (i / (prod.length - 1)) * w; const y = mid - prod[i] * g; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+    ctx.stroke();
+  };
+
+  const drawRecovered = (ctx: CanvasRenderingContext2D, w: number, h: number) => {
+    const cx = w / 2; const cy = h / 2; const s = Math.min(w, h) * 0.34;
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx, 6); ctx.lineTo(cx, h - 6); ctx.moveTo(6, cy); ctx.lineTo(w - 6, cy); ctx.stroke();
+    // original point (hollow) vs recovered (filled)
+    const orig = decIdx < 0 ? { i: 1, q: 0 } : qpsk(tones[decIdx].b0, tones[decIdx].b1);
+    ctx.strokeStyle = 'rgba(210,210,200,0.6)'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(cx + orig.i * s, cy - orig.q * s, 8, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = decColor;
+    ctx.beginPath(); ctx.arc(cx + dec.I * s, cy - dec.Q * s, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(210,210,200,0.6)'; ctx.font = `9px ${T.mono}`;
+    ctx.fillText('○ sent  ● recovered', 6, h - 4);
   };
 
   // ─── FFT the decoder sees ───
@@ -254,6 +313,37 @@ export function PresentationMode({ onExit }: { onExit: () => void }) {
         <div style={{ ...panel, flex: '1 1 400px' }}>
           <div style={title}>FFT — what the decoder sees (peaks = tones)</div>
           <Screen width={520} height={240} draw={drawFft} grid={false} />
+        </div>
+      </div>
+
+      {/* DECODE — recover I/Q by correlating against reference cos/sin */}
+      <div style={panel}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+          <span style={title as CSSProperties}>DECODE — multiply by reference sine &amp; its 90° offset, then sum</span>
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <span style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk, opacity: 0.7 }}>decode tone:</span>
+            {tones.map((t, i) => t.on && (
+              <button key={i} style={btn(decIdx === i)} onClick={() => setDecIdx(i)}>{TONE_HZ[i]}</button>
+            ))}
+            {pilotOn && <button style={btn(decIdx === -1)} onClick={() => setDecIdx(-1)}>pilot</button>}
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+          <div>
+            <div style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk }}>× cos (in-phase) → I = {dec.I.toFixed(2)}</div>
+            <Screen width={360} height={110} draw={drawMix(dec.cosRef, dec.prodI, dec.I)} grid={false} />
+          </div>
+          <div>
+            <div style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk }}>× sin (90° offset) → Q = {dec.Q.toFixed(2)}</div>
+            <Screen width={360} height={110} draw={drawMix(dec.sinRef, dec.prodQ, -dec.Q)} grid={false} />
+          </div>
+          <div>
+            <div style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk }}>recovered I/Q</div>
+            <Screen width={150} height={110} draw={drawRecovered} grid={false} />
+          </div>
+        </div>
+        <div style={{ fontFamily: T.mono, fontSize: 10, color: T.panelInk, opacity: 0.7, marginTop: 4 }}>
+          net shaded area = the sum. Other tones average to ~0 here (orthogonality) — only this tone survives.
         </div>
       </div>
     </div>
