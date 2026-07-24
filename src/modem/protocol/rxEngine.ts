@@ -22,6 +22,7 @@ import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
 import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_SYMBOL_MS, OFDM_CP_MS, OFDM_TUNING } from '../types';
 import { generateChirp, chirpCorrelate, type ChirpConfig } from './chirp';
 import { dlog } from '../../lib/debug/dlog';
+import { decompress } from '../compression';
 
 // ─── Constants ───────────────────────────────────────
 
@@ -139,6 +140,10 @@ export class RxEngine {
   private fileID = 0;
   private fileName = '';
   private fileSize = 0;
+  /** Phase 6 compression: scheme id carried in the header (0 = raw). */
+  private fileSchemeId = 0;
+  /** Phase 6 compression: original (pre-compression) size carried in the header. */
+  private fileOrigSize = 0;
   private fileData: number[] = [];
   private totalFrames = 0;
   private framesReceived = 0;
@@ -1019,7 +1024,11 @@ export class RxEngine {
   private receivedPayloadSeqs = new Set<number>();
 
   private processHeader(payload: Uint8Array): void {
-    // Header payload format: [fileID:4B][totalSize:4B][nameLen:1B][name...]
+    // Header payload format:
+    // [fileID:4B][totalSize:4B][nameLen:1B][name...][schemeId:1B][origSize:4B LE][padding...]
+    // The trailing [schemeId][origSize] (Phase 6 compression) live in what
+    // used to be the zero-pad region — a legacy RX simply never reads that
+    // far, so this is backward compatible.
     const fileID = (payload[0] << 24) | (payload[1] << 16) | (payload[2] << 8) | payload[3];
 
     // Duplicate header (diversity mode repetition) — ignore, keep existing state
@@ -1030,7 +1039,7 @@ export class RxEngine {
 
     const totalSize =
       (payload[4] | (payload[5] << 8) | (payload[6] << 16) | (payload[7] << 24)) >>> 0;
-    const nameLen = Math.min(payload[8] & 0xff, PAYLOAD_DATA_SIZE - 9);
+    const nameLen = Math.min(payload[8] & 0xff, PAYLOAD_DATA_SIZE - 9 - 5);
 
     let name = '';
     for (let i = 0; i < nameLen; i++) {
@@ -1038,9 +1047,31 @@ export class RxEngine {
       if (c >= 0x20 && c <= 0x7e) name += String.fromCharCode(c);
     }
 
+    // [schemeId:1][origSize:4 LE] appended right after the name. Treat an
+    // absent/short/zero region as raw (schemeId 0) — this is what a stream
+    // produced before Phase 6 (or a truncated/corrupt header) looks like.
+    const schemeOff = 9 + nameLen;
+    let schemeId = 0;
+    let origSize = totalSize;
+    if (schemeOff + 5 <= payload.length) {
+      const sid = payload[schemeOff] & 0xff;
+      const os =
+        (payload[schemeOff + 1] |
+          (payload[schemeOff + 2] << 8) |
+          (payload[schemeOff + 3] << 16) |
+          (payload[schemeOff + 4] << 24)) >>>
+        0;
+      if (sid !== 0 && os > 0) {
+        schemeId = sid;
+        origSize = os;
+      }
+    }
+
     this.fileID = fileID;
     this.fileSize = totalSize;
     this.fileName = name;
+    this.fileSchemeId = schemeId;
+    this.fileOrigSize = origSize;
     this.fileData = [];
     this.framesReceived = 0;
     this.receivedPayloadSeqs = new Set();
@@ -1074,11 +1105,28 @@ export class RxEngine {
       return;
     }
 
-    const data = new Uint8Array(this.fileData.slice(0, this.fileSize));
+    const wireData = new Uint8Array(this.fileData.slice(0, this.fileSize));
+
+    // Phase 6 compression: schemeId 0 is identity (no-op); any other scheme
+    // decompresses the wire bytes back to the original size. Keep this
+    // byte-exact — a decode failure must not silently corrupt the file, so
+    // any thrown error falls back to the raw wire bytes.
+    let data: Uint8Array = wireData;
+    let totalBytes = this.fileSize;
+    if (this.fileSchemeId !== 0) {
+      try {
+        const restored = decompress(wireData, this.fileSchemeId);
+        data = restored;
+        totalBytes = this.fileOrigSize || restored.length;
+      } catch (err) {
+        dlog('RX-FRAME', { decompressError: (err as Error).message });
+      }
+    }
+
     this.completedFile = {
       fileName: this.fileName,
       data,
-      totalBytes: this.fileSize,
+      totalBytes,
     };
     this.state = RxState.COMPLETE;
     this.fileName = '';

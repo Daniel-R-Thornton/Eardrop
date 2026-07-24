@@ -7,6 +7,7 @@ import { TxEngine } from '../modem/protocol/txEngine';
 import { captureTransmit } from '../modem/protocol/txCapture';
 import { toneIQ } from '../modem/pilot';
 import { DEFAULT_CONFIG, ofdmToneFrequencies, type ModemConfig } from '../modem/types';
+import { compress, detect } from '../modem/compression';
 import type { ModemCommand, ModemEvent, ModemTelemetry } from './modemSchema';
 
 const RING_SECONDS = 10;
@@ -78,7 +79,10 @@ export class ModemService {
         if (!this.config) { this.emit({ type: 'error', id: cmd.id, error: 'encodeFile before configure' }); return; }
         try {
           const tx = new TxEngine(this.config as ConstructorParameters<typeof TxEngine>[0]);
-          const samples = tx.transmitFile(cmd.fileName, new Uint8Array(cmd.data));
+          const rawData = new Uint8Array(cmd.data);
+          const scheme = detect(cmd.fileName, rawData);
+          const { bytes: wireData, scheme: schemeId } = compress(rawData, scheme);
+          const samples = tx.transmitFile(cmd.fileName, wireData, schemeId, rawData.length);
           this.emit(
             { type: 'encoded', id: cmd.id, samples: samples.buffer as ArrayBuffer, sampleRate: this.config.sampleRate },
             [samples.buffer as ArrayBuffer],
@@ -92,9 +96,20 @@ export class ModemService {
         if (!this.config) { this.emit({ type: 'error', id: cmd.id, error: 'encodeStreamStart before configure' }); return; }
         try {
           const tx = new TxEngine(this.config as ConstructorParameters<typeof TxEngine>[0]);
-          const data = new Uint8Array(cmd.data);
-          const totalSamples = tx.estimateStreamSamples(data.length);
-          this.stream = { id: cmd.id, gen: tx.streamChunks(cmd.fileName, data, this.streamChunkSamples()) };
+          const rawData = new Uint8Array(cmd.data);
+          const scheme = detect(cmd.fileName, rawData);
+          const { bytes: wireData, scheme: schemeId } = compress(rawData, scheme);
+          const totalSamples = tx.estimateStreamSamples(wireData.length);
+          this.stream = {
+            id: cmd.id,
+            gen: tx.streamChunks(
+              cmd.fileName,
+              wireData,
+              this.streamChunkSamples(),
+              schemeId,
+              rawData.length,
+            ),
+          };
           this.emit({ type: 'streamStart', id: cmd.id, sampleRate: this.config.sampleRate, totalSamples });
         } catch (err) {
           this.stream = null;

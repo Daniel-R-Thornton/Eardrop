@@ -112,10 +112,15 @@ export class TxEngine {
   /**
    * Generate complete audio for a file transfer.
    */
-  transmitFile(fileName: string, data: Uint8Array): Float32Array {
+  transmitFile(
+    fileName: string,
+    data: Uint8Array,
+    schemeId = 0,
+    origSize = data.length,
+  ): Float32Array {
     // Concatenate every segment, then peak-normalize the whole signal.
     // Behaviourally identical to the pre-generator implementation.
-    const segments = [...this.frameSegments(fileName, data)];
+    const segments = [...this.frameSegments(fileName, data, schemeId, origSize)];
     const totalLen = segments.reduce((a, b) => a + b.length, 0);
     const result = new Float32Array(totalLen);
     let offset = 0;
@@ -148,7 +153,12 @@ export class TxEngine {
    * concatenation; the streaming path relies on each OFDM symbol already being
    * peak-normed to 0.95 inside OFDMQPSKModulator.generateSymbol.
    */
-  private *frameSegments(fileName: string, data: Uint8Array): Generator<Float32Array> {
+  private *frameSegments(
+    fileName: string,
+    data: Uint8Array,
+    schemeId = 0,
+    origSize = data.length,
+  ): Generator<Float32Array> {
     this.reset();
 
     // 1. Preamble: chirp (sync) + training symbols (channel est)
@@ -184,7 +194,7 @@ export class TxEngine {
     };
 
     // 2. Header frame (type 0x01) — repeat if diversity mode
-    const headerPayload = this.buildHeaderPayload(fileName, data.length);
+    const headerPayload = this.buildHeaderPayload(fileName, data.length, schemeId, origSize);
     const headerFrame = modulate({ type: 0x01, seqNum: 0, totalFrames, crc: 0 }, headerPayload);
     for (let r = 0; r < repeats; r++) yield headerFrame;
 
@@ -213,11 +223,17 @@ export class TxEngine {
    * chunk size instead of the whole waveform. No global peak-normalize (see
    * frameSegments); each OFDM symbol is already peak-normed to 0.95.
    */
-  *streamChunks(fileName: string, data: Uint8Array, chunkSamples: number): Generator<Float32Array> {
+  *streamChunks(
+    fileName: string,
+    data: Uint8Array,
+    chunkSamples: number,
+    schemeId = 0,
+    origSize = data.length,
+  ): Generator<Float32Array> {
     const target = Math.max(1, Math.floor(chunkSamples));
     let buf = new Float32Array(target);
     let filled = 0;
-    for (const seg of this.frameSegments(fileName, data)) {
+    for (const seg of this.frameSegments(fileName, data, schemeId, origSize)) {
       let segOff = 0;
       while (segOff < seg.length) {
         const take = Math.min(target - filled, seg.length - segOff);
@@ -316,10 +332,22 @@ export class TxEngine {
   // ─── Private helpers ────────────────────────────────
 
   /**
-   * Build the 40-byte header frame payload.
-   * Format: [fileID:4B][totalSize:4B][fileNameLen:1B][fileName...][padding...]
+   * Build the header frame payload (PAYLOAD_DATA_SIZE bytes, currently 160).
+   * Format: [fileID:4B][totalSize:4B][fileNameLen:1B][fileName...][schemeId:1B][origSize:4B LE][padding...]
+   *
+   * `totalSize` is the WIRE (post-compression) size — legacy progress math
+   * depends on this remaining the size of what's actually transmitted.
+   * `schemeId`/`origSize` (Phase 6 compression) are appended immediately
+   * after the file name, ahead of the zero-pad, so a legacy RX (which only
+   * reads up to the name and ignores the rest as padding) stays compatible;
+   * a new RX reads them back to restore the true (decompressed) size.
    */
-  private buildHeaderPayload(fileName: string, totalSize: number): Uint8Array {
+  private buildHeaderPayload(
+    fileName: string,
+    totalSize: number,
+    schemeId = 0,
+    origSize = totalSize,
+  ): Uint8Array {
     const nameBytes = new TextEncoder().encode(fileName);
     const payload = new Uint8Array(PAYLOAD_DATA_SIZE);
     let off = 0;
@@ -342,14 +370,22 @@ export class TxEngine {
     payload[off++] = (totalSize >> 16) & 0xff;
     payload[off++] = (totalSize >> 24) & 0xff;
 
-    // File name length (1 byte, max 31)
-    const nameLen = Math.min(nameBytes.length, PAYLOAD_DATA_SIZE - 9);
+    // File name length (1 byte) — reserve 5 trailing bytes for
+    // [schemeId:1][origSize:4] appended right after the name.
+    const nameLen = Math.min(nameBytes.length, PAYLOAD_DATA_SIZE - 9 - 5);
     payload[off++] = nameLen & 0xff;
 
     // File name
     for (let i = 0; i < nameLen && off < PAYLOAD_DATA_SIZE; i++) {
       payload[off++] = nameBytes[i];
     }
+
+    // Compression scheme id (1 byte) + original (decompressed) size (4 bytes LE)
+    if (off < PAYLOAD_DATA_SIZE) payload[off++] = schemeId & 0xff;
+    payload[off++] = origSize & 0xff;
+    payload[off++] = (origSize >> 8) & 0xff;
+    payload[off++] = (origSize >> 16) & 0xff;
+    payload[off++] = (origSize >> 24) & 0xff;
 
     // Zero-pad remaining
     while (off < PAYLOAD_DATA_SIZE) {
