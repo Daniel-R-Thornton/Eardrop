@@ -32,3 +32,33 @@ test('BPSK: modem native rate', () => {
   expect(cfg.toneCount).toBe(4);
   expect(cfg.bitsPerFrame).toBe(8);
 });
+
+test('dataQamBits=2 (QPSK, default): no link profile emitted', () => {
+  const cfg = buildModemConfig({ ...UI, dataQamBits: 2 });
+  expect(cfg.emitLinkProfile).toBeFalsy();
+  expect(cfg.qamMap).toBeUndefined();
+});
+
+test('dataQamBits omitted: defaults to QPSK, no link profile emitted', () => {
+  const cfg = buildModemConfig(UI);
+  expect(cfg.emitLinkProfile).toBeFalsy();
+  expect(cfg.qamMap).toBeUndefined();
+});
+
+test('dataQamBits=4 (16-QAM) with OFDM: emits link profile, qamMap all 1s', () => {
+  const cfg = buildModemConfig({ ...UI, dataQamBits: 4 });
+  expect(cfg.emitLinkProfile).toBe(true);
+  expect(cfg.qamMap).toEqual(new Array(UI.toneCount).fill(1));
+});
+
+test('dataQamBits=6 (64-QAM) with OFDM: emits link profile, qamMap all 2s', () => {
+  const cfg = buildModemConfig({ ...UI, dataQamBits: 6 });
+  expect(cfg.emitLinkProfile).toBe(true);
+  expect(cfg.qamMap).toEqual(new Array(UI.toneCount).fill(2));
+});
+
+test('dataQamBits=4 without OFDM: never emits link profile', () => {
+  const cfg = buildModemConfig({ ...UI, useOFDM: false, dataQamBits: 4 });
+  expect(cfg.emitLinkProfile).toBeFalsy();
+  expect(cfg.qamMap).toBeUndefined();
+});

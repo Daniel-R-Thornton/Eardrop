@@ -72,6 +72,37 @@ export function TxPanel() {
         <Button onClick={() => dispatch('eardrop-load-wav')}>⬆ FROM WAV</Button>
       </div>
 
+      <div style={{ marginTop: 10 }}>
+        <div style={{ fontFamily: T.mono, fontSize: 11, color: '#6b6355', marginBottom: 4 }}>
+          DATA CONSTELLATION
+        </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          {([
+            { bits: 2, label: 'QPSK' },
+            { bits: 4, label: '16-QAM' },
+            { bits: 6, label: '64-QAM' },
+          ] as const).map((opt) => (
+            <Button
+              key={opt.bits}
+              primary={s.dataQamBits === opt.bits}
+              onClick={() => setState({ dataQamBits: opt.bits })}
+            >
+              {opt.label}
+            </Button>
+          ))}
+        </div>
+        {s.dataQamBits === 4 && (
+          <div style={{ fontFamily: T.mono, fontSize: 11, color: '#a08050', marginTop: 4 }}>
+            ⚠ needs a clean signal
+          </div>
+        )}
+        {s.dataQamBits === 6 && (
+          <div style={{ fontFamily: T.mono, fontSize: 11, color: '#a08050', marginTop: 4 }}>
+            ⚠ needs strong signal
+          </div>
+        )}
+      </div>
+
       {s.isSending && (
         <div style={{ marginTop: 8, height: 6, background: T.panelEdge, borderRadius: 3, overflow: 'hidden' }}>
           <div style={{ width: `${s.progress}%`, height: '100%', background: T.phosphor, transition: 'width .2s' }} />

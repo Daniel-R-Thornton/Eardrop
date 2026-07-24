@@ -30,7 +30,10 @@ export interface ModemTelemetry {
 }
 
 export type ModemCommand =
-  | { type: 'configure'; config: ModemConfig & { useOFDM?: boolean } }
+  | {
+      type: 'configure';
+      config: ModemConfig & { useOFDM?: boolean; emitLinkProfile?: boolean; qamMap?: number[] };
+    }
   | { type: 'startRx' }
   | { type: 'stopRx' }
   | { type: 'feedChunk'; samples: ArrayBuffer } // Float32Array buffer, transferred
