@@ -18,6 +18,15 @@ export class ModemService {
   private rx: RxEngine | null = null;
   private fileSent = false;
 
+  // Active streaming-encode generator + its request id (one at a time).
+  private stream: { id: number; gen: Generator<Float32Array> } | null = null;
+
+  /** Chunk size for streaming encode ≈ 0.5 s of audio at the configured rate. */
+  private streamChunkSamples(): number {
+    const sr = this.config?.sampleRate ?? DEFAULT_CONFIG.sampleRate;
+    return Math.max(1, Math.floor(sr * 0.5));
+  }
+
   // Rolling ring of recent samples (Float32, telemetry + dumpBuffer)
   private ring: Float32Array = new Float32Array(0);
   private ringLen = 0; // valid samples (<= ring.length)
@@ -77,6 +86,48 @@ export class ModemService {
         } catch (err) {
           this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
         }
+        break;
+      }
+      case 'encodeStreamStart': {
+        if (!this.config) { this.emit({ type: 'error', id: cmd.id, error: 'encodeStreamStart before configure' }); return; }
+        try {
+          const tx = new TxEngine(this.config as ConstructorParameters<typeof TxEngine>[0]);
+          const data = new Uint8Array(cmd.data);
+          const totalSamples = tx.estimateStreamSamples(data.length);
+          this.stream = { id: cmd.id, gen: tx.streamChunks(cmd.fileName, data, this.streamChunkSamples()) };
+          this.emit({ type: 'streamStart', id: cmd.id, sampleRate: this.config.sampleRate, totalSamples });
+        } catch (err) {
+          this.stream = null;
+          this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
+        }
+        break;
+      }
+      case 'encodeStreamPull': {
+        if (!this.stream || this.stream.id !== cmd.id) {
+          // Stale pull (cancelled or already ended) — ignore.
+          return;
+        }
+        try {
+          const next = this.stream.gen.next();
+          if (next.done) {
+            this.stream = null;
+            this.emit({ type: 'streamEnd', id: cmd.id });
+          } else {
+            // Copy out of the generator's internal buffer so it is safe to transfer.
+            const chunk = next.value.slice();
+            this.emit(
+              { type: 'streamChunk', id: cmd.id, samples: chunk.buffer as ArrayBuffer },
+              [chunk.buffer as ArrayBuffer],
+            );
+          }
+        } catch (err) {
+          this.stream = null;
+          this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
+        }
+        break;
+      }
+      case 'encodeStreamCancel': {
+        if (this.stream && this.stream.id === cmd.id) this.stream = null;
         break;
       }
       case 'demoEncode': {

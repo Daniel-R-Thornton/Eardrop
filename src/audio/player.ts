@@ -7,6 +7,8 @@ import { dlog } from '../lib/debug/dlog';
 export class AudioPlayer {
   private ctx: AudioContext;
   private currentSource: AudioBufferSourceNode | null = null;
+  /** Abort hook for an in-flight streaming playback (set by playStream). */
+  private streamStop: (() => void) | null = null;
   /** Playback volume multiplier (1.0 = unity). Default 2× (was 6× — reduced to prevent clipping). */
   public volume = 2.0;
 
@@ -102,8 +104,128 @@ export class AudioPlayer {
     });
   }
 
+  /**
+   * Stream playback: schedule audio chunks back-to-back as they are pulled,
+   * keeping ~2 s buffered ahead. `pull()` returns the next chunk or null at end.
+   * Gapless — chunks are contiguous slices scheduled at contiguous times.
+   * Samples are expected pre-normalized (≈0.95 peak), so a fixed unity gain is
+   * used (no whole-signal analysis, which streaming can't do). Resolves when the
+   * last scheduled chunk finishes; rejects if pull() throws.
+   * @param onProgress optional — called with seconds of audio scheduled so far.
+   */
+  async playStream(
+    pull: () => Promise<Float32Array | null>,
+    sampleRate: number,
+    deviceId?: string,
+    onProgress?: (scheduledSec: number) => void,
+  ): Promise<void> {
+    const ctx = this.ensureCtx();
+    if (deviceId && typeof (ctx as any).setSinkId === 'function') {
+      try {
+        await (ctx as any).setSinkId(deviceId);
+      } catch (e: any) {
+        dlog('PLAY', { setSinkIdFailed: e.message || String(e) }, { level: 'warn' });
+      }
+    }
+
+    const gain = ctx.createGain();
+    gain.gain.value = 1.0;
+    gain.connect(ctx.destination);
+
+    const LOOKAHEAD_SEC = 2.0;
+    const START_PAD_SEC = 0.15; // small lead so the first chunk isn't scheduled in the past
+    const sources = new Set<AudioBufferSourceNode>();
+    let nextTime = ctx.currentTime + START_PAD_SEC;
+    let scheduledSamples = 0;
+    let aborted = false;
+    let producerDone = false;
+
+    const schedule = (chunk: Float32Array): void => {
+      const buffer = ctx.createBuffer(1, chunk.length, sampleRate);
+      buffer.getChannelData(0).set(chunk);
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(gain);
+      // Guard against underrun scheduling into the past (shouldn't happen — encode
+      // runs far faster than realtime — but keeps playback monotonic if it does).
+      const startAt = Math.max(nextTime, ctx.currentTime);
+      src.start(startAt);
+      nextTime = startAt + chunk.length / sampleRate;
+      scheduledSamples += chunk.length;
+      sources.add(src);
+      src.onended = () => sources.delete(src);
+    };
+
+    return new Promise<void>((resolve, reject) => {
+      const cleanup = (): void => {
+        this.streamStop = null;
+        try {
+          gain.disconnect();
+        } catch {
+          /* already disconnected */
+        }
+      };
+
+      this.streamStop = () => {
+        aborted = true;
+        for (const s of sources) {
+          try {
+            s.stop();
+          } catch {
+            /* already stopped */
+          }
+        }
+        sources.clear();
+        cleanup();
+        resolve();
+      };
+
+      let pumping = false;
+      const pump = async (): Promise<void> => {
+        if (pumping || aborted) return;
+        pumping = true;
+        try {
+          while (!aborted && !producerDone && nextTime - ctx.currentTime < LOOKAHEAD_SEC) {
+            const chunk = await pull();
+            if (aborted) return;
+            if (chunk === null) {
+              producerDone = true;
+              break;
+            }
+            schedule(chunk);
+            onProgress?.(scheduledSamples / sampleRate);
+          }
+        } catch (err) {
+          cleanup();
+          reject(err instanceof Error ? err : new Error(String(err)));
+          return;
+        } finally {
+          pumping = false;
+        }
+
+        if (aborted) return;
+        if (producerDone) {
+          // Everything is scheduled; resolve once playback reaches the end.
+          const remainingMs = Math.max(0, (nextTime - ctx.currentTime) * 1000) + 50;
+          setTimeout(() => {
+            cleanup();
+            resolve();
+          }, remainingMs);
+          return;
+        }
+        setTimeout(() => void pump(), 200);
+      };
+
+      void pump();
+    });
+  }
+
   /** Stop current playback immediately */
   stopPlayback(): void {
+    if (this.streamStop) {
+      console.debug('[AUDIO-PLAYER] ⏹️  Stopping stream playback');
+      this.streamStop();
+    }
     if (this.currentSource) {
       console.debug('[AUDIO-PLAYER] ⏹️  Stopping current playback');
       try {

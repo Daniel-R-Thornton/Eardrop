@@ -202,18 +202,9 @@ window.addEventListener('eardrop-send', (async () => {
         hwSampleRate: audioCtx.sampleRate,
       }),
     );
-    const { samples: playSamples, sampleRate: actualRate } = await modem.encodeFile(
-      selectedFile.name,
-      raw,
-    );
     setState({ isPlaying: true, progress: 0 });
-    const cleanPlay = getState().musicalMode;
-    await playWithProgress(
-      playSamples,
-      actualRate,
-      getState().selectedOutputId || undefined,
-      cleanPlay,
-    );
+    // Stream-encode + play: memory stays bounded for large files.
+    await playFileStreaming(selectedFile.name, raw, getState().selectedOutputId || undefined);
     setState({
       isSending: false,
       isPlaying: false,
@@ -237,6 +228,44 @@ window.addEventListener('eardrop-record', (async () => {
   }
   await startListening();
 }) as EventListener);
+
+/** Cancel hook for an in-flight streaming send (aborts the worker generator). */
+let currentStreamCancel: (() => void) | null = null;
+
+/**
+ * Stream-encode a file in the worker and play it as chunks arrive. Memory stays
+ * bounded regardless of file size (unlike the batch encodeFile path, which
+ * builds the whole waveform up front). Progress/ETA from wall-clock vs the
+ * estimated total duration; playback runs in realtime so the two track closely.
+ */
+async function playFileStreaming(
+  fileName: string,
+  raw: Uint8Array,
+  deviceId?: string,
+): Promise<void> {
+  const { sampleRate, totalSamples, pull, cancel } = await modem.startFileStream(fileName, raw);
+  currentStreamCancel = cancel;
+  const totalSec = totalSamples / sampleRate;
+  const startTime = Date.now();
+  const interval = setInterval(() => {
+    const elapsedSec = (Date.now() - startTime) / 1000;
+    const pct = totalSec > 0 ? Math.min(99, Math.round((elapsedSec / totalSec) * 100)) : 0;
+    const remainingSec = Math.max(0, totalSec - elapsedSec);
+    setState({
+      progress: pct,
+      sendStatus: {
+        type: 'info',
+        msg: `📤 ${pct}% · ${remainingSec < 60 ? `${remainingSec.toFixed(0)}s` : `${(remainingSec / 60).toFixed(1)}m`} remaining`,
+      },
+    });
+  }, 200);
+  try {
+    await player.playStream(pull, sampleRate, deviceId);
+  } finally {
+    clearInterval(interval);
+    currentStreamCancel = null;
+  }
+}
 
 /** Play audio with progress tracking and ETA display. */
 async function playWithProgress(
@@ -305,17 +334,8 @@ window.addEventListener('eardrop-send-test', (async () => {
         hwSampleRate: audioCtx.sampleRate,
       }),
     );
-    const { samples: playSamples, sampleRate: actualRate } = await modem.encodeFile(
-      'hello.txt',
-      raw,
-    );
     setState({ isPlaying: true, progress: 0 });
-    await playWithProgress(
-      playSamples,
-      actualRate,
-      getState().selectedOutputId || undefined,
-      getState().musicalMode,
-    );
+    await playFileStreaming('hello.txt', raw, getState().selectedOutputId || undefined);
     setState({ progress: 100, sendStatus: { type: 'success', msg: '✅ Test sent' } });
   } catch (err: any) {
     setState({ sendStatus: { type: 'error', msg: `❌ ${err.message}` } });
@@ -324,6 +344,8 @@ window.addEventListener('eardrop-send-test', (async () => {
 
 // Stop playback
 window.addEventListener('eardrop-stop-playback', (() => {
+  currentStreamCancel?.();
+  currentStreamCancel = null;
   player.stopPlayback();
   setState({
     isSending: false,

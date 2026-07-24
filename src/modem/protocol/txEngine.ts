@@ -113,10 +113,45 @@ export class TxEngine {
    * Generate complete audio for a file transfer.
    */
   transmitFile(fileName: string, data: Uint8Array): Float32Array {
+    // Concatenate every segment, then peak-normalize the whole signal.
+    // Behaviourally identical to the pre-generator implementation.
+    const segments = [...this.frameSegments(fileName, data)];
+    const totalLen = segments.reduce((a, b) => a + b.length, 0);
+    const result = new Float32Array(totalLen);
+    let offset = 0;
+    for (const seg of segments) {
+      result.set(seg, offset);
+      offset += seg.length;
+    }
+
+    // Peak-normalize
+    let peak = 0;
+    for (let i = 0; i < result.length; i++) {
+      const abs = Math.abs(result[i]);
+      if (abs > peak) peak = abs;
+    }
+    if (peak > 1.0) {
+      const scale = 1.0 / peak;
+      for (let i = 0; i < result.length; i++) result[i] *= scale;
+    }
+
+    return result;
+  }
+
+  /**
+   * Yield the audio segments of a complete file transfer, in order:
+   * preamble → header (×repeats) → data frames (×repeats) → tail (×repeats)
+   * → trailing silence. Single source of truth for transmission layout; both
+   * the batch (`transmitFile`) and streaming (`streamChunks`) paths consume it.
+   *
+   * NB: NO global peak-normalize here — the batch path applies it after
+   * concatenation; the streaming path relies on each OFDM symbol already being
+   * peak-normed to 0.95 inside OFDMQPSKModulator.generateSymbol.
+   */
+  private *frameSegments(fileName: string, data: Uint8Array): Generator<Float32Array> {
     this.reset();
 
-    // 1. Generate preamble: chirp (sync) + training symbols (channel est)
-    let preamble: Float32Array;
+    // 1. Preamble: chirp (sync) + training symbols (channel est)
     if (this.useOFDM && this.ofdmEngine) {
       const syncCount = OFDM_TUNING.syncBurstSymbols;
       const trainCount = OFDM_TUNING.trainingSymbols;
@@ -125,20 +160,17 @@ export class TxEngine {
       const combined = new Float32Array(chirp.length + training.length);
       combined.set(chirp, 0);
       combined.set(training, chirp.length);
-      preamble = combined;
       dlog('TX-OFDM', {
         chirpSamples: chirp.length,
         trainingSymbols: trainCount,
         preambleMs: Math.round((combined.length / (this.cfg.sampleRate || 48000)) * 1000),
       });
+      yield combined;
     } else {
-      preamble = this.transmitPreamble();
+      yield this.transmitPreamble();
     }
 
-    // 2. Build atomic frames
     const totalFrames = this.calcFrameCount(data.length);
-    const frameAudios: Float32Array[] = [preamble];
-
     const repeats = this.cfg.diversityMode ? 3 : 1;
 
     // ── Helper: dispatch to BPSK or OFDM ──
@@ -151,70 +183,79 @@ export class TxEngine {
       return this.transmitFrame(header, payload);
     };
 
-    // Header frame (type 0x01) — repeat 3× if diversity mode
+    // 2. Header frame (type 0x01) — repeat if diversity mode
     const headerPayload = this.buildHeaderPayload(fileName, data.length);
-    const headerFrame = modulate(
-      {
-        type: 0x01,
-        seqNum: 0,
-        totalFrames,
-        crc: 0,
-      },
-      headerPayload,
-    );
-    for (let r = 0; r < repeats; r++) frameAudios.push(headerFrame);
+    const headerFrame = modulate({ type: 0x01, seqNum: 0, totalFrames, crc: 0 }, headerPayload);
+    for (let r = 0; r < repeats; r++) yield headerFrame;
 
-    // Data frames (type 0x02) — repeat 3× if diversity mode
+    // 3. Data frames (type 0x02) — repeat if diversity mode
     const dataFrames = this.splitDataIntoFrames(data);
     for (let i = 0; i < dataFrames.length; i++) {
-      const frameAudio = modulate(
-        {
-          type: 0x02,
-          seqNum: 1 + i,
-          totalFrames,
-          crc: 0,
-        },
-        dataFrames[i],
-      );
-      for (let r = 0; r < repeats; r++) frameAudios.push(frameAudio);
+      const frameAudio = modulate({ type: 0x02, seqNum: 1 + i, totalFrames, crc: 0 }, dataFrames[i]);
+      for (let r = 0; r < repeats; r++) yield frameAudio;
     }
 
-    // Tail frame (type 0x03)
+    // 4. Tail frame (type 0x03)
     const tailFrame = modulate(
-      {
-        type: 0x03,
-        seqNum: totalFrames - 1,
-        totalFrames,
-        crc: 0,
-      },
+      { type: 0x03, seqNum: totalFrames - 1, totalFrames, crc: 0 },
       new Uint8Array(PAYLOAD_DATA_SIZE),
     );
-    for (let r = 0; r < repeats; r++) frameAudios.push(tailFrame);
+    for (let r = 0; r < repeats; r++) yield tailFrame;
 
-    // 3. Add tail silence
-    frameAudios.push(new Float32Array(this.getSymbolLengthInSamples() * OFDM_TUNING.tailSilenceSymbols));
+    // 5. Trailing silence
+    yield new Float32Array(this.getSymbolLengthInSamples() * OFDM_TUNING.tailSilenceSymbols);
+  }
 
-    // 4. Concatenate all audio segments
-    const totalLen = frameAudios.reduce((a, b) => a + b.length, 0);
-    const result = new Float32Array(totalLen);
-    let offset = 0;
-    for (const seg of frameAudios) {
-      result.set(seg, offset);
-      offset += seg.length;
+  /**
+   * Stream a file transfer as a sequence of audio chunks of ≈chunkSamples each
+   * (the final chunk may be shorter). Consumes the same frameSegments layout as
+   * transmitFile but emits incrementally, so peak memory is bounded to the
+   * chunk size instead of the whole waveform. No global peak-normalize (see
+   * frameSegments); each OFDM symbol is already peak-normed to 0.95.
+   */
+  *streamChunks(fileName: string, data: Uint8Array, chunkSamples: number): Generator<Float32Array> {
+    const target = Math.max(1, Math.floor(chunkSamples));
+    let buf = new Float32Array(target);
+    let filled = 0;
+    for (const seg of this.frameSegments(fileName, data)) {
+      let segOff = 0;
+      while (segOff < seg.length) {
+        const take = Math.min(target - filled, seg.length - segOff);
+        buf.set(seg.subarray(segOff, segOff + take), filled);
+        filled += take;
+        segOff += take;
+        if (filled === target) {
+          yield buf;
+          buf = new Float32Array(target);
+          filled = 0;
+        }
+      }
     }
+    if (filled > 0) yield buf.subarray(0, filled);
+  }
 
-    // 5. Peak-normalize
-    let peak = 0;
-    for (let i = 0; i < result.length; i++) {
-      const abs = Math.abs(result[i]);
-      if (abs > peak) peak = abs;
+  /**
+   * Cheap upper-ish estimate of total samples for a streamed transfer, used to
+   * drive the progress bar. Approximate — never used for correctness.
+   */
+  estimateStreamSamples(dataLen: number): number {
+    const symLen = this.getSymbolLengthInSamples();
+    const repeats = this.cfg.diversityMode ? 3 : 1;
+    const totalFrames = this.calcFrameCount(dataLen); // header + data + tail
+    let symbolsPerFrame: number;
+    if (this.useOFDM && this.ofdmEngine) {
+      const blockCount = Math.max(1, Math.floor(this.cfg.toneCount / 4));
+      symbolsPerFrame = Math.ceil(FRAME_SIZE / blockCount);
+    } else {
+      symbolsPerFrame = (FRAME_SIZE * 8) / TONE_COUNT;
     }
-    if (peak > 1.0) {
-      const scale = 1.0 / peak;
-      for (let i = 0; i < result.length; i++) result[i] *= scale;
-    }
-
-    return result;
+    const preambleSamples =
+      this.useOFDM && this.ofdmEngine
+        ? (OFDM_TUNING.syncBurstSymbols + OFDM_TUNING.trainingSymbols) * symLen
+        : this.transmitPreamble().length;
+    const frameSamples = totalFrames * repeats * symbolsPerFrame * symLen;
+    const silence = OFDM_TUNING.tailSilenceSymbols * symLen;
+    return preambleSamples + frameSamples + silence;
   }
 
   /**

@@ -63,6 +63,66 @@ test('encodeFile emits encoded with the config given to configure (no per-call c
   }
 });
 
+test('streaming encode (start → pull* → end) reconstructs the batch waveform', () => {
+  const { svc, events } = makeService();
+  svc.handle({ type: 'configure', config: CFG });
+
+  const data = new Uint8Array(600);
+  for (let i = 0; i < data.length; i++) data[i] = (i * 29 + 7) & 0xff;
+
+  svc.handle({ type: 'encodeStreamStart', id: 7, fileName: 's.bin', data: data.slice().buffer });
+  const start = events.find((e) => e.type === 'streamStart');
+  expect(start, 'streamStart should fire').toBeDefined();
+
+  // Pull until streamEnd; collect chunk buffers.
+  const chunks: Float32Array[] = [];
+  let ended = false;
+  for (let guard = 0; guard < 100000 && !ended; guard++) {
+    const before = events.length;
+    svc.handle({ type: 'encodeStreamPull', id: 7 });
+    for (let i = before; i < events.length; i++) {
+      const ev = events[i];
+      if (ev.type === 'streamChunk' && ev.id === 7) chunks.push(new Float32Array(ev.samples));
+      if (ev.type === 'streamEnd' && ev.id === 7) ended = true;
+    }
+  }
+  expect(ended, 'streamEnd should fire').toBe(true);
+  expect(chunks.length).toBeGreaterThan(1);
+
+  // Concatenate + global peak-normalize → must equal batch transmitFile.
+  const total = chunks.reduce((a, b) => a + b.length, 0);
+  const streamed = new Float32Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    streamed.set(c, off);
+    off += c.length;
+  }
+  let peak = 0;
+  for (let i = 0; i < streamed.length; i++) peak = Math.max(peak, Math.abs(streamed[i]));
+  if (peak > 1.0) {
+    const scale = 1.0 / peak;
+    for (let i = 0; i < streamed.length; i++) streamed[i] *= scale;
+  }
+
+  const batch = new TxEngine(CFG as ConstructorParameters<typeof TxEngine>[0]).transmitFile('s.bin', data);
+  expect(streamed.length).toBe(batch.length);
+  let maxDiff = 0;
+  for (let i = 0; i < batch.length; i++) maxDiff = Math.max(maxDiff, Math.abs(batch[i] - streamed[i]));
+  expect(maxDiff).toBeLessThan(1e-6);
+});
+
+test('encodeStreamCancel stops further chunk production', () => {
+  const { svc, events } = makeService();
+  svc.handle({ type: 'configure', config: CFG });
+  const data = new Uint8Array(600);
+  svc.handle({ type: 'encodeStreamStart', id: 9, fileName: 's.bin', data: data.slice().buffer });
+  svc.handle({ type: 'encodeStreamPull', id: 9 }); // one chunk
+  svc.handle({ type: 'encodeStreamCancel', id: 9 });
+  const before = events.length;
+  svc.handle({ type: 'encodeStreamPull', id: 9 }); // stale — ignored
+  expect(events.length).toBe(before); // no new events after cancel
+});
+
 test('telemetry tick while listening reports rms, spectrum, progress', () => {
   const { svc, events } = makeService();
   svc.handle({ type: 'configure', config: CFG });
