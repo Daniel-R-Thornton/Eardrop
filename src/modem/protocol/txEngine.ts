@@ -15,10 +15,26 @@
 
 import { type ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG, ofdmSamples, OFDM_DEFAULTS, OFDM_TUNING } from '../types';
 import { generatePreamble, type PreambleConfig } from '../protocol/preamble';
-import { encodeFrame, type AtomicHeader, FRAME_SIZE, PAYLOAD_DATA_SIZE } from '../protocol/atomicFrame';
+import {
+  encodeFrame,
+  type AtomicHeader,
+  FRAME_SIZE,
+  PAYLOAD_DATA_SIZE,
+  FRAME_TYPE_HEADER,
+  FRAME_TYPE_PAYLOAD,
+  FRAME_TYPE_TAIL,
+  FRAME_TYPE_PROFILE,
+} from '../protocol/atomicFrame';
 import { BPSKModulator, type BPSKModulatorConfig } from '../modulation/BPSKModulator';
 import { OFDMEngine } from './ofdmEngine';
+import { packLinkProfile, DEFAULT_LINK_PROFILE } from '../protocol/linkProfile';
 import { dlog } from '../../lib/debug/dlog';
+
+/**
+ * Repeat count for the PROFILE frame — cheap insurance since a lost profile
+ * kills interpretation of the whole transmission (plan Phase 4).
+ */
+const PROFILE_FRAME_REPEATS = 2;
 
 
 // ─── Constants ───────────────────────────────────────
@@ -39,11 +55,17 @@ export class TxEngine {
   private ofdmEngine: OFDMEngine | null = null;
   /** Whether to use OFDM/QPSK for frame payloads */
   private useOFDM = false;
+  /**
+   * Whether to emit the link-profile frame (Phase 4). Default FALSE —
+   * live transmission is byte-identical to today unless explicitly opted in.
+   */
+  private emitLinkProfile = false;
 
-  constructor(cfg: Partial<ModemConfig> & { useOFDM?: boolean } = {}) {
+  constructor(cfg: Partial<ModemConfig> & { useOFDM?: boolean; emitLinkProfile?: boolean } = {}) {
     // Check for OFDM flag before merging into ModemConfig
     this.useOFDM = (cfg as any).useOFDM === true;
-    
+    this.emitLinkProfile = (cfg as any).emitLinkProfile === true;
+
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
     const offsets = this.cfg.musical ? [87.5, 162.5, 287.5, 487.5] : TONE_OFFSETS;
     this.toneFreqs = [
@@ -193,21 +215,36 @@ export class TxEngine {
       return this.transmitFrame(header, payload);
     };
 
+    // 1b. Link-profile frame (Phase 4, flag-gated) — sent AFTER training,
+    // BEFORE the header, always at the base rate (today's exact modulation:
+    // all-QPSK, RS t=6, 5ms CP) so it decodes before any profile is known.
+    // Sent ×2 (cheap insurance — a lost profile kills interpretation of the
+    // whole transmission). Default OFF: emits nothing, waveform unchanged.
+    if (this.emitLinkProfile) {
+      const profile = DEFAULT_LINK_PROFILE(this.cfg.toneCount);
+      const profilePayload = packLinkProfile(profile);
+      const profileFrame = modulate(
+        { type: FRAME_TYPE_PROFILE, seqNum: 0, totalFrames, crc: 0 },
+        profilePayload,
+      );
+      for (let r = 0; r < PROFILE_FRAME_REPEATS; r++) yield profileFrame;
+    }
+
     // 2. Header frame (type 0x01) — repeat if diversity mode
     const headerPayload = this.buildHeaderPayload(fileName, data.length, schemeId, origSize);
-    const headerFrame = modulate({ type: 0x01, seqNum: 0, totalFrames, crc: 0 }, headerPayload);
+    const headerFrame = modulate({ type: FRAME_TYPE_HEADER, seqNum: 0, totalFrames, crc: 0 }, headerPayload);
     for (let r = 0; r < repeats; r++) yield headerFrame;
 
     // 3. Data frames (type 0x02) — repeat if diversity mode
     const dataFrames = this.splitDataIntoFrames(data);
     for (let i = 0; i < dataFrames.length; i++) {
-      const frameAudio = modulate({ type: 0x02, seqNum: 1 + i, totalFrames, crc: 0 }, dataFrames[i]);
+      const frameAudio = modulate({ type: FRAME_TYPE_PAYLOAD, seqNum: 1 + i, totalFrames, crc: 0 }, dataFrames[i]);
       for (let r = 0; r < repeats; r++) yield frameAudio;
     }
 
     // 4. Tail frame (type 0x03)
     const tailFrame = modulate(
-      { type: 0x03, seqNum: totalFrames - 1, totalFrames, crc: 0 },
+      { type: FRAME_TYPE_TAIL, seqNum: totalFrames - 1, totalFrames, crc: 0 },
       new Uint8Array(PAYLOAD_DATA_SIZE),
     );
     for (let r = 0; r < repeats; r++) yield tailFrame;

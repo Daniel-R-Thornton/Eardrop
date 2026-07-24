@@ -47,10 +47,26 @@ export const FRAME_SIZE = SENTINEL_SIZE + BCH_HEADER_SIZE + RS_PAYLOAD_SIZE;
 
 const SENTINEL_BYTES = new Uint8Array([0xe7, 0x9f, 0xe7]);
 
+// ─── Frame type constants ────────────────────────────
+
+/** Header frame — file metadata. */
+export const FRAME_TYPE_HEADER = 0x01;
+/** Data (payload) frame. */
+export const FRAME_TYPE_PAYLOAD = 0x02;
+/** Tail frame — end-of-transmission marker. */
+export const FRAME_TYPE_TAIL = 0x03;
+/**
+ * Link-profile frame (Phase 4). Always sent at the base rate (all-QPSK,
+ * RS t=6, 5ms CP) so it decodes before any adaptive profile is known.
+ * Carries a `linkProfile.ts`-packed payload describing how the REST of the
+ * transmission is encoded (per-tone QAM map, ECC rate, CP id).
+ */
+export const FRAME_TYPE_PROFILE = 0x04;
+
 // ─── Types ───────────────────────────────────────────
 
 export interface AtomicHeader {
-  /** Block type: 0x01=HEADER, 0x02=PAYLOAD, 0x03=TAIL */
+  /** Block type: 0x01=HEADER, 0x02=PAYLOAD, 0x03=TAIL, 0x04=PROFILE */
   type: number;
   /** Sequence number (0-based) */
   seqNum: number;

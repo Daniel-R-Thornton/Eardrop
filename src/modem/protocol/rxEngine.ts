@@ -16,7 +16,17 @@
 
 import { type ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG } from '../types';
 import { PilotPLL, toneIQ, getDataToneFreqs } from '../pilot';
-import { decodeFrame, FRAME_SIZE, PAYLOAD_DATA_SIZE, RAW_HEADER_SIZE } from '../protocol/atomicFrame';
+import {
+  decodeFrame,
+  FRAME_SIZE,
+  PAYLOAD_DATA_SIZE,
+  RAW_HEADER_SIZE,
+  FRAME_TYPE_HEADER,
+  FRAME_TYPE_PAYLOAD,
+  FRAME_TYPE_TAIL,
+  FRAME_TYPE_PROFILE,
+} from '../protocol/atomicFrame';
+import { parseLinkProfile, DEFAULT_LINK_PROFILE, type LinkProfile } from '../protocol/linkProfile';
 import { SentinelScanner } from '../receiver/SentinelScanner';
 import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
 import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_SYMBOL_MS, OFDM_CP_MS, OFDM_TUNING } from '../types';
@@ -158,6 +168,15 @@ export class RxEngine {
   // Completed file
   private completedFile: ReceivedFile | null = null;
 
+  /**
+   * Phase 4: link profile learned from a decoded PROFILE (0x04) frame.
+   * Starts at (and resets to) the base default — all-QPSK, RS t=6, 5ms CP —
+   * on every new sync detection and on watchdog reset, so a receiver that
+   * never sees a profile frame (legacy TX, or a lost/corrupt profile) stays
+   * on exactly today's decoding assumptions.
+   */
+  private linkProfile: LinkProfile = DEFAULT_LINK_PROFILE(4);
+
   // Per-tone I/Q calibration references (from Gray code calibration)
   /** Reference vectors for bit=0 (ref0I/Q) and bit=1 (ref1I/Q) per tone */
   private ref0I: number[] = [1, 1, 1, 1];
@@ -206,6 +225,9 @@ export class RxEngine {
         tones: this.ofdmToneCount,
       });
     }
+
+    // Phase 4: base link profile, sized to the actual (OFDM) tone count.
+    this.linkProfile = DEFAULT_LINK_PROFILE(this.ofdmToneCount);
 
     this.scanner.onFrame = (frame: Uint8Array) => {
       dlog('RX', { scanFrame: frame.length });
@@ -327,6 +349,8 @@ export class RxEngine {
           this.ofdmFrameSeen = false;
           this.ofdmTrainingSymbols = 0;
           this.ofdmDemod!.resetTraining();
+          // Phase 4: new sync detected — reset to the base link profile.
+          this.linkProfile = DEFAULT_LINK_PROFILE(this.ofdmToneCount);
           dlog('OFDM-SYNC', { chirpHandoff: true, boundary: probe.offset, score: probe.score });
           return;
         } else {
@@ -404,6 +428,8 @@ export class RxEngine {
           this.ofdmSyncFrames = 0;
           this.ofdmTrainingSymbols = 0;
           this.ofdmDemod?.resetTraining();
+          // Phase 4: new sync detected — reset to the base link profile.
+          this.linkProfile = DEFAULT_LINK_PROFILE(this.ofdmToneCount);
 
           // Align the window grid to the TX symbol boundary. Energy detection
           // fires at an arbitrary offset; the CP only absorbs offsets within
@@ -650,6 +676,8 @@ export class RxEngine {
         this.ofdmTrainingSymbols = 0;
         this.ofdmDemod.discardMER();
         this.ofdmDemod.resetTraining();
+        // Phase 4: watchdog reset — back to the base link profile.
+        this.linkProfile = DEFAULT_LINK_PROFILE(this.ofdmToneCount);
         this.buf = [];
         this.ofdmAlignBuf = [];
         return;
@@ -972,6 +1000,8 @@ export class RxEngine {
     this.chirpDetected = false;
     this.chirpBuf = [];
     this.scanner.reset();
+    // Phase 4: back to the base link profile.
+    this.linkProfile = DEFAULT_LINK_PROFILE(this.ofdmToneCount);
   }
 
   // ─── Private ─────────────────────────────────────
@@ -1011,17 +1041,39 @@ export class RxEngine {
     if (decoded.header!.totalFrames > 0) this.totalFrames = decoded.header!.totalFrames;
 
     switch (decoded.header!.type) {
-      case 0x01: // HEADER
+      case FRAME_TYPE_HEADER:
         this.processHeader(decoded.payload);
         break;
-      case 0x02: // PAYLOAD
+      case FRAME_TYPE_PAYLOAD:
         this.processPayload(decoded.payload, decoded.header!.seqNum);
         break;
-      case 0x03: // TAIL
+      case FRAME_TYPE_TAIL:
         dlog('RX-FRAME', { tail: true, assembled: this.fileData.length, size: this.fileSize });
         this.processTail();
         break;
+      case FRAME_TYPE_PROFILE: {
+        // Phase 4: parse+store only — NOT fed to file assembly. Always
+        // handled regardless of the TX-side emit flag: a new RX may receive
+        // a profile-bearing stream from any sender. crc/ver mismatch is
+        // silently ignored (stay on current/default profile).
+        const profile = parseLinkProfile(decoded.payload);
+        if (profile) {
+          this.linkProfile = profile;
+          dlog('RX-PROFILE', { eccT: profile.eccT, cpId: profile.cpId, toneCount: profile.toneCount });
+        } else {
+          dlog('RX-PROFILE', { invalid: true }, { level: 'warn' });
+        }
+        break;
+      }
+      default:
+        // Unknown/future frame type — legacy-compatible silent drop.
+        break;
     }
+  }
+
+  /** Phase 4: current link profile (defaults until a valid PROFILE frame is seen). */
+  getLinkProfile(): LinkProfile {
+    return this.linkProfile;
   }
 
   /** Track received payload sequence numbers for diversity-mode dedup */
