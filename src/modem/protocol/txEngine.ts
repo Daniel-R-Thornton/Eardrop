@@ -27,14 +27,14 @@ import {
 } from '../protocol/atomicFrame';
 import { BPSKModulator, type BPSKModulatorConfig } from '../modulation/BPSKModulator';
 import { OFDMEngine } from './ofdmEngine';
-import { packLinkProfile, DEFAULT_LINK_PROFILE } from '../protocol/linkProfile';
+import {
+  packLinkProfile,
+  DEFAULT_LINK_PROFILE,
+  qamMapToOrders,
+  PROFILE_FRAME_REPEATS,
+  type LinkProfile,
+} from '../protocol/linkProfile';
 import { dlog } from '../../lib/debug/dlog';
-
-/**
- * Repeat count for the PROFILE frame — cheap insurance since a lost profile
- * kills interpretation of the whole transmission (plan Phase 4).
- */
-const PROFILE_FRAME_REPEATS = 2;
 
 
 // ─── Constants ───────────────────────────────────────
@@ -60,11 +60,20 @@ export class TxEngine {
    * live transmission is byte-identical to today unless explicitly opted in.
    */
   private emitLinkProfile = false;
+  /**
+   * Phase 3 per-tone qamMap (2-bit codes, see linkProfile.ts), supplied by
+   * config/bit-loading policy. Only consulted when emitLinkProfile is true;
+   * undefined ⇒ the announced (and used) profile is the all-QPSK default.
+   */
+  private qamMap: number[] | undefined;
 
-  constructor(cfg: Partial<ModemConfig> & { useOFDM?: boolean; emitLinkProfile?: boolean } = {}) {
+  constructor(
+    cfg: Partial<ModemConfig> & { useOFDM?: boolean; emitLinkProfile?: boolean; qamMap?: number[] } = {},
+  ) {
     // Check for OFDM flag before merging into ModemConfig
     this.useOFDM = (cfg as any).useOFDM === true;
     this.emitLinkProfile = (cfg as any).emitLinkProfile === true;
+    this.qamMap = (cfg as any).qamMap;
 
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
     const offsets = this.cfg.musical ? [87.5, 162.5, 287.5, 487.5] : TONE_OFFSETS;
@@ -182,6 +191,11 @@ export class TxEngine {
     origSize = data.length,
   ): Generator<Float32Array> {
     this.reset();
+    // Phase 3: always start a transmission at the base (all-QPSK) rate —
+    // preamble, training, and the profile frame are always base-rate; a
+    // previous transmission on this same engine instance may have left the
+    // OFDM engine switched to a QAM map.
+    if (this.useOFDM && this.ofdmEngine) this.ofdmEngine.resetToneOrders();
 
     // 1. Preamble: chirp (sync) + training symbols (channel est)
     if (this.useOFDM && this.ofdmEngine) {
@@ -221,13 +235,24 @@ export class TxEngine {
     // Sent ×2 (cheap insurance — a lost profile kills interpretation of the
     // whole transmission). Default OFF: emits nothing, waveform unchanged.
     if (this.emitLinkProfile) {
-      const profile = DEFAULT_LINK_PROFILE(this.cfg.toneCount);
+      const profile: LinkProfile = this.qamMap
+        ? { ...DEFAULT_LINK_PROFILE(this.cfg.toneCount), qamMap: this.qamMap }
+        : DEFAULT_LINK_PROFILE(this.cfg.toneCount);
       const profilePayload = packLinkProfile(profile);
       const profileFrame = modulate(
         { type: FRAME_TYPE_PROFILE, seqNum: 0, totalFrames, crc: 0 },
         profilePayload,
       );
       for (let r = 0; r < PROFILE_FRAME_REPEATS; r++) yield profileFrame;
+
+      // Phase 3: NOW switch the OFDM engine to the announced qamMap — after
+      // the profile itself (base-rate) but before header/data/tail, which
+      // are the frames the profile describes. This is the ONE switch point
+      // on the TX side (see plan deviation doc at the top of this file's
+      // sibling rxEngine.ts for the matching RX-side switch point).
+      if (this.useOFDM && this.ofdmEngine && this.qamMap) {
+        this.ofdmEngine.setToneOrders(qamMapToOrders(this.qamMap));
+      }
     }
 
     // 2. Header frame (type 0x01) — repeat if diversity mode

@@ -116,6 +116,17 @@ export class OFDMQPSKModulator {
    * Default (never called) is all-QPSK, which keeps generateSymbol on the
    * legacy byte-identical path. Length must match toneFrequencies.
    */
+  /**
+   * Fixed QAM-path scale (see the `qamScale` field/config doc above) — exposed
+   * so the demodulator can compute the correction ratio between the training
+   * burst's per-symbol peak-norm amplitude and this fixed scale (both are
+   * pure functions of shared config, no channel measurement needed; see
+   * OFDMQPSKDemodulator's `computeQamRefScale` doc for the derivation).
+   */
+  getQamScale(): number {
+    return this.qamScale;
+  }
+
   setToneOrders(orders: QamOrder[]): void {
     if (orders.length !== this.cfg.toneFrequencies.length) {
       throw new Error(

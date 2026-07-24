@@ -10,8 +10,10 @@
  * of bin indices.
  */
 import { toneIQ } from '../pilot';
-import { ofdmSamples, OFDM_TUNING } from '../types';
+import { ofdmSamples, OFDM_TUNING, OFDM_DEFAULTS } from '../types';
 import { dlog } from '../../lib/debug/dlog';
+import { mapSymbol, sliceSymbol, type QamOrder } from '../modulation/constellation';
+import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
 
 export interface OFDMQPSKDemodulatorConfig {
   sampleRate: number;
@@ -78,6 +80,30 @@ export class OFDMQPSKDemodulator {
   private fftSamples: number;
   private cpSamples: number;
 
+  // Per-tone bit-loading (Phase 3). Default: every tone QPSK (order 2), which
+  // keeps demodulate() on the untouched legacy hard 4-phase slicer path below
+  // — byte-identical to the pre-QAM demodulator. Only set by setToneOrders(),
+  // which rxEngine calls exactly ONCE per transmission, right after it parses
+  // the base-rate PROFILE (0x04) frame (see rxEngine.processFrame). Training
+  // and the profile frame itself are always demodulated at this default.
+  private toneOrders: QamOrder[];
+  private allQpsk = true;
+  /**
+   * Correction ratio applied to the QAM path's channel-equalized tone
+   * reading before slicing (see computeQamRefScale doc). Recomputed whenever
+   * setToneOrders() switches away from all-QPSK; irrelevant (and unused)
+   * while allQpsk is true.
+   */
+  private qamRefScale = 1;
+  /**
+   * Decision-directed tracking gain for the QAM channel-estimate tracker —
+   * deliberately separate from (and much faster than) `trackingAlpha`, which
+   * stays untouched for the QPSK path's byte-identical behavior. QAM frames
+   * are short (one atomic frame is tens of symbols), so the tracker needs to
+   * converge within the first few symbols rather than over a whole session.
+   */
+  private readonly qamTrackingAlpha = 0.15;
+
   constructor(config: OFDMQPSKDemodulatorConfig) {
     this.cfg = config;
     this.toneCount = config.toneFrequencies.length;
@@ -85,6 +111,7 @@ export class OFDMQPSKDemodulator {
     const { fftSamples, cpSamples } = ofdmSamples(config.sampleRate);
     this.fftSamples = fftSamples;
     this.cpSamples = cpSamples;
+    this.toneOrders = new Array(this.toneCount).fill(2) as QamOrder[];
     if (config.trackingAlpha !== undefined) this.trackingAlpha = config.trackingAlpha;
 
     // Initialize channel estimates to identity
@@ -210,6 +237,72 @@ export class OFDMQPSKDemodulator {
   }
 
   /**
+   * Per-tone bit-loading (Phase 3): assign each tone's constellation order
+   * for demodulation. Default (never called) is all-QPSK, which keeps
+   * demodulate() on the legacy byte-identical hard-slicer path. Called
+   * exactly once per transmission by rxEngine, right after a base-rate
+   * PROFILE frame is parsed — see the class-level doc.
+   */
+  setToneOrders(orders: QamOrder[]): void {
+    if (orders.length !== this.toneCount) {
+      throw new Error(`Expected ${this.toneCount} tone orders, got ${orders.length}`);
+    }
+    this.toneOrders = orders.slice();
+    this.allQpsk = orders.every((o) => o === 2);
+    if (!this.allQpsk) {
+      this.qamRefScale = this.computeQamRefScale();
+    }
+  }
+
+  /**
+   * Derives the correction ratio between the training burst's amplitude and
+   * the QAM data path's fixed amplitude — both TX scales are deterministic
+   * functions of shared config, not of the channel, so this needs no live
+   * measurement.
+   *
+   * Why a ratio is needed at all: per the plan's architecture, the training
+   * burst is ALWAYS synthesized via the legacy all-QPSK path (OFDMQPSKModulator
+   * .synthesizeQpsk), which peak-normalizes each symbol to 0.95 — call that
+   * per-symbol scale S0 (deterministic, since every training symbol is the
+   * same all-zero pattern). QAM data symbols use a different, FIXED scale
+   * (OFDMQPSKModulator.qamScale, see 3a) that is NOT equal to S0. The trained
+   * `channelEstRe/Im` therefore encodes (channel gain × S0), while a raw QAM
+   * tone reading encodes (channel gain × qamScale × point). Dividing the two
+   * directly leaves a residual (qamScale / S0) factor that must be corrected
+   * before the result can be compared against the constellation's designed
+   * (unit mean-power) scale.
+   *
+   * Derivation (toneIQ() is a linear matched filter: for x(n)=A·sin/cos(wn),
+   * it returns (i,q) = A·(∓0.5·[sin coeff], ±0.5·[cos coeff]) — a fixed,
+   * tone-independent 0.5 gain):
+   *   - Training tone (x(n)=1·sin(wn), scaled by the global S0): clean (no
+   *     channel) measurement = (0.5·S0, 0) — real, same for every tone.
+   *   - A QAM point (re,im) synthesized as re·cos(wn) − im·sin(wn), scaled
+   *     by qamScale: clean measurement = qamScale·(−0.5·im, 0.5·re).
+   *   - So: (re,im) = (2·q, −2·i) recovers the point from a CLEAN (channel-
+   *     free) measurement of scale 1; with channel + S0/qamScale scaling
+   *     folded in, the correction factor to apply before that 2·/−2· step is
+   *     κ = |clean training tone reading| / qamScale — computed here via a
+   *     throwaway modulator (same config as the real training burst) so no
+   *     channel or noise ever enters the calculation.
+   */
+  private computeQamRefScale(): number {
+    const shadow = new OFDMQPSKModulator({
+      sampleRate: this.cfg.sampleRate,
+      toneFrequencies: this.cfg.toneFrequencies,
+      pilotFreqHz: this.cfg.pilotFreqHz,
+      pilotAmplitude: OFDM_DEFAULTS.pilotAmplitude,
+    });
+    shadow.setSymbols(new Array(this.toneCount).fill(0));
+    const trainSym = shadow.generateSymbol();
+    const body = trainSym.slice(this.cpSamples, this.cpSamples + this.fftSamples);
+    const { toneRe, toneIm } = this.analyze(body);
+    const refAmp = Math.hypot(toneRe[0], toneIm[0]); // identical for every tone by construction
+    const qamScale = shadow.getQamScale();
+    return refAmp > 0 && qamScale > 0 ? refAmp / qamScale : 1;
+  }
+
+  /**
    * Analyze a window: toneIQ per tone + pilot.
    */
   private analyze(window: Float32Array): {
@@ -298,87 +391,187 @@ export class OFDMQPSKDemodulator {
       // quantization noise. Tone tracking below is sufficient.
 
 
-      for (let t = 0; t < this.toneCount; t++) {
-        const chPhase = Math.atan2(this.channelEstIm[t], this.channelEstRe[t]);
-        const toneCorr = -chPhase - driftPerHz * this.cfg.toneFrequencies[t];
-        const corrCos = Math.cos(toneCorr);
-        const corrSin = Math.sin(toneCorr);
+      if (this.allQpsk) {
+        // ── Legacy hard 4-phase slicer — UNCHANGED, byte-identical to the
+        // pre-QAM demodulator (only phase is corrected; amplitude is never a
+        // decision axis here, matching the legacy TX per-symbol peak-norm). ──
+        for (let t = 0; t < this.toneCount; t++) {
+          const chPhase = Math.atan2(this.channelEstIm[t], this.channelEstRe[t]);
+          const toneCorr = -chPhase - driftPerHz * this.cfg.toneFrequencies[t];
+          const corrCos = Math.cos(toneCorr);
+          const corrSin = Math.sin(toneCorr);
 
-        const rawRe = toneRe[t];
-        const rawIm = toneIm[t];
-        eqRe = rawRe * corrCos - rawIm * corrSin;
-        eqIm = rawRe * corrSin + rawIm * corrCos;
+          const rawRe = toneRe[t];
+          const rawIm = toneIm[t];
+          eqRe = rawRe * corrCos - rawIm * corrSin;
+          eqIm = rawRe * corrSin + rawIm * corrCos;
 
-        // ── decision-directed channel tracking (confidence-gated) ──
-        // Only update on confident decisions (within 22.5° of the nearest
-        // QPSK point) — otherwise a single noisy symbol nudges channelEst
-        // toward the wrong constellation point and, with no gate, later
-        // frames in the same burst inherit and compound that error.
-        if (this.trackingAlpha > 0) {
-          let normPh = Math.atan2(eqIm, eqRe);
-          if (normPh < 0) normPh += 2 * Math.PI;
-          const sym = Math.round(normPh / (Math.PI / 2)) % 4;
-          const nearestAngle = sym * (Math.PI / 2) + Math.PI / 4;
-          const phaseError = Math.abs(normPh - nearestAngle);
-          const wrappedError = phaseError > Math.PI ? 2 * Math.PI - phaseError : phaseError;
-          if (wrappedError < Math.PI / 8) {
-            const expRe = Math.cos(nearestAngle);
-            const expIm = Math.sin(nearestAngle);
-            const ratioRe = rawRe * expRe + rawIm * expIm;
-            const ratioIm = rawIm * expRe - rawRe * expIm;
-            this.channelEstRe[t] += this.trackingAlpha * (ratioRe - this.channelEstRe[t]);
-            this.channelEstIm[t] += this.trackingAlpha * (ratioIm - this.channelEstIm[t]);
+          // ── decision-directed channel tracking (confidence-gated) ──
+          // Only update on confident decisions (within 22.5° of the nearest
+          // QPSK point) — otherwise a single noisy symbol nudges channelEst
+          // toward the wrong constellation point and, with no gate, later
+          // frames in the same burst inherit and compound that error.
+          if (this.trackingAlpha > 0) {
+            let normPh = Math.atan2(eqIm, eqRe);
+            if (normPh < 0) normPh += 2 * Math.PI;
+            const sym = Math.round(normPh / (Math.PI / 2)) % 4;
+            const nearestAngle = sym * (Math.PI / 2) + Math.PI / 4;
+            const phaseError = Math.abs(normPh - nearestAngle);
+            const wrappedError = phaseError > Math.PI ? 2 * Math.PI - phaseError : phaseError;
+            if (wrappedError < Math.PI / 8) {
+              const expRe = Math.cos(nearestAngle);
+              const expIm = Math.sin(nearestAngle);
+              const ratioRe = rawRe * expRe + rawIm * expIm;
+              const ratioIm = rawIm * expRe - rawRe * expIm;
+              this.channelEstRe[t] += this.trackingAlpha * (ratioRe - this.channelEstRe[t]);
+              this.channelEstIm[t] += this.trackingAlpha * (ratioIm - this.channelEstIm[t]);
+            }
           }
+          // ── end tracking ──
+
+          toneIQOut.push({ i: eqRe, q: eqIm });
+
+          let normalizedPhase = Math.atan2(eqIm, eqRe);
+          if (normalizedPhase < 0) normalizedPhase += 2 * Math.PI;
+          const sym = Math.round(normalizedPhase / (Math.PI / 2)) % 4;
+
+          // ── MER/EVM accumulation (diagnostic only, staged) ──
+          // Phase-EVM: the TX peak-normalizes each OFDM symbol independently, so
+          // per-tone amplitude is not constant and QPSK decides on phase alone.
+          // Normalize each point to unit magnitude and measure its distance to
+          // the ideal unit point sym·90° — i.e. angular tightness (|err| =
+          // 2·sin(Δφ/2)). This is the "how dead-center in the quadrant" number.
+          // Lands in STAGED only — demodulate() doesn't know yet whether this
+          // window belongs to a frame that will decode successfully; the
+          // caller commits or discards the whole run via commitMER()/
+          // discardMER() once that's known.
+          const mag = Math.hypot(eqRe, eqIm);
+          if (mag > 0) {
+            const idealAngle = sym * (Math.PI / 2);
+            const eRe = eqRe / mag - Math.cos(idealAngle);
+            const eIm = eqIm / mag - Math.sin(idealAngle);
+            const errPow = eRe * eRe + eIm * eIm;
+            this.stagedErrPow += errPow;
+            this.stagedRefPow += 1; // unit reference power
+            this.stagedCount++;
+            this.stagedToneErr[t] += errPow;
+            this.stagedToneRef[t] += 1;
+          }
+          // ── end MER ──
+
+          const b0 = (sym >> 1) & 1;
+          const b1 = sym & 1;
+          bits.push(b0, b1);
+          frameBits |= b0 << (7 - t * 2);
+          frameBits |= 1 << (6 - t * 2);
         }
-        // ── end tracking ──
 
-        toneIQOut.push({ i: eqRe, q: eqIm });
+        if (this.diagCount === 0) {
+          this.diagCount++;
+          const perTone = toneIQOut
+            .map((iq, t) => {
+              let deg = (Math.atan2(iq.q, iq.i) * 180) / Math.PI;
+              if (deg < 0) deg += 360;
+              return `t${t}:${deg.toFixed(0)}°/${(bits[t * 2] << 1) | bits[t * 2 + 1]}`;
+            })
+            .join(' ');
+          dlog('OFDM-DEMOD', { firstSym: perTone });
+        }
+      } else {
+        // ── Per-tone QAM path (taken only when some tone's order > QPSK) ──
+        // Full complex equalization (phase AND magnitude) instead of the
+        // legacy phase-only correction — 16/64-QAM need amplitude as a
+        // decision axis, which only works because 3a gave the TX a fixed
+        // (not per-symbol-renormalized) amplitude. See computeQamRefScale's
+        // doc for why a fixed correction ratio is layered on top of the
+        // per-tone channel estimate. Decision-directed tracking (confidence-
+        // gated, same idea as the QPSK path above but updating the FULL
+        // complex channel estimate, not just phase) keeps channelEst from
+        // drifting relative to the fixed κ/drift correction over a long
+        // QAM-rate run — without it, 16/64-QAM's much tighter decision
+        // regions accumulate enough residual error to raise the effective
+        // symbol error rate well above what the channel's actual MER
+        // supports (phase-only tracking, as QPSK does, isn't enough once
+        // amplitude is itself a decision axis).
+        for (let t = 0; t < this.toneCount; t++) {
+          const order = this.toneOrders[t];
+          const chRe = this.channelEstRe[t];
+          const chIm = this.channelEstIm[t];
+          const chMagSq = chRe * chRe + chIm * chIm;
+          const rawRe = toneRe[t];
+          const rawIm = toneIm[t];
 
-        let normalizedPhase = Math.atan2(eqIm, eqRe);
-        if (normalizedPhase < 0) normalizedPhase += 2 * Math.PI;
-        const sym = Math.round(normalizedPhase / (Math.PI / 2)) % 4;
+          // Complex divide raw by the trained channel estimate — corrects
+          // both phase and magnitude (unlike the QPSK path above).
+          const divRe = chMagSq > 1e-12 ? (rawRe * chRe + rawIm * chIm) / chMagSq : 0;
+          const divIm = chMagSq > 1e-12 ? (rawIm * chRe - rawRe * chIm) / chMagSq : 0;
 
-        // ── MER/EVM accumulation (diagnostic only, staged) ──
-        // Phase-EVM: the TX peak-normalizes each OFDM symbol independently, so
-        // per-tone amplitude is not constant and QPSK decides on phase alone.
-        // Normalize each point to unit magnitude and measure its distance to
-        // the ideal unit point sym·90° — i.e. angular tightness (|err| =
-        // 2·sin(Δφ/2)). This is the "how dead-center in the quadrant" number.
-        // Lands in STAGED only — demodulate() doesn't know yet whether this
-        // window belongs to a frame that will decode successfully; the
-        // caller commits or discards the whole run via commitMER()/
-        // discardMER() once that's known.
-        const mag = Math.hypot(eqRe, eqIm);
-        if (mag > 0) {
-          const idealAngle = sym * (Math.PI / 2);
-          const eRe = eqRe / mag - Math.cos(idealAngle);
-          const eIm = eqIm / mag - Math.sin(idealAngle);
+          // Extra pilot-drift rotation beyond the trained snapshot (phase
+          // only — drift is a timing artifact, not a per-tone gain change).
+          const extraAngle = -driftPerHz * this.cfg.toneFrequencies[t];
+          const cosE = Math.cos(extraAngle);
+          const sinE = Math.sin(extraAngle);
+          const rotRe = divRe * cosE - divIm * sinE;
+          const rotIm = divRe * sinE + divIm * cosE;
+
+          // Correct the residual training-scale-vs-qamScale ratio (see
+          // computeQamRefScale), then undo the fixed rotation/scale baked
+          // into the re·cos − im·sin synthesis + toneIQ(sin,cos) convention:
+          // a clean (re,im) point measures as (i,q) = (−0.5·im, 0.5·re), so
+          // (re,im) = (2·q, −2·i) recovers it.
+          const iCorr = rotRe * this.qamRefScale;
+          const qCorr = rotIm * this.qamRefScale;
+          const re = 2 * qCorr;
+          const im = -2 * iCorr;
+
+          toneIQOut.push({ i: re, q: im });
+
+          const symBits = sliceSymbol(re, im, order);
+          for (let b = order - 1; b >= 0; b--) bits.push((symBits >> b) & 1);
+
+          // ── MER/EVM (diagnostic only, staged) — QAM tones compare against
+          // the actual nearest constellation point (no unit-magnitude
+          // normalization: amplitude is a real decision axis here). ──
+          const ideal = mapSymbol(symBits, order);
+          const eRe = re - ideal.re;
+          const eIm = im - ideal.im;
           const errPow = eRe * eRe + eIm * eIm;
+          const refPow = ideal.re * ideal.re + ideal.im * ideal.im;
           this.stagedErrPow += errPow;
-          this.stagedRefPow += 1; // unit reference power
+          this.stagedRefPow += refPow;
           this.stagedCount++;
           this.stagedToneErr[t] += errPow;
-          this.stagedToneRef[t] += 1;
+          this.stagedToneRef[t] += refPow;
+
+          // ── decision-directed FULL channel tracking (confidence-gated) ──
+          // Only update on confident decisions (error small relative to the
+          // point's own power) — reconstruct what `div` (the pre-κ, pre-
+          // rotation equalized value) SHOULD have been for the sliced
+          // `ideal` point, then channelEstImplied = raw / expectedDiv gives
+          // a fresh complex channel estimate directly from this symbol,
+          // independent of the current one — blended in with a leaky
+          // integrator exactly like the QPSK tracker above.
+          if (refPow > 0 && errPow / refPow < 0.09) {
+            const i0 = -ideal.im / 2;
+            const q0 = ideal.re / 2;
+            const expRotRe = i0 / this.qamRefScale;
+            const expRotIm = q0 / this.qamRefScale;
+            // Undo the drift rotation (inverse of the forward rotRe/rotIm step).
+            const expDivRe = expRotRe * cosE + expRotIm * sinE;
+            const expDivIm = expRotIm * cosE - expRotRe * sinE;
+            const expDivMagSq = expDivRe * expDivRe + expDivIm * expDivIm;
+            if (expDivMagSq > 1e-12) {
+              const impliedRe = (rawRe * expDivRe + rawIm * expDivIm) / expDivMagSq;
+              const impliedIm = (rawIm * expDivRe - rawRe * expDivIm) / expDivMagSq;
+              this.channelEstRe[t] += this.qamTrackingAlpha * (impliedRe - this.channelEstRe[t]);
+              this.channelEstIm[t] += this.qamTrackingAlpha * (impliedIm - this.channelEstIm[t]);
+            }
+          }
+          // ── end tracking ──
         }
-        // ── end MER ──
-
-        const b0 = (sym >> 1) & 1;
-        const b1 = sym & 1;
-        bits.push(b0, b1);
-        frameBits |= b0 << (7 - t * 2);
-        frameBits |= 1 << (6 - t * 2);
-      }
-
-      if (this.diagCount === 0) {
-        this.diagCount++;
-        const perTone = toneIQOut
-          .map((iq, t) => {
-            let deg = (Math.atan2(iq.q, iq.i) * 180) / Math.PI;
-            if (deg < 0) deg += 360;
-            return `t${t}:${deg.toFixed(0)}°/${(bits[t * 2] << 1) | bits[t * 2 + 1]}`;
-          })
-          .join(' ');
-        dlog('OFDM-DEMOD', { firstSym: perTone });
+        // frameBits has no meaningful generic encoding across mixed tone
+        // orders — the caller (rxEngine) uses `bits` directly for the QAM
+        // path instead of the QPSK-only nibble-lane frameBits byte.
       }
     } else {
       // Fallback: pilot-phase correction (same for all tones)

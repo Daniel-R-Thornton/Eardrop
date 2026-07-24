@@ -135,3 +135,8 @@ export function sliceSymbol(re: number, im: number, order: QamOrder): number {
 export function qamMapValueToOrder(value: 0 | 1 | 2): QamOrder {
   return value === 0 ? 2 : value === 1 ? 4 : 6;
 }
+
+/** Inverse of qamMapValueToOrder: bits-per-tone order → Phase-4 profile qamMap value. */
+export function orderToQamMapValue(order: QamOrder): 0 | 1 | 2 {
+  return order === 2 ? 0 : order === 4 ? 1 : 2;
+}

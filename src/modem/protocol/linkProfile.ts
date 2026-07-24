@@ -16,9 +16,24 @@
 
 import { crc32 } from '../../crc32';
 import { PAYLOAD_DATA_SIZE } from './atomicFrame';
+import {
+  qamMapValueToOrder,
+  orderToQamMapValue,
+  type QamOrder as ConstellationQamOrder,
+} from '../modulation/constellation';
 
 /** Current profile payload version. */
 export const LINK_PROFILE_VERSION = 1;
+
+/**
+ * Repeat count for the PROFILE frame on the wire — cheap insurance since a
+ * lost profile kills interpretation of the whole transmission. Shared
+ * between txEngine (how many copies to send) and rxEngine (how many valid
+ * decodes to wait for before switching demod tone orders — see rxEngine's
+ * FRAME_TYPE_PROFILE handling doc: RX must not switch mid-repeat, since
+ * every copy is transmitted at the base rate).
+ */
+export const PROFILE_FRAME_REPEATS = 2;
 
 /** QAM order per tone, as carried in the 2-bit qamMap. */
 export enum QamOrder {
@@ -136,4 +151,23 @@ export function parseLinkProfile(payload: Uint8Array): LinkProfile | null {
   }
 
   return { ver, flags, eccT, cpId, toneCount, qamMap };
+}
+
+/**
+ * Convert a profile's 2-bit-per-tone `qamMap` (0=QPSK/1=16QAM/2=64QAM, 3=
+ * reserved) into the bits-per-tone `QamOrder[]` the modulator/demodulator
+ * use. Value 3 (reserved, never emitted by packLinkProfile) safely falls
+ * back to QPSK rather than throwing — a forward-compat guard for a field
+ * that's currently unused.
+ */
+export function qamMapToOrders(qamMap: number[]): ConstellationQamOrder[] {
+  return qamMap.map((v) => {
+    const code = (v & 0x3) as 0 | 1 | 2 | 3;
+    return code === 3 ? 2 : qamMapValueToOrder(code);
+  });
+}
+
+/** Inverse of qamMapToOrders: bits-per-tone orders → 2-bit-per-tone qamMap values. */
+export function ordersToQamMap(orders: ConstellationQamOrder[]): number[] {
+  return orders.map(orderToQamMapValue);
 }

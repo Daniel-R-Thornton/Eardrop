@@ -26,9 +26,16 @@ import {
   FRAME_TYPE_TAIL,
   FRAME_TYPE_PROFILE,
 } from '../protocol/atomicFrame';
-import { parseLinkProfile, DEFAULT_LINK_PROFILE, type LinkProfile } from '../protocol/linkProfile';
+import {
+  parseLinkProfile,
+  DEFAULT_LINK_PROFILE,
+  qamMapToOrders,
+  PROFILE_FRAME_REPEATS,
+  type LinkProfile,
+} from '../protocol/linkProfile';
 import { SentinelScanner } from '../receiver/SentinelScanner';
 import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
+import type { QamOrder } from '../modulation/constellation';
 import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_SYMBOL_MS, OFDM_CP_MS, OFDM_TUNING } from '../types';
 import { generateChirp, chirpCorrelate, type ChirpConfig } from './chirp';
 import { dlog } from '../../lib/debug/dlog';
@@ -177,6 +184,44 @@ export class RxEngine {
    */
   private linkProfile: LinkProfile = DEFAULT_LINK_PROFILE(4);
 
+  /**
+   * Phase 3 deviation from the plan (documented here — the single place RX
+   * switches rate): the plan says "header at base rate," but RX only
+   * discovers frame boundaries AFTER assembling bytes, so it cannot switch
+   * QAM order per-frame-type mid-stream. Instead, the qamMap applies to
+   * EVERYTHING AFTER the profile frame (header + data + tail); RX switches
+   * demod tone orders ONCE, right here, immediately after a PROFILE frame
+   * parses successfully (see processFrame's FRAME_TYPE_PROFILE case). Reset
+   * to all-QPSK happens at every point linkProfile itself resets (new sync,
+   * chirp handoff, watchdog) — see resetLinkProfile().
+   */
+  private toneOrders: QamOrder[] = new Array(4).fill(2) as QamOrder[];
+  private allQpsk = true;
+  /** Generic (QAM) bit accumulator for the RX bit-serializer (see feedSample). */
+  private qamBitAcc = 0;
+  private qamBitCount = 0;
+  /**
+   * Every atomic frame is a fixed FRAME_SIZE bytes, so — for the CONSTANT
+   * toneOrders in force between one profile switch and the next — every
+   * frame spans the same number of OFDM symbols, `ceil(FRAME_SIZE*8 /
+   * bitsPerSymbol)`, with TX zero-padding the last symbol to fill it (see
+   * OFDMEngine.modulateFrameGeneric). RX must discard that same padding
+   * rather than let it bleed into the next frame's byte alignment — this
+   * counter tracks symbols-into-the-current-frame so the bit accumulator can
+   * be reset at each frame boundary (computed once at the profile switch;
+   * see processFrame's FRAME_TYPE_PROFILE case).
+   */
+  private qamSymbolsPerFrame = 0;
+  private qamSymbolCounter = 0;
+  /**
+   * Count of valid PROFILE-frame decodes seen since the last reset. TX sends
+   * PROFILE_FRAME_REPEATS identical copies, ALL at the base rate, before
+   * switching its own modulator — RX must wait for the same count before
+   * switching its demod, or it would misinterpret a later base-rate repeat
+   * as generic-rate content (see FRAME_TYPE_PROFILE handling in processFrame).
+   */
+  private profileFramesSeen = 0;
+
   // Per-tone I/Q calibration references (from Gray code calibration)
   /** Reference vectors for bit=0 (ref0I/Q) and bit=1 (ref1I/Q) per tone */
   private ref0I: number[] = [1, 1, 1, 1];
@@ -227,7 +272,7 @@ export class RxEngine {
     }
 
     // Phase 4: base link profile, sized to the actual (OFDM) tone count.
-    this.linkProfile = DEFAULT_LINK_PROFILE(this.ofdmToneCount);
+    this.resetLinkProfile();
 
     this.scanner.onFrame = (frame: Uint8Array) => {
       dlog('RX', { scanFrame: frame.length });
@@ -350,7 +395,7 @@ export class RxEngine {
           this.ofdmTrainingSymbols = 0;
           this.ofdmDemod!.resetTraining();
           // Phase 4: new sync detected — reset to the base link profile.
-          this.linkProfile = DEFAULT_LINK_PROFILE(this.ofdmToneCount);
+          this.resetLinkProfile();
           dlog('OFDM-SYNC', { chirpHandoff: true, boundary: probe.offset, score: probe.score });
           return;
         } else {
@@ -429,7 +474,7 @@ export class RxEngine {
           this.ofdmTrainingSymbols = 0;
           this.ofdmDemod?.resetTraining();
           // Phase 4: new sync detected — reset to the base link profile.
-          this.linkProfile = DEFAULT_LINK_PROFILE(this.ofdmToneCount);
+          this.resetLinkProfile();
 
           // Align the window grid to the TX symbol boundary. Energy detection
           // fires at an arbitrary offset; the CP only absorbs offsets within
@@ -677,7 +722,7 @@ export class RxEngine {
         this.ofdmDemod.discardMER();
         this.ofdmDemod.resetTraining();
         // Phase 4: watchdog reset — back to the base link profile.
-        this.linkProfile = DEFAULT_LINK_PROFILE(this.ofdmToneCount);
+        this.resetLinkProfile();
         this.buf = [];
         this.ofdmAlignBuf = [];
         return;
@@ -693,32 +738,70 @@ export class RxEngine {
         return; // Don't process bits during training
       }
 
-      // OFDM/QPSK demodulation — FFT + per-tone equalization + QPSK decode
+      // OFDM demodulation — FFT + per-tone equalization + slicing.
       const result = this.ofdmDemod.demodulate(window);
-      // Tones are grouped in 4-tone blocks; each block carries one byte
-      // (b0 lane = upper nibble, b1 lane = lower nibble — matches the BPSK
-      // frame-pair format consumed below). 8 tones → 2 bytes per symbol.
-      const blockCount = Math.max(1, Math.floor(this.ofdmToneCount / 4));
-      for (let blk = 0; blk < blockCount; blk++) {
-        let fbUpper = 0;
-        let fbLower = 0;
-        for (let j = 0; j < 4; j++) {
-          const bitIdx = (blk * 4 + j) * 2;
-          const b0 = result.bits[bitIdx] ?? 0;
-          const b1 = result.bits[bitIdx + 1] ?? 0;
-          fbUpper |= b0 << (7 - j * 2);
-          fbUpper |= 1 << (6 - j * 2);
-          fbLower |= b1 << (7 - j * 2);
-          fbLower |= 1 << (6 - j * 2);
+
+      if (this.allQpsk) {
+        // ── Legacy all-QPSK path — UNCHANGED, byte-identical to the pre-QAM
+        // receiver. Tones are grouped in 4-tone blocks; each block carries
+        // one byte (b0 lane = upper nibble, b1 lane = lower nibble — matches
+        // the BPSK frame-pair format consumed below). 8 tones → 2 bytes/symbol. ──
+        const blockCount = Math.max(1, Math.floor(this.ofdmToneCount / 4));
+        for (let blk = 0; blk < blockCount; blk++) {
+          let fbUpper = 0;
+          let fbLower = 0;
+          for (let j = 0; j < 4; j++) {
+            const bitIdx = (blk * 4 + j) * 2;
+            const b0 = result.bits[bitIdx] ?? 0;
+            const b1 = result.bits[bitIdx + 1] ?? 0;
+            fbUpper |= b0 << (7 - j * 2);
+            fbUpper |= 1 << (6 - j * 2);
+            fbLower |= b1 << (7 - j * 2);
+            fbLower |= 1 << (6 - j * 2);
+          }
+          this.bchBuf.push(fbUpper, fbLower);
+          this.bchBufCount += 2;
+          if (blk === 0) frameBits = fbUpper;
         }
-        this.bchBuf.push(fbUpper, fbLower);
-        this.bchBufCount += 2;
-        if (blk === 0) frameBits = fbUpper;
+        for (let t = 0; t < TONE_COUNT && t < result.toneIQ.length; t++) {
+          rawIQs[t] = result.toneIQ[t];
+        }
+        this.pilotAmplitude = result.pilotAmplitude;
+      } else {
+        // ── Generic per-tone bit-serializer (QAM path) — the exact inverse
+        // of OFDMEngine.modulateFrameGeneric: result.bits already carries
+        // toneOrders[t] bits per tone, tone-major, MSB-first (see
+        // OFDMQPSKDemodulator's QAM branch). Accumulate into a byte buffer
+        // and feed the scanner directly — bypassing the legacy bchBuf/
+        // frame-pair bridge entirely, since it only makes sense for the
+        // fixed 2-bits/tone QPSK layout.
+        for (let bi = 0; bi < result.bits.length; bi++) {
+          this.qamBitAcc = (this.qamBitAcc << 1) | result.bits[bi];
+          this.qamBitCount++;
+          if (this.qamBitCount === 8) {
+            this.scanner.feedByte(this.qamBitAcc & 0xff);
+            this.qamBitAcc = 0;
+            this.qamBitCount = 0;
+          }
+        }
+        // Frame-boundary reset — discard this frame's tail zero-padding
+        // before the next frame's real bytes start (see qamSymbolsPerFrame's
+        // doc). qamSymbolsPerFrame is 0 until the first profile switch sets
+        // it, so this is a no-op before that.
+        if (this.qamSymbolsPerFrame > 0) {
+          this.qamSymbolCounter++;
+          if (this.qamSymbolCounter >= this.qamSymbolsPerFrame) {
+            this.qamSymbolCounter = 0;
+            this.qamBitAcc = 0;
+            this.qamBitCount = 0;
+          }
+        }
+        for (let t = 0; t < TONE_COUNT && t < result.toneIQ.length; t++) {
+          rawIQs[t] = result.toneIQ[t];
+        }
+        this.pilotAmplitude = result.pilotAmplitude;
+        return; // bytes already fed directly — skip the legacy debug/bchBuf machinery below.
       }
-      for (let t = 0; t < TONE_COUNT && t < result.toneIQ.length; t++) {
-        rawIQs[t] = result.toneIQ[t];
-      }
-      this.pilotAmplitude = result.pilotAmplitude;
     } else {
       // ── Differential BPSK bit detection ──
       // Compare each tone's I against the PREVIOUS frame's I.
@@ -833,6 +916,25 @@ export class RxEngine {
   /** Batch entry point — behaviorally identical to per-sample feeding. */
   feedChunk(chunk: Float32Array): void {
     for (let i = 0; i < chunk.length; i++) this.feedSample(chunk[i]);
+  }
+
+  /**
+   * Reset to the base link profile — all-QPSK, RS t=6, 5ms CP — and the
+   * matching demod tone orders + generic bit accumulator. Called on every
+   * new sync detection, chirp handoff, and watchdog reset, plus RxEngine's
+   * own reset(), so a receiver that hasn't (yet, or ever) seen a valid
+   * PROFILE frame always decodes assuming exactly today's modulation.
+   */
+  private resetLinkProfile(): void {
+    this.linkProfile = DEFAULT_LINK_PROFILE(this.ofdmToneCount);
+    this.toneOrders = new Array(this.ofdmToneCount).fill(2) as QamOrder[];
+    this.allQpsk = true;
+    this.ofdmDemod?.setToneOrders(this.toneOrders);
+    this.qamBitAcc = 0;
+    this.qamBitCount = 0;
+    this.qamSymbolsPerFrame = 0;
+    this.qamSymbolCounter = 0;
+    this.profileFramesSeen = 0;
   }
 
   /** Frame-assembly progress snapshot for telemetry. */
@@ -1001,7 +1103,7 @@ export class RxEngine {
     this.chirpBuf = [];
     this.scanner.reset();
     // Phase 4: back to the base link profile.
-    this.linkProfile = DEFAULT_LINK_PROFILE(this.ofdmToneCount);
+    this.resetLinkProfile();
   }
 
   // ─── Private ─────────────────────────────────────
@@ -1057,9 +1159,39 @@ export class RxEngine {
         // a profile-bearing stream from any sender. crc/ver mismatch is
         // silently ignored (stay on current/default profile).
         const profile = parseLinkProfile(decoded.payload);
-        if (profile) {
+        if (profile && profile.toneCount === this.ofdmToneCount) {
           this.linkProfile = profile;
+          this.profileFramesSeen++;
+          // TX sends PROFILE_FRAME_REPEATS identical copies, ALL at the base
+          // rate, before switching its own modulator (see txEngine's
+          // frameSegments). RX must wait for the SAME count before switching
+          // its demod — switching after the first copy would misdemodulate
+          // the second (still base-rate, on the wire) copy with the wrong
+          // slicer. This is THE single RX-side switch point: everything
+          // after it (header, data, tail) demodulates at the announced
+          // per-tone orders until the next reset (see resetLinkProfile).
+          if (this.profileFramesSeen >= PROFILE_FRAME_REPEATS) {
+            this.toneOrders = qamMapToOrders(profile.qamMap);
+            this.allQpsk = this.toneOrders.every((o) => o === 2);
+            this.ofdmDemod?.setToneOrders(this.toneOrders);
+            // Every subsequent frame (header/data/tail) is FRAME_SIZE bytes
+            // at this same (now-fixed) rate, so it spans a constant symbol
+            // count — reset the generic bit-serializer's frame-boundary
+            // tracking (see qamSymbolsPerFrame's doc) so tail zero-padding
+            // never bleeds into the next frame's byte alignment.
+            if (this.allQpsk) {
+              this.qamSymbolsPerFrame = 0;
+            } else {
+              const bitsPerSymbol = this.toneOrders.reduce((a, b) => a + b, 0);
+              this.qamSymbolsPerFrame = Math.ceil((FRAME_SIZE * 8) / bitsPerSymbol);
+            }
+            this.qamSymbolCounter = 0;
+            this.qamBitAcc = 0;
+            this.qamBitCount = 0;
+          }
           dlog('RX-PROFILE', { eccT: profile.eccT, cpId: profile.cpId, toneCount: profile.toneCount });
+        } else if (profile) {
+          dlog('RX-PROFILE', { toneCountMismatch: true, got: profile.toneCount, want: this.ofdmToneCount }, { level: 'warn' });
         } else {
           dlog('RX-PROFILE', { invalid: true }, { level: 'warn' });
         }
