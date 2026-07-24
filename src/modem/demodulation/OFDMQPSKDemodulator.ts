@@ -48,11 +48,31 @@ export class OFDMQPSKDemodulator {
   // ── MER / EVM measurement (diagnostic only — never affects decoding) ──
   // Accumulates error power vs the ideal constellation point over a rolling
   // window of data symbols, so we can judge how much SNR headroom exists for
-  // a denser constellation (16-QAM etc.). Reset after each report.
+  // a denser constellation (16-QAM etc.).
+  //
+  // Staged/committed split: demodulate() only knows it is looking at an OFDM
+  // data symbol, not whether that symbol will end up inside a frame that
+  // decodes successfully (or silence/noise between transmissions, which is
+  // demodulated exactly the same way). So every window's stats land in the
+  // STAGED accumulators first; the caller (rxEngine) folds staged → committed
+  // via commitMER() once the frame the symbols belonged to is confirmed
+  // valid, or throws them away via discardMER() when the frame is invalid or
+  // sync is lost. getMER()/getPerToneMER() only ever read committed sums, so
+  // the reported MER can never include windows that didn't belong to a
+  // successfully-decoded frame.
+  private stagedErrPow = 0;
+  private stagedRefPow = 0;
+  private stagedCount = 0;
   private merErrPow = 0;
   private merRefPow = 0;
   private merCount = 0;
   private readonly MER_REPORT_SYMBOLS = 64;
+
+  // Per-tone staged/committed sums, same semantics as above (index = tone).
+  private stagedToneErr: number[] = [];
+  private stagedToneRef: number[] = [];
+  private toneErr: number[] = [];
+  private toneRef: number[] = [];
 
   /** Window sizes computed once from sampleRate */
   private fftSamples: number;
@@ -72,6 +92,10 @@ export class OFDMQPSKDemodulator {
     this.channelEstIm = new Array(this.toneCount).fill(0);
     this.pilotChannelEstRe = 1;
     this.pilotChannelEstIm = 0;
+    this.stagedToneErr = new Array(this.toneCount).fill(0);
+    this.stagedToneRef = new Array(this.toneCount).fill(0);
+    this.toneErr = new Array(this.toneCount).fill(0);
+    this.toneRef = new Array(this.toneCount).fill(0);
   }
 
   resetTraining(): void {
@@ -82,9 +106,69 @@ export class OFDMQPSKDemodulator {
     this.channelEstIm = new Array(this.toneCount).fill(0);
     this.pilotChannelEstRe = 1;
     this.pilotChannelEstIm = 0;
+    this.stagedErrPow = 0;
+    this.stagedRefPow = 0;
+    this.stagedCount = 0;
     this.merErrPow = 0;
     this.merRefPow = 0;
     this.merCount = 0;
+    this.stagedToneErr = new Array(this.toneCount).fill(0);
+    this.stagedToneRef = new Array(this.toneCount).fill(0);
+    this.toneErr = new Array(this.toneCount).fill(0);
+    this.toneRef = new Array(this.toneCount).fill(0);
+  }
+
+  /**
+   * Fold the current run's staged MER stats into the committed totals — call
+   * once the frame these symbols belonged to is confirmed to have decoded
+   * successfully. Emits the existing OFDM-MER dlog report once the committed
+   * total reaches MER_REPORT_SYMBOLS worth of data, then zeroes committed.
+   */
+  commitMER(): void {
+    if (this.stagedCount === 0) return;
+    this.merErrPow += this.stagedErrPow;
+    this.merRefPow += this.stagedRefPow;
+    this.merCount += this.stagedCount;
+    for (let t = 0; t < this.toneCount; t++) {
+      this.toneErr[t] += this.stagedToneErr[t];
+      this.toneRef[t] += this.stagedToneRef[t];
+    }
+    this.stagedErrPow = 0;
+    this.stagedRefPow = 0;
+    this.stagedCount = 0;
+    this.stagedToneErr = new Array(this.toneCount).fill(0);
+    this.stagedToneRef = new Array(this.toneCount).fill(0);
+
+    if (this.merCount >= this.toneCount * this.MER_REPORT_SYMBOLS) {
+      const evm = Math.sqrt(this.merErrPow / this.merRefPow);
+      const merDb = evm > 0 ? -20 * Math.log10(evm) : 99;
+      const verdict =
+        merDb >= 22 ? '64-QAM ok' : merDb >= 16 ? '16-QAM ok' : merDb >= 9 ? 'QPSK only' : 'marginal';
+      dlog('OFDM-MER', {
+        merDb: merDb.toFixed(1),
+        evmPct: (evm * 100).toFixed(1),
+        symbols: Math.round(this.merCount / this.toneCount),
+        verdict,
+      });
+      this.merErrPow = 0;
+      this.merRefPow = 0;
+      this.merCount = 0;
+      this.toneErr = new Array(this.toneCount).fill(0);
+      this.toneRef = new Array(this.toneCount).fill(0);
+    }
+  }
+
+  /**
+   * Drop the current run's staged MER stats without committing — call when
+   * the frame these symbols belonged to failed to decode, or sync was lost
+   * (watchdog reset), so noise/silence never taints the committed report.
+   */
+  discardMER(): void {
+    this.stagedErrPow = 0;
+    this.stagedRefPow = 0;
+    this.stagedCount = 0;
+    this.stagedToneErr = new Array(this.toneCount).fill(0);
+    this.stagedToneRef = new Array(this.toneCount).fill(0);
   }
 
   /**
@@ -102,6 +186,27 @@ export class OFDMQPSKDemodulator {
 
   isTraining(): boolean {
     return this.trainingSymbols < this.TRAINING_SYMBOLS;
+  }
+
+  /**
+   * Per-tone MER in dB from committed sums (same phase-EVM math as getMER(),
+   * split per tone) — needed by bit-loading to pick a constellation per tone.
+   * A tone with no committed reference power yet reports 0 dB (unknown, not
+   * "bad") rather than -Infinity.
+   */
+  getPerToneMER(): number[] {
+    return Array.from({ length: this.toneCount }, (_unused, t) => {
+      if (this.toneRef[t] === 0) return 0;
+      const evm = Math.sqrt(this.toneErr[t] / this.toneRef[t]);
+      if (evm <= 0) return 99;
+      return -20 * Math.log10(evm);
+    });
+  }
+
+  /** Trained per-tone channel magnitude (relative gain from the sync burst). */
+  getPerToneChannelMagnitude(): number[] {
+    return Array.from({ length: this.toneCount }, (_unused, t) =>
+      Math.hypot(this.channelEstRe[t], this.channelEstIm[t]));
   }
 
   /**
@@ -233,20 +338,27 @@ export class OFDMQPSKDemodulator {
         if (normalizedPhase < 0) normalizedPhase += 2 * Math.PI;
         const sym = Math.round(normalizedPhase / (Math.PI / 2)) % 4;
 
-        // ── MER/EVM accumulation (diagnostic only) ──
+        // ── MER/EVM accumulation (diagnostic only, staged) ──
         // Phase-EVM: the TX peak-normalizes each OFDM symbol independently, so
         // per-tone amplitude is not constant and QPSK decides on phase alone.
         // Normalize each point to unit magnitude and measure its distance to
         // the ideal unit point sym·90° — i.e. angular tightness (|err| =
         // 2·sin(Δφ/2)). This is the "how dead-center in the quadrant" number.
+        // Lands in STAGED only — demodulate() doesn't know yet whether this
+        // window belongs to a frame that will decode successfully; the
+        // caller commits or discards the whole run via commitMER()/
+        // discardMER() once that's known.
         const mag = Math.hypot(eqRe, eqIm);
         if (mag > 0) {
           const idealAngle = sym * (Math.PI / 2);
           const eRe = eqRe / mag - Math.cos(idealAngle);
           const eIm = eqIm / mag - Math.sin(idealAngle);
-          this.merErrPow += eRe * eRe + eIm * eIm;
-          this.merRefPow += 1; // unit reference power
-          this.merCount++;
+          const errPow = eRe * eRe + eIm * eIm;
+          this.stagedErrPow += errPow;
+          this.stagedRefPow += 1; // unit reference power
+          this.stagedCount++;
+          this.stagedToneErr[t] += errPow;
+          this.stagedToneRef[t] += 1;
         }
         // ── end MER ──
 
@@ -255,23 +367,6 @@ export class OFDMQPSKDemodulator {
         bits.push(b0, b1);
         frameBits |= b0 << (7 - t * 2);
         frameBits |= 1 << (6 - t * 2);
-      }
-
-      // Rolling MER report every MER_REPORT_SYMBOLS data symbols.
-      if (this.merCount >= this.toneCount * this.MER_REPORT_SYMBOLS) {
-        const evm = Math.sqrt(this.merErrPow / this.merRefPow);
-        const merDb = evm > 0 ? -20 * Math.log10(evm) : 99;
-        const verdict =
-          merDb >= 22 ? '64-QAM ok' : merDb >= 16 ? '16-QAM ok' : merDb >= 9 ? 'QPSK only' : 'marginal';
-        dlog('OFDM-MER', {
-          merDb: merDb.toFixed(1),
-          evmPct: (evm * 100).toFixed(1),
-          symbols: Math.round(this.merCount / this.toneCount),
-          verdict,
-        });
-        this.merErrPow = 0;
-        this.merRefPow = 0;
-        this.merCount = 0;
       }
 
       if (this.diagCount === 0) {

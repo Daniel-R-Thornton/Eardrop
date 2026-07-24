@@ -639,6 +639,7 @@ export class RxEngine {
         this.ofdmSyncFrames = 0;
         this.ofdmNoiseEma = this.OFDM_EMA_SEED;
         this.ofdmTrainingSymbols = 0;
+        this.ofdmDemod.discardMER();
         this.ofdmDemod.resetTraining();
         this.buf = [];
         this.ofdmAlignBuf = [];
@@ -989,6 +990,13 @@ export class RxEngine {
       seq: decoded.header?.seqNum ?? -1,
       len: decoded.payload?.length ?? 0,
     });
+    // Gate MER accumulation to windows that belong to a successfully-decoded
+    // frame — commit the staged stats on success, throw them away on failure,
+    // so the "how much SNR headroom exists" number never includes garbage
+    // demodulated during inter-send silence or a corrupt frame.
+    if (decoded.valid) this.ofdmDemod?.commitMER();
+    else this.ofdmDemod?.discardMER();
+
     if (!decoded.valid) return;
 
     if (decoded.header!.totalFrames > 0) this.totalFrames = decoded.header!.totalFrames;
