@@ -45,6 +45,15 @@ export class OFDMQPSKDemodulator {
   /** Leaky-integrator gain for per-symbol channel tracking (0 = off) */
   private trackingAlpha: number = 0.003;
 
+  // ── MER / EVM measurement (diagnostic only — never affects decoding) ──
+  // Accumulates error power vs the ideal constellation point over a rolling
+  // window of data symbols, so we can judge how much SNR headroom exists for
+  // a denser constellation (16-QAM etc.). Reset after each report.
+  private merErrPow = 0;
+  private merRefPow = 0;
+  private merCount = 0;
+  private readonly MER_REPORT_SYMBOLS = 64;
+
   /** Window sizes computed once from sampleRate */
   private fftSamples: number;
   private cpSamples: number;
@@ -73,6 +82,22 @@ export class OFDMQPSKDemodulator {
     this.channelEstIm = new Array(this.toneCount).fill(0);
     this.pilotChannelEstRe = 1;
     this.pilotChannelEstIm = 0;
+    this.merErrPow = 0;
+    this.merRefPow = 0;
+    this.merCount = 0;
+  }
+
+  /**
+   * Current rolling MER (modulation error ratio) in dB and EVM as a fraction,
+   * measured over the data symbols seen since the last report. Higher MER =
+   * tighter constellation = more headroom for a denser scheme. Returns null
+   * until enough symbols have accumulated.
+   */
+  getMER(): { merDb: number; evm: number; symbols: number } | null {
+    if (this.merCount === 0 || this.merRefPow === 0) return null;
+    const evm = Math.sqrt(this.merErrPow / this.merRefPow);
+    const merDb = evm > 0 ? -20 * Math.log10(evm) : 99;
+    return { merDb, evm, symbols: Math.round(this.merCount / this.toneCount) };
   }
 
   isTraining(): boolean {
@@ -208,11 +233,45 @@ export class OFDMQPSKDemodulator {
         if (normalizedPhase < 0) normalizedPhase += 2 * Math.PI;
         const sym = Math.round(normalizedPhase / (Math.PI / 2)) % 4;
 
+        // ── MER/EVM accumulation (diagnostic only) ──
+        // Phase-EVM: the TX peak-normalizes each OFDM symbol independently, so
+        // per-tone amplitude is not constant and QPSK decides on phase alone.
+        // Normalize each point to unit magnitude and measure its distance to
+        // the ideal unit point sym·90° — i.e. angular tightness (|err| =
+        // 2·sin(Δφ/2)). This is the "how dead-center in the quadrant" number.
+        const mag = Math.hypot(eqRe, eqIm);
+        if (mag > 0) {
+          const idealAngle = sym * (Math.PI / 2);
+          const eRe = eqRe / mag - Math.cos(idealAngle);
+          const eIm = eqIm / mag - Math.sin(idealAngle);
+          this.merErrPow += eRe * eRe + eIm * eIm;
+          this.merRefPow += 1; // unit reference power
+          this.merCount++;
+        }
+        // ── end MER ──
+
         const b0 = (sym >> 1) & 1;
         const b1 = sym & 1;
         bits.push(b0, b1);
         frameBits |= b0 << (7 - t * 2);
         frameBits |= 1 << (6 - t * 2);
+      }
+
+      // Rolling MER report every MER_REPORT_SYMBOLS data symbols.
+      if (this.merCount >= this.toneCount * this.MER_REPORT_SYMBOLS) {
+        const evm = Math.sqrt(this.merErrPow / this.merRefPow);
+        const merDb = evm > 0 ? -20 * Math.log10(evm) : 99;
+        const verdict =
+          merDb >= 22 ? '64-QAM ok' : merDb >= 16 ? '16-QAM ok' : merDb >= 9 ? 'QPSK only' : 'marginal';
+        dlog('OFDM-MER', {
+          merDb: merDb.toFixed(1),
+          evmPct: (evm * 100).toFixed(1),
+          symbols: Math.round(this.merCount / this.toneCount),
+          verdict,
+        });
+        this.merErrPow = 0;
+        this.merRefPow = 0;
+        this.merCount = 0;
       }
 
       if (this.diagCount === 0) {
