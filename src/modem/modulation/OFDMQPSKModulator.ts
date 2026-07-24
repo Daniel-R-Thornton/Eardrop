@@ -7,7 +7,7 @@
  * is the tail of the window copied to the front, exactly as before.
  */
 import { ofdmSamples } from '../types';
-import { MAX_QAM_MAGNITUDE, mapSymbol, type QamOrder } from './constellation';
+import { mapSymbol, type QamOrder } from './constellation';
 
 export interface OFDMQPSKModulatorConfig {
   sampleRate: number;
@@ -73,19 +73,23 @@ export class OFDMQPSKModulator {
     this.allQpsk = true;
     this.symRe = new Float32Array(numTones);
     this.symIm = new Float32Array(numTones);
-    // Fixed QAM-path scale: bound the worst case where every tone lands on
-    // its largest QAM corner point (MAX_QAM_MAGNITUDE, from the 64-QAM
-    // corner) fully in-phase, plus the pilot, then back off to a 0.95 peak.
-    // This is a hard worst-case bound, not a measured-PAPR estimate — actual
-    // multitone peaks are far below full alignment almost always (the CLT
-    // sum-of-random-phases result), so real symbols will sit well under 0.95
-    // peak on average. That's an intentional, documented loudness trade —
-    // amplitude STABILITY across symbols (a fixed scale) is the requirement
-    // here, not peak loudness; hardware-tuning a tighter back-off constant is
-    // left for later per the plan.
-    this.qamScale =
-      config.qamScaleOverride ??
-      0.95 / (numTones * MAX_QAM_MAGNITUDE + config.pilotAmplitude);
+    // Fixed QAM-path scale (stable across symbols — the requirement for
+    // amplitude to be a usable decision axis; the demod derives its reference
+    // from this same value so raising it is safe).
+    //
+    // PAPR back-off, not the worst case: an OFDM symbol is a sum of N
+    // independent tones, so by the CLT its peak sits at ~CREST·RMS, far below
+    // the all-tones-aligned worst case. Targeting the worst case made QAM data
+    // ~2.5× quieter than the per-symbol-normalized QPSK preamble → after the
+    // player normalizes the whole signal to the loud preamble, the QAM data
+    // lost ~8 dB of SNR and failed to decode even on a pristine link. Instead
+    // target a high-percentile peak at 0.95: RMS = sqrt(Σ tone power + pilot²)
+    // (constellation is unit average power), peak ≈ CREST·RMS. CREST=3.5
+    // (~11 dB) covers ~99.9% of symbols; the rare over-peak clips harmlessly.
+    // This makes QAM data as loud as QPSK so its SNR is fair.
+    const CREST = 3.5;
+    const rms = Math.sqrt(numTones + config.pilotAmplitude * config.pilotAmplitude);
+    this.qamScale = config.qamScaleOverride ?? 0.95 / (CREST * rms);
 
     const twoPiOverFs = (2 * Math.PI) / config.sampleRate;
     this.sinTable = new Array(numTones);
