@@ -1075,6 +1075,7 @@ export class RxEngine {
     this.fileData = [];
     this.framesReceived = 0;
     this.receivedPayloadSeqs = new Set();
+    dlog('RX-COMP', { scheme: schemeId, wire: totalSize, orig: origSize });
   }
 
   private processPayload(payload: Uint8Array, seqNum: number): void {
@@ -1118,6 +1119,7 @@ export class RxEngine {
         const restored = decompress(wireData, this.fileSchemeId);
         data = restored;
         totalBytes = this.fileOrigSize || restored.length;
+        dlog('RX-COMP', { scheme: this.fileSchemeId, wire: wireData.length, decompressed: totalBytes });
       } catch (err) {
         dlog('RX-FRAME', { decompressError: (err as Error).message });
       }

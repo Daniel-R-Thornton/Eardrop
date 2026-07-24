@@ -8,6 +8,7 @@ import { captureTransmit } from '../modem/protocol/txCapture';
 import { toneIQ } from '../modem/pilot';
 import { DEFAULT_CONFIG, ofdmToneFrequencies, type ModemConfig } from '../modem/types';
 import { compress, detect } from '../modem/compression';
+import { dlog } from '../lib/debug/dlog';
 import type { ModemCommand, ModemEvent, ModemTelemetry } from './modemSchema';
 
 const RING_SECONDS = 10;
@@ -82,6 +83,13 @@ export class ModemService {
           const rawData = new Uint8Array(cmd.data);
           const scheme = detect(cmd.fileName, rawData);
           const { bytes: wireData, scheme: schemeId } = compress(rawData, scheme);
+          dlog('TX-COMP', {
+            scheme: schemeId,
+            raw: rawData.length,
+            wire: wireData.length,
+            ratio: rawData.length ? (wireData.length / rawData.length).toFixed(2) : '1.00',
+            saved: rawData.length - wireData.length,
+          });
           const samples = tx.transmitFile(cmd.fileName, wireData, schemeId, rawData.length);
           this.emit(
             { type: 'encoded', id: cmd.id, samples: samples.buffer as ArrayBuffer, sampleRate: this.config.sampleRate },
@@ -99,6 +107,13 @@ export class ModemService {
           const rawData = new Uint8Array(cmd.data);
           const scheme = detect(cmd.fileName, rawData);
           const { bytes: wireData, scheme: schemeId } = compress(rawData, scheme);
+          dlog('TX-COMP', {
+            scheme: schemeId,
+            raw: rawData.length,
+            wire: wireData.length,
+            ratio: rawData.length ? (wireData.length / rawData.length).toFixed(2) : '1.00',
+            saved: rawData.length - wireData.length,
+          });
           const totalSamples = tx.estimateStreamSamples(wireData.length);
           this.stream = {
             id: cmd.id,
