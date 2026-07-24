@@ -9,7 +9,7 @@
  * restores the exact original bytes.
  */
 import { expect, test, describe } from 'vitest';
-import { compress, decompress, detect, SCHEME } from '../compression';
+import { compress, decompress, detect, SCHEME, compressBest, decompressScheme, gzipBytes, gunzipBytes } from '../compression';
 import { ModemService } from '../../workers/modemService';
 import type { ModemEvent } from '../../workers/modemSchema';
 import { DEFAULT_CONFIG, ofdmSamples } from '../types';
@@ -182,6 +182,35 @@ describe('detect()', () => {
   });
 });
 
+// ─── gzip (the real workhorse) ──────────────────────────────────────────
+describe('gzip codec', () => {
+  test('gzip round-trips arbitrary bytes exactly', async () => {
+    const rng = mulberry32(3);
+    for (const n of [0, 1, 200, 5000]) {
+      const data = randomBytes(rng, n);
+      const restored = await gunzipBytes(await gzipBytes(data));
+      expect(Array.from(restored)).toEqual(Array.from(data));
+    }
+  });
+
+  test('compressBest picks GZIP and shrinks repetitive text, byte-exact restore', async () => {
+    const data = new TextEncoder().encode('{"k":"v"},'.repeat(500));
+    const { bytes, scheme } = await compressBest(data, 'x.json');
+    expect(scheme).toBe(SCHEME.GZIP);
+    expect(bytes.length).toBeLessThan(data.length / 3);
+    const restored = await decompressScheme(bytes, scheme);
+    expect(Array.from(restored)).toEqual(Array.from(data));
+  });
+
+  test('compressBest falls back to raw on incompressible data', async () => {
+    const rng = mulberry32(9);
+    const data = randomBytes(rng, 500);
+    const { bytes, scheme } = await compressBest(data, 'blob.bin');
+    expect(scheme).toBe(SCHEME.RAW);
+    expect(bytes.length).toBeLessThanOrEqual(data.length);
+  });
+});
+
 // ─── End-to-end: header carries schemeId+origSize, RX restores exact bytes ──
 
 const SAMPLE_RATE = 48000;
@@ -193,13 +222,17 @@ const CFG = {
   useOFDM: true,
 };
 
-function runThroughModemService(fileName: string, data: Uint8Array): ModemEvent[] {
+// gzip compression + file-complete decompression are async in the service.
+const flush = () => new Promise((r) => setTimeout(r, 20));
+
+async function runThroughModemService(fileName: string, data: Uint8Array): Promise<ModemEvent[]> {
   const events: ModemEvent[] = [];
   const svc = new ModemService((ev) => events.push(ev));
   svc.handle({ type: 'configure', config: CFG });
   svc.handle({ type: 'startRx' });
 
   svc.handle({ type: 'encodeFile', id: 1, fileName, data: data.buffer as ArrayBuffer });
+  await flush(); // encode runs after async compression
   const encoded = events.find((e) => e.type === 'encoded');
   if (!encoded || encoded.type !== 'encoded') throw new Error('encode failed');
   const audio = new Float32Array(encoded.samples);
@@ -213,11 +246,12 @@ function runThroughModemService(fileName: string, data: Uint8Array): ModemEvent[
     svc.handle({ type: 'feedChunk', samples: chunk.buffer as ArrayBuffer });
     svc.tick();
   }
+  await flush(); // fileComplete emitted after async decompression
   return events;
 }
 
 describe('modemService end-to-end: compression header carriage', () => {
-  test('compressible JSON payload round-trips byte-exact through encode -> RX -> decompress', () => {
+  test('compressible JSON payload round-trips byte-exact through encode -> RX -> decompress', async () => {
     const records = Array.from({ length: 20 }, (_, i) => ({
       id: i,
       name: `n${i}`,
@@ -227,14 +261,13 @@ describe('modemService end-to-end: compression header carriage', () => {
     const json = JSON.stringify(records);
     const data = new TextEncoder().encode(json);
 
-    // Sanity: this payload really is detected + compressed (proves the
-    // header will actually carry a non-zero schemeId for this test).
-    const scheme = detect('data.json', data);
-    expect(scheme).toBe(SCHEME.JSON);
-    const { scheme: usedScheme } = compress(data, scheme);
-    expect(usedScheme).not.toBe(SCHEME.RAW);
+    // Sanity: this payload really is compressed (proves the header will carry
+    // a non-zero schemeId for this test).
+    const { scheme: usedScheme, bytes } = await compressBest(data, 'data.json');
+    expect(usedScheme).toBe(SCHEME.GZIP);
+    expect(bytes.length).toBeLessThan(data.length);
 
-    const events = runThroughModemService('data.json', data);
+    const events = await runThroughModemService('data.json', data);
     const done = events.find((e) => e.type === 'fileComplete');
     expect(done, 'fileComplete event should fire').toBeDefined();
     if (done && done.type === 'fileComplete') {
@@ -243,10 +276,10 @@ describe('modemService end-to-end: compression header carriage', () => {
     }
   });
 
-  test('incompressible binary payload still round-trips (raw fallback path)', () => {
+  test('incompressible binary payload still round-trips (raw fallback path)', async () => {
     const rng = mulberry32(7);
     const data = randomBytes(rng, 150);
-    const events = runThroughModemService('blob.bin', data);
+    const events = await runThroughModemService('blob.bin', data);
     const done = events.find((e) => e.type === 'fileComplete');
     expect(done).toBeDefined();
     if (done && done.type === 'fileComplete') {

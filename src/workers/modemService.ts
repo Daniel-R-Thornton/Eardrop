@@ -7,7 +7,7 @@ import { TxEngine } from '../modem/protocol/txEngine';
 import { captureTransmit } from '../modem/protocol/txCapture';
 import { toneIQ } from '../modem/pilot';
 import { DEFAULT_CONFIG, ofdmToneFrequencies, type ModemConfig } from '../modem/types';
-import { compress, detect } from '../modem/compression';
+import { compressBest, decompressScheme } from '../modem/compression';
 import { dlog } from '../lib/debug/dlog';
 import type { ModemCommand, ModemEvent, ModemTelemetry } from './modemSchema';
 
@@ -77,59 +77,11 @@ export class ModemService {
         break;
       }
       case 'encodeFile': {
-        if (!this.config) { this.emit({ type: 'error', id: cmd.id, error: 'encodeFile before configure' }); return; }
-        try {
-          const tx = new TxEngine(this.config as ConstructorParameters<typeof TxEngine>[0]);
-          const rawData = new Uint8Array(cmd.data);
-          const scheme = detect(cmd.fileName, rawData);
-          const { bytes: wireData, scheme: schemeId } = compress(rawData, scheme);
-          dlog('TX-COMP', {
-            scheme: schemeId,
-            raw: rawData.length,
-            wire: wireData.length,
-            ratio: rawData.length ? (wireData.length / rawData.length).toFixed(2) : '1.00',
-            saved: rawData.length - wireData.length,
-          });
-          const samples = tx.transmitFile(cmd.fileName, wireData, schemeId, rawData.length);
-          this.emit(
-            { type: 'encoded', id: cmd.id, samples: samples.buffer as ArrayBuffer, sampleRate: this.config.sampleRate },
-            [samples.buffer as ArrayBuffer],
-          );
-        } catch (err) {
-          this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
-        }
+        void this.encodeFileAsync(cmd);
         break;
       }
       case 'encodeStreamStart': {
-        if (!this.config) { this.emit({ type: 'error', id: cmd.id, error: 'encodeStreamStart before configure' }); return; }
-        try {
-          const tx = new TxEngine(this.config as ConstructorParameters<typeof TxEngine>[0]);
-          const rawData = new Uint8Array(cmd.data);
-          const scheme = detect(cmd.fileName, rawData);
-          const { bytes: wireData, scheme: schemeId } = compress(rawData, scheme);
-          dlog('TX-COMP', {
-            scheme: schemeId,
-            raw: rawData.length,
-            wire: wireData.length,
-            ratio: rawData.length ? (wireData.length / rawData.length).toFixed(2) : '1.00',
-            saved: rawData.length - wireData.length,
-          });
-          const totalSamples = tx.estimateStreamSamples(wireData.length);
-          this.stream = {
-            id: cmd.id,
-            gen: tx.streamChunks(
-              cmd.fileName,
-              wireData,
-              this.streamChunkSamples(),
-              schemeId,
-              rawData.length,
-            ),
-          };
-          this.emit({ type: 'streamStart', id: cmd.id, sampleRate: this.config.sampleRate, totalSamples });
-        } catch (err) {
-          this.stream = null;
-          this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
-        }
+        void this.encodeStreamStartAsync(cmd);
         break;
       }
       case 'encodeStreamPull': {
@@ -199,14 +151,86 @@ export class ModemService {
       const file = this.rx.getFile();
       if (file) {
         this.fileSent = true;
-        this.emit(
-          { type: 'fileComplete', fileName: file.fileName, data: file.data.buffer as ArrayBuffer },
-          [file.data.buffer as ArrayBuffer],
-        );
+        void this.deliverCompletedFile(file);
       }
     }
 
     this.emit({ type: 'telemetry', telemetry: this.computeTelemetry() });
+  }
+
+  /** Compress (async gzip) then encode a one-shot file → 'encoded'. */
+  private async encodeFileAsync(cmd: Extract<ModemCommand, { type: 'encodeFile' }>): Promise<void> {
+    if (!this.config) { this.emit({ type: 'error', id: cmd.id, error: 'encodeFile before configure' }); return; }
+    try {
+      const tx = new TxEngine(this.config as ConstructorParameters<typeof TxEngine>[0]);
+      const rawData = new Uint8Array(cmd.data);
+      const { bytes: wireData, scheme: schemeId } = await compressBest(rawData, cmd.fileName);
+      dlog('TX-COMP', {
+        scheme: schemeId,
+        raw: rawData.length,
+        wire: wireData.length,
+        ratio: rawData.length ? (wireData.length / rawData.length).toFixed(2) : '1.00',
+        saved: rawData.length - wireData.length,
+      });
+      const samples = tx.transmitFile(cmd.fileName, wireData, schemeId, rawData.length);
+      this.emit(
+        { type: 'encoded', id: cmd.id, samples: samples.buffer as ArrayBuffer, sampleRate: this.config.sampleRate },
+        [samples.buffer as ArrayBuffer],
+      );
+    } catch (err) {
+      this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
+    }
+  }
+
+  /** Compress (async gzip) then set up the streaming generator → 'streamStart'. */
+  private async encodeStreamStartAsync(cmd: Extract<ModemCommand, { type: 'encodeStreamStart' }>): Promise<void> {
+    if (!this.config) { this.emit({ type: 'error', id: cmd.id, error: 'encodeStreamStart before configure' }); return; }
+    try {
+      const tx = new TxEngine(this.config as ConstructorParameters<typeof TxEngine>[0]);
+      const rawData = new Uint8Array(cmd.data);
+      const { bytes: wireData, scheme: schemeId } = await compressBest(rawData, cmd.fileName);
+      dlog('TX-COMP', {
+        scheme: schemeId,
+        raw: rawData.length,
+        wire: wireData.length,
+        ratio: rawData.length ? (wireData.length / rawData.length).toFixed(2) : '1.00',
+        saved: rawData.length - wireData.length,
+      });
+      const totalSamples = tx.estimateStreamSamples(wireData.length);
+      this.stream = {
+        id: cmd.id,
+        gen: tx.streamChunks(cmd.fileName, wireData, this.streamChunkSamples(), schemeId, rawData.length),
+      };
+      this.emit({ type: 'streamStart', id: cmd.id, sampleRate: this.config.sampleRate, totalSamples });
+    } catch (err) {
+      this.stream = null;
+      this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
+    }
+  }
+
+  /** Decompress a completed file (async — gzip) and emit fileComplete once. */
+  private async deliverCompletedFile(file: {
+    fileName: string;
+    data: Uint8Array;
+    schemeId: number;
+    origSize: number;
+  }): Promise<void> {
+    let out = file.data;
+    if (file.schemeId !== 0) {
+      try {
+        out = await decompressScheme(file.data, file.schemeId);
+        dlog('RX-COMP', { scheme: file.schemeId, wire: file.data.length, decompressed: out.length });
+      } catch (err) {
+        dlog('RX-FRAME', { decompressError: (err as Error).message });
+        out = file.data; // fall back to wire bytes rather than corrupting silently
+      }
+    }
+    // Own a transferable copy so the underlying buffer is safe to hand off.
+    const owned = out.slice();
+    this.emit(
+      { type: 'fileComplete', fileName: file.fileName, data: owned.buffer as ArrayBuffer },
+      [owned.buffer as ArrayBuffer],
+    );
   }
 
   private pushRing(chunk: Float32Array): void {

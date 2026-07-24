@@ -29,6 +29,8 @@ export const SCHEME = {
   TEXT: 0x01,
   JSON: 0x02,
   LOG: 0x03,
+  /** Platform-native gzip (LZ77+Huffman) — the general-purpose workhorse. */
+  GZIP: 0x10,
 } as const;
 
 export interface CompressResult {

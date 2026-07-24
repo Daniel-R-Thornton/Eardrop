@@ -22,7 +22,6 @@ import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
 import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_SYMBOL_MS, OFDM_CP_MS, OFDM_TUNING } from '../types';
 import { generateChirp, chirpCorrelate, type ChirpConfig } from './chirp';
 import { dlog } from '../../lib/debug/dlog';
-import { decompress } from '../compression';
 
 // ─── Constants ───────────────────────────────────────
 
@@ -44,8 +43,13 @@ export enum RxState {
 
 export interface ReceivedFile {
   fileName: string;
+  /** Wire bytes as received (still compressed if schemeId !== 0). */
   data: Uint8Array;
   totalBytes: number;
+  /** Compression scheme id from the header (0 = raw). Decompressed by the consumer. */
+  schemeId: number;
+  /** Original (decompressed) size from the header. */
+  origSize: number;
 }
 
 // ─── RxEngine ────────────────────────────────────────
@@ -1108,27 +1112,14 @@ export class RxEngine {
 
     const wireData = new Uint8Array(this.fileData.slice(0, this.fileSize));
 
-    // Phase 6 compression: schemeId 0 is identity (no-op); any other scheme
-    // decompresses the wire bytes back to the original size. Keep this
-    // byte-exact — a decode failure must not silently corrupt the file, so
-    // any thrown error falls back to the raw wire bytes.
-    let data: Uint8Array = wireData;
-    let totalBytes = this.fileSize;
-    if (this.fileSchemeId !== 0) {
-      try {
-        const restored = decompress(wireData, this.fileSchemeId);
-        data = restored;
-        totalBytes = this.fileOrigSize || restored.length;
-        dlog('RX-COMP', { scheme: this.fileSchemeId, wire: wireData.length, decompressed: totalBytes });
-      } catch (err) {
-        dlog('RX-FRAME', { decompressError: (err as Error).message });
-      }
-    }
-
+    // Decompression is deferred to the consumer (ModemService), because gzip
+    // uses the async CompressionStream API. Hand up the wire bytes + scheme.
     this.completedFile = {
       fileName: this.fileName,
-      data,
-      totalBytes,
+      data: wireData,
+      totalBytes: this.fileSize,
+      schemeId: this.fileSchemeId,
+      origSize: this.fileOrigSize || this.fileSize,
     };
     this.state = RxState.COMPLETE;
     this.fileName = '';
