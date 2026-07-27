@@ -238,7 +238,7 @@ export class AudioRecorder {
   }
 
   stop() {
-    '[Recorder] ⏹ Stopping recording...');
+    console.log('[Recorder] ⏹ Stopping recording...');
     if (this.workletNode) {
       this.workletNode.port.onmessage = null;
       this.workletNode.port.onmessageerror = null;
