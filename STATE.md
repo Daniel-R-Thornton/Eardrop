@@ -121,3 +121,4 @@
 - `src/modem/types.ts` — OFDM constants and tuning levers (OFDM_SYMBOL_MS, OFDM_TUNING, OFDM_DEFAULTS)
 Manually fixed syntax error in src/audio/recorder.ts
 Fix: Corrected syntax error in src/audio/recorder.ts
+Manually fixed syntax error in src/audio/recorder.ts to resolve build error.
