@@ -1,8 +1,20 @@
 # Eardrop — State Summary
 
-**Branch**: `main`  
-**Last commit**: `4571f6c` — feat: add Export to WAV and From WAV buttons with play-while-decode option  
-**Date**: 2026-07-14
+**Branch**: `perf/streaming-encode`
+**Last commit**: `746a8cd` — test(modem): QAM BER-vs-MER sweep — verifies impl matches theory
+**Date**: 2026-07-27
+
+---
+
+## Current session — Send File / 16-tone QAM fix
+
+- Root cause: chirp detection fired after the first OFDM training symbol, but the chirp handoff copied the rolling alignment buffer from an offset inside the old chirp tail. `RxEngine` therefore consumed roughly two chirp windows as channel-training symbols. QPSK profile frames tolerated the bad estimate; 16-QAM header/data frames did not.
+- Fix: record the detected chirp end, wait for two genuine post-chirp symbols, run CP correlation only on that training tail, and interpret an offset near `sps - 1` as the equivalent signed one-sample-early boundary so no training symbol is discarded.
+- Regression coverage: 16-tone QAM direct loopback, full `TxEngine` → `RxEngine` file transfer, and the production `streamChunks` Send File path all decode byte-exact.
+- Validation: production build passes; full Vitest result is **248 passed / 3 failed**, with only the documented BPSK Doppler +2 Hz, Doppler -1 Hz, and Full Stress failures.
+- Targeted ESLint passes for the new tests; `rxEngine.ts` retains only pre-existing warnings. Repository-wide lint still has unrelated pre-existing failures.
+- Prettier check was unavailable because Prettier is not installed in `node_modules` and network access was unavailable.
+- **Still required before acoustic sign-off**: two-tab speaker → microphone Send File test using 16 tones / 16-QAM.
 
 ---
 
@@ -66,7 +78,7 @@
 > **Note**: Legacy `encoder.worker.ts` and `broadcast.worker.ts` were removed in favor of unified `modem.worker.ts` + `ModemService` (see `PROGRESS.md`).
 
 ### Tests
-- **127 tests total** (124 pass, 3 pre-existing failures)
+- **251 tests total** (248 pass, 3 pre-existing failures)
 - **All OFDM tests pass**: modulation, demodulation, loopback, sync, acoustic path, cross-rate, hum immunity, frame geometry V2, tuning invariants, pilot level, throughput benchmark, channel drift
 - 3 pre-existing failures: Doppler +2Hz, Doppler -1Hz, Full Stress (BPSK pipeline test — do not chase)
 - Architecture guardrails prevent per-sample messaging regression and inline modem configs
@@ -107,3 +119,5 @@
 - `src/modem/protocol/rxEngine.ts` — RxEngine integration (OFDM detection, demod path)
 - `src/modem/protocol/atomicFrame.ts` — Frame geometry (4 RS blocks, 235B frame, 160B payload)
 - `src/modem/types.ts` — OFDM constants and tuning levers (OFDM_SYMBOL_MS, OFDM_TUNING, OFDM_DEFAULTS)
+Manually fixed syntax error in src/audio/recorder.ts
+Fix: Corrected syntax error in src/audio/recorder.ts
