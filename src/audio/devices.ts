@@ -13,10 +13,6 @@ export type DeviceList = { inputs: DeviceInfo[]; outputs: DeviceInfo[] };
 /** Enumerate all audio input/output devices */
 export async function enumerateDevices(): Promise<DeviceList> {
   // Request mic permission first so labels populate
-  try {
-    const temp = await navigator.mediaDevices.getUserMedia({ audio: true });
-    temp.getTracks().forEach((t) => t.stop());
-  } catch {
     /* user may deny — labels stay empty */
   }
 
