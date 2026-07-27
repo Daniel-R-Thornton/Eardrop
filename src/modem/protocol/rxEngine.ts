@@ -113,6 +113,8 @@ export class RxEngine {
   private chirpTick = 0;
   /** Set when chirp correlation fires — triggers CP boundary check in WAITING */
   private chirpDetected = false;
+  /** Absolute sample count immediately after the detected chirp. */
+  private chirpEndSample = -1;
   /** Rolling buffer of recent samples (2 OFDM symbols) for boundary search */
   private ofdmAlignBuf: number[] = [];
   /** Samples still to discard so the window grid lands on a symbol boundary */
@@ -264,7 +266,7 @@ export class RxEngine {
     if (this.useOFDM) {
       this.initOfdmDemod();
       const { symSamples: sps } = ofdmSamples(this.cfg.sampleRate);
-      dlog('RX-OFDM', {
+      'RX-OFDM', {
         pilot: this.cfg.pilotFreqHz,
         sps,
         tones: this.ofdmToneCount,
@@ -275,7 +277,7 @@ export class RxEngine {
     this.resetLinkProfile();
 
     this.scanner.onFrame = (frame: Uint8Array) => {
-      dlog('RX', { scanFrame: frame.length });
+      'RX', { scanFrame: frame.length });
       this.ofdmFrameSeen = true;
       this.processFrame(frame);
     };
@@ -292,7 +294,7 @@ export class RxEngine {
       this.pll = new PilotPLL(this.cfg.pilotFreqHz, 0, 0.05, {
         sampleRate: this.cfg.sampleRate,
       });
-      dlog('RX', { pllPilot: this.cfg.pilotFreqHz });
+      'RX', { pllPilot: this.cfg.pilotFreqHz });
     }
 
     // Feed EVERY sample to the PLL for continuous phase tracking
@@ -344,7 +346,13 @@ export class RxEngine {
           ? peakValue / (tplDec.length * sigRms)
           : 0;
         if (normScore > 0.15 && peakIndex >= 0) {
-          dlog('OFDM-SYNC', { chirp: true, norm: normScore, peak: peakValue, idx: peakIndex });
+          const chirpEndInBuffer = Math.min(
+            this.chirpBuf.length,
+            peakIndex * ds + this.chirpTemplate.length,
+          );
+          const samplesAfterChirp = this.chirpBuf.length - chirpEndInBuffer;
+          this.chirpEndSample = this.samplesSeen - samplesAfterChirp;
+          'OFDM-SYNC', { chirp: true, norm: normScore, peak: peakValue, idx: peakIndex });
           // Flag chirp detected — let the existing CP correlation path
           // (running on ofdmAlignBuf which fills with training OFDM symbols)
           // handle boundary alignment. This reuses the proven ±1-sample
@@ -358,7 +366,7 @@ export class RxEngine {
           this.ofdmDemod!.resetTraining();
         } else {
           // Score too low — reset and retry on fresh data.
-          dlog('OFDM-SYNC', { chirpMiss: true, norm: normScore, peak: peakValue });
+          'OFDM-SYNC', { chirpMiss: true, norm: normScore, peak: peakValue });
           this.chirpRan = false;
           this.chirpTick = 0;
           // Shift the buffer to drop old data, giving new samples a chance
@@ -379,15 +387,26 @@ export class RxEngine {
       // ── Chirp → CP handoff: chirp correlation fired; training OFDM
       //    symbols are already accumulating in ofdmAlignBuf. Run the
       //    proven CP boundary check (same as energy-sync path).
-      if (this.chirpDetected && this.useOFDM && this.ofdmAlignBuf.length >= this.sps * 2) {
-        const probe = this.findOfdmBlockStart(this.ofdmAlignBuf);
+      const samplesAfterChirp = this.chirpEndSample >= 0
+        ? this.samplesSeen - this.chirpEndSample
+        : 0;
+      if (this.chirpDetected && this.useOFDM && samplesAfterChirp >= this.sps * 2) {
+        const trainingSamples = Math.min(samplesAfterChirp, this.ofdmAlignBuf.length);
+        const trainingStart = this.ofdmAlignBuf.length - trainingSamples;
+        const trainingTail = this.ofdmAlignBuf.slice(trainingStart);
+        const probe = this.findOfdmBlockStart(trainingTail);
         if (probe.offset >= 0 && probe.score >= 0.35 && probe.sharpness >= 1.5) {
           this.chirpDetected = false;
-          // buf is pre-filled with the aligned tail below, so no additional
-          // ofdmSkip is needed here — that would double-shift the phase
-          // (a non-sps-multiple sample offset shows up as a linear phase
-          // ramp across subcarriers and corrupts every OFDM symbol).
-          this.buf = this.ofdmAlignBuf.slice(probe.offset);
+          this.chirpEndSample = -1;
+          // CP correlation reports offsets modulo one symbol. A peak near the
+          // end (e.g. sps-1) is the equivalent one-sample-early boundary, not
+          // a reason to discard almost a full training symbol. Keep that
+          // signed offset so all configured training symbols reach the demod.
+          const signedBoundary = probe.offset > this.sps / 2
+            ? probe.offset - this.sps
+            : probe.offset;
+          const alignedStart = Math.max(0, trainingStart + signedBoundary);
+          this.buf = this.ofdmAlignBuf.slice(alignedStart);
           this.ofdmAlignBuf = [];
           this.ofdmSyncFrames = 0;
           this.state = RxState.FRAMES;
@@ -396,11 +415,16 @@ export class RxEngine {
           this.ofdmDemod!.resetTraining();
           // Phase 4: new sync detected — reset to the base link profile.
           this.resetLinkProfile();
-          dlog('OFDM-SYNC', { chirpHandoff: true, boundary: probe.offset, score: probe.score });
+          'OFDM-SYNC', {
+            chirpHandoff: true,
+            boundary: signedBoundary,
+            trainingSamples,
+            score: probe.score,
+          });
           return;
         } else {
           // Probe failed - log for diagnostics
-          dlog('OFDM-SYNC', { chirpProbeFail: true, score: probe.score, sharpness: probe.sharpness, offset: probe.offset, bufLen: this.ofdmAlignBuf.length });
+          'OFDM-SYNC', { chirpProbeFail: true, score: probe.score, sharpness: probe.sharpness, offset: probe.offset, bufLen: this.ofdmAlignBuf.length });
         }
       }
 
@@ -430,7 +454,7 @@ export class RxEngine {
         }
         const effThr = Math.max(this.ofdmSyncThreshold, 3 * this.ofdmNoiseEma);
         // Heartbeat while waiting: 1 line per 25 windows (~2/s)
-        dlog(
+        
           'OFDM-SYNC',
           { e: totalE, thr: effThr, sync: this.ofdmSyncFrames },
           { every: 25 },
@@ -448,7 +472,7 @@ export class RxEngine {
           // symbols partially correlate at every offset); flat periodic hum
           // measures ~1.0-1.3. The adaptive energy floor is the third layer.
           if (probe.score < 0.35 || probe.sharpness < 1.5) {
-            dlog(
+            
               'OFDM-SYNC',
               { falseTrigger: true, e: totalE, score: probe.score, sharp: probe.sharpness },
               { level: 'warn' },
@@ -459,7 +483,7 @@ export class RxEngine {
           }
 
           // Signal detected! Enter FRAMES state.
-          dlog('OFDM-SYNC', { detected: true, e: totalE });
+          'OFDM-SYNC', { detected: true, e: totalE });
           this.ofdmWindowsSinceDetect = 0;
           this.ofdmFrameSeen = false;
           this.state = RxState.FRAMES;
@@ -486,13 +510,13 @@ export class RxEngine {
               (((boundary - this.ofdmAlignBuf.length) % this.sps) + this.sps) %
               this.sps;
             this.ofdmSkip = skip;
-            dlog(
+            
               'OFDM-SYNC',
               { boundary, skip, score },
               { level: score < 0.5 ? 'warn' : 'info' },
             );
           } else {
-            dlog('OFDM-SYNC', { aligned: false, alignBuf: this.ofdmAlignBuf.length }, { level: 'warn' });
+            'OFDM-SYNC', { aligned: false, alignBuf: this.ofdmAlignBuf.length }, { level: 'warn' });
           }
           this.buf = [];
           this.ofdmAlignBuf = [];
@@ -566,7 +590,7 @@ export class RxEngine {
           const codeOk =
             this.warbleCodeBits.length >= 16 && bestCodeCorr >= this.WARBLE_CODE_THRESHOLD;
           if (!codeOk) {
-            dlog('WARBLE', { reject: true, corr: bestCodeCorr, need: this.WARBLE_CODE_THRESHOLD });
+            'WARBLE', { reject: true, corr: bestCodeCorr, need: this.WARBLE_CODE_THRESHOLD });
             this.warbleFrames = 0;
           } else {
             RxEngine.rxLog(
@@ -597,7 +621,7 @@ export class RxEngine {
       if (this.preambleFrames > 80) {
         this.warbleTimeoutCount++;
         const newThreshold = 0.025 * Math.pow(1.5, this.warbleTimeoutCount);
-        dlog('PREAMBLE', { timeout: this.warbleTimeoutCount, newThr: newThreshold });
+        'PREAMBLE', { timeout: this.warbleTimeoutCount, newThr: newThreshold });
         this.warbleThreshold = newThreshold;
         this.state = RxState.WAITING;
         this.warbleFrames = 0;
@@ -664,7 +688,7 @@ export class RxEngine {
               this.ref1Q[t] = cal1Q[t] / cnt1[t];
             }
           }
-          dlog('CAL', {
+          'CAL', {
             refs: [0, 1, 2, 3]
               .map(
                 (t) =>
@@ -675,7 +699,7 @@ export class RxEngine {
           // Initialize absolute phase state from last calibration frame
           const lastGc = this.grayCodes[this.prevCalIQs.length - 1];
           this.absBits = [(lastGc >> 3) & 1, (lastGc >> 2) & 1, (lastGc >> 1) & 1, lastGc & 1];
-          dlog('CAL', { absBits: this.absBits.join('') });
+          'CAL', { absBits: this.absBits.join('') });
           // Initialize differential BPSK from last calibration frame's I values
           const lastCal = this.prevCalIQs[this.prevCalIQs.length - 1];
           for (let t = 0; t < TONE_COUNT; t++) {
@@ -688,7 +712,7 @@ export class RxEngine {
       // After calibration: guard frames (pilot only)
       if (this.calFrameCount >= 16) {
         this.guardFrames++;
-        if (this.guardFrames === 1) dlog('GUARD', { waiting: 2 });
+        if (this.guardFrames === 1) 'GUARD', { waiting: 2 });
         if (this.guardFrames >= 2) {
           RxEngine.rxLog('[FRAMES] entering data decode');
           this.state = RxState.FRAMES;
@@ -714,7 +738,7 @@ export class RxEngine {
       // the receiver stuck in FRAMES forever, deaf to the next transmission.
       this.ofdmWindowsSinceDetect++;
       if (!this.ofdmFrameSeen && this.ofdmWindowsSinceDetect > this.OFDM_WATCHDOG_WINDOWS) {
-        dlog('OFDM-SYNC', { watchdogReset: true, windows: this.ofdmWindowsSinceDetect }, { level: 'warn' });
+        'OFDM-SYNC', { watchdogReset: true, windows: this.ofdmWindowsSinceDetect }, { level: 'warn' });
         this.state = RxState.WAITING;
         this.ofdmSyncFrames = 0;
         this.ofdmNoiseEma = this.OFDM_EMA_SEED;
@@ -733,7 +757,7 @@ export class RxEngine {
         this.ofdmDemod.trainOnSyncSymbol(window);
         this.ofdmTrainingSymbols++;
         if (this.ofdmTrainingSymbols >= this.OFDM_TRAINING_SYMBOLS) {
-          dlog('OFDM-TRAIN', { done: true, symbols: this.ofdmTrainingSymbols });
+          'OFDM-TRAIN', { done: true, symbols: this.ofdmTrainingSymbols });
         }
         return; // Don't process bits during training
       }
@@ -966,7 +990,7 @@ export class RxEngine {
     this.sps = symSamples;
     let ofdmToneCount = this.cfg.toneCount || OFDM_DEFAULTS.toneCount;
     if (ofdmToneCount % 4 !== 0) {
-      dlog('RX-OFDM', { badToneCount: ofdmToneCount, using: 4 }, { level: 'warn' });
+      'RX-OFDM', { badToneCount: ofdmToneCount, using: 4 }, { level: 'warn' });
       ofdmToneCount = 4;
     }
     this.ofdmToneCount = ofdmToneCount;
@@ -1100,6 +1124,7 @@ export class RxEngine {
     this.chirpRan = false;
     this.chirpTick = 0;
     this.chirpDetected = false;
+    this.chirpEndSample = -1;
     this.chirpBuf = [];
     this.scanner.reset();
     // Phase 4: back to the base link profile.
@@ -1125,7 +1150,7 @@ export class RxEngine {
     // 5-6 are pre-decode and would be misleading to log against it.
     const decoded = decodeFrame(frame);
 
-    dlog('RX-FRAME', {
+    'RX-FRAME', {
       valid: decoded.valid,
       type: decoded.header ? `0x${decoded.header.type.toString(16).padStart(2, '0')}` : '?',
       seq: decoded.header?.seqNum ?? -1,
@@ -1150,7 +1175,7 @@ export class RxEngine {
         this.processPayload(decoded.payload, decoded.header!.seqNum);
         break;
       case FRAME_TYPE_TAIL:
-        dlog('RX-FRAME', { tail: true, assembled: this.fileData.length, size: this.fileSize });
+        'RX-FRAME', { tail: true, assembled: this.fileData.length, size: this.fileSize });
         this.processTail();
         break;
       case FRAME_TYPE_PROFILE: {
@@ -1189,11 +1214,11 @@ export class RxEngine {
             this.qamBitAcc = 0;
             this.qamBitCount = 0;
           }
-          dlog('RX-PROFILE', { eccT: profile.eccT, cpId: profile.cpId, toneCount: profile.toneCount });
+          'RX-PROFILE', { eccT: profile.eccT, cpId: profile.cpId, toneCount: profile.toneCount });
         } else if (profile) {
-          dlog('RX-PROFILE', { toneCountMismatch: true, got: profile.toneCount, want: this.ofdmToneCount }, { level: 'warn' });
+          'RX-PROFILE', { toneCountMismatch: true, got: profile.toneCount, want: this.ofdmToneCount }, { level: 'warn' });
         } else {
-          dlog('RX-PROFILE', { invalid: true }, { level: 'warn' });
+          'RX-PROFILE', { invalid: true }, { level: 'warn' });
         }
         break;
       }
@@ -1221,7 +1246,7 @@ export class RxEngine {
 
     // Duplicate header (diversity mode repetition) — ignore, keep existing state
     if (fileID === this.fileID && this.fileName !== '') {
-      dlog('RX-FRAME', { dupHeader: true });
+      'RX-FRAME', { dupHeader: true });
       return;
     }
 
@@ -1263,7 +1288,7 @@ export class RxEngine {
     this.fileData = [];
     this.framesReceived = 0;
     this.receivedPayloadSeqs = new Set();
-    dlog('RX-COMP', { scheme: schemeId, wire: totalSize, orig: origSize });
+    'RX-COMP', { scheme: schemeId, wire: totalSize, orig: origSize });
   }
 
   private processPayload(payload: Uint8Array, seqNum: number): void {
@@ -1271,7 +1296,7 @@ export class RxEngine {
 
     // Skip duplicate payload frames (diversity mode repetition)
     if (this.receivedPayloadSeqs.has(seqNum)) {
-      dlog('RX-FRAME', { dupPayload: seqNum });
+      'RX-FRAME', { dupPayload: seqNum });
       return;
     }
     this.receivedPayloadSeqs.add(seqNum);
@@ -1290,7 +1315,7 @@ export class RxEngine {
 
     // Already completed (duplicate tail from diversity mode)
     if (this.state === RxState.COMPLETE) {
-      dlog('RX-FRAME', { dupTail: true });
+      'RX-FRAME', { dupTail: true });
       return;
     }
 

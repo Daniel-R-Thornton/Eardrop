@@ -171,7 +171,7 @@ export class OFDMQPSKDemodulator {
       const merDb = evm > 0 ? -20 * Math.log10(evm) : 99;
       const verdict =
         merDb >= 22 ? '64-QAM ok' : merDb >= 16 ? '16-QAM ok' : merDb >= 9 ? 'QPSK only' : 'marginal';
-      dlog('OFDM-MER', {
+      'OFDM-MER', {
         merDb: merDb.toFixed(1),
         evmPct: (evm * 100).toFixed(1),
         symbols: Math.round(this.merCount / this.toneCount),
@@ -355,7 +355,7 @@ export class OFDMQPSKDemodulator {
         const phase = (Math.atan2(this.channelEstIm[t], this.channelEstRe[t]) * 180) / Math.PI;
         return `${amp.toExponential(1)}@${phase.toFixed(0)}`;
       }).join(' ');
-      dlog('OFDM-TRAIN', {
+      'OFDM-TRAIN', {
         symbols: this.trainingSymbols,
         pilotAmp: Math.hypot(this.pilotChannelEstRe, this.pilotChannelEstIm),
         h: tones,
@@ -475,7 +475,7 @@ export class OFDMQPSKDemodulator {
               return `t${t}:${deg.toFixed(0)}°/${(bits[t * 2] << 1) | bits[t * 2 + 1]}`;
             })
             .join(' ');
-          dlog('OFDM-DEMOD', { firstSym: perTone });
+          'OFDM-DEMOD', { firstSym: perTone });
         }
       } else {
         // ── Per-tone QAM path (taken only when some tone's order > QPSK) ──

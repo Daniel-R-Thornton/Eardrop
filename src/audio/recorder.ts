@@ -238,7 +238,7 @@ export class AudioRecorder {
   }
 
   stop() {
-    console.log('[Recorder] ⏹ Stopping recording...');
+    '[Recorder] ⏹ Stopping recording...');
     if (this.workletNode) {
       this.workletNode.port.onmessage = null;
       this.workletNode.port.onmessageerror = null;
@@ -260,7 +260,7 @@ export class AudioRecorder {
     }
     this.onChunk = null;
     this.running = false;
-    console.log('[Recorder] ✅ stopped');
+    '[Recorder] ✅ stopped');
   }
 
   getDiag(): {
