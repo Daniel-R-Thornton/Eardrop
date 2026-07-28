@@ -106,7 +106,7 @@ export class OFDMQPSKDemodulator {
    * are short (one atomic frame is tens of symbols), so the tracker needs to
    * converge within the first few symbols rather than over a whole session.
    */
-  private readonly qamTrackingAlpha = 0.15;
+  private readonly qamTrackingAlpha = 0.05;
 
   constructor(config: OFDMQPSKDemodulatorConfig) {
     this.cfg = config;
