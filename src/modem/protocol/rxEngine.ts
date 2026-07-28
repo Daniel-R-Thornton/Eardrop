@@ -308,7 +308,7 @@ export class RxEngine {
       if (this.state === RxState.WAITING) {
         // Keep the last 4 symbols of audio for the CP boundary search —
         // extra periods let the search average correlation across repeats
-        const alignCap = Math.max(4 * this.sps, this.OFDM_TRAINING_SYMBOLS * this.sps);
+        const alignCap = 4 * this.sps;
         this.ofdmAlignBuf.push(sample);
         if (this.ofdmAlignBuf.length > alignCap) this.ofdmAlignBuf.shift();
       }
@@ -443,6 +443,14 @@ export class RxEngine {
         } else {
           // Probe failed - log for diagnostics
           dlog('OFDM-SYNC', { chirpProbeFail: true, score: probe.score, sharpness: probe.sharpness, offset: probe.offset, bufLen: this.ofdmAlignBuf.length });
+          // Safety valve: if the chirp probe stays stuck for many symbols,
+          // the detected chirp is probably stale or the buffer is corrupt.
+          // Fall back to energy-based sync rather than re-probing forever.
+          if (samplesAfterChirp > this.sps * 16) {
+            dlog('OFDM-SYNC', { chirpProbeTimeout: true, samplesAfterChirp }, { level: 'warn' });
+            this.chirpDetected = false;
+            this.chirpEndSample = -1;
+          }
         }
       }
 

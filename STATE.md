@@ -31,10 +31,16 @@
   3. On correlation miss: do NOT reset `chirpTick` and do NOT shift `chirpBuf`. Letting the buffer accumulate until a good match arrives, instead of discarding partial signal, prevents repeated weak-detection failures.
 - **Verified**: Tests at baseline (3 pre-existing failures only). No regressions.
 
-#### Fix 5: OFDM alignment buffer capacity increase (`rxEngine.ts`)
+#### Fix 5: OFDM alignment buffer capacity increase (`rxEngine.ts`) — REVERTED
 - **Problem**: `ofdmAlignBuf` was hard-capped at `4 × sps` samples. For OFDM training sequences longer than 4 symbols, the rolling window discarded early training symbols before the chirp→CP handoff probe could accumulate enough CP-correlation history, especially in acoustic channels where the probe threshold was already marginal.
 - **Fix**: Compute `alignCap = Math.max(4 × sps, this.OFDM_TRAINING_SYMBOLS × sps)`. This keeps the existing 4-symbol minimum for short trainings while extending the window to the full training duration when more symbols are configured.
-- **Verified**: Tests remain at baseline (4 pre-existing failures). No regressions.
+- **Result**: In-memory tests stayed at baseline, but real acoustic tests showed `chirpProbeFail=true score=0 sharpness=0 offset=0` with `bufLen=14400`. The larger rolling window eventually includes data symbols (which have no CP structure) alongside training symbols, averaging the CP correlation to zero. **Reverted** to `4 × sps` cap.
+- **Conclusion**: A larger `ofdmAlignBuf` hurts the chirp→CP probe because it keeps symbols past the training burst. The probe must see only training symbols; widening the window beyond ~4 symbols is counter-productive.
+
+#### Fix 6: Chirp probe timeout / safety valve (`rxEngine.ts`)
+- **Problem**: If the chirp probe returns `{ score: 0, sharpness: 0, offset: 0 }` repeatedly, the state machine never advances because `chirpDetected` stays true and the energy-sync path is gated by `!chirpDetected`. The same failing probe runs every `feedSample()` cycle until playback ends.
+- **Fix**: In the chirp-handoff failure branch, count consecutive failures via `samplesAfterChirp`. If more than 16 symbols elapse without a successful handoff, clear `chirpDetected`/`chirpEndSample` so the receiver can fall back to energy-based sync rather than re-probing forever.
+- **Verified**: In-memory tests remain at baseline (4 pre-existing failures). No regressions.
 
 ### Buffer-flush attempt (reverted)
 - **Hypothesis**: The chirp-correlation tail and any pre-chirp room noise were polluting `ofdmAlignBuf`, mixing into the training-symbol window and lowering CP-correlation sharpness below the probe threshold in acoustic environments.
