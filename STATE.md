@@ -1,20 +1,68 @@
 # Eardrop — State Summary
 
 **Branch**: `perf/streaming-encode`
-**Last commit**: `746a8cd` — test(modem): QAM BER-vs-MER sweep — verifies impl matches theory
-**Date**: 2026-07-27
+**Last commit**: `35af4ca` — fix(ofdm): freeze decision tracking post-training + prevent chirp probe buffer drain
+**Date**: 2026-07-28
 
 ---
 
-## Current session — Send File / 16-tone QAM fix
+## Current session — OFDM 32-tone 64-QAM receiver fixes
 
-- Root cause: chirp detection fired after the first OFDM training symbol, but the chirp handoff copied the rolling alignment buffer from an offset inside the old chirp tail. `RxEngine` therefore consumed roughly two chirp windows as channel-training symbols. QPSK profile frames tolerated the bad estimate; 16-QAM header/data frames did not.
-- Fix: record the detected chirp end, wait for two genuine post-chirp symbols, run CP correlation only on that training tail, and interpret an offset near `sps - 1` as the equivalent signed one-sample-early boundary so no training symbol is discarded.
-- Regression coverage: 16-tone QAM direct loopback, full `TxEngine` → `RxEngine` file transfer, and the production `streamChunks` Send File path all decode byte-exact.
-- Validation: production build passes; full Vitest result is **248 passed / 3 failed**, with only the documented BPSK Doppler +2 Hz, Doppler -1 Hz, and Full Stress failures.
-- Targeted ESLint passes for the new tests; `rxEngine.ts` retains only pre-existing warnings. Repository-wide lint still has unrelated pre-existing failures.
-- Prettier check was unavailable because Prettier is not installed in `node_modules` and network access was unavailable.
-- **Still required before acoustic sign-off**: two-tab speaker → microphone Send File test using 16 tones / 16-QAM.
+### Completed this session
+
+#### Fix 1: Decision-tracking freeze after training (`OFDMQPSKDemodulator.ts`)
+- **Problem**: After training, all 32 tones equalized to ~-5° (diagnostic trace showed `eqP=-5.3°, -5.5°, -4.6°...`). Decision tracker saw "confident" QPSK symbol `0b00` → updated channelEst toward wrong direction → feedback loop collapsed all subsequent symbols within ~10 symbols.
+- **Fix**: Added `postTrainingSymbols` counter; froze decision tracking for first 14 data symbols after training completes. Initial frames use pure training-based compensation; tracking resumes naturally once channel settles.
+
+#### Fix 2: Chirp probe buffer drain prevention (`rxEngine.ts`)
+- **Problem**: During chirp probing in WAITING state, each feedSample() iteration extracted a 1200-sample window from `this.buf` via splice, but probe failures fell through without returning. Net loss: ~1199 samples/iteration. By handoff time, buffer was nearly empty. After handoff replaced `this.buf = ofdmAlignBuf.slice(alignedStart)` (~4700 samples), barely enough for 3 training windows out of required 12.
+- **Fix**: Gate only the splice operation during active chirp probing (`probingChirp` flag). Window slice still computed for toneIQ diagnostics, but `splice()` skipped — `this.buf` accumulates freely until chirp handoff fires.
+- **Verified**: Tests restored to baseline (3 pre-existing failures only).
+
+#### Previously completed in prior sessions
+- **Tone count adaptation**: RX PROFILE handler dynamically updates tone count and demodulator config when TX announces different grid (e.g., 32-tone vs default 4). FIX confirmed by `[RX-FRAME] valid=true type=0x04 seq=0 len=160` — first successful PROFILE decode.
+- **Removed premature reset**: Eliminated `setToneOrders()` call from `resetLinkProfile()` that overrode profile updates.
+- **Lowered chirp sharpness threshold**: Changed from 1.5 to 1.1 to accept wider variety of chirp waveforms.
+- **OFDM QAM mapping**: Fixed `setToneOrders()` routing in `OFDMQPSKDemodulator.ts` to correctly apply qamMap → toneOrders → allQpsk flag.
+- **Diagnostic enhancement**: Deep phase-trace logs showing raw→chPhase→drift→equalized per tone.
+
+### Acoustic test results (live speaker→mic)
+```
+[OFDM-SYNC] chirp=true norm=0.716 peak=2.33e+4 idx=58          ← chirp detected
+[OFDM-SYNC] chirpProbeFail=true score=0.614 sharpness=1.35      ← CP probe failed
+[OFDM-SYNC] chirpProbeFail=true score=0.609 sharpness=1.25
+[CAL] refs=t0:-0.06,0.11/-0.06,0.07 ...                         ← calibration OK
+[OFDM-TRAIN] symbols=12 pilotAmp=0.586                           ← training complete
+[OFDM-DEMOD] firstSym=t0:1°/0 t1:1°/0 ... pilotAmp=0.6085       ← all zeros (expected)
+[RX-FRAME] valid=true type=0x04 seq=0 len=160                   ← PROFILE decoded! ✓
+[PLAY] done=5.39                                                 ← playback ended
+[RX-SCAN] bits=8000 sentinel=false sr=0x133527                   ← noise scan, no file
+```
+
+**Key observations:**
+- Training completed ✅, PROFILE frame decoded ✅ (tone count adaptation works)
+- All tones show 0-1° equalized phase despite varied raw phases (-143° to +111°) — channel estimate matches raw within <1° on every tone. Compensation formula correct; result indicates transmitted signal has reference-phase alignment on all tones.
+- Playback ended at 5.39s — short transfer window. Buffer starvation appears resolved (training succeeded), but remaining question: why do received data tones have same constellation points as training reference symbols?
+- Next diagnostic step: verify TX waveform actually varies constellation across tones (scope/logic analyzer capture or controlled injection test).
+
+### Current issues
+
+#### Equalization collapse mystery
+Raw phases vary wildly across tones (-180° to +180°) but channelEst tracks them almost exactly. After compensation, all land at 0-1°. Possible causes:
+1. TX sends identical QAM points (all-reference-phase) — bit-loading/tone-order not applied to modulator output
+2. Acoustic path introduces near-constant group delay that perfectly aligns all tones
+3. Sampling timing misalignment between TX and RX FFT bins
+
+**Status**: Tracking freeze prevents further degradation. Channel estimates stable. Need to verify TX waveform diversity before proceeding.
+
+#### Buffer starvation partially resolved
+Pre-chirp-handoff buffer drain fixed by skipping splice during probing. Chirp handoff now provides sufficient buffer for full training sequence. However, total audio duration available may still be limited by play/start latency gap — next acoustic test should measure actual end-to-end timing.
+
+### Build & tests
+- Build: clean ✅
+- Tests: **248 passed / 3 failed** (same 3 pre-existing: Doppler ±1Hz + Full Stress)
+- No regressions from changes
+
 
 ---
 
