@@ -1362,6 +1362,7 @@ export class RxEngine {
     }
 
     this.fileID = fileID;
+    this.framesReceived++;
     this.fileSize = totalSize;
     this.fileName = name;
     this.fileSchemeId = schemeId;
@@ -1411,6 +1412,7 @@ export class RxEngine {
       schemeId: this.fileSchemeId,
       origSize: this.fileOrigSize || this.fileSize,
     };
+    this.framesReceived++;
     this.state = RxState.COMPLETE;
     this.fileName = '';
     this.fileData = [];
