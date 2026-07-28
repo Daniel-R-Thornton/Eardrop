@@ -308,8 +308,9 @@ export class RxEngine {
       if (this.state === RxState.WAITING) {
         // Keep the last 4 symbols of audio for the CP boundary search —
         // extra periods let the search average correlation across repeats
+        const alignCap = Math.max(4 * this.sps, this.OFDM_TRAINING_SYMBOLS * this.sps);
         this.ofdmAlignBuf.push(sample);
-        if (this.ofdmAlignBuf.length > 4 * this.sps) this.ofdmAlignBuf.shift();
+        if (this.ofdmAlignBuf.length > alignCap) this.ofdmAlignBuf.shift();
       }
       if (this.ofdmSkip > 0) {
         this.ofdmSkip--;
@@ -408,7 +409,7 @@ export class RxEngine {
         const trainingStart = this.ofdmAlignBuf.length - trainingSamples;
         const trainingTail = this.ofdmAlignBuf.slice(trainingStart);
         const probe = this.findOfdmBlockStart(trainingTail);
-        if (probe.offset >= 0 && probe.score >= 0.35 && probe.sharpness >= 1.5) {
+        if (probe.offset >= 0 && probe.score >= 0.35 && probe.sharpness >= 1.1) {
           this.chirpDetected = false;
           this.chirpEndSample = -1;
           // CP correlation reports offsets modulo one symbol. A peak near the
