@@ -106,6 +106,25 @@ export function TxPanel() {
             ⚠ needs strong signal
           </div>
         )}
+        {s.useOFDM && s.dataQamBits > 2 && (
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 8 }}>
+            <span className="lab-panel__title" style={{ padding: 0, background: 'transparent', border: 0 }}>
+              QAM SCALE: {s.qamScaleOverride ? s.qamScaleOverride.toFixed(3) : 'Auto'}
+            </span>
+            <input
+              type="range"
+              className="lab-slider"
+              min={0}
+              max={0.3}
+              step={0.005}
+              value={s.qamScaleOverride ?? 0}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                setState({ qamScaleOverride: v > 0 ? v : undefined });
+              }}
+            />
+          </label>
+        )}
       </div>
 
       {s.isSending && (

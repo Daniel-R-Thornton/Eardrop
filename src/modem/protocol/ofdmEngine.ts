@@ -39,6 +39,7 @@ export class OFDMEngine {
     pilotFreqHz?: number;
     pilotAmplitude?: number;
     chirpSpanHz?: number;
+    qamScaleOverride?: number;
   }) {
     const toneCount = cfg.toneCount ?? OFDM_DEFAULTS.toneCount;
     this.toneCount = toneCount % 4 !== 0 ? 4 : toneCount;
@@ -61,6 +62,7 @@ export class OFDMEngine {
       toneFrequencies: this.toneFreqs,
       pilotFreqHz,
       pilotAmplitude,
+      qamScaleOverride: cfg.qamScaleOverride,
     });
     this.toneOrders = new Array(this.toneCount).fill(2) as QamOrder[];
 

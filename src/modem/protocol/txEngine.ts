@@ -66,14 +66,16 @@ export class TxEngine {
    * undefined ⇒ the announced (and used) profile is the all-QPSK default.
    */
   private qamMap: number[] | undefined;
+  private qamScaleOverride: number | undefined;
 
   constructor(
-    cfg: Partial<ModemConfig> & { useOFDM?: boolean; emitLinkProfile?: boolean; qamMap?: number[] } = {},
+    cfg: Partial<ModemConfig> & { useOFDM?: boolean; emitLinkProfile?: boolean; qamMap?: number[]; qamScaleOverride?: number } = {},
   ) {
     // Check for OFDM flag before merging into ModemConfig
     this.useOFDM = (cfg as any).useOFDM === true;
     this.emitLinkProfile = (cfg as any).emitLinkProfile === true;
     this.qamMap = (cfg as any).qamMap;
+    this.qamScaleOverride = (cfg as any).qamScaleOverride;
 
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
     const offsets = this.cfg.musical ? [87.5, 162.5, 287.5, 487.5] : TONE_OFFSETS;
@@ -110,6 +112,7 @@ export class TxEngine {
         // OFDM-scaled value or it vanishes at high tone counts.
         pilotAmplitude: OFDM_DEFAULTS.pilotAmplitude,
         toneCount: this.cfg.toneCount,
+        qamScaleOverride: this.qamScaleOverride,
       });
     }
   }

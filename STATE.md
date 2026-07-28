@@ -37,6 +37,12 @@
 - **Result**: In-memory tests stayed at baseline, but real acoustic tests showed `chirpProbeFail=true score=0 sharpness=0 offset=0` with `bufLen=14400`. The larger rolling window eventually includes data symbols (which have no CP structure) alongside training symbols, averaging the CP correlation to zero. **Reverted** to `4 × sps` cap.
 - **Conclusion**: A larger `ofdmAlignBuf` hurts the chirp→CP probe because it keeps symbols past the training burst. The probe must see only training symbols; widening the window beyond ~4 symbols is counter-productive.
 
+#### Fix 7: UI `qamScaleOverride` knob for real-HW 16/64-QAM (`TxPanel.tsx` etc.)
+- **Problem**: Real audio chains (speaker/amp/AGC/player normalization) can change the amplitude of QAM data symbols relative to the QPSK training burst. The receiver's fixed `qamRefScale` assumes the modulator's predicted ratio, so 16/64-QAM data frames fail CRC even though the profile frame (QPSK) decodes fine.
+- **Fix**: Expose the OFDM modulator's `qamScaleOverride` parameter in the UI as a "QAM SCALE" slider. Default `Auto` uses the crest-factor-derived scale; the user can tune the TX QAM amplitude until the receiver's expected amplitude matches the actual transmitted amplitude.
+- **Files changed**: `src/ui/views/TxPanel.tsx`, `src/ui/Store.ts`, `src/ui/controllers/buildModemConfig.ts`, `src/ui/app.ts`, `src/modem/protocol/txEngine.ts`, `src/modem/protocol/ofdmEngine.ts`.
+- **Verified**: Tests remain at baseline (4 pre-existing failures). TypeScript compiles cleanly.
+
 #### Fix 6: Chirp probe timeout / safety valve (`rxEngine.ts`)
 - **Problem**: If the chirp probe returns `{ score: 0, sharpness: 0, offset: 0 }` repeatedly, the state machine never advances because `chirpDetected` stays true and the energy-sync path is gated by `!chirpDetected`. The same failing probe runs every `feedSample()` cycle until playback ends.
 - **Fix**: In the chirp-handoff failure branch, count consecutive failures via `samplesAfterChirp`. If more than 16 symbols elapse without a successful handoff, clear `chirpDetected`/`chirpEndSample` so the receiver can fall back to energy-based sync rather than re-probing forever.

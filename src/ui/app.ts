@@ -157,6 +157,7 @@ window.addEventListener('eardrop-demo-encode', (async () => {
       diversityMode: getState().diversityMode,
       hwSampleRate: audioCtx.sampleRate,
       dataQamBits: getState().dataQamBits,
+      qamScaleOverride: getState().qamScaleOverride,
     }),
   );
   showTxPayload(DEMO_PAYLOAD.bytes, DEMO_PAYLOAD.name);
@@ -202,6 +203,7 @@ window.addEventListener('eardrop-send', (async () => {
         diversityMode: getState().diversityMode,
         hwSampleRate: audioCtx.sampleRate,
         dataQamBits: getState().dataQamBits,
+      qamScaleOverride: getState().qamScaleOverride,
       }),
     );
     setState({ isPlaying: true, progress: 0 });
@@ -335,6 +337,7 @@ window.addEventListener('eardrop-send-test', (async () => {
         diversityMode: getState().diversityMode,
         hwSampleRate: audioCtx.sampleRate,
         dataQamBits: getState().dataQamBits,
+      qamScaleOverride: getState().qamScaleOverride,
       }),
     );
     setState({ isPlaying: true, progress: 0 });
@@ -632,6 +635,7 @@ async function startListening() {
       diversityMode: getState().diversityMode,
       hwSampleRate: audioCtx.sampleRate,
       dataQamBits: getState().dataQamBits,
+      qamScaleOverride: getState().qamScaleOverride,
     });
     modem.configure(cfg);
     await modem.startListening(getState().micGain, getState().selectedInputId || undefined);
@@ -2100,6 +2104,7 @@ async function runAcousticSpeedSweep() {
       diversityMode: getState().diversityMode,
       hwSampleRate: audioCtx.sampleRate,
       dataQamBits: getState().dataQamBits,
+      qamScaleOverride: getState().qamScaleOverride,
     }),
   );
   await modem.startListening(getState().micGain, getState().selectedInputId || undefined);
@@ -2254,6 +2259,7 @@ window.addEventListener('eardrop-export-wav', (async () => {
       diversityMode: getState().diversityMode,
       hwSampleRate: audioCtx.sampleRate,
       dataQamBits: getState().dataQamBits,
+      qamScaleOverride: getState().qamScaleOverride,
     });
     modem.configure(modemConfig);
     const { samples: audioSamples, sampleRate: actualRate } = await modem.encodeFile(
@@ -2309,6 +2315,7 @@ window.addEventListener('eardrop-load-wav', (async () => {
         diversityMode: getState().diversityMode,
         hwSampleRate: audioCtx.sampleRate,
         dataQamBits: getState().dataQamBits,
+      qamScaleOverride: getState().qamScaleOverride,
       }));
       // Poll for fileComplete
       const filePromise = new Promise<{ fileName: string; data: Uint8Array }>((resolve, reject) => {
