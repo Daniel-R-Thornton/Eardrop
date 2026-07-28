@@ -95,6 +95,8 @@ export class RxEngine {
   private ofdmSyncThreshold = 0.06;
   /** Count of OFDM sync symbols processed for channel training */
   private ofdmTrainingSymbols = 0;
+  /** Counter for data symbols processed after training — diagnostic only */
+  public ofdmDataSymbolCounter = 0;
   /** Detection (syncMinFrames) + boundary-alignment slack (1) + training (trainingSymbols) must fit in sync burst */
   private readonly OFDM_TRAINING_SYMBOLS = OFDM_TUNING.trainingSymbols;
 
@@ -266,7 +268,7 @@ export class RxEngine {
     if (this.useOFDM) {
       this.initOfdmDemod();
       const { symSamples: sps } = ofdmSamples(this.cfg.sampleRate);
-      'RX-OFDM', {
+      dlog('RX-OFDM', {
         pilot: this.cfg.pilotFreqHz,
         sps,
         tones: this.ofdmToneCount,
@@ -277,7 +279,7 @@ export class RxEngine {
     this.resetLinkProfile();
 
     this.scanner.onFrame = (frame: Uint8Array) => {
-      'RX', { scanFrame: frame.length });
+      dlog('RX', { scanFrame: frame.length });
       this.ofdmFrameSeen = true;
       this.processFrame(frame);
     };
@@ -294,7 +296,7 @@ export class RxEngine {
       this.pll = new PilotPLL(this.cfg.pilotFreqHz, 0, 0.05, {
         sampleRate: this.cfg.sampleRate,
       });
-      'RX', { pllPilot: this.cfg.pilotFreqHz });
+      dlog('RX', { pllPilot: this.cfg.pilotFreqHz });
     }
 
     // Feed EVERY sample to the PLL for continuous phase tracking
@@ -352,7 +354,7 @@ export class RxEngine {
           );
           const samplesAfterChirp = this.chirpBuf.length - chirpEndInBuffer;
           this.chirpEndSample = this.samplesSeen - samplesAfterChirp;
-          'OFDM-SYNC', { chirp: true, norm: normScore, peak: peakValue, idx: peakIndex });
+          dlog('OFDM-SYNC', { chirp: true, norm: normScore, peak: peakValue, idx: peakIndex });
           // Flag chirp detected — let the existing CP correlation path
           // (running on ofdmAlignBuf which fills with training OFDM symbols)
           // handle boundary alignment. This reuses the proven ±1-sample
@@ -366,7 +368,7 @@ export class RxEngine {
           this.ofdmDemod!.resetTraining();
         } else {
           // Score too low — reset and retry on fresh data.
-          'OFDM-SYNC', { chirpMiss: true, norm: normScore, peak: peakValue });
+          dlog('OFDM-SYNC', { chirpMiss: true, norm: normScore, peak: peakValue });
           this.chirpRan = false;
           this.chirpTick = 0;
           // Shift the buffer to drop old data, giving new samples a chance
@@ -376,8 +378,19 @@ export class RxEngine {
     }
 
     if (this.buf.length < this.sps) return;
+    // During active chirp probing we must NOT drain this.buf — probe failures
+    // fall through without returning and these windows would be discarded
+    // anyway (WAITING doesn't decode frames yet).  Keep this.buf intact so
+    // enough samples survive for training + payload after handoff.
+    const probingChirp = this.state === RxState.WAITING
+      && this.chirpDetected
+      && this.useOFDM
+      && this.chirpEndSample >= 0
+      && (this.samplesSeen - this.chirpEndSample) >= this.sps * 2;
     const window = this.buf.slice(0, this.sps);
-    this.buf.splice(0, this.sps);
+    if (!probingChirp) {
+      this.buf.splice(0, this.sps);
+    }
     const rawIQs = this.toneFreqs.map((f) => toneIQ(window, f, this.cfg.sampleRate));
     this.lastRawIQs = rawIQs; // Store for debug snapshot
     const totalE = rawIQs.reduce((a, r) => a + Math.hypot(r.i, r.q), 0);
@@ -415,16 +428,20 @@ export class RxEngine {
           this.ofdmDemod!.resetTraining();
           // Phase 4: new sync detected — reset to the base link profile.
           this.resetLinkProfile();
-          'OFDM-SYNC', {
+          dlog('OFDM-SYNC', {
             chirpHandoff: true,
             boundary: signedBoundary,
             trainingSamples,
             score: probe.score,
+            bufLenBeforeReplace: this.ofdmAlignBuf.length - alignedStart,
+            samplesSeenAtHandoff: this.samplesSeen,
+            chirpEndSample: this.chirpEndSample,
+            ofdmSkipValue: this.ofdmSkip,
           });
           return;
         } else {
           // Probe failed - log for diagnostics
-          'OFDM-SYNC', { chirpProbeFail: true, score: probe.score, sharpness: probe.sharpness, offset: probe.offset, bufLen: this.ofdmAlignBuf.length });
+          dlog('OFDM-SYNC', { chirpProbeFail: true, score: probe.score, sharpness: probe.sharpness, offset: probe.offset, bufLen: this.ofdmAlignBuf.length });
         }
       }
 
@@ -455,7 +472,7 @@ export class RxEngine {
         const effThr = Math.max(this.ofdmSyncThreshold, 3 * this.ofdmNoiseEma);
         // Heartbeat while waiting: 1 line per 25 windows (~2/s)
         
-          'OFDM-SYNC',
+          dlog('OFDM-SYNC',
           { e: totalE, thr: effThr, sync: this.ofdmSyncFrames },
           { every: 25 },
         );
@@ -471,9 +488,9 @@ export class RxEngine {
           // Sharpness: clean bursts measure ~1.7-1.9 (identical repeated
           // symbols partially correlate at every offset); flat periodic hum
           // measures ~1.0-1.3. The adaptive energy floor is the third layer.
-          if (probe.score < 0.35 || probe.sharpness < 1.5) {
+          if (probe.score < 0.35 || probe.sharpness < 1.1) {
             
-              'OFDM-SYNC',
+              dlog('OFDM-SYNC',
               { falseTrigger: true, e: totalE, score: probe.score, sharp: probe.sharpness },
               { level: 'warn' },
             );
@@ -483,7 +500,7 @@ export class RxEngine {
           }
 
           // Signal detected! Enter FRAMES state.
-          'OFDM-SYNC', { detected: true, e: totalE });
+          dlog('OFDM-SYNC', { detected: true, e: totalE });
           this.ofdmWindowsSinceDetect = 0;
           this.ofdmFrameSeen = false;
           this.state = RxState.FRAMES;
@@ -511,12 +528,12 @@ export class RxEngine {
               this.sps;
             this.ofdmSkip = skip;
             
-              'OFDM-SYNC',
+              dlog('OFDM-SYNC',
               { boundary, skip, score },
               { level: score < 0.5 ? 'warn' : 'info' },
             );
           } else {
-            'OFDM-SYNC', { aligned: false, alignBuf: this.ofdmAlignBuf.length }, { level: 'warn' });
+            dlog('OFDM-SYNC', { aligned: false, alignBuf: this.ofdmAlignBuf.length }, { level: 'warn' });
           }
           this.buf = [];
           this.ofdmAlignBuf = [];
@@ -590,7 +607,7 @@ export class RxEngine {
           const codeOk =
             this.warbleCodeBits.length >= 16 && bestCodeCorr >= this.WARBLE_CODE_THRESHOLD;
           if (!codeOk) {
-            'WARBLE', { reject: true, corr: bestCodeCorr, need: this.WARBLE_CODE_THRESHOLD });
+            dlog('WARBLE', { reject: true, corr: bestCodeCorr, need: this.WARBLE_CODE_THRESHOLD });
             this.warbleFrames = 0;
           } else {
             RxEngine.rxLog(
@@ -621,7 +638,7 @@ export class RxEngine {
       if (this.preambleFrames > 80) {
         this.warbleTimeoutCount++;
         const newThreshold = 0.025 * Math.pow(1.5, this.warbleTimeoutCount);
-        'PREAMBLE', { timeout: this.warbleTimeoutCount, newThr: newThreshold });
+        dlog('PREAMBLE', { timeout: this.warbleTimeoutCount, newThr: newThreshold });
         this.warbleThreshold = newThreshold;
         this.state = RxState.WAITING;
         this.warbleFrames = 0;
@@ -688,7 +705,7 @@ export class RxEngine {
               this.ref1Q[t] = cal1Q[t] / cnt1[t];
             }
           }
-          'CAL', {
+          dlog('CAL', {
             refs: [0, 1, 2, 3]
               .map(
                 (t) =>
@@ -699,7 +716,7 @@ export class RxEngine {
           // Initialize absolute phase state from last calibration frame
           const lastGc = this.grayCodes[this.prevCalIQs.length - 1];
           this.absBits = [(lastGc >> 3) & 1, (lastGc >> 2) & 1, (lastGc >> 1) & 1, lastGc & 1];
-          'CAL', { absBits: this.absBits.join('') });
+          dlog('CAL', { absBits: this.absBits.join('') });
           // Initialize differential BPSK from last calibration frame's I values
           const lastCal = this.prevCalIQs[this.prevCalIQs.length - 1];
           for (let t = 0; t < TONE_COUNT; t++) {
@@ -712,7 +729,7 @@ export class RxEngine {
       // After calibration: guard frames (pilot only)
       if (this.calFrameCount >= 16) {
         this.guardFrames++;
-        if (this.guardFrames === 1) 'GUARD', { waiting: 2 });
+        if (this.guardFrames === 1) dlog('GUARD', { waiting: 2 });
         if (this.guardFrames >= 2) {
           RxEngine.rxLog('[FRAMES] entering data decode');
           this.state = RxState.FRAMES;
@@ -738,7 +755,7 @@ export class RxEngine {
       // the receiver stuck in FRAMES forever, deaf to the next transmission.
       this.ofdmWindowsSinceDetect++;
       if (!this.ofdmFrameSeen && this.ofdmWindowsSinceDetect > this.OFDM_WATCHDOG_WINDOWS) {
-        'OFDM-SYNC', { watchdogReset: true, windows: this.ofdmWindowsSinceDetect }, { level: 'warn' });
+        dlog('OFDM-SYNC', { watchdogReset: true, windows: this.ofdmWindowsSinceDetect }, { level: 'warn' });
         this.state = RxState.WAITING;
         this.ofdmSyncFrames = 0;
         this.ofdmNoiseEma = this.OFDM_EMA_SEED;
@@ -757,10 +774,24 @@ export class RxEngine {
         this.ofdmDemod.trainOnSyncSymbol(window);
         this.ofdmTrainingSymbols++;
         if (this.ofdmTrainingSymbols >= this.OFDM_TRAINING_SYMBOLS) {
-          'OFDM-TRAIN', { done: true, symbols: this.ofdmTrainingSymbols });
+          dlog('OFDM-TRAIN', { 
+            done: true, 
+            symbols: this.ofdmTrainingSymbols,
+            bufLenRemaining: this.buf.length,
+            samplesSeen: this.samplesSeen,
+          });
         }
         return; // Don't process bits during training
       }
+
+      // Log transition from training → data (once)
+      if (this.ofdmDataSymbolCounter === 0) {
+        dlog('OFDM-DEMOD', { enteringDataPhase: true, bufLenAtEntry: this.buf.length, samplesSeen: this.samplesSeen }, { level: 'info' });
+      }
+
+      // Count how many data symbols we're processing — helps debug why only
+      // one symbol was decoded before buffer ran dry.
+      this.ofdmDataSymbolCounter = (this.ofdmDataSymbolCounter ?? 0) + 1;
 
       // OFDM demodulation — FFT + per-tone equalization + slicing.
       const result = this.ofdmDemod.demodulate(window);
@@ -950,15 +981,22 @@ export class RxEngine {
    * PROFILE frame always decodes assuming exactly today's modulation.
    */
   private resetLinkProfile(): void {
+    const oldToneCount = this.ofdmToneCount;
     this.linkProfile = DEFAULT_LINK_PROFILE(this.ofdmToneCount);
     this.toneOrders = new Array(this.ofdmToneCount).fill(2) as QamOrder[];
     this.allQpsk = true;
-    this.ofdmDemod?.setToneOrders(this.toneOrders);
+    // Don't call setToneOrders here — let the PROFILE frame do it so we
+    // don't waste training symbols re-syncing after an unnecessary switch.
     this.qamBitAcc = 0;
     this.qamBitCount = 0;
     this.qamSymbolsPerFrame = 0;
     this.qamSymbolCounter = 0;
     this.profileFramesSeen = 0;
+    // If tone count changed during reset, rebuild the demodulator to match.
+    if (oldToneCount !== this.ofdmToneCount) {
+      dlog('RX-OFDM', { toneCountChange: true, from: oldToneCount, to: this.ofdmToneCount }, { level: 'info' });
+      this.initOfdmDemod();
+    }
   }
 
   /** Frame-assembly progress snapshot for telemetry. */
@@ -990,7 +1028,7 @@ export class RxEngine {
     this.sps = symSamples;
     let ofdmToneCount = this.cfg.toneCount || OFDM_DEFAULTS.toneCount;
     if (ofdmToneCount % 4 !== 0) {
-      'RX-OFDM', { badToneCount: ofdmToneCount, using: 4 }, { level: 'warn' });
+      dlog('RX-OFDM', { badToneCount: ofdmToneCount, using: 4 }, { level: 'warn' });
       ofdmToneCount = 4;
     }
     this.ofdmToneCount = ofdmToneCount;
@@ -1150,7 +1188,7 @@ export class RxEngine {
     // 5-6 are pre-decode and would be misleading to log against it.
     const decoded = decodeFrame(frame);
 
-    'RX-FRAME', {
+    dlog('RX-FRAME', {
       valid: decoded.valid,
       type: decoded.header ? `0x${decoded.header.type.toString(16).padStart(2, '0')}` : '?',
       seq: decoded.header?.seqNum ?? -1,
@@ -1175,7 +1213,7 @@ export class RxEngine {
         this.processPayload(decoded.payload, decoded.header!.seqNum);
         break;
       case FRAME_TYPE_TAIL:
-        'RX-FRAME', { tail: true, assembled: this.fileData.length, size: this.fileSize });
+        dlog('RX-FRAME', { tail: true, assembled: this.fileData.length, size: this.fileSize });
         this.processTail();
         break;
       case FRAME_TYPE_PROFILE: {
@@ -1184,41 +1222,75 @@ export class RxEngine {
         // a profile-bearing stream from any sender. crc/ver mismatch is
         // silently ignored (stay on current/default profile).
         const profile = parseLinkProfile(decoded.payload);
-        if (profile && profile.toneCount === this.ofdmToneCount) {
-          this.linkProfile = profile;
-          this.profileFramesSeen++;
-          // TX sends PROFILE_FRAME_REPEATS identical copies, ALL at the base
-          // rate, before switching its own modulator (see txEngine's
-          // frameSegments). RX must wait for the SAME count before switching
-          // its demod — switching after the first copy would misdemodulate
-          // the second (still base-rate, on the wire) copy with the wrong
-          // slicer. This is THE single RX-side switch point: everything
-          // after it (header, data, tail) demodulates at the announced
-          // per-tone orders until the next reset (see resetLinkProfile).
-          if (this.profileFramesSeen >= PROFILE_FRAME_REPEATS) {
-            this.toneOrders = qamMapToOrders(profile.qamMap);
-            this.allQpsk = this.toneOrders.every((o) => o === 2);
-            this.ofdmDemod?.setToneOrders(this.toneOrders);
-            // Every subsequent frame (header/data/tail) is FRAME_SIZE bytes
-            // at this same (now-fixed) rate, so it spans a constant symbol
-            // count — reset the generic bit-serializer's frame-boundary
-            // tracking (see qamSymbolsPerFrame's doc) so tail zero-padding
-            // never bleeds into the next frame's byte alignment.
-            if (this.allQpsk) {
-              this.qamSymbolsPerFrame = 0;
-            } else {
-              const bitsPerSymbol = this.toneOrders.reduce((a, b) => a + b, 0);
-              this.qamSymbolsPerFrame = Math.ceil((FRAME_SIZE * 8) / bitsPerSymbol);
-            }
-            this.qamSymbolCounter = 0;
-            this.qamBitAcc = 0;
-            this.qamBitCount = 0;
+        if (!profile) {
+          dlog('RX-PROFILE', { invalid: true }, { level: 'warn' });
+          break;
+        }
+        if (profile.toneCount !== this.ofdmToneCount) {
+          dlog('RX-PROFILE', { 
+            toneCountMismatch: true, 
+            got: profile.toneCount, 
+            want: this.ofdmToneCount,
+            eccT: profile.eccT,
+            qamMapPrefix: profile.qamMap.slice(0, 8).join(',') + (profile.qamMap.length > 8 ? ',…' : ''),
+          }, { level: 'warn' });
+          // Receiver was initialized with a different tone count than what
+          // the TX actually uses. Adapt dynamically: rebuild the demodulator
+          // to match the announced tone count, then fall through to process
+          // the profile at the correct rate.
+          dlog('RX-OFDM', { adaptingToneCount: true, newCount: profile.toneCount }, { level: 'info' });
+          this.ofdmToneCount = profile.toneCount;
+          this.ofdmToneFreqs = ofdmToneFrequencies({ toneCount: profile.toneCount, pilotFreqHz: this.cfg.pilotFreqHz });
+          this.ofdmDemod = new OFDMQPSKDemodulator({
+            sampleRate: this.cfg.sampleRate,
+            toneFrequencies: this.ofdmToneFreqs,
+            pilotFreqHz: this.cfg.pilotFreqHz,
+          });
+          // Reset training so fresh symbols can be accumulated.
+          this.ofdmDemod.resetTraining();
+          this.ofdmTrainingSymbols = 0;
+          // Re-initialize link profile for the new tone count.
+          this.linkProfile = DEFAULT_LINK_PROFILE(profile.toneCount);
+          this.toneOrders = new Array(profile.toneCount).fill(2) as QamOrder[];
+          this.allQpsk = true;
+          // FALL THROUGH — process the profile below with matching tone count.
+        }
+        this.linkProfile = profile;
+        this.profileFramesSeen++;
+        // TX sends PROFILE_FRAME_REPEATS identical copies, ALL at the base
+        // rate, before switching its own modulator (see txEngine's
+        // frameSegments). RX must wait for the SAME count before switching
+        // its demod — switching after the first copy would misdemodulate
+        // the second (still base-rate, on the wire) copy with the wrong
+        // slicer. This is THE single RX-side switch point: everything
+        // after it (header, data, tail) demodulates at the announced
+        // per-tone orders until the next reset (see resetLinkProfile).
+        if (this.profileFramesSeen >= PROFILE_FRAME_REPEATS) {
+          this.toneOrders = qamMapToOrders(profile.qamMap);
+          this.allQpsk = this.toneOrders.every((o) => o === 2);
+          this.ofdmDemod?.setToneOrders(this.toneOrders);
+          dlog('RX-PROFILE', { 
+            eccT: profile.eccT, cpId: profile.cpId, toneCount: profile.toneCount,
+            qamMap: profile.qamMap.join(','), 
+            orders: qamMapToOrders(profile.qamMap).join(','),
+            allQpsk: this.allQpsk,
+          });
+          // Every subsequent frame (header/data/tail) is FRAME_SIZE bytes
+          // at this same (now-fixed) rate, so it spans a constant symbol
+          // count — reset the generic bit-serializer's frame-boundary
+          // tracking (see qamSymbolsPerFrame's doc) so tail zero-padding
+          // never bleeds into the next frame's byte alignment.
+          if (this.allQpsk) {
+            this.qamSymbolsPerFrame = 0;
+          } else {
+            const bitsPerSymbol = this.toneOrders.reduce((a, b) => a + b, 0);
+            this.qamSymbolsPerFrame = Math.ceil((FRAME_SIZE * 8) / bitsPerSymbol);
           }
-          'RX-PROFILE', { eccT: profile.eccT, cpId: profile.cpId, toneCount: profile.toneCount });
-        } else if (profile) {
-          'RX-PROFILE', { toneCountMismatch: true, got: profile.toneCount, want: this.ofdmToneCount }, { level: 'warn' });
+          this.qamSymbolCounter = 0;
+          this.qamBitAcc = 0;
+          this.qamBitCount = 0;
         } else {
-          'RX-PROFILE', { invalid: true }, { level: 'warn' });
+          dlog('RX-PROFILE', { waitingForRepeats: this.profileFramesSeen + '/' + PROFILE_FRAME_REPEATS });
         }
         break;
       }
@@ -1246,7 +1318,7 @@ export class RxEngine {
 
     // Duplicate header (diversity mode repetition) — ignore, keep existing state
     if (fileID === this.fileID && this.fileName !== '') {
-      'RX-FRAME', { dupHeader: true });
+      dlog('RX-FRAME', { dupHeader: true });
       return;
     }
 
@@ -1288,7 +1360,7 @@ export class RxEngine {
     this.fileData = [];
     this.framesReceived = 0;
     this.receivedPayloadSeqs = new Set();
-    'RX-COMP', { scheme: schemeId, wire: totalSize, orig: origSize });
+    dlog('RX-COMP', { scheme: schemeId, wire: totalSize, orig: origSize });
   }
 
   private processPayload(payload: Uint8Array, seqNum: number): void {
@@ -1296,7 +1368,7 @@ export class RxEngine {
 
     // Skip duplicate payload frames (diversity mode repetition)
     if (this.receivedPayloadSeqs.has(seqNum)) {
-      'RX-FRAME', { dupPayload: seqNum });
+      dlog('RX-FRAME', { dupPayload: seqNum });
       return;
     }
     this.receivedPayloadSeqs.add(seqNum);
@@ -1315,7 +1387,7 @@ export class RxEngine {
 
     // Already completed (duplicate tail from diversity mode)
     if (this.state === RxState.COMPLETE) {
-      'RX-FRAME', { dupTail: true });
+      dlog('RX-FRAME', { dupTail: true });
       return;
     }
 

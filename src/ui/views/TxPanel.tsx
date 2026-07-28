@@ -60,6 +60,11 @@ export function TxPanel() {
         >
           {s.isSending ? 'SENDING…' : '▶ TRANSMIT'}
         </Button>
+        <Button
+          onClick={() => dispatch('eardrop-test-frequency')}
+        >
+          Test Frequency
+        </Button>
         <Button onClick={() => dispatch('eardrop-send-test')} disabled={s.isSending}>
           🔊 SEND TEST
         </Button>

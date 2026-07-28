@@ -15,6 +15,7 @@ import { SettingsPanel } from './views/SettingsPanel';
 import { TxPanel } from './views/TxPanel';
 import { Panel } from './components/instrument/Panel';
 import { LED } from './components/instrument/LED';
+import { FrequencySweep } from './views/FrequencySweep';
 import { T } from './theme/labaccent/tokens';
 import { OFDM_DEFAULTS } from '../modem/types';
 import './theme/labaccent/labaccent.css';
@@ -28,6 +29,14 @@ export function BenchApp() {
   const ph = usePipelinePlayhead(s.demoRun, s.demoSpeed);
   const [enlargeFocused, setEnlargeFocused] = useState(false);
   const [presenting, setPresenting] = useState(false);
+  const [showFrequencySweep, setShowFrequencySweep] = useState(false);
+
+  // Event listener for frequency sweep
+  useEffect(() => {
+    const handleFrequencySweep = () => setShowFrequencySweep(true);
+    window.addEventListener('eardrop-test-frequency', handleFrequencySweep);
+    return () => window.removeEventListener('eardrop-test-frequency', handleFrequencySweep);
+  }, []);
 
   // Mirror playhead position into the Store so any panel can read it.
   useEffect(() => {
@@ -134,6 +143,8 @@ export function BenchApp() {
       </Panel>
       </>
       )}
+
+      {showFrequencySweep && <FrequencySweep />}
     </div>
   );
 }

@@ -122,6 +122,7 @@ export class AudioRecorder {
   private workletNode: AudioWorkletNode | null = null;
   private ctx: AudioContext;
   private running = false;
+  private buffer: Float32Array[] = [];
   private onChunk: ChunkCallback | null = null;
   /** Reference to the live GainNode for dynamic mic gain adjustment */
   private micBoostNode: GainNode | null = null;
@@ -130,11 +131,16 @@ export class AudioRecorder {
 
   /** @param ctx - Shared AudioContext (creates own if omitted).
    *  @param micGain - Mic pre-amp multiplier. Default 8.0. */
-  constructor(ctx?: AudioContext, public micGain = 8.0) {
+  constructor(
+    ctx?: AudioContext,
+    public micGain = 8.0,
+  ) {
     this.ctx = ctx ?? new AudioContext();
   }
 
-  get isRunning() { return this.running; }
+  get isRunning() {
+    return this.running;
+  }
 
   /** Dynamically update mic gain while recording. */
   setMicGain(gain: number) {
@@ -144,7 +150,7 @@ export class AudioRecorder {
     }
   }
 
-  async start(_modemRate: number, onChunk: ChunkCallback, deviceId?: string): Promise<void> {
+  async start(_modemRate: number, onChunk?: ChunkCallback, deviceId?: string): Promise<void> {
     if (this.running) return;
     this.micBoostNode = null;
 
@@ -193,7 +199,7 @@ export class AudioRecorder {
     this.stream = await navigator.mediaDevices.getUserMedia(constraints);
 
     this.source = this.ctx.createMediaStreamSource(this.stream);
-    this.onChunk = onChunk;
+    this.onChunk = onChunk ?? null;
 
     // AudioWorklet: compute downsample ratio from ctx rate / modem rate.
     // ratio === 1 means pass-through (native rate OFDM); ratio > 1 uses
@@ -209,7 +215,11 @@ export class AudioRecorder {
     //    micWatchdog (1500 ms silence) will trigger recovery naturally.
     this.workletNode.port.onmessage = (e: MessageEvent<Float32Array>) => {
       if (!this.running) return;
-      this.onChunk!(e.data);
+      if (this.onChunk) {
+        this.onChunk(e.data);
+      } else {
+        this.buffer.push(e.data);
+      }
     };
     // AudioWorkletNode.onmessageerror: catches Chrome's occasional
     // cross-context port teardown errors that would otherwise go silent.
@@ -234,7 +244,13 @@ export class AudioRecorder {
     silentGain.connect(this.ctx.destination);
 
     this.running = true;
-    dlog('REC', { running: true, worklet: isNative ? 'native' : 'sinc127-v2', ratio: workletRatio, gain: this.micGain, outRate: isNative ? this.ctx.sampleRate : _modemRate });
+    dlog('REC', {
+      running: true,
+      worklet: isNative ? 'native' : 'sinc127-v2',
+      ratio: workletRatio,
+      gain: this.micGain,
+      outRate: isNative ? this.ctx.sampleRate : _modemRate,
+    });
   }
 
   stop() {
@@ -259,19 +275,39 @@ export class AudioRecorder {
       this.stream = null;
     }
     this.onChunk = null;
+    this.buffer = [];
     this.running = false;
-    '[Recorder] ✅ stopped');
+  }
+
+  async getRecordedSamples(): Promise<Float32Array> {
+    const totalLength = this.buffer.reduce((sum, arr) => sum + arr.length, 0);
+    const merged = new Float32Array(totalLength);
+    let offset = 0;
+    for (const chunk of this.buffer) {
+      merged.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return merged;
   }
 
   getDiag(): {
-    rmsDb: number; peak: number; zeroCrossingRate: number;
-    ctxState: string; sampleRate: number; calibrationFactor: number;
+
+    rmsDb: number;
+    peak: number;
+    zeroCrossingRate: number;
+    ctxState: string;
+    sampleRate: number;
+    calibrationFactor: number;
     recentSamples: Float32Array;
-    } {
+  } {
     return {
-      rmsDb: -80, peak: 0, zeroCrossingRate: 0,
-      ctxState: this.ctx.state, sampleRate: this.ctx.sampleRate,
-      calibrationFactor: 1.0, recentSamples: new Float32Array(0),
+      rmsDb: -80,
+      peak: 0,
+      zeroCrossingRate: 0,
+      ctxState: this.ctx.state,
+      sampleRate: this.ctx.sampleRate,
+      calibrationFactor: 1.0,
+      recentSamples: new Float32Array(0),
     };
   }
 }

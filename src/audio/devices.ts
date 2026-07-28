@@ -13,8 +13,7 @@ export type DeviceList = { inputs: DeviceInfo[]; outputs: DeviceInfo[] };
 /** Enumerate all audio input/output devices */
 export async function enumerateDevices(): Promise<DeviceList> {
   // Request mic permission first so labels populate
-    /* user may deny — labels stay empty */
-  }
+  // user may deny — labels stay empty
 
   const all = await navigator.mediaDevices.enumerateDevices();
   const inputs: DeviceInfo[] = [];

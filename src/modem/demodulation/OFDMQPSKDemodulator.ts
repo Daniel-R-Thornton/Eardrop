@@ -88,6 +88,10 @@ export class OFDMQPSKDemodulator {
   // and the profile frame itself are always demodulated at this default.
   private toneOrders: QamOrder[];
   private allQpsk = true;
+  /** Track how many post-training symbols we've processed — used to freeze
+   *  decision tracking briefly so initial channel estimates don't get
+   *  corrupted by decisions made on un-equalized (training-phase-like) data. */
+  private postTrainingSymbols = 0;
   /**
    * Correction ratio applied to the QAM path's channel-equalized tone
    * reading before slicing (see computeQamRefScale doc). Recomputed whenever
@@ -123,11 +127,13 @@ export class OFDMQPSKDemodulator {
     this.stagedToneRef = new Array(this.toneCount).fill(0);
     this.toneErr = new Array(this.toneCount).fill(0);
     this.toneRef = new Array(this.toneCount).fill(0);
+    this.postTrainingSymbols = 0;
   }
 
   resetTraining(): void {
     this.trained = false;
     this.trainingSymbols = 0;
+    this.postTrainingSymbols = 0;
     this.diagCount = 0;
     this.channelEstRe = new Array(this.toneCount).fill(1);
     this.channelEstIm = new Array(this.toneCount).fill(0);
@@ -171,7 +177,7 @@ export class OFDMQPSKDemodulator {
       const merDb = evm > 0 ? -20 * Math.log10(evm) : 99;
       const verdict =
         merDb >= 22 ? '64-QAM ok' : merDb >= 16 ? '16-QAM ok' : merDb >= 9 ? 'QPSK only' : 'marginal';
-      'OFDM-MER', {
+      dlog('OFDM-MER', {
         merDb: merDb.toFixed(1),
         evmPct: (evm * 100).toFixed(1),
         symbols: Math.round(this.merCount / this.toneCount),
@@ -355,7 +361,7 @@ export class OFDMQPSKDemodulator {
         const phase = (Math.atan2(this.channelEstIm[t], this.channelEstRe[t]) * 180) / Math.PI;
         return `${amp.toExponential(1)}@${phase.toFixed(0)}`;
       }).join(' ');
-      'OFDM-TRAIN', {
+      dlog('OFDM-TRAIN', {
         symbols: this.trainingSymbols,
         pilotAmp: Math.hypot(this.pilotChannelEstRe, this.pilotChannelEstIm),
         h: tones,
@@ -367,6 +373,11 @@ export class OFDMQPSKDemodulator {
     const buf = window instanceof Float32Array ? window : new Float32Array(window);
     const symSamples = buf.slice(this.cpSamples, this.cpSamples + this.fftSamples);
     const { pilotRe, pilotIm, toneRe, toneIm } = this.analyze(symSamples);
+
+    // Count post-training data symbols so we can freeze tracking briefly.
+    if (this.trained) {
+      this.postTrainingSymbols++;
+    }
 
     const pilotAmp = Math.hypot(pilotRe, pilotIm);
     const pilotPhase = Math.atan2(pilotIm, pilotRe);
@@ -411,14 +422,19 @@ export class OFDMQPSKDemodulator {
           // QPSK point) — otherwise a single noisy symbol nudges channelEst
           // toward the wrong constellation point and, with no gate, later
           // frames in the same burst inherit and compound that error.
-          if (this.trackingAlpha > 0) {
+          // FREEZE: skip tracking during first N post-training symbols so
+          // initial data demodulation uses pure training-based compensation
+          // instead of fighting a tracking loop that collapses all tones.
+          const TRACKING_FREEZE = 14; // postTrainingSymbols starts at 1, so freezes symbols 1..14
+          const trackingDisabled = this.trained && this.postTrainingSymbols < TRACKING_FREEZE;
+          if (this.trackingAlpha > 0 && !trackingDisabled) {
             let normPh = Math.atan2(eqIm, eqRe);
             if (normPh < 0) normPh += 2 * Math.PI;
             const sym = Math.round(normPh / (Math.PI / 2)) % 4;
             const nearestAngle = sym * (Math.PI / 2) + Math.PI / 4;
             const phaseError = Math.abs(normPh - nearestAngle);
             const wrappedError = phaseError > Math.PI ? 2 * Math.PI - phaseError : phaseError;
-            if (wrappedError < Math.PI / 8) {
+            if (wrappedError < Math.PI / 8 && !trackingDisabled) {
               const expRe = Math.cos(nearestAngle);
               const expIm = Math.sin(nearestAngle);
               const ratioRe = rawRe * expRe + rawIm * expIm;
@@ -475,7 +491,20 @@ export class OFDMQPSKDemodulator {
               return `t${t}:${deg.toFixed(0)}°/${(bits[t * 2] << 1) | bits[t * 2 + 1]}`;
             })
             .join(' ');
-          'OFDM-DEMOD', { firstSym: perTone });
+          dlog('OFDM-DEMOD', { firstSym: perTone, pilotAmp: pilotAmp.toFixed(4), tones: this.toneCount });
+          // ── Deep diagnostics for first symbol: trace phase through each step ──
+          const { symSamples } = ofdmSamples(this.cfg.sampleRate);
+          const body = buf.slice(this.cpSamples, this.cpSamples + this.fftSamples);
+          const rawAnalysis = this.analyze(body);
+          const diagLines = [];
+          for (let t = 0; t < Math.min(8, this.toneCount); t++) {
+            const chP = Math.atan2(this.channelEstIm[t], this.channelEstRe[t]) * 180 / Math.PI;
+            const dr = driftPerHz * this.cfg.toneFrequencies[t] * 180 / Math.PI;
+            const rawP = Math.atan2(rawAnalysis.toneIm[t], rawAnalysis.toneRe[t]) * 180 / Math.PI;
+            const eqP = Math.atan2(toneIQOut[t].q, toneIQOut[t].i) * 180 / Math.PI;
+            diagLines.push(`t${t}:raw=${rawP.toFixed(1)}° chP=${chP.toFixed(1)}° drift*freq=${dr.toFixed(1)}° corr=${(-chP-dr).toFixed(1)}° eqP=${eqP.toFixed(1)}°`);
+          }
+          dlog('OFDM-DEMOD-DIAG', { steps: diagLines.join('; ') }, { level: 'warn' });
         }
       } else {
         // ── Per-tone QAM path (taken only when some tone's order > QPSK) ──
