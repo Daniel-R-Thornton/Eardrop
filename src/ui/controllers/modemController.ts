@@ -188,6 +188,22 @@ export class ModemController {
     });
   }
 
+  /**
+   * Barrier: resolves once the worker has drained every command posted before
+   * this one. `fileReady` says whether a completed file was found at that point,
+   * so a failed loopback trial can be declared failed immediately rather than
+   * waiting out a timeout.
+   */
+  flush(): Promise<boolean> {
+    return new Promise((resolve) => {
+      const id = this.nextId++;
+      this.pending.set(id, (ev) => {
+        resolve(ev.type === 'flushed' ? ev.fileReady : false);
+      });
+      this.post({ type: 'flush', id });
+    });
+  }
+
   /** Feed pre-recorded samples into the receiver pipeline (no mic needed).
    *  Sends startRx automatically so the RxEngine is ready to process. */
   feedSamples(samples: Float32Array): void {

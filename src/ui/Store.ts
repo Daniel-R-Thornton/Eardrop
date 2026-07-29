@@ -34,6 +34,38 @@ export interface BlockLogEntry {
   time: number;
 }
 
+export interface SpeedTestResult {
+  toneCount: number;
+  micGain: number;
+  pilotFreqHz: number;
+  qamBits: 2 | 4 | 6;
+  qamScale: number;
+  success: boolean;
+  passes: number;
+  framesOk: number;
+  framesTotal: number;
+  /** Valid frames excluding PROFILE — the ones that prove data got through. */
+  dataFramesOk?: number;
+  merDb: number | null;
+  evmPct: number | null;
+  throughputKbps: number;
+  durationMs: number;
+  /** Staged MER of the last failed frame — signal quality when nothing decoded. */
+  rawMerDb?: number | null;
+  /** How far the receiver got: 0 nothing … 4 profile decoded. */
+  syncLevel?: number;
+  /** Composite score the auto-tune hunt maximises (higher = better). */
+  score?: number;
+  /** Which hunt axis this trial was probing ('grid' for an exhaustive sweep). */
+  phase?: string;
+  /** The debug ring saturated, so frame counts parsed from it may undercount. */
+  logTruncated?: boolean;
+  /** Repeats run at this point, when the path is noisy enough to need them. */
+  attempts?: number;
+  /** Scores of every attempt, worst-first ranking uses the minimum. */
+  attemptScores?: number[];
+}
+
 export interface AppState {
   sendStatus: { type: string; msg: string } | null;
   recvStatus: { type: string; msg: string } | null;
@@ -125,6 +157,22 @@ export interface AppState {
   demoFrameIndex: number;
   /** Which pipeline stage is currently highlighted */
   demoStageIndex: number;
+  /** True while the OFDM speed/auto-tune sweep is running */
+  speedTestRunning: boolean;
+  /** Progress of the current speed sweep: current/total combos */
+  speedTestProgress: { current: number; total: number } | null;
+  /** Per-combo results from the last speed sweep */
+  speedTestResults: SpeedTestResult[];
+  /** Highest-scoring combo from the last speed sweep */
+  speedTestBest: SpeedTestResult | null;
+  /** When true, speed test feeds samples straight back to the RX (no speaker/mic) */
+  speedTestLoopback: boolean;
+  /**
+   * 'grid' = exhaustive sweep of every combo.
+   * 'hunt' = coordinate descent: climb one variable to a local maximum, then
+   * move to the next, repeating passes until nothing improves.
+   */
+  speedTestMode: 'grid' | 'hunt';
 }
 
 const defaultDecoder: DecoderInfo = {
@@ -193,6 +241,12 @@ const defaultState: AppState = {
   demoSpeed: 'slow',
   demoFrameIndex: 0,
   demoStageIndex: 0,
+  speedTestRunning: false,
+  speedTestProgress: null,
+  speedTestResults: [],
+  speedTestBest: null,
+  speedTestLoopback: false,
+  speedTestMode: 'hunt',
 };
 
 // ─── Store ────────────────────────────────────────────

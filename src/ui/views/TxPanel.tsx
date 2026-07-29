@@ -75,7 +75,66 @@ export function TxPanel() {
           <Button onClick={() => dispatch('eardrop-export-wav')}>⬇ WAV</Button>
         )}
         <Button onClick={() => dispatch('eardrop-load-wav')}>⬆ FROM WAV</Button>
+        <Button
+          onClick={() => dispatch('eardrop-speed-test')}
+          disabled={!s.useOFDM || s.isSending || s.speedTestRunning}
+        >
+          {s.speedTestRunning && s.speedTestProgress
+            ? `TEST ${s.speedTestProgress.current}/${s.speedTestProgress.total}`
+            : 'TEST SPEED'}
+        </Button>
       </div>
+
+      {s.useOFDM && (
+        <label
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            marginTop: 8,
+            fontFamily: T.mono,
+            fontSize: 11,
+            color: '#6b6355',
+            cursor: 'pointer',
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={s.speedTestLoopback}
+            onChange={(e) => setState({ speedTestLoopback: e.target.checked })}
+          />
+          Speed test: software loopback (bypass speaker/mic)
+        </label>
+      )}
+
+      {s.useOFDM && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6, fontFamily: T.mono, fontSize: 11, color: '#6b6355' }}>
+          <span>SEARCH</span>
+          {([
+            ['hunt', 'hunt', 'Climb one variable to its local max, then the next'],
+            ['grid', 'grid', 'Exhaustively try every combination'],
+          ] as const).map(([mode, label, hint]) => (
+            <button
+              key={mode}
+              type="button"
+              title={hint}
+              onClick={() => setState({ speedTestMode: mode })}
+              disabled={s.speedTestRunning}
+              style={{
+                fontFamily: T.mono,
+                fontSize: 11,
+                padding: '2px 8px',
+                cursor: s.speedTestRunning ? 'default' : 'pointer',
+                border: `1px solid ${s.speedTestMode === mode ? '#3b7d4f' : '#c9c1b0'}`,
+                background: s.speedTestMode === mode ? '#e2f0e4' : 'transparent',
+                color: '#6b6355',
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
 
       <div style={{ marginTop: 10 }}>
         <div style={{ fontFamily: T.mono, fontSize: 11, color: '#6b6355', marginBottom: 4 }}>
@@ -133,6 +192,69 @@ export function TxPanel() {
         </div>
       )}
       {s.sendStatus && <div style={{ marginTop: 8 }}><StatusBadge {...s.sendStatus} /></div>}
+
+      {s.speedTestResults.length > 0 && (
+        <div
+          style={{
+            marginTop: 10,
+            maxHeight: 220,
+            overflow: 'auto',
+            fontFamily: T.mono,
+            fontSize: 11,
+            border: `1px solid ${T.panelEdge}`,
+            borderRadius: T.radius,
+            padding: 8,
+          }}
+        >
+          {s.speedTestBest && (
+            <div style={{ color: T.phosphor, marginBottom: 6 }}>
+              BEST: {s.speedTestBest.qamBits === 2 ? 'QPSK' : `${s.speedTestBest.qamBits}-QAM`}
+              {' @ '}{s.speedTestBest.pilotFreqHz.toFixed(0)}Hz
+              {' · scale '}{s.speedTestBest.qamScale.toFixed(3)}
+              {' · gain '}{s.speedTestBest.micGain}
+              {' · '}{s.speedTestBest.toneCount} tones
+              {' · '}{s.speedTestBest.throughputKbps.toFixed(1)} kbps
+              {s.speedTestBest.merDb !== null && ` · MER ${s.speedTestBest.merDb.toFixed(1)}dB`}
+            </div>
+          )}
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ color: '#6b6355', textAlign: 'left' }}>
+                <th>QAM</th>
+                <th>Hz</th>
+                <th>Scale</th>
+                <th>Gain</th>
+                <th>Tones</th>
+                <th>OK</th>
+                <th>Frames</th>
+                <th>MER</th>
+                <th>kbps</th>
+              </tr>
+            </thead>
+            <tbody>
+              {s.speedTestResults.map((r, i) => (
+                <tr
+                  key={i}
+                  style={{
+                    color: r.success ? '#a0c0a0' : '#c08080',
+                    background: r === s.speedTestBest ? 'rgba(0,255,0,0.08)' : 'transparent',
+                  }}
+                >
+                  <td>{r.qamBits === 2 ? 'QPSK' : `${r.qamBits}-QAM`}</td>
+                  <td>{r.pilotFreqHz.toFixed(0)}</td>
+                  <td>{r.qamScale.toFixed(3)}</td>
+                  <td>{r.micGain}</td>
+                  <td>{r.toneCount}</td>
+                  <td>{r.success ? 'OK' : 'FAIL'}</td>
+                  <td>{r.framesOk}/{r.framesTotal}</td>
+                  <td>{r.merDb !== null ? r.merDb.toFixed(1) : '—'}</td>
+                  <td>{r.throughputKbps.toFixed(1)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </Panel>
   );
 }

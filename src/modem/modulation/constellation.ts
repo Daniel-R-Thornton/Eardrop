@@ -131,6 +131,35 @@ export function sliceSymbol(re: number, im: number, order: QamOrder): number {
   return (iGray << m) | qGray;
 }
 
+/**
+ * Outer-corner symbol for an order — the constellation point with the
+ * largest re+im (i.e. the (+max,+max) corner of the square). Used by the
+ * QAM reference-symbol scheme (see OFDM_TUNING.qamRefSymbols): TX transmits
+ * this exact known point per tone so RX can invert its equalizer against a
+ * point it doesn't have to guess. Found by brute-force scan rather than a
+ * closed form so it stays correct if the Gray-coding scheme above ever
+ * changes — 2^order is tiny (≤64) so the scan is free.
+ */
+export function outerCornerSymbol(order: QamOrder): number {
+  const count = 1 << order;
+  let best = 0;
+  let bestScore = -Infinity;
+  for (let bits = 0; bits < count; bits++) {
+    const { re, im } = mapSymbol(bits, order);
+    const score = re + im;
+    if (score > bestScore) {
+      bestScore = score;
+      best = bits;
+    }
+  }
+  return best;
+}
+
+/** Constellation point for outerCornerSymbol(order) — see its doc. */
+export function outerCornerPoint(order: QamOrder): ConstellationPoint {
+  return mapSymbol(outerCornerSymbol(order), order);
+}
+
 /** Phase-4 profile qamMap value (0/1/2) → bits-per-tone order. */
 export function qamMapValueToOrder(value: 0 | 1 | 2): QamOrder {
   return value === 0 ? 2 : value === 1 ? 4 : 6;

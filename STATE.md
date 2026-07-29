@@ -1,12 +1,118 @@
 # Eardrop — State Summary
 
-**Branch**: `review-fixes`
-**Last commit**: `35af4ca` — fix(ofdm): freeze decision tracking post-training + prevent chirp probe buffer drain
-**Date**: 2026-07-28
+**Branch**: `main`
+**Last commit**: `7a19320` — refactor(logs): denser dlog output, compact RX-FAIL, shorter sync/scan/profile tags (all work below is uncommitted on top)
+**Date**: 2026-07-30
 
 ---
 
-## Current session — review-fixes cleanup
+## Current session — QAM acoustic root cause + amplitude calibration (2026-07-30)
+
+### Root cause of acoustic 16-QAM failure — FOUND and MEASURED
+
+The long-standing "QPSK works, 16-QAM fails acoustically despite loud signal" mystery is not
+SNR, reverb, AEC, or clock drift. Chain of evidence:
+
+1. **The 34 dB vs 8.5 dB MER numbers were never comparable.** QPSK MER
+   (`OFDMQPSKDemodulator`, staged-MER block in the allQpsk branch) normalizes each point to
+   unit magnitude first — it measures *phase only*. QAM MER measures against the absolute
+   constellation grid. Real acoustic runs show phase EVM ~2° (pristine) while amplitude is
+   systematically wrong — so noise/reverb/ISI (complex-valued impairments that would hit phase
+   equally) are ruled out.
+2. **QAM data arrives at ~0.5× the amplitude the model predicts.** QAMD constellation dumps
+   (8 tones, pilot 1850, grid 3850–4200, 16-QAM) show axis levels at ~±0.15/±0.47 instead of
+   ±0.316/±0.949 — exactly half scale, level ratio still 3. Half-scale outer points fall below
+   the 0.632 slicing boundary → all amplitude bits wrong → sentinel never matches
+   (`sr=0x555555`). Loopback with the *identical* config decodes byte-exact.
+3. **The attenuation is level-dependent (expander-like) and frequency-dependent.** Doubling the
+   TX QAM scale moved received points from 0.47× to only ~0.7–0.9× of grid (non-linear), with
+   ±15% per-tone spread — and frames then *nearly* decoded (single RS block failures). Pilot
+   (1850 Hz) arrives at expected amplitude while data tones (3850–4200 Hz) are cut — NOT
+   common-mode gain; the tone/pilot ratio inside one symbol is broken. Suspected always-on
+   speaker/mic DSP (multiband dynamics / smart-amp protection); invisible to
+   pactl, unaffected by volume (volume sweeps changed nothing).
+4. **Constant-point runs in QAMD** (all tones at the same point for most of the data phase) are
+   zero-padding filler in mostly-empty frames — no scrambler/whitening exists, so padding makes
+   long identical-symbol runs. Not a bug, but worth whitening later (symbol statistics, PAPR).
+
+### Fix 1: pilot-referenced per-symbol gain correction (QAM path)
+- The pilot rides in every symbol; its phase already drives `driftPerHz`. Now its *magnitude*
+  drives a gain correction: EMA (α=0.25) of per-symbol pilot amplitude, reference latched after
+  an 8-symbol warmup (first data frame behavior unchanged), `gainCorr = ref/current` clamped
+  [0.5, 2.0], multiplied into the QAM equalizer output before `qamRefScale`; decision-directed
+  tracker reconstruction walks back through it consistently.
+- Confirmed live: `OFDM-GAIN g=0.92–0.94` during real transfers — ~7–8% genuine gain drift.
+- Note: 16-QAM's slicer tolerates *uniform* gain error up to ~2.05× (outer-level clamp), so the
+  regression test uses a 1.0→2.2 ramp (verified failing pre-fix).
+- Files: `OFDMQPSKDemodulator.ts`, test `src/modem/test/ofdmGainSag.test.ts`.
+
+### Fix 2: QAM reference symbols — per-tone amplitude calibration at data scale (wire format change)
+- **TX** (`txEngine.ts` / `ofdmEngine.modulateQamRefSymbols()`): after the profile frames, when
+  any tone is above QPSK, inserts `OFDM_TUNING.qamRefSymbols = 4` OFDM symbols with every tone
+  at its order's outer-corner constellation point, at the real data-path `qamScale`. All-QPSK
+  waveforms are byte-identical to before (regression-tested).
+- **RX** (`rxEngine.ts` `qamRefPending` counter, set at the profile switch): consumes those 4
+  symbols via `ofdmDemod.calibrateQamRef(window)` instead of feeding bits to the scanner.
+- **Demod** (`calibrateQamRef`): inverts the equalizer math against the known corner point
+  (drift rotation included, gainCorr pinned to 1) and REPLACES per-tone `channelEstRe/Im` with
+  the implied channel — i.e. re-training at true data amplitude, through the real nonlinearity,
+  per tone. Pilot gain-correction warmup re-arms against the calibrated reference. Logs
+  `QAMCAL k=…` (per-tone correction, percent of old magnitude).
+- Shared helper `outerCornerSymbol/Point(order)` in `constellation.ts` keeps TX and RX agreeing
+  on the known point.
+- Tests: expander simulation (0.5× everything after the preamble — fails without the fix,
+  byte-exact with it), unity-gain regression, all-QPSK no-ref-symbols regression.
+
+### Diagnostics added (all dlog)
+- `RX-FRAME` now includes `mer=` (staged, per frame) and `pa=` (pilot amplitude) on every frame.
+- `OFDM-TMER db=…` — per-tone MER dump with each OFDM-MER report (flat = gain/CPE, ramp =
+  timing, notches = multipath/IMD).
+- `QAMD n=.. g=.. p=13,45;-15,13;…` — equalized QAM constellation points, centi-units (÷100),
+  tone = position, first 2 data symbols + every 16th.
+- `QPSKD drift=.. d=raw/chP/eqP;…` — compact per-tone first-symbol trace (integer degrees),
+  replaces the wordy OFDM-DEMOD-DIAG steps.
+- `OFDM-GAIN g=…` every 32 QAM symbols when correction >5%; `QAMCAL k=…` at calibration.
+
+### Also found (not fixed)
+- **QPSK decision-tracking gate is dead code**: the confidence gate computes
+  `nearestAngle = sym·90°+45°` but the slicer/MER use the `sym·90°` grid, so the gate error is
+  always ~45° > the 22.5° threshold and tracking never fires. Harmless today (QPSK works);
+  fix or delete when next in that code.
+- `qamScaleOverride` hand-tuning (0.03 etc.) was compensating for the level-dependent
+  attenuation; with Fix 2 the slider should go back to Auto.
+
+### Status / verification
+- `npx tsc --noEmit` clean; `npx vitest run src/modem/test` → **254 passed / 3 failed** (the 3
+  pre-existing BPSK failures: Doppler +2Hz, Doppler −1Hz, Full Stress). `tuning.test.ts`
+  shape assertion updated for the new `qamRefSymbols` key.
+- **Not yet validated acoustically.** Next step: real speaker→mic run at default QAM scale
+  (slider on Auto). Watch `QAMCAL` (expect ~200% correction if half-scale theory holds), `QAMD`
+  points near ±32/±95 centi-units post-calibration, and `RX-FRAME ok=true` for 0x1/0x2/0x3.
+- If it decodes: consider a byte scrambler/whitener (fixes filler symbol runs + statistics),
+  then revisit 64-QAM and re-enabling decision-directed tracking.
+
+---
+
+## Previous session — OFDM speed/auto-tune sweep
+
+### Completed this session
+
+#### Feature: TEST SPEED button
+- **What**: Added a `TEST SPEED` button in `TxPanel.tsx` that runs an OFDM-only sweep across pilot frequencies, QAM orders (QPSK/16-QAM/64-QAM), QAM scale overrides, mic gains, and tone counts.
+- **How**: For each combo it re-configures the modem (resetting RX state), sends a 10-frame random payload through the live TX/RX pipeline, and waits for the `fileComplete` event. **One decode attempt per combo** — no repeats, so the OK/FAIL result is meaningful.
+- **Loopback mode**: Added a "Speed test: software loopback (bypass speaker/mic)" checkbox. In loopback mode the generated samples are fed straight back via `modem.feedSamples()` instead of playing through the speaker; mic gain is ignored and decode wait is shorter (1000 ms vs 1500 ms acoustic).
+- **Timing**: Delays reduced to 50 ms between configure/play, between combos, and for mic-gain settle. Throughput is computed from the actual waveform duration rather than total trial time. Payload reduced to 4 frames (was 10) so the sweep stays fast; loopback decode wait is now `min(5 s, max(2 s, duration*1.2))` so long QPSK waveforms don't time out.
+- **Scoring**: Results are sorted by QAM order then net throughput; the best passing combo is highlighted in the UI and logged to the console. The results table shows `OK`/`FAIL` instead of a pass count.
+- **Files changed**: `src/ui/Store.ts`, `src/ui/views/TxPanel.tsx`, `src/ui/app.ts`.
+- **Notes**: Ranges are intentionally small defaults (current tone count, 3 mic gains, 5 pilot offsets, 4 QAM scales) to keep runtime reasonable; the arrays in `runSpeedTest()` are easy to expand.
+
+#### Fix: `qamRefScale` ignored `qamScaleOverride`
+- **Problem**: `OFDMQPSKDemodulator.computeQamRefScale()` hard-coded the default crest-factor QAM scale (`0.95 / (CREST * rms)`). When the speed test (or UI slider) set a `qamScaleOverride`, the receiver's QAM slicer used the wrong amplitude reference, so 16-QAM/64-QAM failed in loopback except when the override happened to be near the default.
+- **Fix**: Added `qamScaleOverride` to `OFDMQPSKDemodulatorConfig` and used `this.cfg.qamScaleOverride ?? defaultScale` in `computeQamRefScale()`. Passed the override through `RxEngine` when constructing the demodulator (both initial and tone-count-adaptation paths).
+- **Files changed**: `src/modem/demodulation/OFDMQPSKDemodulator.ts`, `src/modem/protocol/rxEngine.ts`.
+- **Verification**: `npm test` still 259 passed / 3 failed (pre-existing BPSK pipeline failures). `npx tsc --noEmit` clean.
+
+## Previous session — review-fixes cleanup
 
 ### Completed this session
 

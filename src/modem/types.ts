@@ -199,6 +199,13 @@ export const OFDM_TUNING = {
   cpCorrelationMinScore: 0.35,
   /** RX: minimum CP correlation sharpness (peak / mean) to reject flat hum */
   cpCorrelationMinSharpness: 1.1,
+  /** TX/RX: known QAM-scale reference symbols inserted after the profile
+   *  frames (only when the announced qamMap uses any tone above QPSK) —
+   *  every tone carries its order's outer-corner constellation point at
+   *  the real data-path qamScale, so RX can re-fit per-tone channel
+   *  estimates at the ACTUAL data amplitude (see
+   *  OFDMQPSKDemodulator.calibrateQamRef). */
+  qamRefSymbols: 4,
 } as const;
 
 /**

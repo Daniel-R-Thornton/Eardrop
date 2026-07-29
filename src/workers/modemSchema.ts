@@ -44,6 +44,9 @@ export type ModemCommand =
   | { type: 'encodeStreamCancel'; id: number }
   | { type: 'demoEncode'; id: number; fileName: string; data: ArrayBuffer }
   | { type: 'dumpBuffer'; id: number; seconds: number }
+  // Round-trip barrier: the worker processes commands in order, so a 'flushed'
+  // reply proves every previously-posted feedChunk has already been demodulated.
+  | { type: 'flush'; id: number }
   | { type: 'setVerboseLogging'; enabled: boolean };
 
 export type ModemEvent =
@@ -59,5 +62,7 @@ export type ModemEvent =
   | { type: 'streamEnd'; id: number }
   | { type: 'demoEncoded'; id: number; run: Run }
   | { type: 'bufferDump'; id: number; samples: ArrayBuffer; rms: number; peak: number }
+  /** Reply to 'flush'. `fileReady` = a completed file was found by this barrier. */
+  | { type: 'flushed'; id: number; fileReady: boolean }
   | { type: 'dlog'; line: string }
   | { type: 'error'; id?: number; error: string };

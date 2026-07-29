@@ -195,8 +195,14 @@ export class AudioRecorder {
         channelCount: { ideal: 1 },
       },
     };
-    this.stream = await navigator.mediaDevices.getUserMedia(constraints);
 
+    this.stream = await navigator.mediaDevices.getUserMedia(constraints);
+    console.log(this.stream);
+    const track = this.stream.getAudioTracks()[0];
+    console.log('Mic settings:', track.getSettings());
+    console.log('Mic constraints:', track.getConstraints());
+    console.log('AudioContext rate:', this.ctx.sampleRate);
+    // globalThis.window.['myStream'] = this.stream;
     this.source = this.ctx.createMediaStreamSource(this.stream);
     this.onChunk = onChunk ?? null;
 
@@ -290,7 +296,6 @@ export class AudioRecorder {
   }
 
   getDiag(): {
-
     rmsDb: number;
     peak: number;
     zeroCrossingRate: number;

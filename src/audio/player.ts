@@ -58,8 +58,8 @@ export class AudioPlayer {
       } else {
         // Find peak to auto-normalize
         let peak = 0;
-        for (let i = 0; i < samples.length; i++) {
-          const abs = Math.abs(samples[i]);
+        for (const element of samples) {
+          const abs = Math.abs(element);
           if (abs > peak) peak = abs;
         }
         // Scale so that peak * volume * scale = 0.95 (no clipping)

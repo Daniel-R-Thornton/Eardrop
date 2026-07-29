@@ -254,7 +254,14 @@ export class TxEngine {
       // on the TX side (see plan deviation doc at the top of this file's
       // sibling rxEngine.ts for the matching RX-side switch point).
       if (this.useOFDM && this.ofdmEngine && this.qamMap) {
-        this.ofdmEngine.setToneOrders(qamMapToOrders(this.qamMap));
+        const orders = qamMapToOrders(this.qamMap);
+        this.ofdmEngine.setToneOrders(orders);
+        // QAM reference symbols (see OFDM_TUNING.qamRefSymbols doc): only
+        // when some tone is actually above QPSK — an all-QPSK qamMap must
+        // leave the waveform byte-identical to before this feature existed.
+        if (!orders.every((o) => o === 2)) {
+          yield this.ofdmEngine.modulateQamRefSymbols();
+        }
       }
     }
 

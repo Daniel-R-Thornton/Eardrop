@@ -9,9 +9,9 @@
  * Sync burst: chirped pilot (LFM sweep) for frequency-diversity timing.
  * Training: standard OFDM all-zero symbols for per-tone channel estimation.
  */
-import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS } from '../types';
+import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_TUNING } from '../types';
 import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
-import type { QamOrder } from '../modulation/constellation';
+import { outerCornerSymbol, type QamOrder } from '../modulation/constellation';
 import { generateChirp, type ChirpConfig } from './chirp';
 import { dlog } from '../../lib/debug/dlog';
 
@@ -158,6 +158,33 @@ export class OFDMEngine {
           symbols[blk * 4 + j] = (b0 << 1) | b1;
         }
       }
+      this.ofdm.setSymbols(symbols);
+      parts.push(this.ofdm.generateSymbol());
+    }
+    const totalLen = parts.reduce((a, b) => a + b.length, 0);
+    const audio = new Float32Array(totalLen);
+    let off = 0;
+    for (const p of parts) { audio.set(p, off); off += p.length; }
+    return audio;
+  }
+
+  /**
+   * QAM reference symbols — inserted (by txEngine) right after the profile
+   * frames and setToneOrders(), before the header frame, ONLY when the
+   * announced qamMap uses any tone above QPSK. Every tone transmits the
+   * OUTER CORNER constellation point of its assigned order (e.g. (3,3)/
+   * sqrt(10) for 16-QAM — see outerCornerSymbol) through the exact same
+   * synthesis path as ordinary QAM data (setSymbols/generateSymbol at
+   * qamScale, pilot as usual, standard CP). Because RX knows this point
+   * exactly, it can invert its equalizer to re-fit each tone's channel
+   * estimate AT THE ACTUAL DATA AMPLITUDE, through whatever level-dependent
+   * nonlinearity the real audio chain applies — see
+   * OFDMQPSKDemodulator.calibrateQamRef.
+   */
+  modulateQamRefSymbols(): Float32Array {
+    const symbols = this.toneOrders.map((order) => outerCornerSymbol(order));
+    const parts: Float32Array[] = [];
+    for (let i = 0; i < OFDM_TUNING.qamRefSymbols; i++) {
       this.ofdm.setSymbols(symbols);
       parts.push(this.ofdm.generateSymbol());
     }

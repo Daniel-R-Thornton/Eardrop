@@ -18,5 +18,6 @@ test('current default values', () => {
     tailSilenceSymbols: 6,
     cpCorrelationMinScore: 0.35,
     cpCorrelationMinSharpness: 1.1,
+    qamRefSymbols: 4,
   });
 });

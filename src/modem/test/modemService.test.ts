@@ -167,3 +167,49 @@ test('dumpBuffer returns the most recent seconds of audio', () => {
     expect(d.peak).toBeCloseTo(0.25, 2);
   }
 });
+
+test('flush reports fileReady=false when the fed audio decoded nothing', () => {
+  const { svc, events } = makeService();
+  svc.handle({ type: 'configure', config: CFG });
+  svc.handle({ type: 'startRx' });
+  const noise = new Float32Array(SAMPLE_RATE / 2);
+  for (let i = 0; i < noise.length; i++) noise[i] = Math.sin(i * 0.31) * 0.05;
+  svc.handle({ type: 'feedChunk', samples: noise.buffer });
+  svc.handle({ type: 'flush', id: 5 });
+
+  const f = events.find((e) => e.type === 'flushed');
+  expect(f, 'flush must always reply, so callers never wait out a timeout').toBeDefined();
+  if (f && f.type === 'flushed') {
+    expect(f.id).toBe(5);
+    expect(f.fileReady).toBe(false);
+  }
+});
+
+test('flush finds a completed file without any tick(), and the file follows', async () => {
+  const { svc, events } = makeService();
+  svc.handle({ type: 'configure', config: CFG });
+  svc.handle({ type: 'startRx' });
+
+  const data = new Uint8Array(120);
+  for (let i = 0; i < data.length; i++) data[i] = (i * 7 + 1) & 0xff;
+  const tx = new TxEngine(CFG as ConstructorParameters<typeof TxEngine>[0]);
+  const audio = tx.transmitFile('flush.bin', data);
+  const { symSamples } = ofdmSamples(SAMPLE_RATE);
+  const padded = new Float32Array(audio.length + symSamples * 8);
+  padded.set(audio, 0);
+
+  // Deliberately no tick() anywhere: the flush barrier alone must notice.
+  svc.handle({ type: 'feedChunk', samples: padded.buffer });
+  svc.handle({ type: 'flush', id: 9 });
+
+  const f = events.find((e) => e.type === 'flushed');
+  expect(f).toBeDefined();
+  if (f && f.type === 'flushed') expect(f.fileReady).toBe(true);
+
+  await flush();
+  const done = events.find((e) => e.type === 'fileComplete');
+  expect(done, 'fileComplete should follow the flush barrier').toBeDefined();
+  if (done && done.type === 'fileComplete') {
+    expect(Array.from(new Uint8Array(done.data))).toEqual(Array.from(data));
+  }
+});

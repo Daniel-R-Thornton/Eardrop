@@ -239,6 +239,19 @@ export function dlogDump(count = 200): string {
   return ring.slice(-count).join('\n');
 }
 
+/**
+ * Ring capacity, exported so callers that COUNT events in a dump (rather than
+ * just reading it) can ask for everything and detect saturation. Scraping a
+ * short tail silently undercounts: early lines get evicted while later ones
+ * survive, which reads as "no frames arrived but here is their MER".
+ */
+export const DLOG_RING_MAX = RING_MAX;
+
+/** Lines currently buffered. Equal to DLOG_RING_MAX means older lines were dropped. */
+export function dlogRingLength(): number {
+  return ring.length;
+}
+
 /** Reset rate counters, duplicate state, and ring (call when starting a fresh transmission test). */
 export function dlogReset(): void {
   ring.length = 0;

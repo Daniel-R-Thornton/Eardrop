@@ -225,6 +225,15 @@ export class RxEngine {
    * as generic-rate content (see FRAME_TYPE_PROFILE handling in processFrame).
    */
   private profileFramesSeen = 0;
+  /**
+   * Countdown of QAM reference symbols (see OFDM_TUNING.qamRefSymbols) still
+   * to consume right after a non-all-QPSK profile switch. While > 0, each
+   * OFDM data window is handed to ofdmDemod.calibrateQamRef() instead of
+   * having its bits fed to the scanner (see feedSample). Set at the profile
+   * switch (FRAME_TYPE_PROFILE handling below); reset to 0 wherever
+   * resetLinkProfile() runs, so an all-QPSK stream never sees it.
+   */
+  private qamRefPending = 0;
 
   // Per-tone I/Q calibration references (from Gray code calibration)
   /** Reference vectors for bit=0 (ref0I/Q) and bit=1 (ref1I/Q) per tone */
@@ -802,6 +811,16 @@ export class RxEngine {
       // OFDM demodulation — FFT + per-tone equalization + slicing.
       const result = this.ofdmDemod.demodulate(window);
 
+      // QAM reference symbols (see qamRefPending's doc): consume them for
+      // calibration instead of feeding their (meaningless-as-data) bits to
+      // the scanner. demodulate() above still ran on this window — this
+      // just re-derives the raw tone IQ separately (analyze() is pure).
+      if (this.qamRefPending > 0) {
+        this.qamRefPending--;
+        this.ofdmDemod.calibrateQamRef(window);
+        return;
+      }
+
       if (this.allQpsk) {
         // ── Legacy all-QPSK path — UNCHANGED, byte-identical to the pre-QAM
         // receiver. Tones are grouped in 4-tone blocks; each block carries
@@ -998,6 +1017,7 @@ export class RxEngine {
     this.qamSymbolsPerFrame = 0;
     this.qamSymbolCounter = 0;
     this.profileFramesSeen = 0;
+    this.qamRefPending = 0;
     // If tone count changed during reset, rebuild the demodulator to match.
     if (oldToneCount !== this.ofdmToneCount) {
       dlog('RX-OFDM', { toneCountChange: true, from: oldToneCount, to: this.ofdmToneCount }, { level: 'info' });
@@ -1044,6 +1064,7 @@ export class RxEngine {
       sampleRate: this.cfg.sampleRate,
       toneFrequencies: demodToneFreqs,
       pilotFreqHz: this.cfg.pilotFreqHz,
+      qamScaleOverride: (this.cfg as any).qamScaleOverride,
     });
     // Pre-compute chirp template for sync detection
     const chirpDurationSec = (OFDM_TUNING.syncBurstSymbols * symSamples) / this.cfg.sampleRate;
@@ -1190,7 +1211,10 @@ export class RxEngine {
   }
 
   /** Log a concise failure diagnosis when a frame does not decode. */
-  private logFrameFailure(decoded: ReturnType<typeof decodeFrame>): void {
+  private logFrameFailure(
+    decoded: ReturnType<typeof decodeFrame>,
+    stagedMerDb: number | null = null,
+  ): void {
     const fields: Record<string, unknown> = {
       r: decoded.failureReason,
       t: decoded.header ? `0x${decoded.header.type.toString(16)}` : '?',
@@ -1208,6 +1232,10 @@ export class RxEngine {
     if (this.useOFDM && this.ofdmDemod) {
       const mer = this.ofdmDemod.getMER();
       if (mer) fields.mer = dlogFmt(mer.merDb);
+      // Staged MER of the frame that just failed. Captured before discardMER()
+      // wiped it, and the only signal-quality figure available when nothing
+      // decodes — auto-tune hill-climbs on it.
+      if (stagedMerDb !== null) fields.smer = dlogFmt(stagedMerDb);
     } else {
       fields.pa = dlogFmt(this.pilotAmplitude);
     }
@@ -1220,11 +1248,21 @@ export class RxEngine {
     // 5-6 are pre-decode and would be misleading to log against it.
     const decoded = decodeFrame(frame);
 
-    dlog('RX-FRAME', {
+    // Read the staged MER before commit/discard clears it — it is the only
+    // signal-quality figure a fully-failing config ever produces (diagnostic).
+    const stagedMer = this.useOFDM ? (this.ofdmDemod?.getStagedMER() ?? null) : null;
+
+    const frameFields: Record<string, unknown> = {
       ok: decoded.valid,
       t: decoded.header ? `0x${decoded.header.type.toString(16)}` : '?',
       s: decoded.header?.seqNum ?? -1,
-    });
+    };
+    // Per-frame MER and pilot amplitude expose channel drift across a
+    // transfer (MER decay with stable pa = timing/EQ drift; both decaying
+    // together = gain sag from AEC/compression).
+    if (stagedMer) frameFields.mer = dlogFmt(stagedMer.merDb);
+    if (this.useOFDM) frameFields.pa = dlogFmt(this.pilotAmplitude);
+    dlog('RX-FRAME', frameFields);
     // Gate MER accumulation to windows that belong to a successfully-decoded
     // frame — commit the staged stats on success, throw them away on failure,
     // so the "how much SNR headroom exists" number never includes garbage
@@ -1233,7 +1271,7 @@ export class RxEngine {
     else this.ofdmDemod?.discardMER();
 
     if (!decoded.valid) {
-      this.logFrameFailure(decoded);
+      this.logFrameFailure(decoded, stagedMer ? stagedMer.merDb : null);
       return;
     }
 
@@ -1279,6 +1317,7 @@ export class RxEngine {
             sampleRate: this.cfg.sampleRate,
             toneFrequencies: this.ofdmToneFreqs,
             pilotFreqHz: this.cfg.pilotFreqHz,
+            qamScaleOverride: (this.cfg as any).qamScaleOverride,
           });
           // Reset training so fresh symbols can be accumulated.
           this.ofdmDemod.resetTraining();
@@ -1303,6 +1342,10 @@ export class RxEngine {
           this.toneOrders = qamMapToOrders(profile.qamMap);
           this.allQpsk = this.toneOrders.every((o) => o === 2);
           this.ofdmDemod?.setToneOrders(this.toneOrders);
+          // QAM reference symbols (see OFDM_TUNING.qamRefSymbols doc): TX
+          // only inserts these when some tone is above QPSK, so only wait
+          // for them in that case — an all-QPSK stream is unaffected.
+          this.qamRefPending = this.allQpsk ? 0 : OFDM_TUNING.qamRefSymbols;
           dlog('RX-PROFILE', { 
             t: profile.toneCount,
             eccT: profile.eccT,

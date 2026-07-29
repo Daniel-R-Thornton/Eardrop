@@ -138,6 +138,25 @@ export class ModemService {
         this.emit({ type: 'bufferDump', id: cmd.id, samples: out.buffer as ArrayBuffer, rms, peak }, [out.buffer as ArrayBuffer]);
         break;
       }
+      case 'flush': {
+        // Every feedChunk posted before this command has already run (single
+        // message queue), so poll for a completed file now instead of making
+        // the caller wait for the next 20 Hz tick — or for a timeout when the
+        // decode failed and no file will ever arrive.
+        let fileReady = false;
+        if (this.rx && !this.fileSent) {
+          const file = this.rx.getFile();
+          if (file) {
+            this.fileSent = true;
+            fileReady = true;
+            void this.deliverCompletedFile(file);
+          }
+        } else if (this.fileSent) {
+          fileReady = true;
+        }
+        this.emit({ type: 'flushed', id: cmd.id, fileReady });
+        break;
+      }
       case 'setVerboseLogging': {
         RxEngine.verboseRxLogging = cmd.enabled;
         break;
