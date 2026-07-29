@@ -3,7 +3,6 @@
  * Hann-windowed polyphase FIR filter in AudioWorklet, feeds samples to decoder.
  */
 
-import { dbg } from '../lib/debug';
 import { dlog } from '../lib/debug/dlog';
 
 export type ChunkCallback = (chunk: Float32Array) => void;
@@ -163,27 +162,27 @@ export class AudioRecorder {
     });
 
     if (this.ctx.state === 'suspended') {
-      console.debug('[Recorder] Resuming suspended AudioContext');
+      dlog('REC', { resumingContext: true });
       await this.ctx.resume();
-      console.debug('[Recorder] ✅ AudioContext resumed');
+      dlog('REC', { resumedContext: true });
     }
 
     // Load AudioWorklet with Hann-sinc downsampler (once per class lifetime)
     if (!AudioRecorder.workletLoaded) {
-      console.debug('[Recorder] Initializing AudioWorklet processor...');
+      dlog('REC', { initWorklet: true });
       try {
         await this.ctx.audioWorklet.addModule(WORKLET_URL);
         AudioRecorder.workletLoaded = true;
-        console.debug('[Recorder] ✅ AudioWorklet module loaded');
+        dlog('REC', { workletLoaded: true });
       } catch (err: any) {
-        console.error('[Recorder] ❌ AudioWorklet addModule failed:', err);
+        dlog('REC-ERR', { workletAddModuleFailed: true, error: err.message }, { level: 'warn' });
         throw new Error(`AudioWorklet init failed: ${err.message}`);
       }
     } else {
-      console.debug('[Recorder] AudioWorklet already loaded, skipping');
+      dlog('REC', { workletAlreadyLoaded: true });
     }
 
-    console.debug('[Recorder] Requesting mic stream (raw 48kHz mono, AGC/NS/EC off)');
+    dlog('REC', { requestingMic: true });
 
     // Get mic — force raw 48kHz mono, no processing
     const constraints: MediaStreamConstraints = {
@@ -254,7 +253,7 @@ export class AudioRecorder {
   }
 
   stop() {
-    console.log('[Recorder] ⏹ Stopping recording...');
+    dlog('REC', { stopping: true });
     if (this.workletNode) {
       this.workletNode.port.onmessage = null;
       this.workletNode.port.onmessageerror = null;

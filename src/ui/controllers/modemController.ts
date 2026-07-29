@@ -6,6 +6,7 @@
 import { AudioRecorder } from '../../audio/recorder';
 import type { ModemCommand, ModemEvent } from '../../workers/modemSchema';
 import type { buildModemConfig } from './buildModemConfig';
+import type { Run } from '../../modem/protocol/captureTypes';
 
 type Handler<T extends ModemEvent['type']> = (ev: Extract<ModemEvent, { type: T }>) => void;
 
@@ -163,7 +164,7 @@ export class ModemController {
     return { sampleRate: start.sampleRate, totalSamples: start.totalSamples, pull, cancel };
   }
 
-  demoEncode(fileName: string, data: Uint8Array): Promise<import('../../modem/protocol/captureTypes').Run> {
+  demoEncode(fileName: string, data: Uint8Array): Promise<Run> {
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       this.pending.set(id, (ev) => {

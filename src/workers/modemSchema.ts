@@ -5,6 +5,7 @@
  * Audio always crosses as transferable Float32Array buffers.
  */
 import type { ModemConfig } from '../modem/types';
+import type { Run } from '../modem/protocol/captureTypes';
 
 export interface RxProgress {
   state: number; // RxState enum value
@@ -56,7 +57,7 @@ export type ModemEvent =
   | { type: 'streamStart'; id: number; sampleRate: number; totalSamples: number }
   | { type: 'streamChunk'; id: number; samples: ArrayBuffer }
   | { type: 'streamEnd'; id: number }
-  | { type: 'demoEncoded'; id: number; run: import('../modem/protocol/captureTypes').Run }
+  | { type: 'demoEncoded'; id: number; run: Run }
   | { type: 'bufferDump'; id: number; samples: ArrayBuffer; rms: number; peak: number }
   | { type: 'dlog'; line: string }
   | { type: 'error'; id?: number; error: string };

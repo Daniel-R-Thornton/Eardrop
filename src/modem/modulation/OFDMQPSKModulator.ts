@@ -92,6 +92,9 @@ export class OFDMQPSKModulator {
     this.qamScale = config.qamScaleOverride ?? 0.95 / (CREST * rms);
 
     const twoPiOverFs = (2 * Math.PI) / config.sampleRate;
+    // Precomputed sin/cos tables: each is a Float32Array of fftSamples.
+    // Memory footprint is approximately 2 * toneCount * fftSamples * 4 bytes
+    // (plus one pilotTable of fftSamples * 4 bytes).
     this.sinTable = new Array(numTones);
     this.cosTable = new Array(numTones);
     for (let t = 0; t < numTones; t++) {

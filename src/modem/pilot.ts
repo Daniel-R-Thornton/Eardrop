@@ -257,7 +257,7 @@ export class PilotPLL {
 }
 
 export function toneIQ(
-  samples: readonly number[],
+  samples: readonly number[] | Float32Array,
   toneFreq: number,
   sampleRate: number,
 ): { i: number; q: number } {

@@ -1,12 +1,52 @@
 # Eardrop — State Summary
 
-**Branch**: `perf/streaming-encode`
+**Branch**: `review-fixes`
 **Last commit**: `35af4ca` — fix(ofdm): freeze decision tracking post-training + prevent chirp probe buffer drain
 **Date**: 2026-07-28
 
 ---
 
-## Current session — OFDM 32-tone 64-QAM receiver fixes
+## Current session — review-fixes cleanup
+
+### Completed this session
+
+#### Fix 1: `framesReceived` progress count (`rxEngine.ts`)
+- **Problem**: `processHeader()` incremented `this.framesReceived++` and then immediately assigned `this.framesReceived = 0`, so the header frame was never counted. The UI showed progress lagging behind `totalFrames` (which includes header + payload + tail).
+- **Fix**: Reset `receivedPayloadSeqs` and `fileData` first, then set `this.framesReceived = 1` so the header counts. Payload and tail frames continue to increment as before.
+- **Files changed**: `src/modem/protocol/rxEngine.ts`.
+
+#### Fix 2: Centralize OFDM sync thresholds (`types.ts` → `rxEngine.ts`)
+- **Problem**: CP correlation thresholds in `RxEngine.findOfdmBlockStart` handoff paths were hard-coded literals (`0.35` and `1.1`).
+- **Fix**: Added `cpCorrelationMinScore: 0.35` and `cpCorrelationMinSharpness: 1.1` to `OFDM_TUNING` in `src/modem/types.ts` and replaced the literals in `src/modem/protocol/rxEngine.ts` with references to these constants.
+- **Files changed**: `src/modem/types.ts`, `src/modem/protocol/rxEngine.ts`.
+
+#### Fix 3: OFDM tuning invariant check (`types.ts`)
+- **Problem**: The documented invariant `syncBurstSymbols >= syncMinFrames + 2 + trainingSymbols` had no runtime enforcement.
+- **Fix**: Added exported `checkOfdmTuningInvariants()` function that throws a clear error if the invariant is violated, and invoked it at module load.
+- **Files changed**: `src/modem/types.ts`.
+
+#### Fix 4: Recorder console cleanup (`recorder.ts`)
+- **Problem**: `src/audio/recorder.ts` used raw `console.log`, `console.debug`, and `console.error` for lifecycle messages, inconsistent with the project's `dlog()` debug pipeline.
+- **Fix**: Replaced all raw `console.*` calls with `dlog('REC', ...)` or `dlog('REC-ERR', ..., { level: 'warn' })` calls. Removed the now-unused `dbg` import.
+- **Files changed**: `src/audio/recorder.ts`.
+
+#### Fix 5: OFDM demod hot-path optimization (`OFDMQPSKDemodulator.ts`, `pilot.ts`, `OFDMQPSKModulator.ts`)
+- **Problem**: `OFDMQPSKDemodulator.analyze()` converted every symbol's `Float32Array` window to a regular array via `Array.from(window)`, and `computeQamRefScale()` constructed a full throwaway `OFDMQPSKModulator` on every `setToneOrders()` call.
+- **Fix**: 
+  1. Updated `toneIQ()` in `src/modem/pilot.ts` to accept `Float32Array` directly, removing the per-symbol `Array.from()` copy.
+  2. Replaced the throwaway modulator in `computeQamRefScale()` with a static pure helper that synthesizes the all-zero QPSK training symbol, peak-normalizes it, and applies `toneIQ()` — bit-identical to the old reference for all supported tone counts and sample rates.
+  3. Added a memory-footprint comment near the sin/cos table construction in `OFDMQPSKModulator.ts`.
+- **Files changed**: `src/modem/demodulation/OFDMQPSKDemodulator.ts`, `src/modem/pilot.ts`, `src/modem/modulation/OFDMQPSKModulator.ts`.
+
+### Build & tests
+- Build: clean ✅
+- Lint: 221 problems (17 errors, 204 warnings) — same pre-existing issues as before; 1 unused-import warning removed by the recorder cleanup.
+- Tests: **259 passed / 3 failed** (pre-existing BPSK pipeline failures: Doppler +2Hz, Doppler −1Hz, Full Stress).
+- No regressions from changes.
+
+---
+
+## Previous session — OFDM 32-tone 64-QAM receiver fixes
 
 ### Completed this session
 
@@ -37,7 +77,18 @@
 - **Result**: In-memory tests stayed at baseline, but real acoustic tests showed `chirpProbeFail=true score=0 sharpness=0 offset=0` with `bufLen=14400`. The larger rolling window eventually includes data symbols (which have no CP structure) alongside training symbols, averaging the CP correlation to zero. **Reverted** to `4 × sps` cap.
 - **Conclusion**: A larger `ofdmAlignBuf` hurts the chirp→CP probe because it keeps symbols past the training burst. The probe must see only training symbols; widening the window beyond ~4 symbols is counter-productive.
 
-#### Fix 7: UI `qamScaleOverride` knob for real-HW 16/64-QAM (`TxPanel.tsx` etc.)
+#### Fix 9: UI progress count includes header and tail frames (`rxEngine.ts`)
+- **Problem**: With QAM tracking disabled, real-HW 16-QAM transfers now succeed end-to-end. However the UI showed "2/4 frames" because `framesReceived` only counted payload frames while `totalFrames` included header + payload + tail. The file decoded correctly; only the progress ratio was wrong.
+- **Fix**: Increment `this.framesReceived` in `processHeader()` and `processTail()` as well as `processPayload()`.
+- **Verified**: In-memory tests remain at baseline.
+
+### Current real-HW status
+- **QPSK**: works.
+- **16-QAM with qamScaleOverride=0.03, mic gain 6×, QAM tracking disabled**: end-to-end file transfers succeed (profile passes MER≈34 dB, first data frame passes, subsequent frames decode with marginal MER≈8.5 dB but file assembles correctly).
+- **Known limitation**: MER on later 16-QAM frames is marginal (~8–9 dB). This is acceptable for the current short transfers but may degrade further with longer files or noisier channels. A proper frame-validated tracker (only update channel estimate after a frame passes CRC) is the next improvement, but keeping tracking disabled is the safe baseline for now.
+- **Problem**: With `qamScaleOverride=0.03` and lower mic gain, the profile frame and first 16-QAM data frame decoded cleanly (MER≈32 dB), but subsequent data frames failed CRC as MER collapsed to ~14.8 dB. The decision-directed QAM tracker (`qamTrackingAlpha = 0.15`) was walking the per-tone channel estimate away from the good training-based estimate.
+- **Fix**: Reduced `qamTrackingAlpha` from `0.15` to `0.05`. This makes the tracker follow slow channel changes without drifting after a few frames.
+- **Verified**: In-memory tests remain at baseline (4 pre-existing failures). No regressions.
 - **Problem**: Real audio chains (speaker/amp/AGC/player normalization) can change the amplitude of QAM data symbols relative to the QPSK training burst. The receiver's fixed `qamRefScale` assumes the modulator's predicted ratio, so 16/64-QAM data frames fail CRC even though the profile frame (QPSK) decodes fine.
 - **Fix**: Expose the OFDM modulator's `qamScaleOverride` parameter in the UI as a "QAM SCALE" slider. Default `Auto` uses the crest-factor-derived scale; the user can tune the TX QAM amplitude until the receiver's expected amplitude matches the actual transmitted amplitude.
 - **Files changed**: `src/ui/views/TxPanel.tsx`, `src/ui/Store.ts`, `src/ui/controllers/buildModemConfig.ts`, `src/ui/app.ts`, `src/modem/protocol/txEngine.ts`, `src/modem/protocol/ofdmEngine.ts`.
@@ -226,3 +277,27 @@ Post-handoff buffer drain to `bufLenRemaining=0` is **expected behavior** in rea
 - `src/modem/protocol/rxEngine.ts` — BPSK detection + calibration tightly coupled
 - `src/modem/pilot.ts` — PLL Kp/Ki scaling is fragile
 - `src/audio/recorder.ts` — Hann-sinc worklet is production-quality
+
+---
+
+## Review-fixes branch (`review-fixes`)
+
+Applied 2026-07-28 from code review. Goal: fix test/lint failures, small bugs, and low-risk performance cleanups without touching the fragile BPSK/OFDM state machines structurally.
+
+### Done
+- **Tests/lint**: Fixed `qam-propagation.test.ts` payload size (320 B) so the QAM-64 vs QPSK symbol-count assertion is valid. Fixed real lint errors in `PresentationMode.tsx` (unused ternary expressions, short identifiers), `testFixtures.ts` (`_` identifiers), `modemController.ts`, `modemSchema.ts`, and `useDecoderState.ts`.
+- **Progress bug**: `RxEngine.processHeader()` now sets `framesReceived = 1` after reset so the header frame counts toward UI progress.
+- **OFDM tuning**: Moved CP correlation thresholds (`score >= 0.35`, `sharpness >= 1.1`) into `OFDM_TUNING` as `cpCorrelationMinScore` and `cpCorrelationMinSharpness`. Added `checkOfdmTuningInvariants()` to enforce `syncBurstSymbols >= syncMinFrames + 2 + trainingSymbols`.
+- **Audio cleanup**: Replaced raw `console.*` calls in `src/audio/recorder.ts` with `dlog()`.
+- **Demod hot path**: `OFDMQPSKDemodulator.analyze()` no longer copies `Float32Array` windows via `Array.from()`. `computeQamRefScale()` no longer allocates a throwaway `OFDMQPSKModulator`; it uses a pure static helper. Added a memory-footprint comment to `OFDMQPSKModulator`.
+- **Concise debug logs**: `dlog()` now suppresses consecutive duplicate lines per tag and prints a `(+N dup)` summary when the line changes. `MAX_LINE_LEN` reduced from 200 to 120 for denser output.
+- **Packet failure diagnosis**: `decodeFrame()` returns `failureReason`, `crcMismatch`, `bchErrorCounts`, and `rsBlockErrors`. `RxEngine` logs a `RX-FAIL` line with the failure reason, ECC error counts, and available signal/MER context.
+- **Presentation layer**: `PresentationMode.tsx` now has preset examples (reset, all tones, one tone, alternating, random), an AWGN noise slider with live SNR estimate, step-highlighting, and a decoded-bits table showing sent vs received QPSK bits.
+
+### Not done (intentionally)
+- **RxEngine refactor into mode-specific receivers**: Started with a subagent, but a full BPSK/OFDM extraction of `rxEngine.ts` requires acoustic validation per `AGENTS.md` (`src/modem/protocol/rxEngine.ts` is flagged as fragile). The partial extraction was removed rather than left as dead code. This remains the top maintainability follow-up once a real speaker→mic pass can be run against the refactored code.
+
+### Verification
+- `npm test`: 259 passed / 3 failed (pre-existing BPSK pipeline failures: Doppler +2Hz, Doppler −1Hz, Full Stress).
+- `npx tsc --noEmit`: clean.
+- `npm run lint`: 220 problems remaining (15 errors, 205 warnings) — all pre-existing in files not touched by this branch.

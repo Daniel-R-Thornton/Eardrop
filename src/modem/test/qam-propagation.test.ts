@@ -87,14 +87,14 @@ describe('TxEngine construction with 64-QAM config', () => {
   test('modulateFrame returns fewer symbols at QAM-64 vs QPSK', () => {
     const cfg = buildModemConfig(BASE_UI); // QPSK default
     const tx = new TxEngine(cfg as any);
-    const qpskAudio = tx.transmitFile('test.bin', new Uint8Array(8), 0, 8);
+    const qpskAudio = tx.transmitFile('test.bin', new Uint8Array(320), 0, 320);
     const symLen = tx.getSymbolLengthInSamples();
     const qpskSymbols = Math.ceil(qpskAudio.length / symLen);
 
     // Switch to 64-QAM
     const qamCfg = buildModemConfig({ ...BASE_UI, dataQamBits: 6 });
     const qamTx = new TxEngine(qamCfg as any);
-    const qamAudio = qamTx.transmitFile('test.bin', new Uint8Array(8), 0, 8);
+    const qamAudio = qamTx.transmitFile('test.bin', new Uint8Array(320), 0, 320);
     const qamSymbols = Math.ceil(qamAudio.length / qamTx.getSymbolLengthInSamples());
 
     // QAM packs more bits/symbol → fewer symbols for same frame

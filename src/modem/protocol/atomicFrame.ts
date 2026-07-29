@@ -20,7 +20,7 @@
  * chunks (last chunk padded) and BCH encode each.
  */
 
-import { bch63Encode, bch63Decode } from '../ecc/bch63';
+import { bch63Encode, bch63Decode, type Bch63Result } from '../ecc/bch63';
 import { rsEncode, rsDecode } from '../ecc/reedsolomon';
 import { crc32 } from '../../crc32';
 
@@ -82,6 +82,14 @@ export interface DecodedFrame {
   payload: Uint8Array;
   /** True if CRC verified AND RS/BCH decoding succeeded */
   valid: boolean;
+  /** Why the frame failed, or 'ok'. */
+  failureReason: 'short' | 'sentinel' | 'bch' | 'crc' | 'rs' | 'ok';
+  /** True when the stored header CRC did not match the recomputed CRC. */
+  crcMismatch: boolean;
+  /** Corrected bit errors per BCH codeword (-1 if uncorrectable). */
+  bchErrorCounts: number[];
+  /** Corrected byte errors per RS block (-1 if uncorrectable/invalid length). */
+  rsBlockErrors: number[];
 }
 
 // ─── Header Packing ──────────────────────────────────
@@ -225,23 +233,49 @@ export function encodeFrame(header: AtomicHeader, payload: Uint8Array): Uint8Arr
 }
 
 /**
- * Decode a frame. Returns header + payload + validity.
+ * Decode a frame. Returns header + payload + validity + failure diagnosis.
  */
 export function decodeFrame(frame: Uint8Array): DecodedFrame {
+  const emptyPayload = new Uint8Array(PAYLOAD_DATA_SIZE);
+  const emptyResult = (reason: DecodedFrame['failureReason']): DecodedFrame => ({
+    header: null,
+    payload: emptyPayload,
+    valid: false,
+    failureReason: reason,
+    crcMismatch: false,
+    bchErrorCounts: [],
+    rsBlockErrors: [],
+  });
+
   if (frame.length < FRAME_SIZE) {
-    return { header: null, payload: new Uint8Array(PAYLOAD_DATA_SIZE), valid: false };
+    return emptyResult('short');
   }
 
   // 1. Check sentinel
   for (let i = 0; i < SENTINEL_SIZE; i++) {
     if (frame[i] !== SENTINEL_BYTES[i]) {
-      return { header: null, payload: new Uint8Array(PAYLOAD_DATA_SIZE), valid: false };
+      return emptyResult('sentinel');
     }
   }
 
   // 2. BCH(63,30) × 3 decode header
   const bchStart = SENTINEL_SIZE;
-  const decodedHeader = decodeBCHHeader(frame.slice(bchStart, bchStart + BCH_HEADER_SIZE));
+  const bchEncoded = frame.slice(bchStart, bchStart + BCH_HEADER_SIZE);
+  const bchResults: Bch63Result[] = [];
+  for (let i = 0; i < 3; i++) {
+    bchResults.push(bch63Decode(bchEncoded.slice(i * 8, (i + 1) * 8)));
+  }
+  const bchErrorCounts = bchResults.map((r) => r.errors);
+  const bchOk = bchResults.every((r) => r.valid && r.errors >= 0);
+  if (!bchOk) {
+    return { ...emptyResult('bch'), bchErrorCounts };
+  }
+
+  // Reconstruct decoded header from the three BCH codewords.
+  const decodedHeader = new Uint8Array(RAW_HEADER_SIZE);
+  decodedHeader.set(bchResults[0].data.slice(0, 3), 0);
+  decodedHeader.set(bchResults[1].data.slice(0, 3), 3);
+  decodedHeader.set(bchResults[2].data.slice(0, 3), 6);
 
   // 3. Parse AtomicHeader from decoded bytes
   const header = unpackHeader(decodedHeader);
@@ -252,21 +286,42 @@ export function decodeFrame(frame: Uint8Array): DecodedFrame {
   const fieldBytes = decodedHeader.slice(0, 5);
   const expectedCrc = crc32(fieldBytes);
   const maskedExpected = (expectedCrc & 0xfcffffff) >>> 0;
-  const crcOk = maskedExpected === header.crc;
+  const crcMismatch = maskedExpected !== header.crc;
+  if (crcMismatch) {
+    return {
+      header,
+      payload: emptyPayload,
+      valid: false,
+      failureReason: 'crc',
+      crcMismatch: true,
+      bchErrorCounts,
+      rsBlockErrors: [],
+    };
+  }
 
   // 5. RS(52,40) decode each block
   const rsStart = SENTINEL_SIZE + BCH_HEADER_SIZE;
   const payload = new Uint8Array(PAYLOAD_DATA_SIZE);
+  const rsBlockErrors: number[] = [];
   let allBlocksValid = true;
   for (let b = 0; b < PAYLOAD_BLOCKS; b++) {
     const rsResult = rsDecode(
       frame.slice(rsStart + b * RS_BLOCK_SIZE, rsStart + (b + 1) * RS_BLOCK_SIZE),
     );
+    rsBlockErrors.push(rsResult.errors);
     payload.set(rsResult.data.slice(0, RS_BLOCK_DATA), b * RS_BLOCK_DATA);
     if (!rsResult.valid || rsResult.errors < 0) allBlocksValid = false;
   }
 
   // 6. Return result
-  const valid = crcOk && allBlocksValid;
-  return { header, payload, valid };
+  const valid = !crcMismatch && allBlocksValid;
+  return {
+    header,
+    payload,
+    valid,
+    failureReason: valid ? 'ok' : 'rs',
+    crcMismatch,
+    bchErrorCounts,
+    rsBlockErrors,
+  };
 }

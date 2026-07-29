@@ -13,7 +13,6 @@ import { toneIQ } from '../pilot';
 import { ofdmSamples, OFDM_TUNING, OFDM_DEFAULTS } from '../types';
 import { dlog } from '../../lib/debug/dlog';
 import { mapSymbol, sliceSymbol, type QamOrder } from '../modulation/constellation';
-import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
 
 export interface OFDMQPSKDemodulatorConfig {
   sampleRate: number;
@@ -267,16 +266,16 @@ export class OFDMQPSKDemodulator {
    * measurement.
    *
    * Why a ratio is needed at all: per the plan's architecture, the training
-   * burst is ALWAYS synthesized via the legacy all-QPSK path (OFDMQPSKModulator
-   * .synthesizeQpsk), which peak-normalizes each symbol to 0.95 — call that
-   * per-symbol scale S0 (deterministic, since every training symbol is the
-   * same all-zero pattern). QAM data symbols use a different, FIXED scale
-   * (OFDMQPSKModulator.qamScale, see 3a) that is NOT equal to S0. The trained
-   * `channelEstRe/Im` therefore encodes (channel gain × S0), while a raw QAM
-   * tone reading encodes (channel gain × qamScale × point). Dividing the two
-   * directly leaves a residual (qamScale / S0) factor that must be corrected
-   * before the result can be compared against the constellation's designed
-   * (unit mean-power) scale.
+   * burst is ALWAYS synthesized via the legacy all-QPSK path
+   * (OFDMQPSKModulator.synthesizeQpsk), which peak-normalizes each symbol to
+   * 0.95 — call that per-symbol scale S0 (deterministic, since every training
+   * symbol is the same all-zero pattern). QAM data symbols use a different,
+   * FIXED scale (OFDMQPSKModulator.qamScale, see 3a) that is NOT equal to S0.
+   * The trained `channelEstRe/Im` therefore encodes (channel gain × S0), while
+   * a raw QAM tone reading encodes (channel gain × qamScale × point). Dividing
+   * the two directly leaves a residual (qamScale / S0) factor that must be
+   * corrected before the result can be compared against the constellation's
+   * designed (unit mean-power) scale.
    *
    * Derivation (toneIQ() is a linear matched filter: for x(n)=A·sin/cos(wn),
    * it returns (i,q) = A·(∓0.5·[sin coeff], ±0.5·[cos coeff]) — a fixed,
@@ -288,24 +287,77 @@ export class OFDMQPSKDemodulator {
    *   - So: (re,im) = (2·q, −2·i) recovers the point from a CLEAN (channel-
    *     free) measurement of scale 1; with channel + S0/qamScale scaling
    *     folded in, the correction factor to apply before that 2·/−2· step is
-   *     κ = |clean training tone reading| / qamScale — computed here via a
-   *     throwaway modulator (same config as the real training burst) so no
-   *     channel or noise ever enters the calculation.
+   *     κ = |clean training tone reading| / qamScale.
+   *
+   * The clean training tone reading is computed directly from the same
+   * synthesis math as the legacy all-QPSK path, without instantiating a
+   * throwaway modulator. It builds the all-zero symbol body, peak-normalizes
+   * it to 0.95 (replicating the exact Float32 rounding of the modulator), and
+   * applies toneIQ() to the first tone.
    */
   private computeQamRefScale(): number {
-    const shadow = new OFDMQPSKModulator({
-      sampleRate: this.cfg.sampleRate,
-      toneFrequencies: this.cfg.toneFrequencies,
-      pilotFreqHz: this.cfg.pilotFreqHz,
-      pilotAmplitude: OFDM_DEFAULTS.pilotAmplitude,
-    });
-    shadow.setSymbols(new Array(this.toneCount).fill(0));
-    const trainSym = shadow.generateSymbol();
-    const body = trainSym.slice(this.cpSamples, this.cpSamples + this.fftSamples);
-    const { toneRe, toneIm } = this.analyze(body);
-    const refAmp = Math.hypot(toneRe[0], toneIm[0]); // identical for every tone by construction
-    const qamScale = shadow.getQamScale();
+    const refAmp = OFDMQPSKDemodulator.qpskTrainingToneAmplitude(
+      this.cfg.sampleRate,
+      this.cfg.toneFrequencies,
+      this.cfg.pilotFreqHz,
+      OFDM_DEFAULTS.pilotAmplitude,
+      this.fftSamples,
+    );
+    const numTones = this.toneCount;
+    const { pilotAmplitude } = OFDM_DEFAULTS;
+    const CREST = 3.5;
+    const rms = Math.sqrt(numTones + pilotAmplitude * pilotAmplitude);
+    const qamScale = 0.95 / (CREST * rms);
     return refAmp > 0 && qamScale > 0 ? refAmp / qamScale : 1;
+  }
+
+  /**
+   * Pure helper that computes the amplitude toneIQ() would measure for tone 0
+   * of an all-zero legacy QPSK training symbol. The math mirrors
+   * OFDMQPSKModulator.synthesizeQpsk exactly, including Float32 rounding, so
+   * the result is bit-identical to the throwaway-modulator reference it
+   * replaces.
+   */
+  private static qpskTrainingToneAmplitude(
+    sampleRate: number,
+    toneFrequencies: Float32Array,
+    pilotFreqHz: number,
+    pilotAmplitude: number,
+    fftSamples: number,
+  ): number {
+    const twoPiOverFs = (2 * Math.PI) / sampleRate;
+    const numTones = toneFrequencies.length;
+    const toneW = new Float64Array(numTones);
+    for (let t = 0; t < numTones; t++) toneW[t] = twoPiOverFs * toneFrequencies[t];
+    const pilotW = twoPiOverFs * pilotFreqHz;
+
+    // Build the unscaled all-zero QPSK symbol body and find its peak.
+    const body = new Float32Array(fftSamples);
+    let peak = 0;
+    for (let n = 0; n < fftSamples; n++) {
+      let acc = Math.fround(pilotAmplitude * Math.cos(pilotW * n));
+      for (let t = 0; t < numTones; t++) {
+        acc += Math.fround(Math.sin(toneW[t] * n));
+      }
+      body[n] = acc;
+      const a = Math.abs(body[n]);
+      if (a > peak) peak = a;
+    }
+    const scale = peak > 0 ? 0.95 / peak : 1;
+    for (let n = 0; n < fftSamples; n++) body[n] *= scale;
+
+    // toneIQ() of the first tone on the normalized body.
+    const f0 = toneFrequencies[0];
+    let i = 0;
+    let q = 0;
+    for (let n = 0; n < fftSamples; n++) {
+      const phase = (2 * Math.PI * f0 * n) / sampleRate;
+      i += body[n] * Math.sin(phase);
+      q += body[n] * Math.cos(phase);
+    }
+    i /= fftSamples;
+    q /= fftSamples;
+    return Math.hypot(i, q);
   }
 
   /**
@@ -316,12 +368,11 @@ export class OFDMQPSKDemodulator {
     toneRe: number[]; toneIm: number[];
   } {
     const { sampleRate, toneFrequencies, pilotFreqHz } = this.cfg;
-    const samples = Array.from(window);
-    const pilot = toneIQ(samples, pilotFreqHz, sampleRate);
+    const pilot = toneIQ(window, pilotFreqHz, sampleRate);
     const toneRe: number[] = [];
     const toneIm: number[] = [];
     for (let t = 0; t < this.toneCount; t++) {
-      const iq = toneIQ(samples, toneFrequencies[t], sampleRate);
+      const iq = toneIQ(window, toneFrequencies[t], sampleRate);
       toneRe.push(iq.i);
       toneIm.push(iq.q);
     }

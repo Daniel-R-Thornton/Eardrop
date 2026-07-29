@@ -38,7 +38,7 @@ import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
 import type { QamOrder } from '../modulation/constellation';
 import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_SYMBOL_MS, OFDM_CP_MS, OFDM_TUNING } from '../types';
 import { generateChirp, chirpCorrelate, type ChirpConfig } from './chirp';
-import { dlog } from '../../lib/debug/dlog';
+import { dlog, dlogFmt } from '../../lib/debug/dlog';
 
 // ─── Constants ───────────────────────────────────────
 
@@ -409,7 +409,7 @@ export class RxEngine {
         const trainingStart = this.ofdmAlignBuf.length - trainingSamples;
         const trainingTail = this.ofdmAlignBuf.slice(trainingStart);
         const probe = this.findOfdmBlockStart(trainingTail);
-        if (probe.offset >= 0 && probe.score >= 0.35 && probe.sharpness >= 1.1) {
+        if (probe.offset >= 0 && probe.score >= OFDM_TUNING.cpCorrelationMinScore && probe.sharpness >= OFDM_TUNING.cpCorrelationMinSharpness) {
           this.chirpDetected = false;
           this.chirpEndSample = -1;
           // CP correlation reports offsets modulo one symbol. A peak near the
@@ -497,7 +497,7 @@ export class RxEngine {
           // Sharpness: clean bursts measure ~1.7-1.9 (identical repeated
           // symbols partially correlate at every offset); flat periodic hum
           // measures ~1.0-1.3. The adaptive energy floor is the third layer.
-          if (probe.score < 0.35 || probe.sharpness < 1.1) {
+          if (probe.score < OFDM_TUNING.cpCorrelationMinScore || probe.sharpness < OFDM_TUNING.cpCorrelationMinSharpness) {
             
               dlog('OFDM-SYNC',
               { falseTrigger: true, e: totalE, score: probe.score, sharp: probe.sharpness },
@@ -1192,6 +1192,35 @@ export class RxEngine {
     return crc & 0xffff;
   }
 
+  /** Log a concise failure diagnosis when a frame does not decode. */
+  private logFrameFailure(decoded: ReturnType<typeof decodeFrame>): void {
+    const fields: Record<string, unknown> = {
+      reason: decoded.failureReason,
+      type: decoded.header ? `0x${decoded.header.type.toString(16).padStart(2, '0')}` : '?',
+      seq: decoded.header?.seqNum ?? -1,
+      crc: decoded.crcMismatch,
+      bch: decoded.bchErrorCounts.join(','),
+      rs: decoded.rsBlockErrors.join(','),
+    };
+
+    if (this.useOFDM && this.ofdmDemod) {
+      const mer = this.ofdmDemod.getMER();
+      if (mer) fields.merDb = dlogFmt(mer.merDb);
+      const perTone = this.ofdmDemod.getPerToneChannelMagnitude();
+      if (perTone.length > 0) {
+        const mags = perTone.filter((v) => Number.isFinite(v));
+        fields.chMin = dlogFmt(Math.min(...mags));
+        fields.chMed = dlogFmt(mags.sort((a, b) => a - b)[Math.floor(mags.length / 2)] ?? 0);
+      }
+    } else {
+      fields.pilotAmp = dlogFmt(this.pilotAmplitude);
+      const totalE = this.lastRawIQs.reduce((a, r) => a + Math.hypot(r.i, r.q), 0);
+      fields.toneE = dlogFmt(totalE);
+    }
+
+    dlog('RX-FAIL', fields, { level: 'warn' });
+  }
+
   private processFrame(frame: Uint8Array): void {
     // CRC validation happens inside decodeFrame (post-BCH). Raw frame bytes
     // 5-6 are pre-decode and would be misleading to log against it.
@@ -1210,7 +1239,10 @@ export class RxEngine {
     if (decoded.valid) this.ofdmDemod?.commitMER();
     else this.ofdmDemod?.discardMER();
 
-    if (!decoded.valid) return;
+    if (!decoded.valid) {
+      this.logFrameFailure(decoded);
+      return;
+    }
 
     if (decoded.header!.totalFrames > 0) this.totalFrames = decoded.header!.totalFrames;
 
@@ -1362,14 +1394,13 @@ export class RxEngine {
     }
 
     this.fileID = fileID;
-    this.framesReceived++;
     this.fileSize = totalSize;
     this.fileName = name;
     this.fileSchemeId = schemeId;
     this.fileOrigSize = origSize;
     this.fileData = [];
-    this.framesReceived = 0;
     this.receivedPayloadSeqs = new Set();
+    this.framesReceived = 1; // header frame counts toward progress
     dlog('RX-COMP', { scheme: schemeId, wire: totalSize, orig: origSize });
   }
 
