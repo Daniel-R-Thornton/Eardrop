@@ -6,6 +6,7 @@
 import { AudioRecorder } from '../../audio/recorder';
 import type { ModemCommand, ModemEvent } from '../../workers/modemSchema';
 import type { buildModemConfig } from './buildModemConfig';
+import type { Run } from '../../modem/protocol/captureTypes';
 
 type Handler<T extends ModemEvent['type']> = (ev: Extract<ModemEvent, { type: T }>) => void;
 
@@ -85,7 +86,85 @@ export class ModemController {
     });
   }
 
-  demoEncode(fileName: string, data: Uint8Array): Promise<import('../../modem/protocol/captureTypes').Run> {
+  /**
+   * Start a streaming encode. Resolves once the worker acknowledges with the
+   * sample rate + estimated total samples, and returns a `pull()` that yields
+   * the next audio chunk (or null at end) and a `cancel()`. The worker produces
+   * exactly one chunk per pull, so the caller controls memory/backpressure.
+   * One pull may be in flight at a time.
+   */
+  async startFileStream(
+    fileName: string,
+    data: Uint8Array,
+  ): Promise<{
+    sampleRate: number;
+    totalSamples: number;
+    pull: () => Promise<Float32Array | null>;
+    cancel: () => void;
+  }> {
+    const id = this.nextId++;
+    let ended = false;
+
+    const start = await new Promise<{ sampleRate: number; totalSamples: number }>(
+      (resolve, reject) => {
+        const offStart = this.on('streamStart', (ev) => {
+          if (ev.id !== id) return;
+          offStart();
+          offErr();
+          resolve({ sampleRate: ev.sampleRate, totalSamples: ev.totalSamples });
+        });
+        const offErr = this.on('error', (ev) => {
+          if (ev.id !== id) return;
+          offStart();
+          offErr();
+          reject(new Error(ev.error));
+        });
+        const copy = new Uint8Array(data);
+        this.post({ type: 'encodeStreamStart', id, fileName, data: copy.buffer }, [copy.buffer]);
+      },
+    );
+
+    const pull = (): Promise<Float32Array | null> =>
+      new Promise((resolve, reject) => {
+        if (ended) {
+          resolve(null);
+          return;
+        }
+        const offChunk = this.on('streamChunk', (ev) => {
+          if (ev.id !== id) return;
+          offChunk();
+          offEnd();
+          offErr();
+          resolve(new Float32Array(ev.samples));
+        });
+        const offEnd = this.on('streamEnd', (ev) => {
+          if (ev.id !== id) return;
+          offChunk();
+          offEnd();
+          offErr();
+          ended = true;
+          resolve(null);
+        });
+        const offErr = this.on('error', (ev) => {
+          if (ev.id !== id) return;
+          offChunk();
+          offEnd();
+          offErr();
+          reject(new Error(ev.error));
+        });
+        this.post({ type: 'encodeStreamPull', id });
+      });
+
+    const cancel = (): void => {
+      if (ended) return;
+      ended = true;
+      this.post({ type: 'encodeStreamCancel', id });
+    };
+
+    return { sampleRate: start.sampleRate, totalSamples: start.totalSamples, pull, cancel };
+  }
+
+  demoEncode(fileName: string, data: Uint8Array): Promise<Run> {
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       this.pending.set(id, (ev) => {

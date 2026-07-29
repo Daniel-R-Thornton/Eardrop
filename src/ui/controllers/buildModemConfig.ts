@@ -20,9 +20,18 @@ export interface ModemUiConfig {
   musicalMode: boolean;
   diversityMode: boolean;
   hwSampleRate: number;
+  /** Phase 3 data-tone constellation, applied to ALL tones (default 2 = QPSK, unchanged waveform) */
+  dataQamBits?: 2 | 4 | 6;
+  /** Optional override for the fixed per-tone TX scale used in QAM data symbols.
+   *  Leave undefined for the default crest-factor-derived scale. Tuning this
+   *  can help real audio chains where the receiver's expected QAM amplitude
+   *  does not match the actual transmitted amplitude. */
+  qamScaleOverride?: number;
 }
 
-export function buildModemConfig(ui: ModemUiConfig): ModemConfig & { useOFDM: boolean } {
+export function buildModemConfig(
+  ui: ModemUiConfig,
+): ModemConfig & { useOFDM: boolean; emitLinkProfile?: boolean; qamMap?: number[]; qamScaleOverride?: number } {
   let pilot = ui.pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz;
 
   // OFDM cyclic-prefix continuity requires every tone (pilot + offsets)
@@ -38,15 +47,34 @@ export function buildModemConfig(ui: ModemUiConfig): ModemConfig & { useOFDM: bo
     }
   }
 
-  return {
+  const toneCount = ui.toneCount || DEFAULT_CONFIG.toneCount;
+
+  // Phase 3 per-tone QAM (bit-loading): a 2-bit profile code applied to every
+  // tone. Default (2 bits = QPSK) must NEVER emit a link profile — the
+  // waveform has to stay byte-identical to the pre-bit-loading behavior.
+  const bits = ui.dataQamBits ?? 2;
+  const order = bits === 4 ? 1 : bits === 6 ? 2 : 0;
+
+  const config: ModemConfig & { useOFDM: boolean; emitLinkProfile?: boolean; qamMap?: number[]; qamScaleOverride?: number } = {
     ...DEFAULT_CONFIG,
     sampleRate: ui.useOFDM ? ui.hwSampleRate : DEFAULT_CONFIG.sampleRate,
     pilotFreqHz: pilot,
-    toneCount: ui.toneCount || DEFAULT_CONFIG.toneCount,
-    bitsPerFrame: (ui.toneCount || DEFAULT_CONFIG.toneCount) * 2,
+    toneCount,
+    bitsPerFrame: toneCount * 2,
     symbolsPerSec: ui.symbolsPerSec || DEFAULT_CONFIG.symbolsPerSec,
     musical: ui.musicalMode,
     diversityMode: ui.diversityMode,
     useOFDM: ui.useOFDM,
   };
+
+  if (ui.useOFDM && order > 0) {
+    config.emitLinkProfile = true;
+    config.qamMap = new Array(toneCount).fill(order);
+  }
+
+  if (ui.useOFDM && typeof ui.qamScaleOverride === 'number' && Number.isFinite(ui.qamScaleOverride)) {
+    config.qamScaleOverride = ui.qamScaleOverride;
+  }
+
+  return config;
 }

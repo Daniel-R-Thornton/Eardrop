@@ -195,7 +195,27 @@ export const OFDM_TUNING = {
   syncMinFrames: 8,
   /** TX: trailing silence symbols after the tail frame */
   tailSilenceSymbols: 6,
+  /** RX: minimum cyclic-prefix correlation score to accept a sync boundary */
+  cpCorrelationMinScore: 0.35,
+  /** RX: minimum CP correlation sharpness (peak / mean) to reject flat hum */
+  cpCorrelationMinSharpness: 1.1,
 } as const;
+
+/**
+ * Verify that the OFDM sync burst is long enough for detection,
+ * boundary alignment slack, and channel training.
+ */
+export function checkOfdmTuningInvariants(): void {
+  if (
+    OFDM_TUNING.syncBurstSymbols <
+    OFDM_TUNING.syncMinFrames + 2 + OFDM_TUNING.trainingSymbols
+  ) {
+    throw new Error(
+      `OFDM_TUNING invariant violated: syncBurstSymbols (${OFDM_TUNING.syncBurstSymbols}) must be >= syncMinFrames (${OFDM_TUNING.syncMinFrames}) + 2 + trainingSymbols (${OFDM_TUNING.trainingSymbols})`,
+    );
+  }
+}
+checkOfdmTuningInvariants();
 
 export function ofdmToneFrequencies(opts: {
   toneCount: number;

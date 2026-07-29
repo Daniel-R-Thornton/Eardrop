@@ -29,14 +29,14 @@ export function makeFixtureRun(): Run {
   } {
     // Each tone wave: 64 samples of mild sine
     const toneWaves = Array.from({ length: TONE_COUNT }, () =>
-      new Float32Array(SAMPLES_PER_TONE).map((_, i) => {
+      new Float32Array(SAMPLES_PER_TONE).map((_value, i) => {
         const phase = (i / SAMPLES_PER_TONE) * Math.PI * 2;
         return Math.sin(phase) * 0.3;
       }),
     );
 
     // Pilot: 64 samples
-    const pilotWave = new Float32Array(SAMPLES_PER_TONE).map((_, i) => {
+    const pilotWave = new Float32Array(SAMPLES_PER_TONE).map((_value, i) => {
       const phase = (i / SAMPLES_PER_TONE) * Math.PI * 2;
       return Math.sin(phase * 2) * 0.2;
     });

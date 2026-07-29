@@ -68,6 +68,11 @@ export interface AppState {
   sweepResults: Array<{ freq: number; energy: number }> | null;
   /** Active tones: 2 or 4 */
   toneCount: number; // 2, 4, or 8
+  /** Phase 3 data-tone constellation, applied to ALL tones: 2=QPSK (default), 4=16-QAM, 6=64-QAM */
+  dataQamBits: 2 | 4 | 6;
+  /** Optional override for the fixed per-tone TX scale used in QAM data symbols.
+   *  Higher = louder QAM data. Leave undefined for the default crest-factor scale. */
+  qamScaleOverride?: number;
   /** Hail Mary diversity mode: all tones carry same bit for consensus */
   diversityMode: boolean;
   /** Enable experimental OFDM/QPSK (cyclic‑prefix) path */
@@ -167,6 +172,8 @@ const defaultState: AppState = {
   syncStrongMultiplier: 0.5,
   sweepResults: null,
   toneCount: DEFAULT_CONFIG.toneCount,
+  dataQamBits: 2,
+  qamScaleOverride: undefined,
   diversityMode: false,
   useOFDM: false,
   symbolsPerSec: 50,
@@ -220,6 +227,8 @@ function persistState(s: AppState): void {
     const toSave: Partial<AppState> = {
       // Persist only the configuration‑related fields – everything else is transient.
       toneCount: s.toneCount,
+      dataQamBits: s.dataQamBits,
+      qamScaleOverride: s.qamScaleOverride,
       pilotFreqHz: s.pilotFreqHz,
       musicalMode: s.musicalMode,
       ampThresholdRatio: s.ampThresholdRatio,
@@ -254,7 +263,7 @@ export function setState(update: Partial<AppState>): void {
   state = { ...state, ...update };
   // Only persist when a persisted config key actually changed.
   const persistedKeys: Array<keyof AppState> = [
-    'toneCount', 'pilotFreqHz', 'musicalMode', 'ampThresholdRatio',
+    'toneCount', 'dataQamBits', 'qamScaleOverride', 'pilotFreqHz', 'musicalMode', 'ampThresholdRatio',
     'syncStrongMultiplier', 'diversityMode', 'useOFDM', 'symbolsPerSec',
     'micGain', 'playbackVolume', 'selectedInputId', 'selectedOutputId', 'theme',
   ];

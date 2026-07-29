@@ -45,14 +45,15 @@ export function useDecoderState(): DecoderStateSnapshot {
     // In the future, subscribe to a shared event bus.
     // For now, the app.ts will call setDecoderState() which
     // will be wired to a global event.
-    const handler = (e: CustomEvent) => {
-      if (e.detail && e.detail.type === 'decoderState') {
-        setState(e.detail.snapshot);
+    const handler = (e: Event) => {
+      const evt = e as CustomEvent;
+      if (evt.detail && evt.detail.type === 'decoderState') {
+        setState(evt.detail.snapshot);
       }
     };
-    window.addEventListener('eardrop-decoder-state' as any, handler as any);
+    window.addEventListener('eardrop-decoder-state', handler);
     return () => {
-      window.removeEventListener('eardrop-decoder-state' as any, handler as any);
+      window.removeEventListener('eardrop-decoder-state', handler);
     };
   }, []);
 

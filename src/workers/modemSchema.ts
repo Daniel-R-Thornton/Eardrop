@@ -5,6 +5,7 @@
  * Audio always crosses as transferable Float32Array buffers.
  */
 import type { ModemConfig } from '../modem/types';
+import type { Run } from '../modem/protocol/captureTypes';
 
 export interface RxProgress {
   state: number; // RxState enum value
@@ -30,11 +31,17 @@ export interface ModemTelemetry {
 }
 
 export type ModemCommand =
-  | { type: 'configure'; config: ModemConfig & { useOFDM?: boolean } }
+  | {
+      type: 'configure';
+      config: ModemConfig & { useOFDM?: boolean; emitLinkProfile?: boolean; qamMap?: number[] };
+    }
   | { type: 'startRx' }
   | { type: 'stopRx' }
   | { type: 'feedChunk'; samples: ArrayBuffer } // Float32Array buffer, transferred
   | { type: 'encodeFile'; id: number; fileName: string; data: ArrayBuffer }
+  | { type: 'encodeStreamStart'; id: number; fileName: string; data: ArrayBuffer }
+  | { type: 'encodeStreamPull'; id: number }
+  | { type: 'encodeStreamCancel'; id: number }
   | { type: 'demoEncode'; id: number; fileName: string; data: ArrayBuffer }
   | { type: 'dumpBuffer'; id: number; seconds: number }
   | { type: 'setVerboseLogging'; enabled: boolean };
@@ -47,7 +54,10 @@ export type ModemEvent =
   | { type: 'telemetry'; telemetry: ModemTelemetry }
   | { type: 'fileComplete'; fileName: string; data: ArrayBuffer }
   | { type: 'encoded'; id: number; samples: ArrayBuffer; sampleRate: number }
-  | { type: 'demoEncoded'; id: number; run: import('../modem/protocol/captureTypes').Run }
+  | { type: 'streamStart'; id: number; sampleRate: number; totalSamples: number }
+  | { type: 'streamChunk'; id: number; samples: ArrayBuffer }
+  | { type: 'streamEnd'; id: number }
+  | { type: 'demoEncoded'; id: number; run: Run }
   | { type: 'bufferDump'; id: number; samples: ArrayBuffer; rms: number; peak: number }
   | { type: 'dlog'; line: string }
   | { type: 'error'; id?: number; error: string };

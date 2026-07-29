@@ -60,6 +60,11 @@ export function TxPanel() {
         >
           {s.isSending ? 'SENDING…' : '▶ TRANSMIT'}
         </Button>
+        <Button
+          onClick={() => dispatch('eardrop-test-frequency')}
+        >
+          Test Frequency
+        </Button>
         <Button onClick={() => dispatch('eardrop-send-test')} disabled={s.isSending}>
           🔊 SEND TEST
         </Button>
@@ -70,6 +75,56 @@ export function TxPanel() {
           <Button onClick={() => dispatch('eardrop-export-wav')}>⬇ WAV</Button>
         )}
         <Button onClick={() => dispatch('eardrop-load-wav')}>⬆ FROM WAV</Button>
+      </div>
+
+      <div style={{ marginTop: 10 }}>
+        <div style={{ fontFamily: T.mono, fontSize: 11, color: '#6b6355', marginBottom: 4 }}>
+          DATA CONSTELLATION
+        </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          {([
+            { bits: 2, label: 'QPSK' },
+            { bits: 4, label: '16-QAM' },
+            { bits: 6, label: '64-QAM' },
+          ] as const).map((opt) => (
+            <Button
+              key={opt.bits}
+              primary={s.dataQamBits === opt.bits}
+              onClick={() => setState({ dataQamBits: opt.bits })}
+            >
+              {opt.label}
+            </Button>
+          ))}
+        </div>
+        {s.dataQamBits === 4 && (
+          <div style={{ fontFamily: T.mono, fontSize: 11, color: '#a08050', marginTop: 4 }}>
+            ⚠ needs a clean signal
+          </div>
+        )}
+        {s.dataQamBits === 6 && (
+          <div style={{ fontFamily: T.mono, fontSize: 11, color: '#a08050', marginTop: 4 }}>
+            ⚠ needs strong signal
+          </div>
+        )}
+        {s.useOFDM && s.dataQamBits > 2 && (
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 8 }}>
+            <span className="lab-panel__title" style={{ padding: 0, background: 'transparent', border: 0 }}>
+              QAM SCALE: {s.qamScaleOverride ? s.qamScaleOverride.toFixed(3) : 'Auto'}
+            </span>
+            <input
+              type="range"
+              className="lab-slider"
+              min={0}
+              max={0.3}
+              step={0.005}
+              value={s.qamScaleOverride ?? 0}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                setState({ qamScaleOverride: v > 0 ? v : undefined });
+              }}
+            />
+          </label>
+        )}
       </div>
 
       {s.isSending && (

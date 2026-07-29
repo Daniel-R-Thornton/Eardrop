@@ -8,11 +8,12 @@
  * Features:
  * - per-tag rate limiting (`every: N` logs the 1st then every Nth call)
  * - tag enable/disable at runtime (wired to the debug panel checkboxes)
+ * - consecutive duplicate suppression (shows `(+N dup)` instead of spam)
  * - ring buffer of emitted lines for one-click LLM export (dlogDump)
  */
 
 const RING_MAX = 500;
-const MAX_LINE_LEN = 200; // auto-break long lines at field boundaries
+const MAX_LINE_LEN = 120; // tight lines: max data, min context
 const ring: string[] = [];
 const rateCounters = new Map<string, number>();
 const disabledTags = new Set<string>();
@@ -36,6 +37,13 @@ let redrawPending = false;
 let redrawEmitted = 0;
 /** Lines per console entry — Chrome wraps single entries > ~50 lines */
 const REDRAW_BATCH = 100;
+
+/** Pending duplicate summaries: per tag, the last body and how many times it repeated. */
+interface DupState {
+  lastBody: string;
+  count: number;
+}
+const dupState = new Map<string, DupState>();
 
 export function dlogSetMode(next: DlogMode, onForward?: (line: string) => void): void {
   mode = next;
@@ -112,27 +120,12 @@ export function dlogSetTagEnabled(tag: string, enabled: boolean): void {
   }
 }
 
-/** Emit `[TAG] k=v ...` line(s), auto-breaking at MAX_LINE_LEN (200). Returns the formatted text (or null if suppressed). */
-export function dlog(
-  tag: string,
-  fields: Record<string, unknown>,
-  opts: DlogOptions = {},
-): string | null {
-  if (disabledTags.has(tag)) return null;
-
-  if (opts.every && opts.every > 1) {
-    const count = (rateCounters.get(tag) ?? 0) + 1;
-    rateCounters.set(tag, count);
-    if ((count - 1) % opts.every !== 0) return null;
-  }
-
+/** Format fields into one or more `[TAG] k=v ...` lines, auto-breaking at MAX_LINE_LEN. */
+function formatLines(tag: string, fields: Record<string, unknown>, level: DlogLevel): string[] {
   const pairs = Object.entries(fields).map(([key, value]) => `${key}=${dlogFmt(value)}`);
-  const level = opts.level ?? 'info';
   const marker = level === 'error' ? '!! ' : level === 'warn' ? '! ' : '';
   const prefix = `${marker}[${tag}] `;
 
-  // Build line(s), auto-breaking at field boundaries when exceeding MAX_LINE_LEN.
-  // When a single field value is too long even on a fresh line, break it at spaces.
   const lines: string[] = [];
   let cur = prefix;
 
@@ -152,11 +145,9 @@ export function dlog(
 
     // If pair still won't fit even on a fresh line, break it at spaces.
     if (pair.length + prefix.length > MAX_LINE_LEN) {
-      // Emit whatever fits from the pair's words onto cur, flush when full.
       const words = pair.split(' ');
       for (const w of words) {
-        const wSep = cur === prefix ? '' : ' ';
-        if (cur.length + wSep.length + w.length > MAX_LINE_LEN && cur !== prefix) {
+        if (cur.length + (cur === prefix ? 0 : 1) + w.length > MAX_LINE_LEN && cur !== prefix) {
           flush();
         }
         cur += (cur === prefix ? '' : ' ') + w;
@@ -166,26 +157,81 @@ export function dlog(
     }
   }
   if (cur !== prefix) lines.push(cur);
+  return lines;
+}
 
+/** Emit a line to console/forward/ring and return it. */
+function emitLine(line: string, level: DlogLevel): string {
+  ringPush(line);
+  if (mode === 'forward' && forwardCb) {
+    forwardCb(line);
+  } else if (mode === 'redraw') {
+    scheduleRedraw();
+  } else {
+    const logFn = level === 'error' ? console.error : level === 'warn' ? console.warn : level === 'debug' ? console.debug : console.log;
+    logFn(line);
+  }
+  return line;
+}
+
+/** Build the `[TAG] ` prefix including warning/error markers. */
+function buildPrefix(tag: string, level: DlogLevel): string {
+  const marker = level === 'error' ? '!! ' : level === 'warn' ? '! ' : '';
+  return `${marker}[${tag}] `;
+}
+
+/**
+ * Emit `[TAG] k=v ...` line(s), suppressing consecutive identical lines.
+ * Returns the formatted text (or null if suppressed by rate limiting or disabled).
+ */
+export function dlog(
+  tag: string,
+  fields: Record<string, unknown>,
+  opts: DlogOptions = {},
+): string | null {
+  if (disabledTags.has(tag)) return null;
+
+  if (opts.every && opts.every > 1) {
+    const count = (rateCounters.get(tag) ?? 0) + 1;
+    rateCounters.set(tag, count);
+    if ((count - 1) % opts.every !== 0) return null;
+  }
+
+  const level = opts.level ?? 'info';
+  const lines = formatLines(tag, fields, level);
   if (lines.length === 0) return null;
 
-  // Push all lines into the ring buffer
+  // Deduplication only applies to single-line logs (covers >99% of calls).
+  const primary = lines[0];
+  const prefix = buildPrefix(tag, level);
+  const body = primary.startsWith(prefix) ? primary.slice(prefix.length) : primary;
+
+  const state = dupState.get(tag);
+  let emittedResult: string | null = null;
+
+  if (state && state.lastBody === body) {
+    // Same line again — count it and suppress.
+    state.count++;
+    return null;
+  }
+
+  // Different line — flush any pending duplicate summary first.
+  if (state && state.count > 0) {
+    let dupBody = state.lastBody;
+    const dupSuffix = state.count === 1 ? ' (+dup)' : ` (+${state.count} dup)`;
+    if (dupBody.length + dupSuffix.length > MAX_LINE_LEN - prefix.length) {
+      dupBody = `${dupBody.slice(0, Math.max(1, MAX_LINE_LEN - prefix.length - dupSuffix.length - 3))}...`;
+    }
+    emittedResult = emitLine(`${prefix}${dupBody}${dupSuffix}`, level);
+  }
+
+  // Emit new line(s).
   for (const l of lines) {
-    ringPush(l);
+    emitLine(l, level);
   }
+  dupState.set(tag, { lastBody: body, count: 0 });
 
-  if (mode === 'forward' && forwardCb) {
-    for (const l of lines) forwardCb(l);
-    return lines.join('\n');
-  }
-  if (mode === 'redraw') {
-    scheduleRedraw();
-    return lines.join('\n');
-  }
-
-  const logFn = level === 'error' ? console.error : level === 'warn' ? console.warn : level === 'debug' ? console.debug : console.log;
-  for (const l of lines) logFn(l);
-  return lines.join('\n');
+  return emittedResult ?? lines.join('\n');
 }
 
 /** Last `count` emitted lines, newline-joined — paste-ready for LLM analysis. */
@@ -193,9 +239,10 @@ export function dlogDump(count = 200): string {
   return ring.slice(-count).join('\n');
 }
 
-/** Reset rate counters and ring (call when starting a fresh transmission test). */
+/** Reset rate counters, duplicate state, and ring (call when starting a fresh transmission test). */
 export function dlogReset(): void {
   ring.length = 0;
   rateCounters.clear();
+  dupState.clear();
   redrawEmitted = 0;
 }

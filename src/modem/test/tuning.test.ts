@@ -16,5 +16,7 @@ test('current default values', () => {
     trainingSymbols: 12,
     syncMinFrames: 8,
     tailSilenceSymbols: 6,
+    cpCorrelationMinScore: 0.35,
+    cpCorrelationMinSharpness: 1.1,
   });
 });
