@@ -290,8 +290,8 @@ Applied 2026-07-28 from code review. Goal: fix test/lint failures, small bugs, a
 - **OFDM tuning**: Moved CP correlation thresholds (`score >= 0.35`, `sharpness >= 1.1`) into `OFDM_TUNING` as `cpCorrelationMinScore` and `cpCorrelationMinSharpness`. Added `checkOfdmTuningInvariants()` to enforce `syncBurstSymbols >= syncMinFrames + 2 + trainingSymbols`.
 - **Audio cleanup**: Replaced raw `console.*` calls in `src/audio/recorder.ts` with `dlog()`.
 - **Demod hot path**: `OFDMQPSKDemodulator.analyze()` no longer copies `Float32Array` windows via `Array.from()`. `computeQamRefScale()` no longer allocates a throwaway `OFDMQPSKModulator`; it uses a pure static helper. Added a memory-footprint comment to `OFDMQPSKModulator`.
-- **Concise debug logs**: `dlog()` now suppresses consecutive duplicate lines per tag and prints a `(+N dup)` summary when the line changes. `MAX_LINE_LEN` reduced from 200 to 120 for denser output.
-- **Packet failure diagnosis**: `decodeFrame()` returns `failureReason`, `crcMismatch`, `bchErrorCounts`, and `rsBlockErrors`. `RxEngine` logs a `RX-FAIL` line with the failure reason, ECC error counts, and available signal/MER context.
+- **Concise debug logs**: `dlog()` suppresses consecutive duplicate lines per tag (single dup is silent; N>1 prints `(+N)`). `MAX_LINE_LEN` reduced from 200 → 100. Redraw batch header shortened. `RX-FRAME`, `RX-FAIL`, `RX-PROFILE`, `RX-SCAN`, and `OFDM-SYNC` logs use shorter keys and omit constant/redundant fields.
+- **Packet failure diagnosis**: `decodeFrame()` returns `failureReason`, `crcMismatch`, `bchErrorCounts`, and `rsBlockErrors`. `RxEngine` logs a compact `RX-FAIL` line with only the non-default failure details and available signal/MER context.
 - **Presentation layer**: `PresentationMode.tsx` now has preset examples (reset, all tones, one tone, alternating, random), an AWGN noise slider with live SNR estimate, step-highlighting, and a decoded-bits table showing sent vs received QPSK bits.
 
 ### Not done (intentionally)
@@ -300,4 +300,4 @@ Applied 2026-07-28 from code review. Goal: fix test/lint failures, small bugs, a
 ### Verification
 - `npm test`: 259 passed / 3 failed (pre-existing BPSK pipeline failures: Doppler +2Hz, Doppler −1Hz, Full Stress).
 - `npx tsc --noEmit`: clean.
-- `npm run lint`: 220 problems remaining (15 errors, 205 warnings) — all pre-existing in files not touched by this branch.
+- `npm run lint`: 217 problems remaining (15 errors, 202 warnings) — all pre-existing in files not touched by this branch.

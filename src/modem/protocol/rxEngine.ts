@@ -480,9 +480,8 @@ export class RxEngine {
         }
         const effThr = Math.max(this.ofdmSyncThreshold, 3 * this.ofdmNoiseEma);
         // Heartbeat while waiting: 1 line per 25 windows (~2/s)
-        
-          dlog('OFDM-SYNC',
-          { e: totalE, thr: effThr, sync: this.ofdmSyncFrames },
+        dlog('OFDM-SYNC',
+          { e: dlogFmt(totalE), thr: dlogFmt(effThr), sync: this.ofdmSyncFrames },
           { every: 25 },
         );
         this.ofdmSyncFrames = totalE > effThr ? this.ofdmSyncFrames + 1 : 0;
@@ -498,9 +497,8 @@ export class RxEngine {
           // symbols partially correlate at every offset); flat periodic hum
           // measures ~1.0-1.3. The adaptive energy floor is the third layer.
           if (probe.score < OFDM_TUNING.cpCorrelationMinScore || probe.sharpness < OFDM_TUNING.cpCorrelationMinSharpness) {
-            
-              dlog('OFDM-SYNC',
-              { falseTrigger: true, e: totalE, score: probe.score, sharp: probe.sharpness },
+            dlog('OFDM-SYNC',
+              { reject: true, e: dlogFmt(totalE), score: dlogFmt(probe.score), sharp: dlogFmt(probe.sharpness) },
               { level: 'warn' },
             );
             this.ofdmSyncFrames = 0;
@@ -509,7 +507,7 @@ export class RxEngine {
           }
 
           // Signal detected! Enter FRAMES state.
-          dlog('OFDM-SYNC', { detected: true, e: totalE });
+          dlog('OFDM-SYNC', { detected: true, e: dlogFmt(totalE) });
           this.ofdmWindowsSinceDetect = 0;
           this.ofdmFrameSeen = false;
           this.state = RxState.FRAMES;
@@ -536,13 +534,12 @@ export class RxEngine {
               (((boundary - this.ofdmAlignBuf.length) % this.sps) + this.sps) %
               this.sps;
             this.ofdmSkip = skip;
-            
-              dlog('OFDM-SYNC',
-              { boundary, skip, score },
+            dlog('OFDM-SYNC',
+              { boundary, skip, score: dlogFmt(score) },
               { level: score < 0.5 ? 'warn' : 'info' },
             );
           } else {
-            dlog('OFDM-SYNC', { aligned: false, alignBuf: this.ofdmAlignBuf.length }, { level: 'warn' });
+            dlog('OFDM-SYNC', { aligned: false, buf: this.ofdmAlignBuf.length }, { level: 'warn' });
           }
           this.buf = [];
           this.ofdmAlignBuf = [];
@@ -1195,27 +1192,24 @@ export class RxEngine {
   /** Log a concise failure diagnosis when a frame does not decode. */
   private logFrameFailure(decoded: ReturnType<typeof decodeFrame>): void {
     const fields: Record<string, unknown> = {
-      reason: decoded.failureReason,
-      type: decoded.header ? `0x${decoded.header.type.toString(16).padStart(2, '0')}` : '?',
-      seq: decoded.header?.seqNum ?? -1,
-      crc: decoded.crcMismatch,
-      bch: decoded.bchErrorCounts.join(','),
-      rs: decoded.rsBlockErrors.join(','),
+      r: decoded.failureReason,
+      t: decoded.header ? `0x${decoded.header.type.toString(16)}` : '?',
+      s: decoded.header?.seqNum ?? -1,
     };
+
+    if (decoded.crcMismatch) fields.crc = 1;
+    if (decoded.bchErrorCounts.some((e) => e > 0)) {
+      fields.bch = decoded.bchErrorCounts.join(',');
+    }
+    if (decoded.rsBlockErrors.length > 0 && decoded.rsBlockErrors.some((e) => e !== 0)) {
+      fields.rs = decoded.rsBlockErrors.join(',');
+    }
 
     if (this.useOFDM && this.ofdmDemod) {
       const mer = this.ofdmDemod.getMER();
-      if (mer) fields.merDb = dlogFmt(mer.merDb);
-      const perTone = this.ofdmDemod.getPerToneChannelMagnitude();
-      if (perTone.length > 0) {
-        const mags = perTone.filter((v) => Number.isFinite(v));
-        fields.chMin = dlogFmt(Math.min(...mags));
-        fields.chMed = dlogFmt(mags.sort((a, b) => a - b)[Math.floor(mags.length / 2)] ?? 0);
-      }
+      if (mer) fields.mer = dlogFmt(mer.merDb);
     } else {
-      fields.pilotAmp = dlogFmt(this.pilotAmplitude);
-      const totalE = this.lastRawIQs.reduce((a, r) => a + Math.hypot(r.i, r.q), 0);
-      fields.toneE = dlogFmt(totalE);
+      fields.pa = dlogFmt(this.pilotAmplitude);
     }
 
     dlog('RX-FAIL', fields, { level: 'warn' });
@@ -1227,10 +1221,9 @@ export class RxEngine {
     const decoded = decodeFrame(frame);
 
     dlog('RX-FRAME', {
-      valid: decoded.valid,
-      type: decoded.header ? `0x${decoded.header.type.toString(16).padStart(2, '0')}` : '?',
-      seq: decoded.header?.seqNum ?? -1,
-      len: decoded.payload?.length ?? 0,
+      ok: decoded.valid,
+      t: decoded.header ? `0x${decoded.header.type.toString(16)}` : '?',
+      s: decoded.header?.seqNum ?? -1,
     });
     // Gate MER accumulation to windows that belong to a successfully-decoded
     // frame — commit the staged stats on success, throw them away on failure,
@@ -1269,11 +1262,11 @@ export class RxEngine {
         }
         if (profile.toneCount !== this.ofdmToneCount) {
           dlog('RX-PROFILE', { 
-            toneCountMismatch: true, 
+            tcMismatch: true, 
             got: profile.toneCount, 
             want: this.ofdmToneCount,
             eccT: profile.eccT,
-            qamMapPrefix: profile.qamMap.slice(0, 8).join(',') + (profile.qamMap.length > 8 ? ',…' : ''),
+            qamMap: profile.qamMap.slice(0, 8).join(','),
           }, { level: 'warn' });
           // Receiver was initialized with a different tone count than what
           // the TX actually uses. Adapt dynamically: rebuild the demodulator
@@ -1311,10 +1304,10 @@ export class RxEngine {
           this.allQpsk = this.toneOrders.every((o) => o === 2);
           this.ofdmDemod?.setToneOrders(this.toneOrders);
           dlog('RX-PROFILE', { 
-            eccT: profile.eccT, cpId: profile.cpId, toneCount: profile.toneCount,
-            qamMap: profile.qamMap.join(','), 
-            orders: qamMapToOrders(profile.qamMap).join(','),
-            allQpsk: this.allQpsk,
+            t: profile.toneCount,
+            eccT: profile.eccT,
+            qam: profile.qamMap.join(','), 
+            ord: qamMapToOrders(profile.qamMap).join(','),
           });
           // Every subsequent frame (header/data/tail) is FRAME_SIZE bytes
           // at this same (now-fixed) rate, so it spans a constant symbol

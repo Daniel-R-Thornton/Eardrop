@@ -13,7 +13,7 @@
  */
 
 const RING_MAX = 500;
-const MAX_LINE_LEN = 120; // tight lines: max data, min context
+const MAX_LINE_LEN = 100; // tight lines: max data, min context
 const ring: string[] = [];
 const rateCounters = new Map<string, number>();
 const disabledTags = new Set<string>();
@@ -66,7 +66,7 @@ function flushBatch(): void {
     const toLine = redrawEmitted + chunk.length;
     redrawEmitted += chunk.length;
     console.log(
-      `━━ eardrop log (lines ${fromLine}-${toLine} of ${ring.length}) ━━\n${chunk.join('\n')}`,
+      `--- ${fromLine}-${toLine}/${ring.length} ---\n${chunk.join('\n')}`,
     );
   }
 }
@@ -218,7 +218,7 @@ export function dlog(
   // Different line — flush any pending duplicate summary first.
   if (state && state.count > 0) {
     let dupBody = state.lastBody;
-    const dupSuffix = state.count === 1 ? ' (+dup)' : ` (+${state.count} dup)`;
+    const dupSuffix = state.count > 1 ? ` (+${state.count})` : '';
     if (dupBody.length + dupSuffix.length > MAX_LINE_LEN - prefix.length) {
       dupBody = `${dupBody.slice(0, Math.max(1, MAX_LINE_LEN - prefix.length - dupSuffix.length - 3))}...`;
     }
