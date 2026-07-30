@@ -631,9 +631,12 @@ export class OFDMQPSKDemodulator {
 
 
       if (this.allQpsk) {
-        // ── Legacy hard 4-phase slicer — UNCHANGED, byte-identical to the
-        // pre-QAM demodulator (only phase is corrected; amplitude is never a
-        // decision axis here, matching the legacy TX per-symbol peak-norm). ──
+        // ── Legacy hard 4-phase slicer — UNCHANGED (only phase is corrected;
+        // amplitude is never a decision axis here). Note: the TX side no
+        // longer per-symbol peak-normalizes QPSK — since Task 8 (TX level
+        // flattening) every symbol (training, QPSK data, QAM data) shares
+        // ONE fixed, worst-case-safe `qamScale`, so amplitude is now constant
+        // across symbols too, not just irrelevant to this phase-only slicer. ──
         for (let t = 0; t < this.toneCount; t++) {
           const chPhase = Math.atan2(this.channelEstIm[t], this.channelEstRe[t]);
           const toneCorr = -chPhase - driftPerHz * this.cfg.toneFrequencies[t];
@@ -702,8 +705,11 @@ export class OFDMQPSKDemodulator {
           const sym = Math.round(normalizedPhase / (Math.PI / 2)) % 4;
 
           // ── MER/EVM accumulation (diagnostic only, staged) ──
-          // Phase-EVM: the TX peak-normalizes each OFDM symbol independently, so
-          // per-tone amplitude is not constant and QPSK decides on phase alone.
+          // Phase-EVM: QPSK decides on phase alone, regardless of amplitude —
+          // true both before and after Task 8 (previously because the TX
+          // peak-normalized each OFDM symbol independently and per-tone
+          // amplitude wasn't constant; now because amplitude IS constant
+          // across symbols but this slicer still only reads phase).
           // Normalize each point to unit magnitude and measure its distance to
           // the ideal unit point sym·90° — i.e. angular tightness (|err| =
           // 2·sin(Δφ/2)). This is the "how dead-center in the quadrant" number.

@@ -149,29 +149,53 @@ export class RxEngine {
   /** Samples still to discard so the window grid lands on a symbol boundary */
   private ofdmSkip = 0;
   /** EMA of waiting-state tone energy — adapts the sync threshold to mic gain */
-  // Seed low so the first windows don't false-trigger AND the training burst
-  // reliably freezes the floor (needs totalE > 5x this seed — see below).
-  // Was 0.07 back when the OFDM training burst was per-symbol peak-normed to
-  // ~0.95 (total tone energy e~0.4+); TX level flattening (see
-  // OFDMQPSKModulator's qamScale doc) now uses one fixed, worst-case-safe
-  // scale so the burst never clips, at the cost of being quieter — clean
-  // training total-tone-energy is ~0.27-0.31 regardless of tone count (8/16/
-  // 32), not ~0.4+. Reseeded so the SAME margin architecture holds at the
-  // new level: 5x this seed (~0.10) sits well below the new signal
-  // (~0.27-0.31, >2.5x margin), so a clean burst still freezes the floor
-  // instead of the EMA chasing the signal upward and never latching sync
-  // (this chasing was an actual regression this reseed fixes — see
-  // ofdm_acoustic_path.test.ts's 100-sample-delay case). Asymmetric update:
+  // INVARIANT this seed must satisfy: freeze ABOVE typical ambient room noise,
+  // detect BELOW the training signal. (freeze fires at >5x this seed — see
+  // the freeze branch below). Typical real-room ambient noise measures
+  // ~0.2-0.3 in this same total-tone-energy metric (see the old comment this
+  // replaces, referencing real acoustic testing).
+  //
+  // TX level flattening (see OFDMQPSKModulator's qamScale doc) dropped the
+  // training burst from a per-symbol peak-normed ~0.95 (total tone energy
+  // e~0.4+) to one fixed, worst-case-safe scale that's quieter but never
+  // clips: clean training total-tone-energy is now ~0.267-0.299 regardless
+  // of tone count (8/16/32) — a ~1.5x (-3.7 dB) signal drop, not the ~3.5x
+  // this seed was first (wrongly) dropped by. An 0.02 seed freezes at
+  // 5*0.02=0.10, which is BELOW typical ambient noise (0.2-0.3) — any real
+  // room's waiting-state energy takes the freeze branch on window 1, the EMA
+  // pins at the seed forever (adaptation to mic gain is dead), effThr
+  // collapses to the fixed floor, ambient noise exceeds it, sync accumulates
+  // on noise, the CP probe rejects it, the EMA gets reseeded, and it loops —
+  // exactly the false-lock/deafness mode this seed exists to prevent.
+  //
+  // Seeding at 0.04 instead: freeze sits at 5*0.04=0.20 (below ambient
+  // 0.2-0.3, so ambient can still slow-rise the EMA instead of pinning it),
+  // and the new signal (0.267-0.299) clears that freeze threshold with a
+  // 1.3-1.5x margin so a clean burst still latches. Swept 0.02/0.03/0.04/
+  // 0.05/0.07 against the synthetic acoustic-path suite: 0.02-0.04 all score
+  // 283/3, 0.05+ score 282/4 — 0.04 is the largest seed that still passes,
+  // i.e. the one that sits furthest from the now-thinner ambient-noise
+  // margin while remaining in the passing band. Asymmetric update:
   //   - Fast decay (α=0.20) when energy drops below ema
   //   - Slow rise (α=0.05) when ambient noise increases up to 5× ema
   //   - Freeze at >5× ema (sync burst, typically 10-30× noise)
-  // CONCERN: this makes the training burst's absolute level closer to
-  // typical real-room ambient noise (previously e=0.403 vs ~0.2-0.3 noise,
-  // already a thin ~1.3-2x margin) — acoustic sync-detection margin over
-  // ambient noise is worse than before, not just numerically retuned to
-  // pass the in-memory test. Flagged for real-hardware validation.
-  private ofdmNoiseEma = 0.02;
-  private readonly OFDM_EMA_SEED = 0.02;
+  //
+  // Knock-on effect on `ofdmSyncThreshold` (below): with the OLD seed 0.07,
+  // 3*ema=0.21 always dominated the fixed 0.06 floor in `effThr = max(0.06,
+  // 3*ema)`, so 0.06 was dead code. At the (wrong) 0.02 seed the two became
+  // equal (3*0.02=0.06), so the EFFECTIVE minimum threshold silently fell
+  // from 0.21 to 0.06 — a ~10.9 dB sensitivity increase that (not the TX
+  // level change) is why a naive reseed made the acoustic-path test start
+  // passing. At 0.04, 3*ema=0.12 is binding again and the 0.06 floor is
+  // dormant (as designed) — do not "clean up" that constant, it is a real
+  // safety floor for degenerate low-EMA states, just not the normal path.
+  //
+  // CONCERN: even at 0.04 the training burst's absolute level (~0.27-0.30)
+  // is closer to typical real-room ambient noise (~0.2-0.3) than the old
+  // ~0.40 was — the margin is thinner than before, just not inverted.
+  // Flagged for real-hardware validation (see task-8-report.md Concern 1).
+  private ofdmNoiseEma = 0.04;
+  private readonly OFDM_EMA_SEED = 0.04;
   /**
    * Windows processed since the last VALID (CRC-passing) decoded frame —
    * sliding sync-loss watchdog (3b). Reset on every valid frame in

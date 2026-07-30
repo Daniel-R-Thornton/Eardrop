@@ -20,6 +20,7 @@ import { TxEngine } from '../protocol/txEngine';
 import { ordersToQamMap } from '../protocol/linkProfile';
 import type { QamOrder } from '../modulation/constellation';
 import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
+import { toneIQ } from '../pilot';
 import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS } from '../types';
 
 const SAMPLE_RATE = 48000;
@@ -115,10 +116,15 @@ describe('TX level flattening — training vs data per-tone amplitude', () => {
   });
 
   it('per-tone amplitude recovered by the demodulator is consistent between a training symbol and a QPSK data symbol', () => {
-    // End-to-end (mod -> demod) check via the actual toneIQ recovery path,
-    // not just the shared qamScale constant: train on the all-zero pattern,
-    // then confirm a data symbol's recovered per-tone magnitude sits at the
-    // SAME scale as what training measured (channel = identity here).
+    // End-to-end (mod -> demod) check via the actual toneIQ recovery path
+    // (a per-tone matched-filter correlation, the same one demodulate() uses
+    // — see OFDMQPSKDemodulator.ts), not just the shared qamScale constant:
+    // train on the all-zero pattern, then confirm a data symbol (different
+    // phase per tone) recovers the SAME per-tone magnitude — the property
+    // requirement (b) actually claims: training and data amplitude must
+    // match because the receiver trains its channel estimate on training and
+    // applies it to data, so any training-vs-data amplitude ratio other than
+    // 1 is a systematic error QPSK's phase-only slicer would never catch.
     const toneCount = 8;
     const toneFreqs = ofdmToneFrequencies({ toneCount, pilotFreqHz: PILOT_FREQ });
     const mod = new OFDMQPSKModulator({
@@ -127,27 +133,25 @@ describe('TX level flattening — training vs data per-tone amplitude', () => {
       pilotFreqHz: PILOT_FREQ,
       pilotAmplitude: OFDM_DEFAULTS.pilotAmplitude,
     });
-    const { cpSamples } = ofdmSamples(SAMPLE_RATE);
+    const { cpSamples, fftSamples } = ofdmSamples(SAMPLE_RATE);
+    const body = (symbol: Float32Array) => symbol.subarray(cpSamples, cpSamples + fftSamples);
 
+    // Training body: all-zero QPSK, the pattern OFDMEngine uses for sync/training.
     mod.setSymbols(new Array(toneCount).fill(0));
-    const training = mod.generateSymbol();
-    // Peak sample of an all-zero training symbol occurs at n=0 (every tone's
-    // sin(0)=0, only the pilot contributes): pilotAmplitude * qamScale.
-    expect(training[cpSamples]).toBeCloseTo(OFDM_DEFAULTS.pilotAmplitude * mod.getQamScale(), 6);
+    const trainingBody = body(mod.generateSymbol());
 
-    // A QPSK data symbol (phase 1, i.e. every tone at +cos) at n=0: every
-    // tone's cos(0)=1, so the sample is (numTones + pilotAmplitude) * qamScale
-    // — directly comparable to the training sample above via the SAME qamScale.
-    mod.setSymbols(new Array(toneCount).fill(1));
-    const data = mod.generateSymbol();
-    const expected = (toneCount + OFDM_DEFAULTS.pilotAmplitude) * mod.getQamScale();
-    expect(data[cpSamples]).toBeCloseTo(expected, 6);
+    // Data body: QPSK phase 2 on every tone (a different phase than training,
+    // so a bug that only cancels at matching phases wouldn't be caught).
+    mod.setSymbols(new Array(toneCount).fill(2));
+    const dataBody = body(mod.generateSymbol());
 
-    // Both derive from the identical qamScale — the ratio between the
-    // per-tone contribution (excluding pilot) is exactly 1:1.
-    const trainingPerTone = 0; // sin(0) = 0 for the all-zero pattern
-    const dataPerTone = mod.getQamScale(); // cos(0) = 1 for phase index 1
-    expect(dataPerTone).toBeCloseTo(mod.getQamScale(), 10);
-    expect(trainingPerTone).toBe(0);
+    for (let t = 0; t < toneCount; t++) {
+      const trainingIQ = toneIQ(trainingBody, toneFreqs[t], SAMPLE_RATE);
+      const dataIQ = toneIQ(dataBody, toneFreqs[t], SAMPLE_RATE);
+      const trainingMag = Math.hypot(trainingIQ.i, trainingIQ.q);
+      const dataMag = Math.hypot(dataIQ.i, dataIQ.q);
+      expect(trainingMag).toBeGreaterThan(0);
+      expect(dataMag / trainingMag).toBeCloseTo(1, 6);
+    }
   });
 });

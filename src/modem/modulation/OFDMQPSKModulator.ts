@@ -8,6 +8,7 @@
  */
 import { ofdmSamples } from '../types';
 import { mapSymbol, MAX_QAM_MAGNITUDE, type ConstellationPoint, type QamOrder } from './constellation';
+import { dlog } from '../../lib/debug/dlog';
 
 export interface OFDMQPSKModulatorConfig {
   sampleRate: number;
@@ -21,7 +22,10 @@ export interface OFDMQPSKModulatorConfig {
    * the true worst-case fully-aligned sum of every tone at the largest
    * supported constellation's corner point plus the pilot, backed off to a
    * 0.95 peak target. Override only for tuning against real hardware
-   * headroom.
+   * headroom — clamped to that same safe default as an upper bound (an
+   * override now scales the WHOLE transmission, training included, so an
+   * unclamped value above the safe scale would reinstate the per-chunk
+   * clipping this modulator exists to eliminate).
    */
   qamScaleOverride?: number;
 }
@@ -97,19 +101,43 @@ export class OFDMQPSKModulator {
     // the coherent-worst-case alignment is actually reachable, not just a
     // tail event, so a CLT/percentile bound is not safe here. The peak of
     // Σ_t (re_t·cos − im_t·sin) + pilot·cos is bounded (triangle inequality)
-    // by Σ_t |point_t| + pilotAmplitude, and that bound is achieved (every
-    // tone's point real-valued and maximal, evaluated at n=0). Each tone's
-    // |point_t| is at most MAX_QAM_MAGNITUDE (the largest corner magnitude
-    // across every constellation order this modulator can be asked to carry
-    // — see constellation.ts; QPSK's unit-magnitude points are smaller, so
-    // this bound stays safe for a QPSK-only symbol too, and for any per-tone
-    // bit-loading mix). So:
+    // by Σ_t |point_t| + pilotAmplitude. This is a safe UPPER bound, not a
+    // tight one: at n=0 each tone actually contributes only its point's real
+    // part (max Re = maxLevel·scale, e.g. 1.0801 for 64-QAM), not |point_t|
+    // (1.5275) — nothing forces every tone's imaginary part to vanish AND
+    // its real part to hit the corner simultaneously at the same n. Measured
+    // achievable-vs-bound slack: ~0.2 dB for all-64-QAM (nearly tight — the
+    // outer corner is mostly real already) but 3.0-3.5 dB for all-QPSK
+    // (unit-magnitude points, so the n=0 real part is a much smaller
+    // fraction of |point_t|) — i.e. the training/sync portion is leaving
+    // ~3 dB of headroom on the table against this bound. Left unexploited
+    // here deliberately (documenting it honestly, not chasing it) — each
+    // tone's |point_t| is at most MAX_QAM_MAGNITUDE (the largest corner
+    // magnitude across every constellation order this modulator can be
+    // asked to carry — see constellation.ts; QPSK's unit-magnitude points
+    // are smaller, so this bound stays safe for a QPSK-only symbol too, and
+    // for any per-tone bit-loading mix). So:
     //   worstCasePeak = numTones · MAX_QAM_MAGNITUDE + pilotAmplitude
     //   qamScale = 0.95 / worstCasePeak
     // guarantees |sample| <= 0.95 for every symbol this modulator can ever
     // produce, for any data, any per-tone order assignment, any tone count.
     const worstCasePeak = numTones * MAX_QAM_MAGNITUDE + config.pilotAmplitude;
-    this.qamScale = config.qamScaleOverride ?? 0.95 / worstCasePeak;
+    const safeScale = 0.95 / worstCasePeak;
+    // qamScaleOverride is a user/tuning knob, not a way to bypass the safety
+    // bound above — it now scales the WHOLE transmission (training included,
+    // not just QAM data), so an unclamped override above safeScale would
+    // silently reinstate the per-chunk clip-guard rescaling this task exists
+    // to eliminate (e.g. override=0.2 at 32 tones -> peak ~10.0). Clamp to
+    // the safe ceiling; only a SMALLER override (deliberately quieter than
+    // the safe default) has any effect.
+    if (config.qamScaleOverride !== undefined && config.qamScaleOverride > safeScale) {
+      dlog('OFDM-SCALE', {
+        warn: 'qamScaleOverride clamped to safe scale',
+        requested: config.qamScaleOverride,
+        clampedTo: safeScale,
+      }, { level: 'warn' });
+    }
+    this.qamScale = Math.min(config.qamScaleOverride ?? safeScale, safeScale);
 
     const twoPiOverFs = (2 * Math.PI) / config.sampleRate;
     // Precomputed sin/cos tables: each is a Float32Array of fftSamples.

@@ -1219,7 +1219,13 @@ async function runSpeedTest() {
     [-3, -2, -1, 0, 1, 2, 3].map((bins) => snapPilot(basePilot) + bins * pilotBinHz),
   )].filter((f) => f >= 200 && f <= 3500).sort((a, b) => a - b);
   const qamBitsList: Array<2 | 4 | 6> = [2, 4, 6];
-  const qamScales = [0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2];
+  // Sentinel meaning "no override" — buildModemConfig omits qamScaleOverride
+  // entirely (see runOnce), so the modulator falls back to its own derived
+  // safe scale (0.95/worstCasePeak). Never a real transmitted scale (0 would
+  // silence the signal), so it can't collide with a ladder rung.
+  const AUTO_SCALE = 0;
+  const qamScales = [AUTO_SCALE, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2];
+  const scaleLabel = (s: number) => (s === AUTO_SCALE ? 'auto' : s.toFixed(3));
 
   // Short payload: enough frames to exercise the pipeline but short enough
   // that the loopback path finishes processing well inside the wait window.
@@ -1231,19 +1237,17 @@ async function runSpeedTest() {
 
   interface Combo { toneCount: number; micGain: number; pilotFreqHz: number; qamBits: 2 | 4 | 6; qamScale: number }
 
-  // QPSK ignores qamScale — the all-QPSK modulator path peak-normalizes each
-  // symbol and never reads `qamScale` — so two QPSK combos differing only in
-  // scale are the same transmission and must share a cache entry.
+  // qamScale is now part of the transmission for EVERY constellation order,
+  // QPSK included: Task 8 (TX level flattening) removed the per-symbol
+  // peak-normalize QPSK used to rely on, so a QPSK combo differing only in
+  // scale is now a physically different transmission and must NOT share a
+  // cache entry with another scale (that used to be true and isn't anymore —
+  // merging them silently biased the hunt's QPSK trials to whatever scale
+  // the search happened to be carrying).
   //
-  // This is a CACHE-KEY rule only. It must never rewrite the combo the search
-  // carries: doing that pinned the incumbent's scale to the ladder's first
-  // value while at QPSK, so the later step up to 16-QAM got judged at that
-  // arbitrary scale, failed, and the hunt wrongly concluded 16-QAM was worse.
-  // Likewise the pilot is keyed post-snap, since that is the config that runs.
-  const keyOf = (c: Combo) => {
-    const scale = c.qamBits === 2 ? 'n/a' : c.qamScale;
-    return `${c.toneCount}|${c.micGain}|${snapPilot(c.pilotFreqHz)}|${c.qamBits}|${scale}`;
-  };
+  // The pilot is keyed post-snap, since that is the config that actually runs.
+  const keyOf = (c: Combo) =>
+    `${c.toneCount}|${c.micGain}|${snapPilot(c.pilotFreqHz)}|${c.qamBits}|${c.qamScale}`;
 
   let currentCombo = 0;
   let lastMicGain: number | null = null;
@@ -1332,7 +1336,7 @@ async function runSpeedTest() {
     currentCombo++;
     setState({ speedTestProgress: { current: currentCombo, total } });
 
-    const fileName = `__speed_${pilotFreqHz.toFixed(0)}_${qamBits}_${qamScale.toFixed(3)}_${micGain}_${toneCount}.txt`;
+    const fileName = `__speed_${pilotFreqHz.toFixed(0)}_${qamBits}_${scaleLabel(qamScale)}_${micGain}_${toneCount}.txt`;
     const cfg = buildModemConfig({
       useOFDM: true,
       pilotFreqHz,
@@ -1342,7 +1346,10 @@ async function runSpeedTest() {
       diversityMode: state.diversityMode,
       hwSampleRate: audioCtx.sampleRate,
       dataQamBits: qamBits,
-      qamScaleOverride: qamScale,
+      // AUTO_SCALE (0) means "no override" — omit the field so the modulator
+      // falls back to its own derived safe scale, instead of materialising an
+      // explicit (and possibly suboptimal) scale for every trial.
+      qamScaleOverride: qamScale === AUTO_SCALE ? undefined : qamScale,
     });
 
     const tx = new TxEngine(cfg);
@@ -1392,7 +1399,7 @@ async function runSpeedTest() {
       gain: micGain,
       pilot: pilotFreqHz,
       qam: qamBits,
-      scale: qamScale.toFixed(3),
+      scale: scaleLabel(qamScale),
       ok: decoded,
       f: `${frames.dataOk}d ${frames.ok}/${frames.total}`,
       sync: result.syncLevel,
@@ -1429,8 +1436,12 @@ async function runSpeedTest() {
     // Spread across the ladder rather than adjacent, because the right scale for
     // a new constellation order is not near the old order's — and reaching the
     // TOP of the ladder, because 16-QAM's first success came at the highest
-    // scale probed, which means the real optimum may be past it.
-    const QAM_PROBE_SCALES = [0.02, 0.03, 0.05, 0.1, 0.15, 0.2];
+    // scale probed, which means the real optimum may be past it. AUTO_SCALE
+    // (no override, modulator's own derived safe scale) is included and
+    // tried FIRST — it's a reasonable default for any order, not just QPSK,
+    // and cheaper to rule in/out than assuming an explicit small scale is
+    // always better.
+    const QAM_PROBE_SCALES = [AUTO_SCALE, 0.02, 0.03, 0.05, 0.1, 0.15, 0.2];
 
     const allAxes: Array<DescentAxis<Combo>> = [
       { name: 'pilot', values: pilotFreqs, get: (c) => c.pilotFreqHz, set: (c, v) => ({ ...c, pilotFreqHz: v }) },
@@ -1465,9 +1476,15 @@ async function runSpeedTest() {
       micGain: nearest(micGains, state.micGain),
       pilotFreqHz: snapPilot(basePilot),
       qamBits: 2,
-      // 0.03 is the value STATE.md records as working on real hardware — a
-      // sane place for the scale axis to start refining from.
-      qamScale: nearest(qamScales, state.qamScaleOverride ?? 0.03),
+      // Prefer Auto (no override -> the modulator's own derived worst-case-safe
+      // scale) as the starting candidate rather than always materialising an
+      // explicit small scale: Task 8 made that derived scale the safe default
+      // for every constellation order, including QPSK, so it's the natural
+      // place to start refining from. Only start away from Auto if the user
+      // has actually dialed in an override.
+      qamScale: state.qamScaleOverride === undefined
+        ? AUTO_SCALE
+        : nearest(qamScales, state.qamScaleOverride),
     };
 
     // Budget is an upper bound on trials, not a target: convergence usually
@@ -1521,9 +1538,11 @@ async function runSpeedTest() {
       for (const toneCount of toneCounts) {
         for (const micGain of micGains) {
           for (const pilotFreqHz of pilotFreqs) {
+            // qamScale now affects QPSK too (Task 8 removed QPSK's per-symbol
+            // peak-normalize), so it's swept across the full ladder for every
+            // order — QPSK is no longer special-cased to a single scale.
             for (const qamBits of qamBitsList) {
-              const scales = qamBits === 2 ? [qamScales[0]] : qamScales;
-              for (const qamScale of scales) combos.push({ toneCount, micGain, pilotFreqHz, qamBits, qamScale });
+              for (const qamScale of qamScales) combos.push({ toneCount, micGain, pilotFreqHz, qamBits, qamScale });
             }
           }
         }
@@ -1565,7 +1584,7 @@ async function runSpeedTest() {
     if (closest) {
       dlog('SPEED-TEST', {
         nothingDecoded: true,
-        closest: `pilot=${closest.pilotFreqHz} qam=${closest.qamBits} scale=${closest.qamScale}`,
+        closest: `pilot=${closest.pilotFreqHz} qam=${closest.qamBits} scale=${scaleLabel(closest.qamScale)}`,
         sync: closest.syncLevel,
         frames: `${closest.framesOk}/${closest.framesTotal}`,
         mer: (closest.merDb ?? closest.rawMerDb)?.toFixed(1) ?? '—',
@@ -1578,7 +1597,9 @@ async function runSpeedTest() {
     // The constellation name, not the bit count: qamBits=4 is 16-QAM.
     QAM: r.qamBits === 2 ? 'QPSK' : r.qamBits === 4 ? '16-QAM' : '64-QAM',
     Hz: r.pilotFreqHz,
-    Scale: r.qamBits === 2 ? '—' : r.qamScale,
+    // qamScale now affects every order, QPSK included (Task 8) — no more
+    // em-dash special-case for QPSK.
+    Scale: scaleLabel(r.qamScale),
     Gain: r.micGain,
     Tones: r.toneCount,
     OK: r.success ? 'Y' : 'N',
@@ -1604,7 +1625,7 @@ async function runSpeedTest() {
     dlog('SPEED-TEST', {
       best: `${best.qamBits === 2 ? 'QPSK' : `${best.qamBits}-QAM`}`,
       pilot: best.pilotFreqHz,
-      scale: best.qamScale.toFixed(3),
+      scale: scaleLabel(best.qamScale),
       gain: best.micGain,
       tones: best.toneCount,
       kbps: best.throughputKbps.toFixed(1),
