@@ -151,25 +151,44 @@ export class AudioPlayer {
     let producerDone = false;
 
     const schedule = (chunk: Float32Array): void => {
-      // Hard safety clamp: samples should already be ≤1.0 (pre-normalized
-      // upstream), but guard against future coherent-symbol regressions
-      // reaching the DAC — scale the whole chunk down to unity peak rather
-      // than let individual samples clip silently. This is a dormant safety
-      // net, not a leveling stage: the scale factor is computed independently
-      // per chunk, so if it ever actually fires on a live stream it would
-      // step the output level between chunks rather than apply a smooth,
-      // stream-wide normalization.
+      // Safety limiter: CLAMP the few offending samples. It must not rescale
+      // the chunk.
+      //
+      // This used to divide the whole chunk by its own peak, and the previous
+      // comment already named the flaw — "the scale factor is computed
+      // independently per chunk, so if it ever actually fires it would step the
+      // output level between chunks". It fired (measured peak 1.19 on a
+      // 32-tone/16-QAM run) and did exactly that: one chunk went out ~1.5 dB
+      // below the rest. For a QAM link that is far worse than clipping,
+      // because the receiver's amplitude reference is trained on the preamble
+      // and applied to the data — if those land in differently-scaled chunks,
+      // every channel estimate is wrong by the difference. Observed as a flat
+      // 6 dB per-tone profile turning into a 22 dB ramp with the ref-symbol
+      // calibration reporting 1.8-3x corrections.
+      //
+      // Clamping instead distorts only the handful of samples that overshoot,
+      // adds a little broadband noise, and leaves every level relationship in
+      // the transmission intact. Rare clipping is recoverable; a level step is
+      // not.
+      let clipped = 0;
       let peak = 0;
+      let safeChunk = chunk;
       for (let i = 0; i < chunk.length; i++) {
         const abs = Math.abs(chunk[i]);
         if (abs > peak) peak = abs;
+        if (abs > 1.0) clipped++;
       }
-      let safeChunk = chunk;
-      if (peak > 1.0) {
-        dlog('PLAYER', { clipGuard: true, peak: Number(peak.toFixed(4)) }, { level: 'warn' });
+      if (clipped > 0) {
+        dlog(
+          'PLAYER',
+          { clipClamped: clipped, peak: Number(peak.toFixed(4)), of: chunk.length },
+          { level: 'warn' },
+        );
         safeChunk = new Float32Array(chunk.length);
-        const scale = 1.0 / peak;
-        for (let i = 0; i < chunk.length; i++) safeChunk[i] = chunk[i] * scale;
+        for (let i = 0; i < chunk.length; i++) {
+          const v = chunk[i];
+          safeChunk[i] = v > 1.0 ? 1.0 : v < -1.0 ? -1.0 : v;
+        }
       }
       const buffer = ctx.createBuffer(1, safeChunk.length, sampleRate);
       buffer.getChannelData(0).set(safeChunk);

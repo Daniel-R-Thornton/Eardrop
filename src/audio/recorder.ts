@@ -126,7 +126,21 @@ export class AudioRecorder {
   /** Reference to the live GainNode for dynamic mic gain adjustment */
   private micBoostNode: GainNode | null = null;
 
-  private static workletLoaded = false;
+  /**
+   * Which AudioContexts have had the downsampler worklet module added.
+   *
+   * MUST be keyed by context, not a single boolean. An AudioWorklet module is
+   * registered into one AudioContext's AudioWorkletGlobalScope — loading it in
+   * context A does nothing for context B. This was a plain static flag, so the
+   * first recorder to start (the app's, on the shared context) set it and every
+   * later recorder built on its OWN context skipped addModule and then died on
+   * `new AudioWorkletNode` with "AudioWorklet does not have a valid
+   * AudioWorkletGlobalScope" — the failure only shows up for the SECOND
+   * recorder in a session, which is why it survived this long.
+   *
+   * WeakSet so a discarded context doesn't keep an entry alive.
+   */
+  private static workletLoadedFor = new WeakSet<BaseAudioContext>();
 
   /** @param ctx - Shared AudioContext (creates own if omitted).
    *  @param micGain - Mic pre-amp multiplier. Default 8.0. */
@@ -168,11 +182,11 @@ export class AudioRecorder {
     }
 
     // Load AudioWorklet with Hann-sinc downsampler (once per class lifetime)
-    if (!AudioRecorder.workletLoaded) {
+    if (!AudioRecorder.workletLoadedFor.has(this.ctx)) {
       dlog('REC', { initWorklet: true });
       try {
         await this.ctx.audioWorklet.addModule(WORKLET_URL);
-        AudioRecorder.workletLoaded = true;
+        AudioRecorder.workletLoadedFor.add(this.ctx);
         dlog('REC', { workletLoaded: true });
       } catch (err: any) {
         dlog('REC-ERR', { workletAddModuleFailed: true, error: err.message }, { level: 'warn' });
