@@ -187,6 +187,14 @@ export class RxEngine {
 
   // Completed file
   private completedFile: ReceivedFile | null = null;
+  /**
+   * Monotonic counter incremented each time a file completes (processTail
+   * sets completedFile). completedFile itself stays retrievable via getFile()
+   * until the next header arrives, so consumers that must not re-deliver the
+   * same completed file gate on THIS counter (identity), not on getFile()
+   * returning non-null.
+   */
+  private completionCount = 0;
 
   /**
    * Phase 4: link profile learned from a decoded PROFILE (0x04) frame.
@@ -1252,6 +1260,11 @@ export class RxEngine {
     return this.completedFile;
   }
 
+  /** Monotonic count of files completed by this engine instance. See completionCount. */
+  getCompletionCount(): number {
+    return this.completionCount;
+  }
+
   getDebugByteLog(): Array<{ byte: number; phase: string; bitOffset: number }> {
     return this.scanner.getByteLog();
   }
@@ -1632,6 +1645,7 @@ export class RxEngine {
       schemeId: this.fileSchemeId,
       origSize: this.fileOrigSize || this.fileSize,
     };
+    this.completionCount++;
     this.framesReceived++;
     this.fileName = '';
     this.fileData = new Uint8Array(0);

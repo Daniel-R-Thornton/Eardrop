@@ -53,6 +53,53 @@ test('configure → startRx → feedChunk → fileComplete', async () => {
   }
 });
 
+test('one configured session delivers TWO files (fileComplete not latched after first delivery)', async () => {
+  const { svc, events } = makeService();
+  svc.handle({ type: 'configure', config: CFG });
+  svc.handle({ type: 'startRx' });
+
+  const { symSamples } = ofdmSamples(SAMPLE_RATE);
+  const tx = new TxEngine(CFG as ConstructorParameters<typeof TxEngine>[0]);
+
+  const sendAndFeed = (fileName: string, data: Uint8Array) => {
+    const audio = tx.transmitFile(fileName, data);
+    const padded = new Float32Array(audio.length + symSamples * 8);
+    padded.set(audio, 0);
+    for (let off = 0; off < padded.length; off += 512) {
+      const chunk = padded.slice(off, Math.min(off + 512, padded.length));
+      svc.handle({ type: 'feedChunk', samples: chunk.buffer });
+      svc.tick();
+    }
+  };
+
+  const data1 = new Uint8Array(120);
+  for (let i = 0; i < data1.length; i++) data1[i] = (i * 11 + 3) & 0xff;
+  sendAndFeed('first.bin', data1);
+  await flush();
+
+  const data2 = new Uint8Array(140);
+  for (let i = 0; i < data2.length; i++) data2[i] = (i * 17 + 5) & 0xff;
+  sendAndFeed('second.bin', data2);
+  await flush();
+
+  const delivered = events.filter((e) => e.type === 'fileComplete');
+  expect(delivered.length, 'both transfers should deliver fileComplete exactly once each').toBe(2);
+  expect(delivered[0].type === 'fileComplete' && delivered[0].fileName).toBe('first.bin');
+  expect(delivered[1].type === 'fileComplete' && delivered[1].fileName).toBe('second.bin');
+  if (delivered[0].type === 'fileComplete') {
+    expect(Array.from(new Uint8Array(delivered[0].data))).toEqual(Array.from(data1));
+  }
+  if (delivered[1].type === 'fileComplete') {
+    expect(Array.from(new Uint8Array(delivered[1].data))).toEqual(Array.from(data2));
+  }
+
+  // Extra ticks after the second delivery must not re-deliver anything.
+  for (let i = 0; i < 20; i++) svc.tick();
+  await flush();
+  const deliveredAfter = events.filter((e) => e.type === 'fileComplete');
+  expect(deliveredAfter.length, 'no duplicate deliveries from continued polling').toBe(2);
+});
+
 test('encodeFile emits encoded with the config given to configure (no per-call config)', async () => {
   const { svc, events } = makeService();
   svc.handle({ type: 'configure', config: CFG });

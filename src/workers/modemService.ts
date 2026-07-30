@@ -20,7 +20,16 @@ export class ModemService {
     | (ModemConfig & { useOFDM?: boolean; emitLinkProfile?: boolean; qamMap?: number[] })
     | null = null;
   private rx: RxEngine | null = null;
-  private fileSent = false;
+  /**
+   * Completion count (RxEngine.getCompletionCount()) already delivered to the
+   * consumer. Gating on this identity — rather than a one-shot "fileSent"
+   * boolean — lets a single configured session deliver MULTIPLE files: after
+   * RxEngine returns to WAITING post-tail, getFile() keeps returning the same
+   * completedFile until the next header arrives, so a boolean latch would
+   * either never re-arm or re-deliver the same file. Comparing against the
+   * monotonic counter means "new completion" is unambiguous.
+   */
+  private lastDeliveredCompletion = 0;
 
   // Active streaming-encode generator + its request id (one at a time).
   private stream: { id: number; gen: Generator<Float32Array> } | null = null;
@@ -48,7 +57,7 @@ export class ModemService {
         // Listening restarts pick up the new config
         if (this.rx) {
           this.rx = new RxEngine(this.config as ConstructorParameters<typeof RxEngine>[0]);
-          this.fileSent = false;
+          this.lastDeliveredCompletion = 0;
         }
         this.emit({ type: 'configured' });
         break;
@@ -56,7 +65,7 @@ export class ModemService {
       case 'startRx': {
         if (!this.config) { this.emit({ type: 'error', error: 'startRx before configure' }); return; }
         this.rx = new RxEngine(this.config as ConstructorParameters<typeof RxEngine>[0]);
-        this.fileSent = false;
+        this.lastDeliveredCompletion = 0;
         this.emit({ type: 'rxStarted' });
         break;
       }
@@ -143,17 +152,7 @@ export class ModemService {
         // message queue), so poll for a completed file now instead of making
         // the caller wait for the next 20 Hz tick — or for a timeout when the
         // decode failed and no file will ever arrive.
-        let fileReady = false;
-        if (this.rx && !this.fileSent) {
-          const file = this.rx.getFile();
-          if (file) {
-            this.fileSent = true;
-            fileReady = true;
-            void this.deliverCompletedFile(file);
-          }
-        } else if (this.fileSent) {
-          fileReady = true;
-        }
+        const fileReady = this.pollAndDeliverFile();
         this.emit({ type: 'flushed', id: cmd.id, fileReady });
         break;
       }
@@ -168,15 +167,31 @@ export class ModemService {
   tick(): void {
     if (!this.rx || !this.config) return;
 
-    if (!this.fileSent) {
-      const file = this.rx.getFile();
-      if (file) {
-        this.fileSent = true;
-        void this.deliverCompletedFile(file);
-      }
-    }
+    this.pollAndDeliverFile();
 
     this.emit({ type: 'telemetry', telemetry: this.computeTelemetry() });
+  }
+
+  /**
+   * Poll the RxEngine for a newly-completed file (identified by its
+   * monotonic completion counter, not a one-shot boolean — see
+   * lastDeliveredCompletion) and deliver it if not already delivered.
+   * Returns true if a completed file has been delivered (now or previously)
+   * for the current completion count.
+   */
+  private pollAndDeliverFile(): boolean {
+    if (!this.rx) return false;
+    const count = this.rx.getCompletionCount();
+    if (count > this.lastDeliveredCompletion) {
+      const file = this.rx.getFile();
+      if (file) {
+        this.lastDeliveredCompletion = count;
+        void this.deliverCompletedFile(file);
+        return true;
+      }
+      return false;
+    }
+    return count > 0;
   }
 
   /** Compress (async gzip) then encode a one-shot file → 'encoded'. */
