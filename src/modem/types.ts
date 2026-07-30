@@ -206,6 +206,13 @@ export const OFDM_TUNING = {
    *  estimates at the ACTUAL data amplitude (see
    *  OFDMQPSKDemodulator.calibrateQamRef). */
   qamRefSymbols: 4,
+  /** TX: peak amplitude of the chirped sync burst (constant-envelope, so this
+   *  is every sample's magnitude). Reduced from 1.0 (full-scale) to avoid
+   *  driving the transmitting speaker's limiter/compressor hard for the full
+   *  600ms burst duration, whose release can smear into the channel-training
+   *  window that follows. Detection is a normalized cross-correlation (see
+   *  rxEngine `normScore`), so this is scale-invariant to detection. */
+  chirpAmplitude: 0.6,
 } as const;
 
 /**

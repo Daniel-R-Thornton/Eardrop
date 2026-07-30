@@ -108,9 +108,11 @@ export class AudioPlayer {
    * Stream playback: schedule audio chunks back-to-back as they are pulled,
    * keeping ~2 s buffered ahead. `pull()` returns the next chunk or null at end.
    * Gapless — chunks are contiguous slices scheduled at contiguous times.
-   * Samples are expected pre-normalized (≈0.95 peak), so a fixed unity gain is
-   * used (no whole-signal analysis, which streaming can't do). Resolves when the
-   * last scheduled chunk finishes; rejects if pull() throws.
+   * Samples are expected pre-normalized (≈0.95 peak); the UI `volume` control
+   * (see batch `play()`) is applied here via a gain node — streaming can't do
+   * the whole-signal peak analysis `play()` does, so each chunk is additionally
+   * guarded against exceeding unity peak before scheduling (see `schedule()`).
+   * Resolves when the last scheduled chunk finishes; rejects if pull() throws.
    * @param onProgress optional — called with seconds of audio scheduled so far.
    */
   async playStream(
@@ -129,7 +131,7 @@ export class AudioPlayer {
     }
 
     const gain = ctx.createGain();
-    gain.gain.value = 1.0;
+    gain.gain.value = this.volume;
     gain.connect(ctx.destination);
 
     const LOOKAHEAD_SEC = 2.0;
@@ -141,8 +143,24 @@ export class AudioPlayer {
     let producerDone = false;
 
     const schedule = (chunk: Float32Array): void => {
-      const buffer = ctx.createBuffer(1, chunk.length, sampleRate);
-      buffer.getChannelData(0).set(chunk);
+      // Hard safety clamp: samples should already be ≤1.0 (pre-normalized
+      // upstream), but guard against future coherent-symbol regressions
+      // reaching the DAC — scale the whole chunk down to unity peak rather
+      // than let individual samples clip silently.
+      let peak = 0;
+      for (let i = 0; i < chunk.length; i++) {
+        const abs = Math.abs(chunk[i]);
+        if (abs > peak) peak = abs;
+      }
+      let safeChunk = chunk;
+      if (peak > 1.0) {
+        dlog('PLAYER', { clipGuard: true, peak: Number(peak.toFixed(4)) }, { level: 'warn' });
+        safeChunk = new Float32Array(chunk.length);
+        const scale = 1.0 / peak;
+        for (let i = 0; i < chunk.length; i++) safeChunk[i] = chunk[i] * scale;
+      }
+      const buffer = ctx.createBuffer(1, safeChunk.length, sampleRate);
+      buffer.getChannelData(0).set(safeChunk);
       const src = ctx.createBufferSource();
       src.buffer = buffer;
       src.connect(gain);

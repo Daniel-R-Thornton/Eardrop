@@ -81,6 +81,12 @@ export class OFDMEngine {
       fEnd: this.pilotFreqHz + halfSpan,
       durationSec,
       sampleRate: this.sampleRate,
+      // Constant-envelope burst at reduced amplitude: a 0.6 peak (vs 1.0) keeps
+      // the 600ms sync burst from driving the speaker's limiter/compressor hard
+      // right before the channel-training window. Detection is a normalized
+      // cross-correlation (see rxEngine normScore), so this doesn't affect
+      // sync accuracy — only how hard the transmitting hardware is driven.
+      amplitude: OFDM_TUNING.chirpAmplitude,
     };
     const chirp = generateChirp(chirpCfg);
     dlog('TX-OFDM', {

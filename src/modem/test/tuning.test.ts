@@ -19,5 +19,6 @@ test('current default values', () => {
     cpCorrelationMinScore: 0.35,
     cpCorrelationMinSharpness: 1.1,
     qamRefSymbols: 4,
+    chirpAmplitude: 0.6,
   });
 });
