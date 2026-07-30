@@ -33,7 +33,13 @@ export interface ModemTelemetry {
 export type ModemCommand =
   | {
       type: 'configure';
-      config: ModemConfig & { useOFDM?: boolean; emitLinkProfile?: boolean; qamMap?: number[] };
+      config: ModemConfig & {
+        useOFDM?: boolean;
+        emitLinkProfile?: boolean;
+        qamMap?: number[];
+        toneGains?: number[];
+        trainingSettleSymbols?: number;
+      };
     }
   | { type: 'startRx' }
   | { type: 'stopRx' }

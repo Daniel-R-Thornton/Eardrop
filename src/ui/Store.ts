@@ -4,7 +4,7 @@
  */
 
 import { useSyncExternalStore } from 'react';
-import { DEFAULT_CONFIG, OFDM_DEFAULTS } from '../modem/types';
+import { DEFAULT_CONFIG, OFDM_DEFAULTS, OFDM_TUNING } from '../modem/types';
 import type { Run } from '../modem/protocol/captureTypes';
 
 // ─── State Shape ──────────────────────────────────────
@@ -104,6 +104,25 @@ export interface AppState {
    *  tone grid). Lower values move the grid into a better-behaved part of
    *  the speaker/mic response. Default 2000 = today's behavior. */
   toneStartHz: number;
+  /**
+   * Per-tone pre-emphasis calibrations, keyed by input device id, then by
+   * `pilotFreqHz:toneStartHz:toneCount`.
+   *
+   * Keyed by DEVICE because the measured response belongs to the microphone —
+   * three mics on this machine measured a flat band, a 17 dB tilt and a 21 dB
+   * comb respectively. Keyed by BAND because the gains are per tone INDEX, so
+   * reusing a set across a different grid would apply them to the wrong
+   * frequencies. Values are linear multipliers, mean-unity in dB.
+   */
+  toneGainsByDevice: Record<string, Record<string, number[]>>;
+  /**
+   * Settle symbols the TX emits and the RX discards before training (see
+   * OFDMEngine.generateSettleSymbols). Exposed because the right value is
+   * hardware-dependent and pulls two ways: longer lets the output chain recover
+   * from the chirp, but a longer preamble also gives an adaptive microphone DSP
+   * more time to adapt to it. Both effects were measured on this machine.
+   */
+  trainingSettleSymbols: number;
   /** Phase 3 data-tone constellation, applied to ALL tones: 2=QPSK (default), 4=16-QAM, 6=64-QAM */
   dataQamBits: 2 | 4 | 6;
   /** Optional override for the fixed per-tone TX scale used in QAM data symbols.
@@ -224,6 +243,8 @@ const defaultState: AppState = {
   syncStrongMultiplier: 0.5,
   sweepResults: null,
   toneCount: DEFAULT_CONFIG.toneCount,
+  toneGainsByDevice: {},
+  trainingSettleSymbols: OFDM_TUNING.trainingSettleSymbols,
   toneStartHz: OFDM_DEFAULTS.toneStartHz,
   dataQamBits: 2,
   qamScaleOverride: undefined,
@@ -287,6 +308,8 @@ function persistState(s: AppState): void {
       // Persist only the configuration‑related fields – everything else is transient.
       toneCount: s.toneCount,
       toneStartHz: s.toneStartHz,
+      toneGainsByDevice: s.toneGainsByDevice,
+      trainingSettleSymbols: s.trainingSettleSymbols,
       dataQamBits: s.dataQamBits,
       qamScaleOverride: s.qamScaleOverride,
       pilotFreqHz: s.pilotFreqHz,
@@ -323,7 +346,7 @@ export function setState(update: Partial<AppState>): void {
   state = { ...state, ...update };
   // Only persist when a persisted config key actually changed.
   const persistedKeys: Array<keyof AppState> = [
-    'toneCount', 'toneStartHz', 'dataQamBits', 'qamScaleOverride', 'pilotFreqHz', 'musicalMode', 'ampThresholdRatio',
+    'toneCount', 'toneStartHz', 'toneGainsByDevice', 'trainingSettleSymbols', 'dataQamBits', 'qamScaleOverride', 'pilotFreqHz', 'musicalMode', 'ampThresholdRatio',
     'syncStrongMultiplier', 'diversityMode', 'useOFDM', 'symbolsPerSec',
     'micGain', 'playbackVolume', 'selectedInputId', 'selectedOutputId', 'theme',
   ];

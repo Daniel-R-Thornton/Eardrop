@@ -66,6 +66,9 @@ export function TxPanel() {
         >
           Test Frequency
         </Button>
+        <Button onClick={() => dispatch('eardrop-channel-sweep')} disabled={s.isSending}>
+          📈 CHANNEL SWEEP
+        </Button>
         <Button onClick={() => dispatch('eardrop-send-test')} disabled={s.isSending}>
           🔊 SEND TEST
         </Button>
@@ -193,11 +196,25 @@ export function TxPanel() {
               <span className="lab-panel__title" style={{ padding: 0, background: 'transparent', border: 0 }}>
                 TONE START {s.toneStartHz.toFixed(0)} Hz (band {bandLowHz.toFixed(0)}–{bandHighHz.toFixed(0)} Hz)
               </span>
+              {/* toneStartHz is an OFFSET above the pilot, so the reachable
+                  band low is pilotFreqHz + toneStartHz. min mirrors
+                  MIN_TONE_START_HZ (the pilot-alias guard in types.ts, the
+                  only clamp the modem itself applies). max is a UI-only
+                  ceiling: at 2000 an 1850 Hz pilot could not put the tone
+                  grid above 3850 Hz, which is not enough reach to move a
+                  32-tone (1600 Hz wide) grid clear of a mid-band room null.
+                  6000 reaches a 7850 Hz band low. The ceiling is not Nyquist
+                  (far away at any supported rate) but what the channel sweep
+                  has actually measured: it covers 1-9 kHz, and every run so far
+                  shows 6850-9000 Hz flat within 1-2 dB while 4900-6500 carries
+                  moving 19-28 dB cancellation notches. 6000 is what it takes to
+                  put a 32-tone (1600 Hz) grid inside that clean region. Going
+                  higher would place tones in spectrum nothing has measured. */}
               <input
                 type="range"
                 className="lab-slider"
                 min={600}
-                max={2000}
+                max={6000}
                 step={50}
                 value={s.toneStartHz}
                 disabled={s.speedTestRunning}

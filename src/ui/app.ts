@@ -34,6 +34,21 @@ import { resample } from '../lib/math/index';
 import { dlog, dlogDump, dlogInject, dlogReset, dlogSetMode, DLOG_RING_MAX, dlogRingLength } from '../lib/debug/dlog';
 import { ModemController } from './controllers/modemController';
 import { buildModemConfig } from './controllers/buildModemConfig';
+/**
+ * Stored pre-emphasis for the current mic and band, or undefined.
+ *
+ * Keyed by input device AND band because the gains are per tone index — see
+ * AppState.toneGainsByDevice. Applied to TX only; the receiver needs no
+ * knowledge of it, since it trains its channel estimate on a preamble that
+ * carries the same gains as the data.
+ */
+function currentToneGains(): number[] | undefined {
+  const st = getState();
+  const key = `${st.pilotFreqHz}:${st.toneStartHz}:${st.toneCount}`;
+  const gains = st.toneGainsByDevice?.[st.selectedInputId]?.[key];
+  return gains && gains.length === st.toneCount ? gains : undefined;
+}
+
 import { setTelemetry } from './telemetryStore';
 import { DEMO_PAYLOAD } from './demoPayload';
 
@@ -168,6 +183,8 @@ window.addEventListener('eardrop-demo-encode', (async () => {
       hwSampleRate: audioCtx.sampleRate,
       dataQamBits: getState().dataQamBits,
       qamScaleOverride: getState().qamScaleOverride,
+      toneGains: currentToneGains(),
+      trainingSettleSymbols: getState().trainingSettleSymbols,
     }),
   );
   showTxPayload(DEMO_PAYLOAD.bytes, DEMO_PAYLOAD.name);
@@ -215,6 +232,8 @@ window.addEventListener('eardrop-send', (async () => {
         hwSampleRate: audioCtx.sampleRate,
         dataQamBits: getState().dataQamBits,
       qamScaleOverride: getState().qamScaleOverride,
+      toneGains: currentToneGains(),
+      trainingSettleSymbols: getState().trainingSettleSymbols,
       }),
     );
     setState({ isPlaying: true, progress: 0 });
@@ -350,6 +369,8 @@ window.addEventListener('eardrop-send-test', (async () => {
         hwSampleRate: audioCtx.sampleRate,
         dataQamBits: getState().dataQamBits,
       qamScaleOverride: getState().qamScaleOverride,
+      toneGains: currentToneGains(),
+      trainingSettleSymbols: getState().trainingSettleSymbols,
       }),
     );
     setState({ isPlaying: true, progress: 0 });
@@ -649,6 +670,8 @@ async function startListening() {
       hwSampleRate: audioCtx.sampleRate,
       dataQamBits: getState().dataQamBits,
       qamScaleOverride: getState().qamScaleOverride,
+      toneGains: currentToneGains(),
+      trainingSettleSymbols: getState().trainingSettleSymbols,
     });
     modem.configure(cfg);
     await modem.startListening(getState().micGain, getState().selectedInputId || undefined);
@@ -2678,6 +2701,8 @@ async function runAcousticSpeedSweep() {
       hwSampleRate: audioCtx.sampleRate,
       dataQamBits: getState().dataQamBits,
       qamScaleOverride: getState().qamScaleOverride,
+      toneGains: currentToneGains(),
+      trainingSettleSymbols: getState().trainingSettleSymbols,
     }),
   );
   await modem.startListening(getState().micGain, getState().selectedInputId || undefined);
@@ -2834,6 +2859,8 @@ window.addEventListener('eardrop-export-wav', (async () => {
       hwSampleRate: audioCtx.sampleRate,
       dataQamBits: getState().dataQamBits,
       qamScaleOverride: getState().qamScaleOverride,
+      toneGains: currentToneGains(),
+      trainingSettleSymbols: getState().trainingSettleSymbols,
     });
     modem.configure(modemConfig);
     const { samples: audioSamples, sampleRate: actualRate } = await modem.encodeFile(
@@ -2891,6 +2918,8 @@ window.addEventListener('eardrop-load-wav', (async () => {
         hwSampleRate: audioCtx.sampleRate,
         dataQamBits: getState().dataQamBits,
       qamScaleOverride: getState().qamScaleOverride,
+      toneGains: currentToneGains(),
+      trainingSettleSymbols: getState().trainingSettleSymbols,
       }));
       // Poll for fileComplete
       const filePromise = new Promise<{ fileName: string; data: Uint8Array }>((resolve, reject) => {

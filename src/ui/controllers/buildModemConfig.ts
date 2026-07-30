@@ -9,7 +9,7 @@
  * breaks. Snapping is lossless for the user because the bin spacing
  * (50 Hz at 48 kHz native rate) is finer than any practical tuning knob.
  */
-import { DEFAULT_CONFIG, OFDM_DEFAULTS, MIN_TONE_START_HZ, ofdmSamples, type ModemConfig } from '../../modem/types';
+import { DEFAULT_CONFIG, OFDM_DEFAULTS, MIN_TONE_START_HZ, OFDM_TUNING, ofdmSamples, type ModemConfig } from '../../modem/types';
 import { dlog } from '../../lib/debug/dlog';
 
 export interface ModemUiConfig {
@@ -27,6 +27,10 @@ export interface ModemUiConfig {
    *  can help real audio chains where the receiver's expected QAM amplitude
    *  does not match the actual transmitted amplitude. */
   qamScaleOverride?: number;
+  /** Per-tone pre-emphasis (linear, mean-unity). */
+  toneGains?: number[];
+  /** Settle symbols discarded before training; TX and RX must agree. */
+  trainingSettleSymbols?: number;
   /** OFDM: Hz above the pilot where the first data tone sits. Leave undefined
    *  for the default (OFDM_DEFAULTS.toneStartHz = 2000Hz, today's behavior). */
   toneStartHz?: number;
@@ -34,7 +38,8 @@ export interface ModemUiConfig {
 
 export function buildModemConfig(
   ui: ModemUiConfig,
-): ModemConfig & { useOFDM: boolean; emitLinkProfile?: boolean; qamMap?: number[]; qamScaleOverride?: number } {
+): ModemConfig & { useOFDM: boolean; emitLinkProfile?: boolean; qamMap?: number[]; qamScaleOverride?: number; toneGains?: number[];
+  trainingSettleSymbols?: number } {
   let pilot = ui.pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz;
 
   // OFDM cyclic-prefix continuity requires every tone (pilot + offsets)
@@ -82,7 +87,8 @@ export function buildModemConfig(
   const bits = ui.dataQamBits ?? 2;
   const order = bits === 4 ? 1 : bits === 6 ? 2 : 0;
 
-  const config: ModemConfig & { useOFDM: boolean; emitLinkProfile?: boolean; qamMap?: number[]; qamScaleOverride?: number } = {
+  const config: ModemConfig & { useOFDM: boolean; emitLinkProfile?: boolean; qamMap?: number[]; qamScaleOverride?: number; toneGains?: number[];
+  trainingSettleSymbols?: number } = {
     ...DEFAULT_CONFIG,
     sampleRate: ui.useOFDM ? ui.hwSampleRate : DEFAULT_CONFIG.sampleRate,
     pilotFreqHz: pilot,
@@ -102,6 +108,29 @@ export function buildModemConfig(
 
   if (ui.useOFDM && typeof ui.qamScaleOverride === 'number' && Number.isFinite(ui.qamScaleOverride)) {
     config.qamScaleOverride = ui.qamScaleOverride;
+  }
+
+  // Pre-emphasis only applies when it matches the tone count in force. A
+  // calibration captured at a different count would land on the wrong
+  // frequencies, and the modulator would silently apply it to a prefix of the
+  // tones — so drop it here rather than half-use it.
+  if (
+    ui.useOFDM
+    && Array.isArray(ui.toneGains)
+    && ui.toneGains.length === toneCount
+    && ui.toneGains.every((g) => Number.isFinite(g) && g > 0)
+  ) {
+    config.toneGains = ui.toneGains.slice();
+  }
+
+  // Settle length is a bring-up lever (see generateSettleSymbols). Clamped so a
+  // UI value cannot violate OFDM_TUNING's invariant, which the ENERGY-sync path
+  // depends on: the sync burst must still cover detection + alignment + settle
+  // + training, or that path trains on data.
+  if (typeof ui.trainingSettleSymbols === 'number' && Number.isFinite(ui.trainingSettleSymbols)) {
+    const maxSettle =
+      OFDM_TUNING.syncBurstSymbols - OFDM_TUNING.syncMinFrames - 2 - OFDM_TUNING.trainingSymbols;
+    config.trainingSettleSymbols = Math.max(0, Math.min(maxSettle, Math.round(ui.trainingSettleSymbols)));
   }
 
   return config;

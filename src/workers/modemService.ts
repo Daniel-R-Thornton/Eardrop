@@ -17,7 +17,13 @@ const SPECTRUM_BINS = 64;
 export class ModemService {
   private emit: (ev: ModemEvent, transfer?: Transferable[]) => void;
   private config:
-    | (ModemConfig & { useOFDM?: boolean; emitLinkProfile?: boolean; qamMap?: number[] })
+    | (ModemConfig & {
+        useOFDM?: boolean;
+        emitLinkProfile?: boolean;
+        qamMap?: number[];
+        toneGains?: number[];
+        trainingSettleSymbols?: number;
+      })
     | null = null;
   private rx: RxEngine | null = null;
   /**

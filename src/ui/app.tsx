@@ -4,18 +4,25 @@ import { Panel } from './components/instrument/Panel';
 import { TxPanel } from './views/TxPanel';
 import { RxPanel } from './views/RxPanel';
 import { FrequencySweep } from './views/FrequencySweep';
+import { ChannelSweep } from './views/ChannelSweep';
 
 const dispatch = (type: string, detail?: unknown) =>
   window.dispatchEvent(new CustomEvent(type, { detail }));
 
 export function App() {
   const [showFrequencySweep, setShowFrequencySweep] = useState(false);
+  const [showChannelSweep, setShowChannelSweep] = useState(false);
   const s = useStore();
 
   useEffect(() => {
     const handleFrequencySweep = () => setShowFrequencySweep(true);
+    const handleChannelSweep = () => setShowChannelSweep(true);
     window.addEventListener('eardrop-test-frequency', handleFrequencySweep);
-    return () => window.removeEventListener('eardrop-test-frequency', handleFrequencySweep);
+    window.addEventListener('eardrop-channel-sweep', handleChannelSweep);
+    return () => {
+      window.removeEventListener('eardrop-test-frequency', handleFrequencySweep);
+      window.removeEventListener('eardrop-channel-sweep', handleChannelSweep);
+    };
   }, []);
 
   return (
@@ -25,6 +32,7 @@ export function App() {
         <RxPanel />
       </div>
       {showFrequencySweep && <FrequencySweep />}
+      {showChannelSweep && <ChannelSweep onClose={() => setShowChannelSweep(false)} />}
     </div>
   );
 }

@@ -61,7 +61,14 @@ export function SettingsPanel() {
           value={String(s.toneCount)}
           onChange={(v) => setState({ toneCount: parseInt(v, 10) })}
           options={(s.useOFDM
-            ? [8, 16, 32]
+            // Must stay multiples of 4 — OFDMEngine groups tones in 4-tone
+            // blocks and silently collapses to 4 otherwise. 40 and 48 exist
+            // because the channel sweep found 6850-9000 Hz flat within 1-2 dB
+            // across every run, which is 2150 Hz — room for 43 tones on the
+            // 50 Hz grid, not just 32. At tone start 5000 (band low 6900),
+            // 40 tones reach 8850 and stay inside the measured region; 48
+            // reach 9250, i.e. 250 Hz past anything the sweep has looked at.
+            ? [8, 16, 32, 40, 48]
             : [2, 4, 8]
           ).map((n) => ({ value: String(n), label: `${n} tones` }))}
         />
@@ -70,6 +77,12 @@ export function SettingsPanel() {
           min={s.useOFDM ? 500 : 300} max={s.useOFDM ? 4000 : 1500} step={10}
           value={s.pilotFreqHz}
           onChange={(v) => setState({ pilotFreqHz: v })}
+        />
+        <Slider
+          label="SETTLE" unit=" sym"
+          min={0} max={16} step={4}
+          value={s.trainingSettleSymbols}
+          onChange={(v) => setState({ trainingSettleSymbols: v })}
         />
         <Slider
           label="MIC GAIN" unit="×"
