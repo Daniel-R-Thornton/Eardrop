@@ -106,13 +106,40 @@ export class RxEngine {
   private ofdmToneFreqs: Float32Array = new Float32Array(0);
   /** Chirp detection: template (generated once from config) */
   private chirpTemplate: Float32Array = new Float32Array(0);
-  /** Chirp detection: rolling buffer for cross-correlation */
-  private chirpBuf: number[] = [];
+  /**
+   * Chirp detection: 4:1-decimated template + its energy, hoisted out of the
+   * per-attempt correlation path (7c) — both are pure functions of
+   * chirpTemplate (itself constant per config), so recomputing them ~40x/sec
+   * was pure waste. Rebuilt in initOfdmDemod() alongside chirpTemplate.
+   */
+  private chirpTemplateDec: Float32Array = new Float32Array(0);
+  private chirpTemplateEnergyDec = 0;
+  /**
+   * Chirp detection: rolling buffer for cross-correlation, as a fixed-capacity
+   * ring (7b) — capacity == chirpTemplate.length + sps*2, allocated in
+   * initOfdmDemod(). `chirpBufHead`/`chirpBufCount` describe the live window;
+   * `chirpBufPush`/`chirpBufAt`/`chirpBufLen`/`chirpBufClear`/`chirpBufTrimToLast`
+   * below are the only access points — no consumer indexes chirpBufData
+   * directly, so the head/wrap arithmetic stays in one place.
+   */
+  private chirpBufData: Float32Array = new Float32Array(0);
+  private chirpBufHead = 0;
+  private chirpBufCount = 0;
   /** Chirp detection: span Hz around pilot */
   private chirpSpanHz = 200;
   /** Chirp correlation throttle — run once per sps samples (not every sample) */
   private chirpRan = false;
   private chirpTick = 0;
+  /**
+   * Chirp→CP handoff probe throttle (7a) — findOfdmBlockStart is an
+   * O(sps × cp × periods) correlation; while `probingChirp` is true it used
+   * to run on every incoming sample because `buf` never drains. Counts down
+   * from `sps` to 0; the probe runs only when it reaches 0. Reset to 0 the
+   * moment a chirp is (re)detected so the FIRST probe after detection still
+   * fires as soon as the existing sps*2 settle delay elapses, matching
+   * pre-throttle timing exactly.
+   */
+  private chirpProbeTick = 0;
   /** Set when chirp correlation fires — triggers CP boundary check in WAITING */
   private chirpDetected = false;
   /** Absolute sample count immediately after the detected chirp. */
@@ -365,36 +392,39 @@ export class RxEngine {
     // Chirp detector (OFDM only): accumulate every sample for cross-correlation.
     // Only active in WAITING state — once we enter FRAMES, the chirp is done.
     if (this.useOFDM && this.chirpTemplate.length > 0 && this.state === RxState.WAITING) {
-      this.chirpBuf.push(sample);
-      if (this.chirpBuf.length > this.chirpTemplate.length + this.sps * 2) {
-        this.chirpBuf.shift();
-      }
+      // 7b: fixed-capacity ring push — no per-sample memmove. Capacity ==
+      // chirpTemplate.length + sps*2, allocated in initOfdmDemod(); pushing
+      // past capacity silently overwrites the oldest sample, same as the old
+      // push()-then-shift()-when-over-cap.
+      this.chirpBufPush(sample);
       // Run correlation when buffer is large enough; retry every sps samples
       // so the chirp can be detected even if it arrives with acoustic delay.
       this.chirpTick++;
-      if (this.chirpBuf.length >= this.chirpTemplate.length + this.sps
+      if (this.chirpBufLen() >= this.chirpTemplate.length + this.sps
           && this.chirpTick >= this.sps && !this.chirpRan) {
         this.chirpTick = 0;
         this.chirpRan = true;
-        // Decimate 4:1 for performance.
+        // Decimate 4:1 for performance. Template side (tplDec/tplEnergy) is
+        // hoisted (7c, see initOfdmDemod) — only the live signal needs
+        // decimating here.
         const ds = 4;
-        const sigDec = new Float32Array(Math.ceil(this.chirpBuf.length / ds));
-        for (let i = 0; i < sigDec.length; i++) sigDec[i] = this.chirpBuf[i * ds];
-        const tplDec = new Float32Array(Math.ceil(this.chirpTemplate.length / ds));
-        for (let i = 0; i < tplDec.length; i++) tplDec[i] = this.chirpTemplate[i * ds];
+        const bufLen = this.chirpBufLen();
+        const sigDec = new Float32Array(Math.ceil(bufLen / ds));
+        for (let i = 0; i < sigDec.length; i++) sigDec[i] = this.chirpBufAt(i * ds);
+        const tplDec = this.chirpTemplateDec;
         const { peakValue, peakIndex } = chirpCorrelate(sigDec, tplDec);
         // Normalised threshold: correlation / (template_len × signal_rms).
-        const tplEnergy = tplDec.reduce((s, v) => s + v * v, 0);
+        const tplEnergy = this.chirpTemplateEnergyDec;
         const sigRms = Math.sqrt(sigDec.reduce((s, v) => s + v * v, 0) / sigDec.length);
         const normScore = sigRms > 0 && tplEnergy > 0
           ? peakValue / (tplDec.length * sigRms)
           : 0;
         if (normScore > 0.15 && peakIndex >= 0) {
           const chirpEndInBuffer = Math.min(
-            this.chirpBuf.length,
+            bufLen,
             peakIndex * ds + this.chirpTemplate.length,
           );
-          const samplesAfterChirp = this.chirpBuf.length - chirpEndInBuffer;
+          const samplesAfterChirp = bufLen - chirpEndInBuffer;
           this.chirpEndSample = this.samplesSeen - samplesAfterChirp;
           dlog('OFDM-SYNC', { chirp: true, norm: normScore, peak: peakValue, idx: peakIndex });
           // Flag chirp detected — let the existing CP correlation path
@@ -402,9 +432,11 @@ export class RxEngine {
           // handle boundary alignment. This reuses the proven ±1-sample
           // CP correlation instead of custom buffer slicing.
           this.chirpDetected = true;
-          this.chirpBuf = [];
+          this.chirpBufClear();
           this.chirpTick = 0;
           this.chirpRan = false;
+          // 7a: prompt first probe — see chirpProbeTick's doc.
+          this.chirpProbeTick = 0;
           // Suppress energy-based sync: chirp wins, no dual detection
           this.ofdmSyncFrames = 0;
           this.ofdmDemod!.resetTraining();
@@ -413,8 +445,8 @@ export class RxEngine {
           dlog('OFDM-SYNC', { chirpMiss: true, norm: normScore, peak: peakValue });
           this.chirpRan = false;
           this.chirpTick = 0;
-          // Shift the buffer to drop old data, giving new samples a chance
-          this.chirpBuf = this.chirpBuf.slice(-this.chirpTemplate.length);
+          // Drop old data, giving new samples a chance (was chirpBuf.slice(-len)).
+          this.chirpBufTrimToLast(this.chirpTemplate.length);
         }
       }
     }
@@ -433,9 +465,23 @@ export class RxEngine {
     if (!probingChirp) {
       this.buf.splice(0, this.sps);
     }
-    const rawIQs = this.toneFreqs.map((f) => toneIQ(window, f, this.cfg.sampleRate));
-    this.lastRawIQs = rawIQs; // Store for debug snapshot
-    const totalE = rawIQs.reduce((a, r) => a + Math.hypot(r.i, r.q), 0);
+    // 7a: while actively probing for the chirp→CP handoff boundary, this
+    // window's per-tone IQ is dead on arrival — the chirp-handoff branch
+    // below only reads chirpEndSample/ofdmAlignBuf, the energy-sync branch
+    // is gated off by chirpDetected, and the warble branch recomputes its
+    // own toneIQ() over `window` directly. Skip the 4x toneIQ() call (each a
+    // 128-sample correlation) entirely on this path; lastRawIQs just holds
+    // its last real value (debug-snapshot only, not read on this path).
+    let rawIQs: Array<{ i: number; q: number }>;
+    let totalE: number;
+    if (probingChirp) {
+      rawIQs = this.lastRawIQs;
+      totalE = 0;
+    } else {
+      rawIQs = this.toneFreqs.map((f) => toneIQ(window, f, this.cfg.sampleRate));
+      this.lastRawIQs = rawIQs; // Store for debug snapshot
+      totalE = rawIQs.reduce((a, r) => a + Math.hypot(r.i, r.q), 0);
+    }
 
     // ── WAITING: detect sync (OFDM or warble) ──
     if (this.state === RxState.WAITING) {
@@ -446,67 +492,77 @@ export class RxEngine {
         ? this.samplesSeen - this.chirpEndSample
         : 0;
       if (this.chirpDetected && this.useOFDM && samplesAfterChirp >= this.sps * 2) {
-        const trainingSamples = Math.min(samplesAfterChirp, this.ofdmAlignBuf.length);
-        const trainingStart = this.ofdmAlignBuf.length - trainingSamples;
-        const trainingTail = this.ofdmAlignBuf.slice(trainingStart);
-        const probe = this.findOfdmBlockStart(trainingTail);
-        if (probe.offset >= 0 && probe.score >= OFDM_TUNING.cpCorrelationMinScore && probe.sharpness >= OFDM_TUNING.cpCorrelationMinSharpness) {
-          // 3f: capture pre-clear values for the diagnostic log below — both
-          // ofdmAlignBuf and chirpEndSample get cleared/reset in this same
-          // block, so logging them afterward (as before) always printed 0/-1.
-          const chirpEndSampleAtHandoff = this.chirpEndSample;
-          const ofdmAlignBufLenAtHandoff = this.ofdmAlignBuf.length;
-          this.chirpDetected = false;
-          this.chirpEndSample = -1;
-          // CP correlation reports offsets modulo one symbol. A peak near the
-          // end (e.g. sps-1) is the equivalent one-sample-early boundary, not
-          // a reason to discard almost a full training symbol. Keep that
-          // signed offset so all configured training symbols reach the demod.
-          const signedBoundary = probe.offset > this.sps / 2
-            ? probe.offset - this.sps
-            : probe.offset;
-          const alignedStart = Math.max(0, trainingStart + signedBoundary);
-          this.buf = this.ofdmAlignBuf.slice(alignedStart);
-          this.ofdmAlignBuf = [];
-          this.ofdmSyncFrames = 0;
-          this.state = RxState.FRAMES;
-          this.ofdmWindowsSinceDetect = 0;
-          this.ofdmTrainingSymbols = 0;
-          this.ofdmDemod!.resetTraining();
-          // 3c: same file-assembly + dedup resets the energy-sync path does
-          // (below) — without these, a retry of the SAME fileID right after
-          // a chirp-handoff resync was silently swallowed by processHeader's
-          // dup-header check (fileID===this.fileID && fileName!=='').
-          this.fileData = new Uint8Array(0);
-          this.fileID = 0;
-          this.fileName = '';
-          this.fileSize = 0;
-          this.totalFrames = 0;
-          this.framesReceived = 0;
-          this.receivedPayloadSeqs = new Set();
-          // Phase 4: new sync detected — reset to the base link profile.
-          this.resetLinkProfile();
-          dlog('OFDM-SYNC', {
-            chirpHandoff: true,
-            boundary: signedBoundary,
-            trainingSamples,
-            score: probe.score,
-            bufLenBeforeReplace: ofdmAlignBufLenAtHandoff - alignedStart,
-            samplesSeenAtHandoff: this.samplesSeen,
-            chirpEndSample: chirpEndSampleAtHandoff,
-            ofdmSkipValue: this.ofdmSkip,
-          });
-          return;
+        // 7a: throttle the O(sps × cp × periods) boundary probe to once per
+        // sps samples — see chirpProbeTick's doc. chirpProbeTick starts at 0
+        // so the FIRST probe after detection still fires the moment this
+        // block is first reachable (i.e. right after the existing sps*2
+        // settle delay above), not delayed by a further full sps wait.
+        if (this.chirpProbeTick > 0) {
+          this.chirpProbeTick--;
         } else {
-          // Probe failed - log for diagnostics
-          dlog('OFDM-SYNC', { chirpProbeFail: true, score: probe.score, sharpness: probe.sharpness, offset: probe.offset, bufLen: this.ofdmAlignBuf.length });
-          // Safety valve: if the chirp probe stays stuck for many symbols,
-          // the detected chirp is probably stale or the buffer is corrupt.
-          // Fall back to energy-based sync rather than re-probing forever.
-          if (samplesAfterChirp > this.sps * 16) {
-            dlog('OFDM-SYNC', { chirpProbeTimeout: true, samplesAfterChirp }, { level: 'warn' });
+          this.chirpProbeTick = this.sps;
+          const trainingSamples = Math.min(samplesAfterChirp, this.ofdmAlignBuf.length);
+          const trainingStart = this.ofdmAlignBuf.length - trainingSamples;
+          const trainingTail = this.ofdmAlignBuf.slice(trainingStart);
+          const probe = this.findOfdmBlockStart(trainingTail);
+          if (probe.offset >= 0 && probe.score >= OFDM_TUNING.cpCorrelationMinScore && probe.sharpness >= OFDM_TUNING.cpCorrelationMinSharpness) {
+            // 3f: capture pre-clear values for the diagnostic log below — both
+            // ofdmAlignBuf and chirpEndSample get cleared/reset in this same
+            // block, so logging them afterward (as before) always printed 0/-1.
+            const chirpEndSampleAtHandoff = this.chirpEndSample;
+            const ofdmAlignBufLenAtHandoff = this.ofdmAlignBuf.length;
             this.chirpDetected = false;
             this.chirpEndSample = -1;
+            // CP correlation reports offsets modulo one symbol. A peak near the
+            // end (e.g. sps-1) is the equivalent one-sample-early boundary, not
+            // a reason to discard almost a full training symbol. Keep that
+            // signed offset so all configured training symbols reach the demod.
+            const signedBoundary = probe.offset > this.sps / 2
+              ? probe.offset - this.sps
+              : probe.offset;
+            const alignedStart = Math.max(0, trainingStart + signedBoundary);
+            this.buf = this.ofdmAlignBuf.slice(alignedStart);
+            this.ofdmAlignBuf = [];
+            this.ofdmSyncFrames = 0;
+            this.state = RxState.FRAMES;
+            this.ofdmWindowsSinceDetect = 0;
+            this.ofdmTrainingSymbols = 0;
+            this.ofdmDemod!.resetTraining();
+            // 3c: same file-assembly + dedup resets the energy-sync path does
+            // (below) — without these, a retry of the SAME fileID right after
+            // a chirp-handoff resync was silently swallowed by processHeader's
+            // dup-header check (fileID===this.fileID && fileName!=='').
+            this.fileData = new Uint8Array(0);
+            this.fileID = 0;
+            this.fileName = '';
+            this.fileSize = 0;
+            this.totalFrames = 0;
+            this.framesReceived = 0;
+            this.receivedPayloadSeqs = new Set();
+            // Phase 4: new sync detected — reset to the base link profile.
+            this.resetLinkProfile();
+            dlog('OFDM-SYNC', {
+              chirpHandoff: true,
+              boundary: signedBoundary,
+              trainingSamples,
+              score: probe.score,
+              bufLenBeforeReplace: ofdmAlignBufLenAtHandoff - alignedStart,
+              samplesSeenAtHandoff: this.samplesSeen,
+              chirpEndSample: chirpEndSampleAtHandoff,
+              ofdmSkipValue: this.ofdmSkip,
+            });
+            return;
+          } else {
+            // Probe failed - log for diagnostics
+            dlog('OFDM-SYNC', { chirpProbeFail: true, score: probe.score, sharpness: probe.sharpness, offset: probe.offset, bufLen: this.ofdmAlignBuf.length });
+            // Safety valve: if the chirp probe stays stuck for many symbols,
+            // the detected chirp is probably stale or the buffer is corrupt.
+            // Fall back to energy-based sync rather than re-probing forever.
+            if (samplesAfterChirp > this.sps * 16) {
+              dlog('OFDM-SYNC', { chirpProbeTimeout: true, samplesAfterChirp }, { level: 'warn' });
+              this.chirpDetected = false;
+              this.chirpEndSample = -1;
+            }
           }
         }
       }
@@ -1196,7 +1252,65 @@ export class RxEngine {
       sampleRate: this.cfg.sampleRate,
     };
     this.chirpTemplate = generateChirp(chirpCfg);
+    // 7c: hoist the decimated (4:1) template + its energy — both constant
+    // for this config — out of the per-attempt correlation path below.
+    const ds = 4;
+    const tplDec = new Float32Array(Math.ceil(this.chirpTemplate.length / ds));
+    for (let i = 0; i < tplDec.length; i++) tplDec[i] = this.chirpTemplate[i * ds];
+    this.chirpTemplateDec = tplDec;
+    this.chirpTemplateEnergyDec = tplDec.reduce((s, v) => s + v * v, 0);
+    // 7b: (re)allocate the chirpBuf ring at its fixed capacity for this
+    // config and reset it — mirrors the old `this.chirpBuf = []` a fresh
+    // demod init implied.
+    this.chirpBufData = new Float32Array(this.chirpTemplate.length + this.sps * 2);
+    this.chirpBufClear();
     return demodToneFreqs;
+  }
+
+  // ─── chirpBuf ring-buffer access (7b) ────────────────
+  // Fixed-capacity FIFO over chirpBufData: writes always land at
+  // (head+count) % cap while count < cap; once full, the oldest slot
+  // (at head) is overwritten and head advances — equivalent to the old
+  // push()-then-shift()-when-over-cap, without ever memmoving the array.
+
+  private chirpBufLen(): number {
+    return this.chirpBufCount;
+  }
+
+  private chirpBufPush(sample: number): void {
+    const cap = this.chirpBufData.length;
+    if (cap === 0) return;
+    if (this.chirpBufCount < cap) {
+      this.chirpBufData[(this.chirpBufHead + this.chirpBufCount) % cap] = sample;
+      this.chirpBufCount++;
+    } else {
+      this.chirpBufData[this.chirpBufHead] = sample;
+      this.chirpBufHead = (this.chirpBufHead + 1) % cap;
+    }
+  }
+
+  /** Read the element at logical index `idx` (0 = oldest, count-1 = newest). */
+  private chirpBufAt(idx: number): number {
+    const cap = this.chirpBufData.length;
+    if (cap === 0 || idx < 0 || idx >= this.chirpBufCount) return 0;
+    return this.chirpBufData[(this.chirpBufHead + idx) % cap];
+  }
+
+  private chirpBufClear(): void {
+    this.chirpBufHead = 0;
+    this.chirpBufCount = 0;
+  }
+
+  /** Equivalent of `chirpBuf.slice(-n)` — keep only the most recent n elements. */
+  private chirpBufTrimToLast(n: number): void {
+    const cap = this.chirpBufData.length;
+    const keep = Math.min(this.chirpBufCount, Math.max(0, n));
+    if (cap === 0) {
+      this.chirpBufCount = keep;
+      return;
+    }
+    this.chirpBufHead = (this.chirpBufHead + (this.chirpBufCount - keep)) % cap;
+    this.chirpBufCount = keep;
   }
 
   /**
@@ -1315,7 +1429,10 @@ export class RxEngine {
     this.chirpTick = 0;
     this.chirpDetected = false;
     this.chirpEndSample = -1;
-    this.chirpBuf = [];
+    this.chirpProbeTick = 0;
+    // chirpBuf ring is reset by initOfdmDemod() above (useOFDM path); for
+    // non-OFDM configs there's no ring to clear.
+    this.chirpBufClear();
     this.scanner.reset();
     // Phase 4: back to the base link profile.
     this.resetLinkProfile();
