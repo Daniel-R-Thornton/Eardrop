@@ -115,7 +115,7 @@ export class OFDMQPSKDemodulator {
    * are short (one atomic frame is tens of symbols), so the tracker needs to
    * converge within the first few symbols rather than over a whole session.
    */
-  private readonly qamTrackingAlpha = 0.0;
+  private readonly qamTrackingAlpha = 0.05;
 
   // ── Pilot-referenced per-symbol gain correction (QAM path only) ──
   // Real audio chains apply level-dependent gain (speaker-protection
@@ -152,9 +152,17 @@ export class OFDMQPSKDemodulator {
   // sets a pending counter after a non-all-QPSK profile switch and calls
   // calibrateQamRef() for that many symbols instead of feeding demodulate()'s
   // bits to the scanner.
-  private qamRefAccRe: number[] = [];
-  private qamRefAccIm: number[] = [];
+  // Per-symbol samples (index [t][symbolIdx]) instead of a running sum, so
+  // the final pass can reject per-symbol outliers (e.g. a burst of noise or
+  // a mistimed window on one ref symbol) before averaging — see
+  // calibrateQamRef.
+  private qamRefSamplesRe: number[][] = [];
+  private qamRefSamplesIm: number[][] = [];
   private qamRefCount = 0;
+  /** Pilot amplitude accumulated over the same ref-symbol windows, so the
+   *  gain-correction reference can be latched against the exact state the
+   *  calibration encoded (see calibrateQamRef). */
+  private qamRefPilotAmpSum = 0;
 
   constructor(config: OFDMQPSKDemodulatorConfig) {
     this.cfg = config;
@@ -180,9 +188,10 @@ export class OFDMQPSKDemodulator {
     this.qamPilotRefAmp = 0;
     this.qamGainSymbols = 0;
     this.qamDiagCount = 0;
-    this.qamRefAccRe = [];
-    this.qamRefAccIm = [];
+    this.qamRefSamplesRe = [];
+    this.qamRefSamplesIm = [];
     this.qamRefCount = 0;
+    this.qamRefPilotAmpSum = 0;
   }
 
   resetTraining(): void {
@@ -208,9 +217,10 @@ export class OFDMQPSKDemodulator {
     this.qamPilotRefAmp = 0;
     this.qamGainSymbols = 0;
     this.qamDiagCount = 0;
-    this.qamRefAccRe = [];
-    this.qamRefAccIm = [];
+    this.qamRefSamplesRe = [];
+    this.qamRefSamplesIm = [];
     this.qamRefCount = 0;
+    this.qamRefPilotAmpSum = 0;
   }
 
   /**
@@ -507,8 +517,8 @@ export class OFDMQPSKDemodulator {
 
   /**
    * QAM reference-symbol calibration — see the class-level doc above
-   * qamRefAccRe. Called by rxEngine INSTEAD of feeding demodulate()'s bits
-   * to the scanner, for exactly OFDM_TUNING.qamRefSymbols consecutive
+   * qamRefSamplesRe. Called by rxEngine INSTEAD of feeding demodulate()'s
+   * bits to the scanner, for exactly OFDM_TUNING.qamRefSymbols consecutive
    * symbols right after a non-all-QPSK profile switch (demodulate() itself
    * still runs on the same window first — that's what trains driftPerHz
    * bookkeeping/pilot amplitude the same as any other symbol; this method
@@ -521,11 +531,26 @@ export class OFDMQPSKDemodulator {
    * the KNOWN outer-corner point for each tone's order — with gainCorr
    * pinned to 1, since this measurement IS the fresh amplitude reference
    * everything after it will be judged against, not something to correct
-   * relative to a prior one. Accumulates the per-symbol implied channel
-   * across all qamRefSymbols calls; on the final call, REPLACES (not blends)
-   * channelEstRe/Im with the mean, and re-arms the pilot gain-correction
-   * warmup (qamPilotAmpEma/qamPilotRefAmp/qamGainSymbols = 0) so it re-latches
-   * against the freshly calibrated reference instead of the training burst's.
+   * relative to a prior one. Records the per-symbol implied channel and the
+   * pilot amplitude across all qamRefSymbols calls; on the final call:
+   *   1. Per tone, rejects any per-symbol implied estimate whose magnitude
+   *      deviates from the across-symbols median by more than 2x (a single
+   *      noisy/mistimed ref window would otherwise pull the whole average
+   *      off), then averages the survivors.
+   *   2. Clamps the result: if newMag/oldMag falls outside [0.3, 3.0] for a
+   *      tone (implausible given the training estimate — more likely a
+   *      measurement fault than real channel/gain change), blends 50/50 with
+   *      the prior (training) estimate instead of fully replacing it.
+   *   3. Latches the pilot gain-correction reference from the mean pilot
+   *      amplitude seen during these same ref-symbol windows (rather than
+   *      re-arming an 8-symbol EMA warmup against data-frame pilot
+   *      readings), so `gainCorr` is active and correct from the very first
+   *      data symbol.
+   *   4. Discards any MER staged during these ref-symbol demodulate() calls
+   *      — they were judged against the stale (pre-calibration) channel
+   *      estimate, so committing them would pollute the reported MER (and
+   *      the bit-loading decisions it drives) with a systematic error this
+   *      calibration is about to correct.
    */
   calibrateQamRef(window: Float32Array | number[]): void {
     const buf = window instanceof Float32Array ? window : new Float32Array(window);
@@ -533,9 +558,12 @@ export class OFDMQPSKDemodulator {
     const { pilotRe, pilotIm, toneRe, toneIm } = this.analyze(symSamples);
 
     if (this.qamRefCount === 0) {
-      this.qamRefAccRe = new Array(this.toneCount).fill(0);
-      this.qamRefAccIm = new Array(this.toneCount).fill(0);
+      this.qamRefSamplesRe = Array.from({ length: this.toneCount }, () => []);
+      this.qamRefSamplesIm = Array.from({ length: this.toneCount }, () => []);
+      this.qamRefPilotAmpSum = 0;
     }
+
+    this.qamRefPilotAmpSum += Math.hypot(pilotRe, pilotIm);
 
     // Same pilot-referenced drift rotation demodulate() applies (the
     // training snapshot's pilot phase is the reference) — a ref symbol a
@@ -574,8 +602,8 @@ export class OFDMQPSKDemodulator {
         const rawIm = toneIm[t];
         const impliedRe = (rawRe * expDivRe + rawIm * expDivIm) / expDivMagSq;
         const impliedIm = (rawIm * expDivRe - rawRe * expDivIm) / expDivMagSq;
-        this.qamRefAccRe[t] += impliedRe;
-        this.qamRefAccIm[t] += impliedIm;
+        this.qamRefSamplesRe[t].push(impliedRe);
+        this.qamRefSamplesIm[t].push(impliedIm);
       }
     }
     this.qamRefCount++;
@@ -583,27 +611,97 @@ export class OFDMQPSKDemodulator {
     if (this.qamRefCount < OFDM_TUNING.qamRefSymbols) return;
 
     const kLog: string[] = [];
+    const clampedTones: string[] = [];
     for (let t = 0; t < this.toneCount; t++) {
-      const oldMag = Math.hypot(this.channelEstRe[t], this.channelEstIm[t]) || 1;
-      const newRe = this.qamRefAccRe[t] / this.qamRefCount;
-      const newIm = this.qamRefAccIm[t] / this.qamRefCount;
+      const samplesRe = this.qamRefSamplesRe[t];
+      const samplesIm = this.qamRefSamplesIm[t];
+      const oldRe = this.channelEstRe[t];
+      const oldIm = this.channelEstIm[t];
+      const oldMag = Math.hypot(oldRe, oldIm) || 1;
+
+      let newRe: number;
+      let newIm: number;
+      if (samplesRe.length === 0) {
+        // No usable sample this symbol (expDivMagSq underflowed) — keep the
+        // prior (training) estimate rather than dividing by zero survivors.
+        newRe = oldRe;
+        newIm = oldIm;
+      } else {
+        // Outlier rejection: compare each sample's magnitude against the
+        // across-symbols median; reject any that deviate by more than 2x
+        // before averaging the survivors.
+        const mags = samplesRe.map((re, k) => Math.hypot(re, samplesIm[k]));
+        const sortedMags = mags.slice().sort((a, b) => a - b);
+        const mid = sortedMags.length >> 1;
+        const median = sortedMags.length % 2 === 0
+          ? (sortedMags[mid - 1] + sortedMags[mid]) / 2
+          : sortedMags[mid];
+
+        let sumRe = 0;
+        let sumIm = 0;
+        let survivors = 0;
+        for (let k = 0; k < samplesRe.length; k++) {
+          const ratio = median > 1e-12 ? mags[k] / median : 1;
+          const isOutlier = median > 1e-12 && (ratio > 2 || ratio < 0.5);
+          if (isOutlier) continue;
+          sumRe += samplesRe[k];
+          sumIm += samplesIm[k];
+          survivors++;
+        }
+        if (survivors === 0) {
+          // Every sample was flagged (degenerate all-equal-but-zero median
+          // case) — fall back to averaging everything rather than keeping a
+          // stale estimate.
+          for (let k = 0; k < samplesRe.length; k++) {
+            sumRe += samplesRe[k];
+            sumIm += samplesIm[k];
+          }
+          survivors = samplesRe.length;
+        }
+        newRe = sumRe / survivors;
+        newIm = sumIm / survivors;
+      }
+
       const newMag = Math.hypot(newRe, newIm);
-      kLog.push(String(Math.round((100 * newMag) / oldMag)));
-      this.channelEstRe[t] = newRe;
-      this.channelEstIm[t] = newIm;
+      const ratio = newMag / oldMag;
+      kLog.push(String(Math.round(100 * ratio)));
+
+      if (ratio < 0.3 || ratio > 3.0) {
+        // Implausible jump vs the training estimate — more likely a
+        // measurement fault (e.g. an outlier-heavy tone) than a real
+        // channel/gain change of that size. Blend instead of fully
+        // replacing so a bad calibration can't wreck the whole frame.
+        this.channelEstRe[t] = 0.5 * oldRe + 0.5 * newRe;
+        this.channelEstIm[t] = 0.5 * oldIm + 0.5 * newIm;
+        clampedTones.push(String(t));
+      } else {
+        this.channelEstRe[t] = newRe;
+        this.channelEstIm[t] = newIm;
+      }
     }
 
-    // Re-arm the pilot gain-correction warmup against the freshly
-    // calibrated reference (see class doc on qamPilotAmpEma).
-    this.qamPilotAmpEma = 0;
-    this.qamPilotRefAmp = 0;
-    this.qamGainSymbols = 0;
+    // Latch the pilot gain-correction reference from the mean pilot
+    // amplitude seen during calibration itself (rather than re-arming the
+    // 8-symbol data-frame warmup) so gainCorr references the exact gain
+    // state this calibration encoded from data symbol 1 onward.
+    const meanPilotAmp = this.qamRefPilotAmpSum / this.qamRefCount;
+    this.qamPilotRefAmp = meanPilotAmp;
+    this.qamPilotAmpEma = meanPilotAmp;
+    this.qamGainSymbols = this.GAIN_WARMUP_SYMBOLS + 1;
 
-    dlog('QAMCAL', { k: kLog.join(';') });
+    dlog('QAMCAL', { k: kLog.join(';'), clamp: clampedTones.join(',') });
+
+    // The ref-symbol windows were demodulated (for pilot/drift bookkeeping)
+    // against the stale, pre-calibration channel estimate, staging MER error
+    // that no longer reflects reality now that channelEst has been re-fit —
+    // discard it so it doesn't pollute the next frame's committed MER (and
+    // the bit-loading decisions that read it).
+    this.discardMER();
 
     this.qamRefCount = 0;
-    this.qamRefAccRe = [];
-    this.qamRefAccIm = [];
+    this.qamRefSamplesRe = [];
+    this.qamRefSamplesIm = [];
+    this.qamRefPilotAmpSum = 0;
   }
 
   demodulate(window: Float32Array | number[]): OFDMQPSKResult {
@@ -668,14 +766,36 @@ export class OFDMQPSKDemodulator {
             let normPh = Math.atan2(eqIm, eqRe);
             if (normPh < 0) normPh += 2 * Math.PI;
             const sym = Math.round(normPh / (Math.PI / 2)) % 4;
-            const nearestAngle = sym * (Math.PI / 2) + Math.PI / 4;
+            // Nearest-point angle on the SAME sym*90° grid the slicer and the
+            // MER ideal use (2a) — the previous +π/4 offset put this on the
+            // decision-boundary wedge instead of the constellation point,
+            // inverting the confidence gate (passed least-confident symbols,
+            // rejected most-confident ones) and rotating the tracked update
+            // 45° off the true channel phase.
+            const nearestAngle = sym * (Math.PI / 2);
             const phaseError = Math.abs(normPh - nearestAngle);
             const wrappedError = phaseError > Math.PI ? 2 * Math.PI - phaseError : phaseError;
-            if (wrappedError < Math.PI / 8 && !trackingDisabled) {
-              const expRe = Math.cos(nearestAngle);
-              const expIm = Math.sin(nearestAngle);
-              const ratioRe = rawRe * expRe + rawIm * expIm;
-              const ratioIm = rawIm * expRe - rawRe * expIm;
+            if (wrappedError < Math.PI / 8) {
+              // Mirror the QAM tracker's drift-rotation-of-expected-point
+              // pattern (below, ~858-870): `raw` still carries the
+              // driftPerHz·f rotation (toneCorr subtracts it, but raw is
+              // unrotated), so the expected point must be rotated by the
+              // same drift before forming the ratio — otherwise an accepted
+              // update writes ch·e^{j·drift·f} into channelEst while
+              // toneCorr keeps subtracting drift separately each symbol
+              // (double correction that compounds over the burst).
+              const extraAngle = -driftPerHz * this.cfg.toneFrequencies[t];
+              const cosE = Math.cos(extraAngle);
+              const sinE = Math.sin(extraAngle);
+              const expRotRe = Math.cos(nearestAngle);
+              const expRotIm = Math.sin(nearestAngle);
+              // Undo the drift rotation to get back to the raw-comparable
+              // (training-snapshot) frame — same inverse-rotation step the
+              // QAM tracker uses to compute expDivRe/Im from expRotRe/Im.
+              const expDivRe = expRotRe * cosE + expRotIm * sinE;
+              const expDivIm = expRotIm * cosE - expRotRe * sinE;
+              const ratioRe = rawRe * expDivRe + rawIm * expDivIm;
+              const ratioIm = rawIm * expDivRe - rawRe * expDivIm;
               this.channelEstRe[t] += this.trackingAlpha * (ratioRe - this.channelEstRe[t]);
               this.channelEstIm[t] += this.trackingAlpha * (ratioIm - this.channelEstIm[t]);
             }
@@ -854,7 +974,17 @@ export class OFDMQPSKDemodulator {
           // a fresh complex channel estimate directly from this symbol,
           // independent of the current one — blended in with a leaky
           // integrator exactly like the QPSK tracker above.
-          if (refPow > 0 && errPow / refPow < 0.09) {
+          // Gate on absolute error, not error relative to THIS point's own
+          // power: `ideal` is already normalized so mean(|point|^2) === 1
+          // for every order (see normalizationScale in constellation.ts),
+          // i.e. errPow is already in the same "mean constellation power"
+          // units as `ideal` — comparing it against refPow (a single
+          // corner-vs-inner point's own power, which varies ~14 dB between
+          // 64-QAM's corner and innermost points) made the gate ~14 dB
+          // tighter for inner points than corners. An absolute threshold
+          // against the normalized mean power (1) is amplitude-class-
+          // independent across QPSK/16-QAM/64-QAM.
+          if (refPow > 0 && errPow < 0.09) {
             const i0 = -ideal.im / 2;
             const q0 = ideal.re / 2;
             // Undo the gain correction first (expRotRe/Im here is the
