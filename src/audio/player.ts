@@ -131,7 +131,15 @@ export class AudioPlayer {
     }
 
     const gain = ctx.createGain();
-    gain.gain.value = this.volume;
+    // Streamed chunks are pre-normalized to ≈0.95 peak (see class doc above),
+    // with no whole-signal analysis to cancel `this.volume` the way batch
+    // play()'s auto-norm does (`scale = targetPeak/(peak*volume)`). Above
+    // unity, `this.volume` (default 2.0×) would push ≈0.95 peak samples to
+    // ≈1.9 post-gain and hard-clip at the DAC on every chunk. Cap the applied
+    // gain at 1.0 — volume < 1 (backing the speaker OUT of its compressor's
+    // range, the actual use case here) still works; > 1 on this path can only
+    // clip, so it's clamped rather than honored.
+    gain.gain.value = Math.min(this.volume, 1.0);
     gain.connect(ctx.destination);
 
     const LOOKAHEAD_SEC = 2.0;
@@ -146,7 +154,11 @@ export class AudioPlayer {
       // Hard safety clamp: samples should already be ≤1.0 (pre-normalized
       // upstream), but guard against future coherent-symbol regressions
       // reaching the DAC — scale the whole chunk down to unity peak rather
-      // than let individual samples clip silently.
+      // than let individual samples clip silently. This is a dormant safety
+      // net, not a leveling stage: the scale factor is computed independently
+      // per chunk, so if it ever actually fires on a live stream it would
+      // step the output level between chunks rather than apply a smooth,
+      // stream-wide normalization.
       let peak = 0;
       for (let i = 0; i < chunk.length; i++) {
         const abs = Math.abs(chunk[i]);
