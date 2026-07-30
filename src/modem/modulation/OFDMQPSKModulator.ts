@@ -7,10 +7,30 @@
  * is the tail of the window copied to the front, exactly as before.
  */
 import { ofdmSamples } from '../types';
-import { mapSymbol, MAX_QAM_MAGNITUDE, type ConstellationPoint, type QamOrder } from './constellation';
+import {
+  mapSymbol,
+  MAX_QAM_MAGNITUDE,
+  maxConstellationMagnitude,
+  type ConstellationPoint,
+  type QamOrder,
+} from './constellation';
 import { dlog } from '../../lib/debug/dlog';
 
 export interface OFDMQPSKModulatorConfig {
+  /**
+   * Optional per-tone amplitude multipliers (linear, 1 = unity) — pre-emphasis
+   * that pre-distorts the transmitted spectrum so the RECEIVED one comes out
+   * flat. Expected to be mean-unity in dB (see refinePreEmphasis), because the
+   * peak budget below is derived from the gains and a set that raises mean
+   * power raises the peak with it.
+   *
+   * MUST be applied identically to preamble and data. The receiver trains its
+   * channel estimate on the preamble and applies it to data, so a gain present
+   * in one and not the other is indistinguishable from a channel that changed
+   * between them — the exact failure mode that has broken this link repeatedly.
+   * Holding them in one place here guarantees that.
+   */
+  toneGains?: number[];
   sampleRate: number;
   toneFrequencies: Float32Array;
   pilotFreqHz: number;
@@ -33,6 +53,30 @@ export interface OFDMQPSKModulatorConfig {
 function qpskPhase(symbol: number): number {
   return (symbol % 4) * (Math.PI / 2);
 }
+
+/**
+ * Peak-to-RMS budget (crest factor, linear) the fixed TX scale is sized for.
+ *
+ * 5.5 ~= 14.8 dB. NOTE this is not what sets the scale at 16 tones and above —
+ * the phase-aligned sync burst's peak is larger there and wins (see the
+ * syncCoherentPeak block). It still governs at low tone counts and would govern
+ * everywhere if the preamble were ever de-cohered.
+ *
+ * Chosen from measurement, not theory: over 600 random symbols
+ * at every supported tone count and constellation order, the highest crest
+ * factor actually produced was 4.98 (48 tones, QPSK), rising slowly with tone
+ * count from 3.80 at 8 tones — the max of an approximately-Gaussian sum creeps
+ * up as more carriers and more samples are involved. 3.5 was tried first and
+ * clipped at 5e-6 to 3e-5 of samples, so the Gaussian intuition alone sizes
+ * this too tight.
+ *
+ * At 5.5 a symbol has to reach crest 5.79 before any sample exceeds 1.0, ~16%
+ * above the worst yet observed. Raising this reclaims nothing (it only lowers
+ * the scale); lowering it trades clipping for level. clipRate.test.ts measures
+ * what this actually produces across tone counts and orders — change this and
+ * that test tells you what it cost.
+ */
+const PAPR_CREST = 5.5;
 
 export class OFDMQPSKModulator {
   private cfg: OFDMQPSKModulatorConfig;
@@ -69,6 +113,8 @@ export class OFDMQPSKModulator {
   // Fixed per-tone TX scale, applied uniformly to EVERY symbol this modulator
   // emits (training, QPSK data, QAM data, QAM ref) — see config doc + constructor.
   private readonly qamScale: number;
+  /** Per-tone pre-emphasis multipliers (linear); all 1 when uncalibrated. */
+  private readonly toneGains: number[];
 
   constructor(config: OFDMQPSKModulatorConfig) {
     this.cfg = config;
@@ -119,10 +165,101 @@ export class OFDMQPSKModulator {
     // for any per-tone bit-loading mix). So:
     //   worstCasePeak = numTones · MAX_QAM_MAGNITUDE + pilotAmplitude
     //   qamScale = 0.95 / worstCasePeak
-    // guarantees |sample| <= 0.95 for every symbol this modulator can ever
+    // would guarantee |sample| <= 0.95 for every symbol this modulator can ever
     // produce, for any data, any per-tone order assignment, any tone count.
-    const worstCasePeak = numTones * MAX_QAM_MAGNITUDE + config.pilotAmplitude;
-    const safeScale = 0.95 / worstCasePeak;
+    // That guarantee is DELIBERATELY NOT TAKEN any more — see the PAPR block
+    // below for what replaced it and why.
+    // ── PAPR-based scale, NOT the coherent worst case ──
+    // The bound derived above is real but ruinously conservative, and its cost
+    // GROWS WITH TONE COUNT: sum_t |point_t| scales as N, so per-tone amplitude
+    // scales as 1/N and per-tone level falls ~6 dB per doubling. That is why
+    // 8 tones worked at 16-QAM while 32 did not — not any property of the
+    // channel. Measured: at 32 tones the bound clamps a requested 0.16 down to
+    // 0.0187, so every tone is ~22 dB below the level a single tone reaches in
+    // the channel sweep, and the operator compensates with system volume,
+    // which is what drives the output chain into compression.
+    //
+    // A real OFDM sum does not reach the coherent peak: with de-correlated
+    // per-tone data its crest factor is only weakly dependent on N (measured
+    // 3.80 at 8 tones rising to 4.98 at 48), so the peak scales essentially as
+    // sqrt(N) via RMS rather than as N. Scaling to a crest budget instead
+    // recovers real level at every tone count, and unlike cutting the tone
+    // count it costs nothing. In practice the preamble budget below, not this
+    // one, sets the scale at 16 tones and above — see there.
+    //
+    // THIS IS NO LONGER A PROOF. The old bound guaranteed |sample| <= 0.95 for
+    // any data whatsoever; this one guarantees it only up to PAPR_CREST
+    // standard deviations, so it is a MEASURED property and clipRate.test.ts
+    // exists to keep it measured across tone counts and constellation orders.
+    // The residual risk is bounded and one-sided: an exceptional symbol clips a
+    // few samples against the player's guard, where the old behaviour was a
+    // permanent ~9 dB level penalty on every symbol.
+    //
+    // RMS of the synthesized sum: each tone contributes a sinusoid whose
+    // amplitude is |point_t| (mean square 1 after normalizationScale), so its
+    // mean power is 1/2; the pilot contributes pilotAmplitude^2/2. Hence
+    // rms = sqrt((numTones + pilotAmplitude^2) / 2), and the peak budget is
+    // PAPR_CREST times that.
+    // Per-tone pre-emphasis, defaulted to unity and length-checked so a stale
+    // calibration for a different tone count cannot silently apply to some
+    // tones and not others.
+    this.toneGains =
+      config.toneGains && config.toneGains.length === numTones
+        ? config.toneGains.slice()
+        : new Array<number>(numTones).fill(1);
+    const gainSumSq = this.toneGains.reduce((a, g) => a + g * g, 0);
+    const gainSum = this.toneGains.reduce((a, g) => a + Math.abs(g), 0);
+
+    const rmsSum = Math.sqrt(
+      (gainSumSq + config.pilotAmplitude * config.pilotAmplitude) / 2,
+    );
+    const paprPeak = PAPR_CREST * rmsSum;
+
+    // ── the sync/training burst is NOT random data, and must be budgeted ──
+    // A crest budget derived from random payload does not cover the preamble.
+    // generateSyncBurst sets EVERY tone to the same QPSK symbol, so its
+    // carriers are phase-aligned by construction and it hits very nearly the
+    // coherent peak — measured crest 6.70 at 32 tones against ~2.6 for data.
+    // It is also transmitted on every single transmission, so it is a
+    // guaranteed event, not a tail one.
+    //
+    // Sizing to random data alone put its peak at 1.248 at 32 tones: the
+    // preamble clipped on every transmission, which distorted the very symbols
+    // the channel estimate is built from and turned a flat 6 dB h profile into
+    // a 22 dB ramp. Take whichever budget is LARGER so both cases fit.
+    // Gains scale each tone's contribution to the coherent sum, so the budget
+    // uses their SUM rather than the tone count. With unity gains this is
+    // identical to numTones and the pre-emphasis path costs nothing.
+    const syncCoherentPeak =
+      gainSum * maxConstellationMagnitude(2) + config.pilotAmplitude;
+
+    // ── and PAYLOAD symbols can be coherent too, which forces the full bound ──
+    // A crest budget assumes de-correlated per-tone data. Padding breaks that:
+    // a short payload leaves most of the frame zero-filled, every tone maps to
+    // the SAME constellation point, and the symbol is as phase-aligned as the
+    // preamble. Measured on a 12-byte payload at 32 tones/16-QAM: the player's
+    // guard saw a 1.19 peak, i.e. ~42.7 of the 44.9 units the fully coherent
+    // case allows.
+    //
+    // So the binding term is the coherent bound after all, and this scale is
+    // currently identical to the pre-PAPR one. The machinery is kept because
+    // the terms name exactly what has to change to unlock the level: WHITEN THE
+    // PAYLOAD (so padding is not a constant symbol) and de-cohere the sync
+    // burst. With both done, paprPeak becomes the binding term and the crest
+    // budget is worth ~7 dB at 32 tones and ~9 dB at 48. Until then, raising
+    // the scale only converts headroom into clipping — and clipping the
+    // preamble is what corrupts the channel estimate every transmission.
+    const dataCoherentPeak = gainSum * MAX_QAM_MAGNITUDE + config.pilotAmplitude;
+
+    // Never exceed the true worst case — at very low tone counts the coherent
+    // bound is TIGHTER than the crest budget, and taking the looser of the two
+    // there would clip deterministically rather than exceptionally.
+    const worstCasePeak = gainSum * MAX_QAM_MAGNITUDE + config.pilotAmplitude;
+    const budget = Math.min(
+      Math.max(paprPeak, syncCoherentPeak, dataCoherentPeak),
+      worstCasePeak,
+    );
+    const safeScale = 0.95 / Math.max(budget, 1e-9);
     // qamScaleOverride is a user/tuning knob, not a way to bypass the safety
     // bound above — it now scales the WHOLE transmission (training included,
     // not just QAM data), so an unclamped override above safeScale would
@@ -264,11 +401,15 @@ export class OFDMQPSKModulator {
     const { toneFrequencies } = this.cfg;
     const numTones = toneFrequencies.length;
     const body = new Float32Array(this.fftSamples);
-    const { pilotTable, selTable, selSign, qamScale } = this;
+    const { pilotTable, selTable, selSign, qamScale, toneGains } = this;
     for (let n = 0; n < this.fftSamples; n++) {
       let acc = pilotTable[n];
       for (let t = 0; t < numTones; t++) {
-        acc += selSign[t] * selTable[t][n];
+        // Same gains as the QAM path — the preamble and the profile frame go
+        // out through here, and the receiver's channel estimate comes from the
+        // preamble. Applying pre-emphasis to only one of the two paths would
+        // make the estimate disagree with the data it is applied to.
+        acc += toneGains[t] * selSign[t] * selTable[t][n];
       }
       body[n] = acc * qamScale;
     }
@@ -287,11 +428,11 @@ export class OFDMQPSKModulator {
     const { toneFrequencies } = this.cfg;
     const numTones = toneFrequencies.length;
     const body = new Float32Array(this.fftSamples);
-    const { pilotTable, sinTable, cosTable, symRe, symIm, qamScale } = this;
+    const { pilotTable, sinTable, cosTable, symRe, symIm, qamScale, toneGains } = this;
     for (let n = 0; n < this.fftSamples; n++) {
       let acc = pilotTable[n];
       for (let t = 0; t < numTones; t++) {
-        acc += symRe[t] * cosTable[t][n] - symIm[t] * sinTable[t][n];
+        acc += toneGains[t] * (symRe[t] * cosTable[t][n] - symIm[t] * sinTable[t][n]);
       }
       body[n] = acc * qamScale;
     }
