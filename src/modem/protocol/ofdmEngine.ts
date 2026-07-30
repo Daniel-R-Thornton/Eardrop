@@ -40,6 +40,7 @@ export class OFDMEngine {
     pilotAmplitude?: number;
     chirpSpanHz?: number;
     qamScaleOverride?: number;
+    toneStartHz?: number;
   }) {
     const toneCount = cfg.toneCount ?? OFDM_DEFAULTS.toneCount;
     this.toneCount = toneCount % 4 !== 0 ? 4 : toneCount;
@@ -49,13 +50,14 @@ export class OFDMEngine {
 
     const pilotFreqHz = cfg.pilotFreqHz ?? 1900;
     const pilotAmplitude = cfg.pilotAmplitude ?? 2.0;
+    const toneStartHz = cfg.toneStartHz ?? OFDM_DEFAULTS.toneStartHz;
     this.pilotFreqHz = pilotFreqHz;
     this.sampleRate = cfg.sampleRate;
     this.chirpSpanHz = cfg.chirpSpanHz ?? 200;
     const { symSamples } = ofdmSamples(cfg.sampleRate);
     this.symSamples = symSamples;
 
-    this.toneFreqs = ofdmToneFrequencies({ toneCount: this.toneCount, pilotFreqHz });
+    this.toneFreqs = ofdmToneFrequencies({ toneCount: this.toneCount, pilotFreqHz, startHz: toneStartHz });
 
     this.ofdm = new OFDMQPSKModulator({
       sampleRate: cfg.sampleRate,

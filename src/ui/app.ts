@@ -160,6 +160,7 @@ window.addEventListener('eardrop-demo-encode', (async () => {
     buildModemConfig({
       useOFDM: getState().useOFDM,
       pilotFreqHz: getState().pilotFreqHz,
+      toneStartHz: getState().toneStartHz,
       toneCount: getState().toneCount,
       symbolsPerSec: getState().symbolsPerSec,
       musicalMode: getState().musicalMode,
@@ -206,6 +207,7 @@ window.addEventListener('eardrop-send', (async () => {
       buildModemConfig({
         useOFDM: getState().useOFDM,
         pilotFreqHz: getState().pilotFreqHz,
+        toneStartHz: getState().toneStartHz,
         toneCount: getState().toneCount,
         symbolsPerSec: getState().symbolsPerSec,
         musicalMode: getState().musicalMode,
@@ -340,6 +342,7 @@ window.addEventListener('eardrop-send-test', (async () => {
       buildModemConfig({
         useOFDM: getState().useOFDM,
         pilotFreqHz: getState().pilotFreqHz,
+        toneStartHz: getState().toneStartHz,
         toneCount: getState().toneCount,
         symbolsPerSec: getState().symbolsPerSec,
         musicalMode: getState().musicalMode,
@@ -638,6 +641,7 @@ async function startListening() {
     const cfg = buildModemConfig({
       useOFDM: getState().useOFDM,
       pilotFreqHz: getState().pilotFreqHz,
+      toneStartHz: getState().toneStartHz,
       toneCount: getState().toneCount,
       symbolsPerSec: getState().symbolsPerSec,
       musicalMode: getState().musicalMode,
@@ -1187,6 +1191,7 @@ async function runSpeedTest() {
   const originalCfg = buildModemConfig({
     useOFDM: true,
     pilotFreqHz: state.pilotFreqHz,
+    toneStartHz: state.toneStartHz,
     toneCount: state.toneCount,
     symbolsPerSec: state.symbolsPerSec,
     musicalMode: state.musicalMode,
@@ -1340,6 +1345,7 @@ async function runSpeedTest() {
     const cfg = buildModemConfig({
       useOFDM: true,
       pilotFreqHz,
+      toneStartHz: state.toneStartHz,
       toneCount,
       symbolsPerSec: state.symbolsPerSec,
       musicalMode: state.musicalMode,
@@ -2660,6 +2666,7 @@ async function runAcousticSpeedSweep() {
     buildModemConfig({
       useOFDM: getState().useOFDM,
       pilotFreqHz: getState().pilotFreqHz,
+      toneStartHz: getState().toneStartHz,
       toneCount: getState().toneCount,
       symbolsPerSec: getState().symbolsPerSec,
       musicalMode: getState().musicalMode,
@@ -2815,6 +2822,7 @@ window.addEventListener('eardrop-export-wav', (async () => {
     const modemConfig = buildModemConfig({
       useOFDM: getState().useOFDM,
       pilotFreqHz: getState().pilotFreqHz,
+      toneStartHz: getState().toneStartHz,
       toneCount: getState().toneCount,
       symbolsPerSec: getState().symbolsPerSec,
       musicalMode: getState().musicalMode,
@@ -2871,6 +2879,7 @@ window.addEventListener('eardrop-load-wav', (async () => {
       modem.configure(buildModemConfig({
         useOFDM: getState().useOFDM,
         pilotFreqHz: getState().pilotFreqHz,
+        toneStartHz: getState().toneStartHz,
         toneCount: getState().toneCount,
         symbolsPerSec: getState().symbolsPerSec,
         musicalMode: getState().musicalMode,

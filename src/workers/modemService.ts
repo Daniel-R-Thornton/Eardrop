@@ -315,7 +315,7 @@ export class ModemService {
     }
 
     const toneFreqs = this.config!.useOFDM
-      ? ofdmToneFrequencies({ toneCount: this.config!.toneCount, pilotFreqHz: this.config!.pilotFreqHz })
+      ? ofdmToneFrequencies({ toneCount: this.config!.toneCount, pilotFreqHz: this.config!.pilotFreqHz, startHz: this.config!.toneStartHz })
       : new Float32Array(0);
     const toneEnergies: number[] = [];
     for (const f of toneFreqs) {

@@ -114,6 +114,7 @@ export class TxEngine {
         pilotAmplitude: OFDM_DEFAULTS.pilotAmplitude,
         toneCount: this.cfg.toneCount,
         qamScaleOverride: this.qamScaleOverride,
+        toneStartHz: this.cfg.toneStartHz,
       });
     }
   }

@@ -9,7 +9,7 @@
  * breaks. Snapping is lossless for the user because the bin spacing
  * (50 Hz at 48 kHz native rate) is finer than any practical tuning knob.
  */
-import { DEFAULT_CONFIG, ofdmSamples, type ModemConfig } from '../../modem/types';
+import { DEFAULT_CONFIG, OFDM_DEFAULTS, MIN_TONE_START_HZ, ofdmSamples, type ModemConfig } from '../../modem/types';
 import { dlog } from '../../lib/debug/dlog';
 
 export interface ModemUiConfig {
@@ -27,6 +27,9 @@ export interface ModemUiConfig {
    *  can help real audio chains where the receiver's expected QAM amplitude
    *  does not match the actual transmitted amplitude. */
   qamScaleOverride?: number;
+  /** OFDM: Hz above the pilot where the first data tone sits. Leave undefined
+   *  for the default (OFDM_DEFAULTS.toneStartHz = 2000Hz, today's behavior). */
+  toneStartHz?: number;
 }
 
 export function buildModemConfig(
@@ -49,6 +52,17 @@ export function buildModemConfig(
 
   const toneCount = ui.toneCount || DEFAULT_CONFIG.toneCount;
 
+  // Tone-grid start offset above the pilot. Clamp defensively so a config
+  // that somehow slips below the minimum separation can't alias the lowest
+  // data tone onto the pilot — ofdmToneFrequencies() enforces the same floor,
+  // so this is belt-and-braces, not the only guard.
+  const toneStartHz = Math.max(
+    MIN_TONE_START_HZ,
+    typeof ui.toneStartHz === 'number' && Number.isFinite(ui.toneStartHz)
+      ? ui.toneStartHz
+      : OFDM_DEFAULTS.toneStartHz,
+  );
+
   // Phase 3 per-tone QAM (bit-loading): a 2-bit profile code applied to every
   // tone. Default (2 bits = QPSK) must NEVER emit a link profile — the
   // waveform has to stay byte-identical to the pre-bit-loading behavior.
@@ -60,6 +74,7 @@ export function buildModemConfig(
     sampleRate: ui.useOFDM ? ui.hwSampleRate : DEFAULT_CONFIG.sampleRate,
     pilotFreqHz: pilot,
     toneCount,
+    toneStartHz,
     bitsPerFrame: toneCount * 2,
     symbolsPerSec: ui.symbolsPerSec || DEFAULT_CONFIG.symbolsPerSec,
     musical: ui.musicalMode,

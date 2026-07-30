@@ -1277,7 +1277,7 @@ export class RxEngine {
       ofdmToneCount = 4;
     }
     this.ofdmToneCount = ofdmToneCount;
-    const demodToneFreqs = ofdmToneFrequencies({ toneCount: ofdmToneCount, pilotFreqHz: this.cfg.pilotFreqHz });
+    const demodToneFreqs = ofdmToneFrequencies({ toneCount: ofdmToneCount, pilotFreqHz: this.cfg.pilotFreqHz, startHz: this.cfg.toneStartHz });
     this.ofdmToneFreqs = demodToneFreqs;
     this.ofdmDemod = new OFDMQPSKDemodulator({
       sampleRate: this.cfg.sampleRate,
@@ -1602,7 +1602,7 @@ export class RxEngine {
           // the profile at the correct rate.
           dlog('RX-OFDM', { adaptingToneCount: true, newCount: profile.toneCount }, { level: 'info' });
           this.ofdmToneCount = profile.toneCount;
-          this.ofdmToneFreqs = ofdmToneFrequencies({ toneCount: profile.toneCount, pilotFreqHz: this.cfg.pilotFreqHz });
+          this.ofdmToneFreqs = ofdmToneFrequencies({ toneCount: profile.toneCount, pilotFreqHz: this.cfg.pilotFreqHz, startHz: this.cfg.toneStartHz });
           this.ofdmDemod = new OFDMQPSKDemodulator({
             sampleRate: this.cfg.sampleRate,
             toneFrequencies: this.ofdmToneFreqs,

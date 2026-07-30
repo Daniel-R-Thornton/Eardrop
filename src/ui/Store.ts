@@ -4,7 +4,7 @@
  */
 
 import { useSyncExternalStore } from 'react';
-import { DEFAULT_CONFIG } from '../modem/types';
+import { DEFAULT_CONFIG, OFDM_DEFAULTS } from '../modem/types';
 import type { Run } from '../modem/protocol/captureTypes';
 
 // ─── State Shape ──────────────────────────────────────
@@ -100,6 +100,10 @@ export interface AppState {
   sweepResults: Array<{ freq: number; energy: number }> | null;
   /** Active tones: 2 or 4 */
   toneCount: number; // 2, 4, or 8
+  /** OFDM: Hz above the pilot where the first data tone sits (start of the
+   *  tone grid). Lower values move the grid into a better-behaved part of
+   *  the speaker/mic response. Default 2000 = today's behavior. */
+  toneStartHz: number;
   /** Phase 3 data-tone constellation, applied to ALL tones: 2=QPSK (default), 4=16-QAM, 6=64-QAM */
   dataQamBits: 2 | 4 | 6;
   /** Optional override for the fixed per-tone TX scale used in QAM data symbols.
@@ -220,6 +224,7 @@ const defaultState: AppState = {
   syncStrongMultiplier: 0.5,
   sweepResults: null,
   toneCount: DEFAULT_CONFIG.toneCount,
+  toneStartHz: OFDM_DEFAULTS.toneStartHz,
   dataQamBits: 2,
   qamScaleOverride: undefined,
   diversityMode: false,
@@ -281,6 +286,7 @@ function persistState(s: AppState): void {
     const toSave: Partial<AppState> = {
       // Persist only the configuration‑related fields – everything else is transient.
       toneCount: s.toneCount,
+      toneStartHz: s.toneStartHz,
       dataQamBits: s.dataQamBits,
       qamScaleOverride: s.qamScaleOverride,
       pilotFreqHz: s.pilotFreqHz,
@@ -317,7 +323,7 @@ export function setState(update: Partial<AppState>): void {
   state = { ...state, ...update };
   // Only persist when a persisted config key actually changed.
   const persistedKeys: Array<keyof AppState> = [
-    'toneCount', 'dataQamBits', 'qamScaleOverride', 'pilotFreqHz', 'musicalMode', 'ampThresholdRatio',
+    'toneCount', 'toneStartHz', 'dataQamBits', 'qamScaleOverride', 'pilotFreqHz', 'musicalMode', 'ampThresholdRatio',
     'syncStrongMultiplier', 'diversityMode', 'useOFDM', 'symbolsPerSec',
     'micGain', 'playbackVolume', 'selectedInputId', 'selectedOutputId', 'theme',
   ];

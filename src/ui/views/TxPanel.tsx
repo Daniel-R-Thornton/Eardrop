@@ -6,6 +6,7 @@
 import { useCallback } from 'react';
 import { useStore, setState } from '../Store';
 import { formatSize } from '../lib';
+import { OFDM_DEFAULTS } from '../../modem/types';
 import { T } from '../theme/labaccent/tokens';
 import { Panel } from '../components/instrument/Panel';
 import { Button } from '../components/instrument/Button';
@@ -184,6 +185,26 @@ export function TxPanel() {
             />
           </label>
         )}
+        {s.useOFDM && (() => {
+          const bandLowHz = s.pilotFreqHz + s.toneStartHz;
+          const bandHighHz = bandLowHz + (s.toneCount - 1) * OFDM_DEFAULTS.toneSpacingHz;
+          return (
+            <label style={{ display: 'flex', flexDirection: 'column', gap: 2, marginTop: 8 }}>
+              <span className="lab-panel__title" style={{ padding: 0, background: 'transparent', border: 0 }}>
+                TONE START {s.toneStartHz.toFixed(0)} Hz (band {bandLowHz.toFixed(0)}–{bandHighHz.toFixed(0)} Hz)
+              </span>
+              <input
+                type="range"
+                className="lab-slider"
+                min={600}
+                max={2000}
+                step={50}
+                value={s.toneStartHz}
+                onChange={(e) => setState({ toneStartHz: Number(e.target.value) })}
+              />
+            </label>
+          );
+        })()}
       </div>
 
       {s.isSending && (

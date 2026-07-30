@@ -42,6 +42,12 @@ export interface ModemConfig {
   ampThresholdRatio?: number;
   /** Sync strong multiplier for frame sync sensitivity */
   syncStrongMultiplier?: number;
+  /** OFDM: Hz above the pilot where the first data tone sits (start of the
+   *  tone grid). Lower values pull the whole grid into a better part of the
+   *  speaker/mic frequency response. Default OFDM_DEFAULTS.toneStartHz
+   *  (2000) reproduces today's behavior. Must stay >= MIN_TONE_START_HZ so
+   *  the lowest data tone can't alias onto the pilot. */
+  toneStartHz?: number;
 
   // ── Sync / framing ──
   /** Number of sync symbols in the sync burst */
@@ -231,6 +237,14 @@ export function checkOfdmTuningInvariants(): void {
 }
 checkOfdmTuningInvariants();
 
+/**
+ * Minimum Hz separation between the pilot and the first (lowest) data tone.
+ * Guards against a toneStartHz config that would alias the lowest data tone
+ * onto the pilot itself — shared by every ofdmToneFrequencies() caller
+ * (TX and RX alike) so the clamp can never diverge between the two sides.
+ */
+export const MIN_TONE_START_HZ = 600;
+
 export function ofdmToneFrequencies(opts: {
   toneCount: number;
   pilotFreqHz?: number;
@@ -238,7 +252,8 @@ export function ofdmToneFrequencies(opts: {
   spacingHz?: number;
 }): Float32Array {
   const pilot = opts.pilotFreqHz ?? 0;
-  const start = opts.startHz ?? OFDM_DEFAULTS.toneStartHz;
+  const rawStart = opts.startHz ?? OFDM_DEFAULTS.toneStartHz;
+  const start = Math.max(MIN_TONE_START_HZ, rawStart);
   const spacing = opts.spacingHz ?? OFDM_DEFAULTS.toneSpacingHz;
   const freqs = new Float32Array(opts.toneCount);
   for (let t = 0; t < opts.toneCount; t++) freqs[t] = pilot + start + t * spacing;
