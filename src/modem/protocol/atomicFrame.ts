@@ -51,6 +51,14 @@ const SENTINEL_BYTES = new Uint8Array([0xe7, 0x9f, 0xe7]);
 
 /** Header frame — file metadata. */
 export const FRAME_TYPE_HEADER = 0x01;
+/**
+ * Minimum number of times the header frame is transmitted, mirroring
+ * `PROFILE_FRAME_REPEATS` in linkProfile.ts — a lost header currently kills
+ * the whole transfer (RX only learns fileID/size/name from it), so it's
+ * cheap insurance to send it twice unconditionally. RX dedups repeats via
+ * `processHeader`'s fileID check, so this is free on the receive side.
+ */
+export const HEADER_FRAME_REPEATS = 2;
 /** Data (payload) frame. */
 export const FRAME_TYPE_PAYLOAD = 0x02;
 /** Tail frame — end-of-transmission marker. */
@@ -220,13 +228,30 @@ export function encodeFrame(header: AtomicHeader, payload: Uint8Array): Uint8Arr
   const fullPayload = new Uint8Array(PAYLOAD_DATA_SIZE);
   fullPayload.set(payload.slice(0, PAYLOAD_DATA_SIZE), 0);
 
-  // 5. RS(52,40) encode each 40-byte chunk and assemble the frame
+  // 5. RS(52,40) encode each 40-byte chunk, then STRIPE the resulting bytes
+  // round-robin across the 4 blocks on the wire instead of laying them out
+  // contiguously: wire byte j (within the RS region) carries block (j %
+  // PAYLOAD_BLOCKS)'s byte at index floor(j / PAYLOAD_BLOCKS). One corrupted
+  // 25ms OFDM symbol is ~8 consecutive wire bytes; contiguous block layout
+  // would dump all 8 into one RS(52,40) block (t=6 correction limit — the
+  // frame dies). Striped, those 8 consecutive wire bytes land ≤2 per block
+  // (8 / PAYLOAD_BLOCKS), well inside t=6. De-striped before RS decode below.
+  // (This is a local, wire-format-only interleave — unrelated to the dead
+  // `interleaveDepth`/`interleave()` config in types.ts/ecc.ts, which stays
+  // untouched.)
+  const rsBlocks: Uint8Array[] = [];
+  for (let b = 0; b < PAYLOAD_BLOCKS; b++) {
+    const chunk = fullPayload.slice(b * RS_BLOCK_DATA, (b + 1) * RS_BLOCK_DATA);
+    rsBlocks.push(rsEncode(chunk));
+  }
   const frame = new Uint8Array(FRAME_SIZE);
   frame.set(SENTINEL_BYTES, 0);
   frame.set(bchHeader, SENTINEL_SIZE);
-  for (let b = 0; b < PAYLOAD_BLOCKS; b++) {
-    const chunk = fullPayload.slice(b * RS_BLOCK_DATA, (b + 1) * RS_BLOCK_DATA);
-    frame.set(rsEncode(chunk), SENTINEL_SIZE + BCH_HEADER_SIZE + b * RS_BLOCK_SIZE);
+  const rsStart = SENTINEL_SIZE + BCH_HEADER_SIZE;
+  for (let idx = 0; idx < RS_BLOCK_SIZE; idx++) {
+    for (let b = 0; b < PAYLOAD_BLOCKS; b++) {
+      frame[rsStart + idx * PAYLOAD_BLOCKS + b] = rsBlocks[b][idx];
+    }
   }
 
   return frame;
@@ -299,15 +324,18 @@ export function decodeFrame(frame: Uint8Array): DecodedFrame {
     };
   }
 
-  // 5. RS(52,40) decode each block
+  // 5. De-stripe the RS region back into contiguous blocks, then RS(52,40)
+  // decode each block (inverse of the stripe in encodeFrame above).
   const rsStart = SENTINEL_SIZE + BCH_HEADER_SIZE;
   const payload = new Uint8Array(PAYLOAD_DATA_SIZE);
   const rsBlockErrors: number[] = [];
   let allBlocksValid = true;
   for (let b = 0; b < PAYLOAD_BLOCKS; b++) {
-    const rsResult = rsDecode(
-      frame.slice(rsStart + b * RS_BLOCK_SIZE, rsStart + (b + 1) * RS_BLOCK_SIZE),
-    );
+    const block = new Uint8Array(RS_BLOCK_SIZE);
+    for (let idx = 0; idx < RS_BLOCK_SIZE; idx++) {
+      block[idx] = frame[rsStart + idx * PAYLOAD_BLOCKS + b];
+    }
+    const rsResult = rsDecode(block);
     rsBlockErrors.push(rsResult.errors);
     payload.set(rsResult.data.slice(0, RS_BLOCK_DATA), b * RS_BLOCK_DATA);
     if (!rsResult.valid || rsResult.errors < 0) allBlocksValid = false;

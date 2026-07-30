@@ -24,6 +24,7 @@ import {
   FRAME_TYPE_PAYLOAD,
   FRAME_TYPE_TAIL,
   FRAME_TYPE_PROFILE,
+  HEADER_FRAME_REPEATS,
 } from '../protocol/atomicFrame';
 import { BPSKModulator, type BPSKModulatorConfig } from '../modulation/BPSKModulator';
 import { OFDMEngine } from './ofdmEngine';
@@ -265,10 +266,13 @@ export class TxEngine {
       }
     }
 
-    // 2. Header frame (type 0x01) — repeat if diversity mode
+    // 2. Header frame (type 0x01) — repeated at least HEADER_FRAME_REPEATS
+    // times unconditionally (a lost header kills the whole transfer), or
+    // `repeats` times when diversity mode already sends more than that.
     const headerPayload = this.buildHeaderPayload(fileName, data.length, schemeId, origSize);
     const headerFrame = modulate({ type: FRAME_TYPE_HEADER, seqNum: 0, totalFrames, crc: 0 }, headerPayload);
-    for (let r = 0; r < repeats; r++) yield headerFrame;
+    const headerRepeats = Math.max(repeats, HEADER_FRAME_REPEATS);
+    for (let r = 0; r < headerRepeats; r++) yield headerFrame;
 
     // 3. Data frames (type 0x02) — repeat if diversity mode
     const dataFrames = this.splitDataIntoFrames(data);
@@ -329,7 +333,9 @@ export class TxEngine {
   estimateStreamSamples(dataLen: number): number {
     const symLen = this.getSymbolLengthInSamples();
     const repeats = this.cfg.diversityMode ? 3 : 1;
+    const headerRepeats = Math.max(repeats, HEADER_FRAME_REPEATS);
     const totalFrames = this.calcFrameCount(dataLen); // header + data + tail
+    const dataAndTailFrames = totalFrames - 1; // everything except the header
     let symbolsPerFrame: number;
     if (this.useOFDM && this.ofdmEngine) {
       const blockCount = Math.max(1, Math.floor(this.cfg.toneCount / 4));
@@ -341,9 +347,23 @@ export class TxEngine {
       this.useOFDM && this.ofdmEngine
         ? (OFDM_TUNING.syncBurstSymbols + OFDM_TUNING.trainingSymbols) * symLen
         : this.transmitPreamble().length;
-    const frameSamples = totalFrames * repeats * symbolsPerFrame * symLen;
+    // Header is repeated `headerRepeats` times (>= HEADER_FRAME_REPEATS,
+    // unconditionally); data + tail frames repeated `repeats` times each
+    // (diversity mode only).
+    const frameSamples =
+      (headerRepeats + dataAndTailFrames * repeats) * symbolsPerFrame * symLen;
+    // Link-profile frame (Phase 4, flag-gated): sent PROFILE_FRAME_REPEATS
+    // times at the base rate, plus OFDM_TUNING.qamRefSymbols training symbols
+    // when the announced qamMap uses anything above QPSK.
+    let profileSamples = 0;
+    if (this.emitLinkProfile) {
+      profileSamples += PROFILE_FRAME_REPEATS * symbolsPerFrame * symLen;
+      if (this.useOFDM && this.qamMap && !qamMapToOrders(this.qamMap).every((o) => o === 2)) {
+        profileSamples += OFDM_TUNING.qamRefSymbols * symLen;
+      }
+    }
     const silence = OFDM_TUNING.tailSilenceSymbols * symLen;
-    return preambleSamples + frameSamples + silence;
+    return preambleSamples + frameSamples + profileSamples + silence;
   }
 
   /**
