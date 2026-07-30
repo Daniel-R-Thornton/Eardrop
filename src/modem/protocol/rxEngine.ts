@@ -555,15 +555,20 @@ export class RxEngine {
           } else {
             // Probe failed - log for diagnostics
             dlog('OFDM-SYNC', { chirpProbeFail: true, score: probe.score, sharpness: probe.sharpness, offset: probe.offset, bufLen: this.ofdmAlignBuf.length });
-            // Safety valve: if the chirp probe stays stuck for many symbols,
-            // the detected chirp is probably stale or the buffer is corrupt.
-            // Fall back to energy-based sync rather than re-probing forever.
-            if (samplesAfterChirp > this.sps * 16) {
-              dlog('OFDM-SYNC', { chirpProbeTimeout: true, samplesAfterChirp }, { level: 'warn' });
-              this.chirpDetected = false;
-              this.chirpEndSample = -1;
-            }
           }
+        }
+        // Safety valve: if the chirp probe stays stuck for many symbols, the
+        // detected chirp is probably stale or the buffer is corrupt. Fall
+        // back to energy-based sync rather than re-probing forever. This
+        // must run every sample (NOT gated by chirpProbeTick above) — only
+        // the expensive probe itself is throttled; samplesAfterChirp keeps
+        // incrementing every sample regardless, so the timeout has to be
+        // checked at the same cadence or it can fire up to sps-1 samples
+        // late.
+        if (samplesAfterChirp > this.sps * 16) {
+          dlog('OFDM-SYNC', { chirpProbeTimeout: true, samplesAfterChirp }, { level: 'warn' });
+          this.chirpDetected = false;
+          this.chirpEndSample = -1;
         }
       }
 
