@@ -62,3 +62,28 @@ test('dataQamBits=4 without OFDM: never emits link profile', () => {
   expect(cfg.emitLinkProfile).toBeFalsy();
   expect(cfg.qamMap).toBeUndefined();
 });
+
+// ─── toneStartHz snapping (same reasoning as pilotFreqHz above) ───────────
+
+test('toneStartHz omitted: defaults to 2000Hz, already bin-aligned', () => {
+  const cfg = buildModemConfig(UI);
+  expect(cfg.toneStartHz).toBe(2000);
+});
+
+test('toneStartHz off the 50Hz bin grid gets snapped to the nearest bin', () => {
+  const cfg = buildModemConfig({ ...UI, toneStartHz: 1025 });
+  // 48000/960 = 50Hz bins; 1025 is 0.5 bins off, rounds to the nearest (1050).
+  expect(cfg.toneStartHz).toBe(1050);
+});
+
+test('toneStartHz below the 600Hz floor is snapped, then floor-clamped', () => {
+  const cfg = buildModemConfig({ ...UI, toneStartHz: 100 });
+  expect(cfg.toneStartHz).toBe(600);
+});
+
+test('toneStartHz snapping is skipped for non-OFDM configs', () => {
+  const cfg = buildModemConfig({ ...UI, useOFDM: false, toneStartHz: 1025 });
+  // Not OFDM: no FFT-bin invariant to preserve, so the value passes through
+  // unsnapped (still floor-clamped against the separation guard).
+  expect(cfg.toneStartHz).toBe(1025);
+});

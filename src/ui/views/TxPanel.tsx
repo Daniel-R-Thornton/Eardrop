@@ -200,6 +200,7 @@ export function TxPanel() {
                 max={2000}
                 step={50}
                 value={s.toneStartHz}
+                disabled={s.speedTestRunning}
                 onChange={(e) => setState({ toneStartHz: Number(e.target.value) })}
               />
             </label>

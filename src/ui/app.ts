@@ -1251,8 +1251,12 @@ async function runSpeedTest() {
   // the search happened to be carrying).
   //
   // The pilot is keyed post-snap, since that is the config that actually runs.
+  // toneStartHz is read live from state per trial (see runOnce), not carried
+  // on Combo itself — but the cache still has to key on it, or dragging the
+  // slider mid-hunt makes a later re-probe of an otherwise-identical combo
+  // silently reuse a result computed under a different tone grid.
   const keyOf = (c: Combo) =>
-    `${c.toneCount}|${c.micGain}|${snapPilot(c.pilotFreqHz)}|${c.qamBits}|${c.qamScale}`;
+    `${c.toneCount}|${c.micGain}|${snapPilot(c.pilotFreqHz)}|${c.qamBits}|${c.qamScale}|${state.toneStartHz}`;
 
   let currentCombo = 0;
   let lastMicGain: number | null = null;

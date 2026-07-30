@@ -52,16 +52,29 @@ export function buildModemConfig(
 
   const toneCount = ui.toneCount || DEFAULT_CONFIG.toneCount;
 
-  // Tone-grid start offset above the pilot. Clamp defensively so a config
-  // that somehow slips below the minimum separation can't alias the lowest
-  // data tone onto the pilot — ofdmToneFrequencies() enforces the same floor,
-  // so this is belt-and-braces, not the only guard.
-  const toneStartHz = Math.max(
-    MIN_TONE_START_HZ,
+  // Tone-grid start offset above the pilot. Same reasoning as the pilot snap
+  // above: every tone needs integer cycles per FFT window, so toneStartHz
+  // must land on a whole multiple of the bin spacing too — the UI slider's
+  // 50Hz step already guarantees this, but any other ModemUiConfig producer
+  // (persisted state, a script, a test) could hand in an arbitrary value.
+  // Snap first, then floor-clamp so a config that somehow slips below the
+  // minimum separation can't alias the lowest data tone onto the pilot —
+  // ofdmToneFrequencies() enforces the same floor too, so this is
+  // belt-and-braces, not the only guard.
+  let toneStartHz =
     typeof ui.toneStartHz === 'number' && Number.isFinite(ui.toneStartHz)
       ? ui.toneStartHz
-      : OFDM_DEFAULTS.toneStartHz,
-  );
+      : OFDM_DEFAULTS.toneStartHz;
+  if (ui.useOFDM) {
+    const { fftSamples } = ofdmSamples(ui.hwSampleRate);
+    const binHz = ui.hwSampleRate / fftSamples;
+    const snappedStart = Math.round(toneStartHz / binHz) * binHz;
+    if (snappedStart !== toneStartHz) {
+      dlog('CONFIG', { note: 'toneStartSnapped', from: toneStartHz, to: snappedStart, binHz, fftSamples });
+      toneStartHz = snappedStart;
+    }
+  }
+  toneStartHz = Math.max(MIN_TONE_START_HZ, toneStartHz);
 
   // Phase 3 per-tone QAM (bit-loading): a 2-bit profile code applied to every
   // tone. Default (2 bits = QPSK) must NEVER emit a link profile — the
