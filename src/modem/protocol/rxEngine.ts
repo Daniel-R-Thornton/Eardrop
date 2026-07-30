@@ -131,10 +131,13 @@ export class RxEngine {
   // room noise at 0.2-0.3 slow-rises to ~0.3 (thr≈0.9, suppressed).
   private ofdmNoiseEma = 0.07;
   private readonly OFDM_EMA_SEED = 0.07;
-  /** Windows processed since OFDM sync detection (sync-loss watchdog) */
+  /**
+   * Windows processed since the last VALID (CRC-passing) decoded frame —
+   * sliding sync-loss watchdog (3b). Reset on every valid frame in
+   * processFrame(), NOT gated by an "any frame ever seen" latch — a single
+   * garbage/false-lock frame must not permanently disarm it (see below).
+   */
   private ofdmWindowsSinceDetect = 0;
-  /** Whether the scanner produced a frame since the last OFDM detection */
-  private ofdmFrameSeen = false;
   /** Watchdog: reset to WAITING if no frame within this many windows (~15 s at any rate) */
   private get OFDM_WATCHDOG_WINDOWS() {
     return Math.round(15000 / (OFDM_SYMBOL_MS + OFDM_CP_MS));
@@ -169,7 +172,13 @@ export class RxEngine {
   private fileSchemeId = 0;
   /** Phase 6 compression: original (pre-compression) size carried in the header. */
   private fileOrigSize = 0;
-  private fileData: number[] = [];
+  /**
+   * Wire-byte assembly buffer — preallocated to fileSize on header receipt
+   * and written seq-placed (see processPayload) rather than append-in-
+   * arrival-order, so a lost/reordered payload frame can't silently shift
+   * later bytes into the wrong offset (see receivedPayloadSeqs / 3a).
+   */
+  private fileData: Uint8Array = new Uint8Array(0);
   private totalFrames = 0;
   private framesReceived = 0;
 
@@ -225,6 +234,22 @@ export class RxEngine {
    * as generic-rate content (see FRAME_TYPE_PROFILE handling in processFrame).
    */
   private profileFramesSeen = 0;
+  /**
+   * 3e: profile awaiting commit after its FIRST valid decode — see the long
+   * comment at the FRAME_TYPE_PROFILE case. Non-null while a switch is
+   * armed but not yet applied; the countdown below decides when it fires.
+   */
+  private profileSwitchPending: LinkProfile | null = null;
+  /**
+   * Windows still to pass before the pending profile switch is applied —
+   * one base-rate profile-frame's worth, so a still-incoming (or garbled)
+   * second copy's audio is fully behind us before the demod's tone orders
+   * change. Cancelled early (see applyProfileSwitch) if the second copy
+   * decodes validly first, matching the pre-3e timing exactly.
+   */
+  private profileSwitchCountdown = 0;
+  /** True once the tone-order switch has been applied for this sync (dedup — see 3e). */
+  private profileSwitchApplied = false;
   /**
    * Countdown of QAM reference symbols (see OFDM_TUNING.qamRefSymbols) still
    * to consume right after a non-all-QPSK profile switch. While > 0, each
@@ -289,7 +314,6 @@ export class RxEngine {
 
     this.scanner.onFrame = (frame: Uint8Array) => {
       dlog('RX', { scanFrame: frame.length });
-      this.ofdmFrameSeen = true;
       this.processFrame(frame);
     };
   }
@@ -419,6 +443,11 @@ export class RxEngine {
         const trainingTail = this.ofdmAlignBuf.slice(trainingStart);
         const probe = this.findOfdmBlockStart(trainingTail);
         if (probe.offset >= 0 && probe.score >= OFDM_TUNING.cpCorrelationMinScore && probe.sharpness >= OFDM_TUNING.cpCorrelationMinSharpness) {
+          // 3f: capture pre-clear values for the diagnostic log below — both
+          // ofdmAlignBuf and chirpEndSample get cleared/reset in this same
+          // block, so logging them afterward (as before) always printed 0/-1.
+          const chirpEndSampleAtHandoff = this.chirpEndSample;
+          const ofdmAlignBufLenAtHandoff = this.ofdmAlignBuf.length;
           this.chirpDetected = false;
           this.chirpEndSample = -1;
           // CP correlation reports offsets modulo one symbol. A peak near the
@@ -433,9 +462,20 @@ export class RxEngine {
           this.ofdmAlignBuf = [];
           this.ofdmSyncFrames = 0;
           this.state = RxState.FRAMES;
-          this.ofdmFrameSeen = false;
+          this.ofdmWindowsSinceDetect = 0;
           this.ofdmTrainingSymbols = 0;
           this.ofdmDemod!.resetTraining();
+          // 3c: same file-assembly + dedup resets the energy-sync path does
+          // (below) — without these, a retry of the SAME fileID right after
+          // a chirp-handoff resync was silently swallowed by processHeader's
+          // dup-header check (fileID===this.fileID && fileName!=='').
+          this.fileData = new Uint8Array(0);
+          this.fileID = 0;
+          this.fileName = '';
+          this.fileSize = 0;
+          this.totalFrames = 0;
+          this.framesReceived = 0;
+          this.receivedPayloadSeqs = new Set();
           // Phase 4: new sync detected — reset to the base link profile.
           this.resetLinkProfile();
           dlog('OFDM-SYNC', {
@@ -443,9 +483,9 @@ export class RxEngine {
             boundary: signedBoundary,
             trainingSamples,
             score: probe.score,
-            bufLenBeforeReplace: this.ofdmAlignBuf.length - alignedStart,
+            bufLenBeforeReplace: ofdmAlignBufLenAtHandoff - alignedStart,
             samplesSeenAtHandoff: this.samplesSeen,
-            chirpEndSample: this.chirpEndSample,
+            chirpEndSample: chirpEndSampleAtHandoff,
             ofdmSkipValue: this.ofdmSkip,
           });
           return;
@@ -518,9 +558,8 @@ export class RxEngine {
           // Signal detected! Enter FRAMES state.
           dlog('OFDM-SYNC', { detected: true, e: dlogFmt(totalE) });
           this.ofdmWindowsSinceDetect = 0;
-          this.ofdmFrameSeen = false;
           this.state = RxState.FRAMES;
-          this.fileData = [];
+          this.fileData = new Uint8Array(0);
           this.framesReceived = 0;
           this.receivedPayloadSeqs = new Set();
           this.fileID = 0;
@@ -748,7 +787,7 @@ export class RxEngine {
         if (this.guardFrames >= 2) {
           RxEngine.rxLog('[FRAMES] entering data decode');
           this.state = RxState.FRAMES;
-          this.fileData = [];
+          this.fileData = new Uint8Array(0);
           this.framesReceived = 0;
           this.receivedPayloadSeqs = new Set();
           this.fileID = 0;
@@ -768,8 +807,14 @@ export class RxEngine {
     if (this.useOFDM && this.ofdmDemod) {
       // Sync-loss watchdog: a false trigger (or missed frame) previously left
       // the receiver stuck in FRAMES forever, deaf to the next transmission.
+      // 3b: this now fires purely on "no VALID frame in N windows" — it used
+      // to be permanently disarmed by a single garbage/false-lock frame (any
+      // scanner frame, even one that fails CRC, used to set ofdmFrameSeen
+      // and never clear it). ofdmWindowsSinceDetect is reset to 0 on every
+      // CRC-valid decode in processFrame(), which is the only thing that
+      // should keep this watchdog quiet.
       this.ofdmWindowsSinceDetect++;
-      if (!this.ofdmFrameSeen && this.ofdmWindowsSinceDetect > this.OFDM_WATCHDOG_WINDOWS) {
+      if (this.ofdmWindowsSinceDetect > this.OFDM_WATCHDOG_WINDOWS) {
         dlog('OFDM-SYNC', { watchdogReset: true, windows: this.ofdmWindowsSinceDetect }, { level: 'warn' });
         this.state = RxState.WAITING;
         this.ofdmSyncFrames = 0;
@@ -807,6 +852,21 @@ export class RxEngine {
       // Count how many data symbols we're processing — helps debug why only
       // one symbol was decoded before buffer ran dry.
       this.ofdmDataSymbolCounter = (this.ofdmDataSymbolCounter ?? 0) + 1;
+
+      // 3e: advance the armed-but-not-yet-committed profile switch. Waits
+      // exactly one base-rate profile-frame's worth of windows (reserving
+      // the slot the second copy would occupy, present or not) before
+      // committing — see applyProfileSwitch's caller in processFrame for
+      // why this can't just switch immediately on the first valid decode.
+      if (this.profileSwitchPending && !this.profileSwitchApplied) {
+        if (this.profileSwitchCountdown > 0) {
+          this.profileSwitchCountdown--;
+        } else {
+          const pending = this.profileSwitchPending;
+          this.profileSwitchPending = null;
+          this.applyProfileSwitch(pending);
+        }
+      }
 
       // OFDM demodulation — FFT + per-tone equalization + slicing.
       const result = this.ofdmDemod.demodulate(window);
@@ -963,7 +1023,7 @@ export class RxEngine {
       }
     } else if (this.dbgFrameCount % 50 === 0) {
       RxEngine.rxLog(
-        `[RX] Frame ${this.dbgFrameCount}: ${this.fileData.length}B assembled (${this.framesReceived} payload frames)`,
+        `[RX] Frame ${this.dbgFrameCount}: ${this.receivedByteCount()}B assembled (${this.framesReceived} payload frames)`,
       );
     }
 
@@ -1018,11 +1078,61 @@ export class RxEngine {
     this.qamSymbolCounter = 0;
     this.profileFramesSeen = 0;
     this.qamRefPending = 0;
+    this.profileSwitchPending = null;
+    this.profileSwitchCountdown = 0;
+    this.profileSwitchApplied = false;
     // If tone count changed during reset, rebuild the demodulator to match.
     if (oldToneCount !== this.ofdmToneCount) {
       dlog('RX-OFDM', { toneCountChange: true, from: oldToneCount, to: this.ofdmToneCount }, { level: 'info' });
       this.initOfdmDemod();
     }
+  }
+
+  /**
+   * Windows one atomic frame spans at the CURRENT (base/legacy) rate — i.e.
+   * the wire-time of one PROFILE copy, since profile frames are always sent
+   * at the base rate. Used by the 3e switch-countdown to know how long a
+   * (possibly lost/garbled) second copy would occupy.
+   */
+  private baseRateWindowsPerFrame(): number {
+    const blockCount = Math.max(1, Math.floor(this.ofdmToneCount / 4));
+    return Math.ceil(FRAME_SIZE / blockCount);
+  }
+
+  /**
+   * Commit a profile's tone-order switch — the single point where RX
+   * changes how it demodulates header/data/tail (see the FRAME_TYPE_PROFILE
+   * case and the 3e countdown in feedSample for WHEN this is called).
+   */
+  private applyProfileSwitch(profile: LinkProfile): void {
+    this.toneOrders = qamMapToOrders(profile.qamMap);
+    this.allQpsk = this.toneOrders.every((o) => o === 2);
+    this.ofdmDemod?.setToneOrders(this.toneOrders);
+    // QAM reference symbols (see OFDM_TUNING.qamRefSymbols doc): TX only
+    // inserts these when some tone is above QPSK, so only wait for them in
+    // that case — an all-QPSK stream is unaffected.
+    this.qamRefPending = this.allQpsk ? 0 : OFDM_TUNING.qamRefSymbols;
+    dlog('RX-PROFILE', {
+      t: profile.toneCount,
+      eccT: profile.eccT,
+      qam: profile.qamMap.join(','),
+      ord: this.toneOrders.join(','),
+    });
+    // Every subsequent frame (header/data/tail) is FRAME_SIZE bytes at this
+    // same (now-fixed) rate, so it spans a constant symbol count — reset
+    // the generic bit-serializer's frame-boundary tracking (see
+    // qamSymbolsPerFrame's doc) so tail zero-padding never bleeds into the
+    // next frame's byte alignment.
+    if (this.allQpsk) {
+      this.qamSymbolsPerFrame = 0;
+    } else {
+      const bitsPerSymbol = this.toneOrders.reduce((a, b) => a + b, 0);
+      this.qamSymbolsPerFrame = Math.ceil((FRAME_SIZE * 8) / bitsPerSymbol);
+    }
+    this.qamSymbolCounter = 0;
+    this.qamBitAcc = 0;
+    this.qamBitCount = 0;
+    this.profileSwitchApplied = true;
   }
 
   /** Frame-assembly progress snapshot for telemetry. */
@@ -1040,7 +1150,9 @@ export class RxEngine {
       totalFrames: this.totalFrames,
       fileName: this.fileName,
       fileSize: this.fileSize,
-      bytesAssembled: this.fileData.length,
+      // 3a: derived from the received-seq set, not fileData.length — the
+      // buffer is now preallocated to fileSize up front (see processHeader).
+      bytesAssembled: this.receivedByteCount(),
     };
   }
 
@@ -1178,7 +1290,7 @@ export class RxEngine {
     if (this.useOFDM) {
       this.initOfdmDemod();
     }
-    this.fileData = [];
+    this.fileData = new Uint8Array(0);
     this.framesReceived = 0;
     this.receivedPayloadSeqs = new Set();
     this.fileName = '';
@@ -1275,6 +1387,12 @@ export class RxEngine {
       return;
     }
 
+    // 3b: sliding sync-loss watchdog — reset on every VALID (CRC-passing)
+    // frame, not just "any frame the scanner ever produced" (see the
+    // watchdog check above, which used to be permanently disarmed by one
+    // garbage/false-lock frame).
+    this.ofdmWindowsSinceDetect = 0;
+
     if (decoded.header!.totalFrames > 0) this.totalFrames = decoded.header!.totalFrames;
 
     switch (decoded.header!.type) {
@@ -1285,7 +1403,7 @@ export class RxEngine {
         this.processPayload(decoded.payload, decoded.header!.seqNum);
         break;
       case FRAME_TYPE_TAIL:
-        dlog('RX-FRAME', { tail: true, assembled: this.fileData.length, size: this.fileSize });
+        dlog('RX-FRAME', { tail: true, assembled: this.receivedByteCount(), size: this.fileSize });
         this.processTail();
         break;
       case FRAME_TYPE_PROFILE: {
@@ -1330,44 +1448,36 @@ export class RxEngine {
         }
         this.linkProfile = profile;
         this.profileFramesSeen++;
-        // TX sends PROFILE_FRAME_REPEATS identical copies, ALL at the base
-        // rate, before switching its own modulator (see txEngine's
-        // frameSegments). RX must wait for the SAME count before switching
-        // its demod — switching after the first copy would misdemodulate
-        // the second (still base-rate, on the wire) copy with the wrong
-        // slicer. This is THE single RX-side switch point: everything
-        // after it (header, data, tail) demodulates at the announced
-        // per-tone orders until the next reset (see resetLinkProfile).
-        if (this.profileFramesSeen >= PROFILE_FRAME_REPEATS) {
-          this.toneOrders = qamMapToOrders(profile.qamMap);
-          this.allQpsk = this.toneOrders.every((o) => o === 2);
-          this.ofdmDemod?.setToneOrders(this.toneOrders);
-          // QAM reference symbols (see OFDM_TUNING.qamRefSymbols doc): TX
-          // only inserts these when some tone is above QPSK, so only wait
-          // for them in that case — an all-QPSK stream is unaffected.
-          this.qamRefPending = this.allQpsk ? 0 : OFDM_TUNING.qamRefSymbols;
-          dlog('RX-PROFILE', { 
-            t: profile.toneCount,
-            eccT: profile.eccT,
-            qam: profile.qamMap.join(','), 
-            ord: qamMapToOrders(profile.qamMap).join(','),
-          });
-          // Every subsequent frame (header/data/tail) is FRAME_SIZE bytes
-          // at this same (now-fixed) rate, so it spans a constant symbol
-          // count — reset the generic bit-serializer's frame-boundary
-          // tracking (see qamSymbolsPerFrame's doc) so tail zero-padding
-          // never bleeds into the next frame's byte alignment.
-          if (this.allQpsk) {
-            this.qamSymbolsPerFrame = 0;
+        // 3e: TX always sends PROFILE_FRAME_REPEATS identical copies, ALL at
+        // the base rate, before switching its own modulator. Requiring BOTH
+        // to decode (the old `profileFramesSeen >= PROFILE_FRAME_REPEATS`
+        // gate) meant one lost/garbled copy left RX on the default profile
+        // forever — misdemodulating the entire rest of the transfer. A
+        // profile frame is CRC-protected, so a single valid decode is
+        // trustworthy on its own; but switching the demod's tone orders
+        // right away would be WRONG whenever the second copy's audio is
+        // still physically incoming (still base-rate on the wire) — RX
+        // would slice it with the new (mismatched) order and desync the
+        // generic bit-serializer's frame-boundary tracking for everything
+        // after it. So: arm the switch on the FIRST valid decode, but only
+        // *commit* it once we've either (a) seen the natural second decode
+        // (today's exact timing — the common, lossless case), or (b) let
+        // exactly one more base-rate profile-frame's worth of OFDM windows
+        // elapse without one (see the countdown in feedSample) — i.e. the
+        // point where the second copy's audio, present or not, is behind
+        // us. See applyProfileSwitch() / profileSwitchCountdown.
+        if (!this.profileSwitchApplied) {
+          if (this.profileFramesSeen <= 1) {
+            this.profileSwitchPending = profile;
+            this.profileSwitchCountdown = this.baseRateWindowsPerFrame();
+            dlog('RX-PROFILE', { armed: true, countdownWindows: this.profileSwitchCountdown });
           } else {
-            const bitsPerSymbol = this.toneOrders.reduce((a, b) => a + b, 0);
-            this.qamSymbolsPerFrame = Math.ceil((FRAME_SIZE * 8) / bitsPerSymbol);
+            // Natural second copy decoded — switch now (unchanged timing).
+            this.profileSwitchPending = null;
+            this.applyProfileSwitch(profile);
           }
-          this.qamSymbolCounter = 0;
-          this.qamBitAcc = 0;
-          this.qamBitCount = 0;
         } else {
-          dlog('RX-PROFILE', { waitingForRepeats: this.profileFramesSeen + '/' + PROFILE_FRAME_REPEATS });
+          dlog('RX-PROFILE', { alreadySwitched: true });
         }
         break;
       }
@@ -1434,10 +1544,28 @@ export class RxEngine {
     this.fileName = name;
     this.fileSchemeId = schemeId;
     this.fileOrigSize = origSize;
-    this.fileData = [];
+    // 3a: preallocate the exact wire size — payload frames write seq-placed
+    // (see processPayload), so a lost frame can never shift later bytes.
+    this.fileData = new Uint8Array(totalSize);
     this.receivedPayloadSeqs = new Set();
     this.framesReceived = 1; // header frame counts toward progress
     dlog('RX-COMP', { scheme: schemeId, wire: totalSize, orig: origSize });
+  }
+
+  /** Number of DATA frames expected between header and tail (0 if unknown/degenerate). */
+  private expectedDataFrameCount(): number {
+    return Math.max(0, this.totalFrames - 2);
+  }
+
+  /** Bytes actually placed so far, derived from the received-seq set (not fileData.length — see 3a). */
+  private receivedByteCount(): number {
+    let bytes = 0;
+    for (const seq of this.receivedPayloadSeqs) {
+      const offset = (seq - 1) * PAYLOAD_DATA_SIZE;
+      if (offset >= this.fileSize) continue;
+      bytes += Math.min(PAYLOAD_DATA_SIZE, this.fileSize - offset);
+    }
+    return bytes;
   }
 
   private processPayload(payload: Uint8Array, seqNum: number): void {
@@ -1450,14 +1578,22 @@ export class RxEngine {
     }
     this.receivedPayloadSeqs.add(seqNum);
 
-    for (let i = 0; i < payload.length && this.fileData.length < this.fileSize; i++) {
-      this.fileData.push(payload[i]);
+    // 3a: seq-placed write — offset is derived from the wire seq number
+    // (payload seq 1 == first data frame; see txEngine's frameSegments),
+    // NOT from arrival order, so a dropped frame can't shift later bytes.
+    const offset = (seqNum - 1) * PAYLOAD_DATA_SIZE;
+    if (offset < 0 || offset >= this.fileSize) {
+      dlog('RX-FRAME', { badPayloadSeq: seqNum, offset }, { level: 'warn' });
+      this.framesReceived++;
+      return;
     }
+    const writeLen = Math.min(payload.length, this.fileSize - offset);
+    this.fileData.set(payload.subarray(0, writeLen), offset);
     this.framesReceived++;
   }
 
   private processTail(): void {
-    if (!this.fileName || this.fileData.length === 0) {
+    if (!this.fileName || this.fileSize === 0) {
       // Duplicate tail (diversity mode) — already handled, or no data yet
       return;
     }
@@ -1468,7 +1604,24 @@ export class RxEngine {
       return;
     }
 
-    const wireData = new Uint8Array(this.fileData.slice(0, this.fileSize));
+    // 3a: only deliver if every expected payload seq actually arrived —
+    // otherwise a lost frame would silently leave its byte range zeroed
+    // (preallocated Uint8Array) and produce a corrupt-but-"COMPLETE" file.
+    const expected = this.expectedDataFrameCount();
+    const missing: number[] = [];
+    for (let seq = 1; seq <= expected; seq++) {
+      if (!this.receivedPayloadSeqs.has(seq)) missing.push(seq);
+    }
+    if (missing.length > 0) {
+      dlog(
+        'RX-FAIL',
+        { incompleteTail: true, missing: missing.join(','), received: this.receivedPayloadSeqs.size, expected },
+        { level: 'warn' },
+      );
+      return;
+    }
+
+    const wireData = this.fileData;
 
     // Decompression is deferred to the consumer (ModemService), because gzip
     // uses the async CompressionStream API. Hand up the wire bytes + scheme.
@@ -1480,9 +1633,29 @@ export class RxEngine {
       origSize: this.fileOrigSize || this.fileSize,
     };
     this.framesReceived++;
-    this.state = RxState.COMPLETE;
     this.fileName = '';
-    this.fileData = [];
+    this.fileData = new Uint8Array(0);
+    // 3d: return to WAITING so the next transmission's chirp/energy
+    // detection can run (COMPLETE previously stuck the engine forever) —
+    // OFDM only, mirroring the watchdog reset's resets EXCEPT
+    // resetLinkProfile(): getLinkProfile() must keep reporting the
+    // just-finished transfer's profile (same "retain until the next thing
+    // arrives" contract as completedFile/getFile()) — the next sync
+    // detection (chirp handoff / energy path) already resets it once a new
+    // transmission actually starts. The fragile BPSK path is left exactly
+    // as it was (state = COMPLETE).
+    if (this.useOFDM && this.ofdmDemod) {
+      this.state = RxState.WAITING;
+      this.ofdmSyncFrames = 0;
+      this.ofdmNoiseEma = this.OFDM_EMA_SEED;
+      this.ofdmTrainingSymbols = 0;
+      this.ofdmDemod.discardMER();
+      this.ofdmDemod.resetTraining();
+      this.buf = [];
+      this.ofdmAlignBuf = [];
+    } else {
+      this.state = RxState.COMPLETE;
+    }
   }
 
   getDebugSnapshot() {
