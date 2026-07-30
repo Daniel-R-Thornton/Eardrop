@@ -68,15 +68,28 @@ export class TxEngine {
    */
   private qamMap: number[] | undefined;
   private qamScaleOverride: number | undefined;
+  private toneGains: number[] | undefined;
+  /**
+   * Settle symbols emitted before the training symbols. The RX must discard
+   * exactly this many (see OFDM_TUNING.trainingSettleSymbols) — the receiver
+   * finds the preamble/data boundary by counting and nothing else.
+   */
+  private settleSymbols: number;
 
   constructor(
-    cfg: Partial<ModemConfig> & { useOFDM?: boolean; emitLinkProfile?: boolean; qamMap?: number[]; qamScaleOverride?: number } = {},
+    cfg: Partial<ModemConfig> & { useOFDM?: boolean; emitLinkProfile?: boolean; qamMap?: number[]; qamScaleOverride?: number; toneGains?: number[];
+      trainingSettleSymbols?: number } = {},
   ) {
     // Check for OFDM flag before merging into ModemConfig
     this.useOFDM = (cfg as any).useOFDM === true;
     this.emitLinkProfile = (cfg as any).emitLinkProfile === true;
     this.qamMap = (cfg as any).qamMap;
     this.qamScaleOverride = (cfg as any).qamScaleOverride;
+    this.toneGains = (cfg as any).toneGains;
+    const settleOverride = (cfg as any).trainingSettleSymbols;
+    this.settleSymbols = typeof settleOverride === 'number' && Number.isFinite(settleOverride)
+      ? Math.max(0, Math.round(settleOverride))
+      : OFDM_TUNING.trainingSettleSymbols;
 
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
     const offsets = this.cfg.musical ? [87.5, 162.5, 287.5, 487.5] : TONE_OFFSETS;
@@ -114,6 +127,7 @@ export class TxEngine {
         pilotAmplitude: OFDM_DEFAULTS.pilotAmplitude,
         toneCount: this.cfg.toneCount,
         qamScaleOverride: this.qamScaleOverride,
+        toneGains: this.toneGains,
         toneStartHz: this.cfg.toneStartHz,
       });
     }
@@ -210,16 +224,26 @@ export class TxEngine {
 
     // 1. Preamble: chirp (sync) + training symbols (channel est)
     if (this.useOFDM && this.ofdmEngine) {
-      const syncCount = OFDM_TUNING.syncBurstSymbols;
-      const trainCount = OFDM_TUNING.trainingSymbols;
-      const { chirp } = this.ofdmEngine.generateChirpBurst(syncCount);
-      const training = this.ofdmEngine.generateTrainingSymbols(trainCount);
-      const combined = new Float32Array(chirp.length + training.length);
+      // Settle symbols first, then the ones the RX actually trains on — see
+      // OFDM_TUNING.trainingSettleSymbols. The RX discards exactly the same
+      // count, so both sides must read it from there.
+      // Chirp length is its own lever — see OFDM_TUNING.chirpSymbols. Tying it
+      // to the sync-burst pool meant raising the settle period lengthened the
+      // chirp, i.e. more of the thing the settle period exists to recover from.
+      const { chirp } = this.ofdmEngine.generateChirpBurst(OFDM_TUNING.chirpSymbols);
+      // Settle symbols carry VARYING data and are discarded by the RX; only the
+      // training symbols that follow are identical. See generateSettleSymbols
+      // for why a stationary settle period breaks the channel estimate.
+      const settle = this.ofdmEngine.generateSettleSymbols(this.settleSymbols);
+      const training = this.ofdmEngine.generateTrainingSymbols(OFDM_TUNING.trainingSymbols);
+      const combined = new Float32Array(chirp.length + settle.length + training.length);
       combined.set(chirp, 0);
-      combined.set(training, chirp.length);
+      combined.set(settle, chirp.length);
+      combined.set(training, chirp.length + settle.length);
       dlog('TX-OFDM', {
         chirpSamples: chirp.length,
-        trainingSymbols: trainCount,
+        trainingSymbols: OFDM_TUNING.trainingSymbols,
+        settleSymbols: this.settleSymbols,
         preambleMs: Math.round((combined.length / (this.cfg.sampleRate || 48000)) * 1000),
       });
       yield combined;
@@ -353,7 +377,12 @@ export class TxEngine {
     }
     const preambleSamples =
       this.useOFDM && this.ofdmEngine
-        ? (OFDM_TUNING.syncBurstSymbols + OFDM_TUNING.trainingSymbols) * symLen
+        // chirpSymbols, not syncBurstSymbols — this must mirror what the
+        // preamble actually emits (chirp + settle + training), or the
+        // speed-test's duration estimate drifts from reality.
+        ? (OFDM_TUNING.chirpSymbols
+            + OFDM_TUNING.trainingSymbols
+            + this.settleSymbols) * symLen
         : this.transmitPreamble().length;
     // Header is repeated `headerRepeats` times (>= HEADER_FRAME_REPEATS,
     // unconditionally); data + tail frames repeated `repeats` times each

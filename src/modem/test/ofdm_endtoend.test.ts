@@ -16,6 +16,10 @@ const SYNC_COUNT = 24;
 function makeTrainedDemod() {
   const engine = new OFDMEngine({ pilotFreqHz: PILOT_FREQ, sampleRate: SAMPLE_RATE, toneCount: 4 });
   const demod = new OFDMQPSKDemodulator({
+    // Paired with OFDMEngine.generateSyncBurst, which de-coheres the burst —
+    // see OFDMQPSKDemodulatorConfig.deCoheredSyncBurst. Omitting this trains
+    // channelEst with a per-tone phase error and nothing downstream detects it.
+    deCoheredSyncBurst: true,
     sampleRate: SAMPLE_RATE,
     toneFrequencies: TONE_FREQS,
     pilotFreqHz: PILOT_FREQ,

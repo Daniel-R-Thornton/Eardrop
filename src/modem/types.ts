@@ -188,15 +188,74 @@ export const OFDM_DEFAULTS = {
 
 /**
  * OFDM tuning levers — every knob that trades robustness for speed, in one
- * place. Invariant: syncBurstSymbols >= syncMinFrames + 2 + trainingSymbols
- * (detection consumes syncMinFrames windows, boundary alignment can skip up
- * to ~1 symbol, and training needs trainingSymbols full sync symbols).
+ * place.
+ *
+ * INVARIANT:
+ *   syncBurstSymbols >= syncMinFrames + 2 + trainingSettleSymbols + trainingSymbols
+ *
+ * Detection consumes syncMinFrames windows, boundary alignment can skip up to
+ * ~1 symbol, then the RX discards trainingSettleSymbols and accumulates
+ * trainingSymbols. Anything short of that and the receiver runs off the end of
+ * the burst and starts consuming DATA symbols as training — the frame is then
+ * simply lost, with no error that points at the cause. Adding
+ * trainingSettleSymbols without raising syncBurstSymbols did exactly that and
+ * broke four decode tests, so the invariant is asserted in tuning.test.ts.
  */
 export const OFDM_TUNING = {
-  /** TX: repeated all-zero-phase symbols prepended to every transmission */
-  syncBurstSymbols: 24,
+  /** TX: repeated sync symbols prepended to every transmission, and the pool
+   *  the ENERGY-sync path reads its training out of. Sized by the invariant
+   *  above: 8 + 2 + 16 + 12 = 38, rounded up to 40. */
+  syncBurstSymbols: 40,
+  /**
+   * TX: chirp duration, in symbol periods. DECOUPLED from syncBurstSymbols.
+   *
+   * These were the same number, which coupled two unrelated things: raising the
+   * settle period forces syncBurstSymbols up (see the invariant), which would
+   * then have LENGTHENED the chirp — and since the chirp is the loudest thing in
+   * the transmission and the settle period exists to recover from it, that is
+   * exactly backwards. 32 symbols = 800 ms, the length at which chirp
+   * correlation measured norm ~0.70.
+   */
+  chirpSymbols: 32,
   /** RX: sync symbols consumed to train per-tone channel estimates */
   trainingSymbols: 12,
+  /**
+   * Sync symbols transmitted BEFORE the ones used for training, and discarded
+   * by the RX — a settling period so channel estimates are taken with the
+   * transmitting chain in the same gain state the data will see.
+   *
+   * The 600 ms chirp drives the output limiter, and training used to begin in
+   * the very next symbol. Measured over the air: the received pilot was 8.6 dB
+   * stronger during data than during training at 32 tones (9.7 dB at 40), so
+   * every channel estimate was taken against a compressed chain and the
+   * reference then drifted for the whole transmission as the limiter released
+   * (pilot gain correction walking to its 2.0 clamp). QPSK survives that —
+   * phase-only decisions — while 16-QAM and above do not.
+   *
+   * Raised 8 -> 16 (200 ms -> 400 ms) on measurement: with the training burst
+   * de-cohered, the received preamble-to-data step fell from 12.2 dB to 7.6 dB
+   * but did not close. 7.6 dB is very close to the chirp-to-preamble peak ratio
+   * (0.558 / 0.208 = 8.6 dB), which identifies the CHIRP as the remaining
+   * compressor — and the envelope probe measured its recovery taking ~350 ms,
+   * longer than the 200 ms of settle it had.
+   *
+   * Deliberately filled with ordinary sync symbols rather than SILENCE. Silence
+   * would let the chain release all the way to its idle gain, which is not the
+   * state the data occupies either; the goal is steady state at data level, not
+   * an unloaded chain. These symbols are identical to the training ones, so the
+   * only cost is preamble time.
+   *
+   * TX and RX must agree EXACTLY: TxEngine emits trainingSymbols + this, and
+   * RxEngine discards this many windows after sync before it starts
+   * accumulating. There is no room for slack in either direction — the receiver
+   * finds the preamble/data boundary by COUNTING, nothing else. Emit more than
+   * it consumes and the leftovers are demodulated as data (the giveaway is a
+   * first data symbol reading ~0 degrees on every tone, since a training symbol
+   * equalized by an estimate trained on training symbols is exactly that);
+   * emit fewer and it consumes real data as training. A "slack" term was tried
+   * to absorb boundary-alignment loss and did the former.
+   */
+  trainingSettleSymbols: 16,
   /** RX: consecutive above-threshold windows required to declare sync */
   syncMinFrames: 8,
   /** TX: trailing silence symbols after the tail frame */
@@ -212,12 +271,18 @@ export const OFDM_TUNING = {
    *  estimates at the ACTUAL data amplitude (see
    *  OFDMQPSKDemodulator.calibrateQamRef). */
   qamRefSymbols: 4,
-  /** TX: peak amplitude of the chirped sync burst (constant-envelope, so this
-   *  is every sample's magnitude). Reduced from 1.0 (full-scale) to avoid
-   *  driving the transmitting speaker's limiter/compressor hard for the full
-   *  600ms burst duration, whose release can smear into the channel-training
-   *  window that follows. Detection is a normalized cross-correlation (see
-   *  rxEngine `normScore`), so this is scale-invariant to detection. */
+  /**
+   * TX: CEILING on the chirped sync burst's peak amplitude (constant-envelope,
+   * so this is every sample's magnitude).
+   *
+   * No longer the value actually used. OFDMEngine.generateChirpBurst now
+   * level-matches the chirp to the RMS of the OFDM symbols that follow it and
+   * takes the smaller of the two, because a chirp louder than the data
+   * compresses the output chain during the training window and leaves every
+   * channel estimate wrong — see that function for the measurement. This value
+   * only caps the result, so a configuration whose data is louder than 0.6 RMS
+   * still cannot drive the speaker at full scale for 600 ms.
+   */
   chirpAmplitude: 0.6,
 } as const;
 

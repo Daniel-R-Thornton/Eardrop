@@ -7,11 +7,18 @@
  * window ⇒ orthogonal at any sample rate). No FFT, no power-of-two constraint.
  *
  * Sync burst: chirped pilot (LFM sweep) for frequency-diversity timing.
- * Training: standard OFDM all-zero symbols for per-tone channel estimation.
+ * Training: OFDM symbols with de-cohered per-tone phases (see syncQpskSymbols)
+ * for per-tone channel estimation.
  */
 import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_TUNING } from '../types';
 import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
-import { outerCornerPoint, qamRefPhase, rotatePoint, type QamOrder } from '../modulation/constellation';
+import {
+  outerCornerPoint,
+  qamRefPhase,
+  rotatePoint,
+  syncQpskSymbols,
+  type QamOrder,
+} from '../modulation/constellation';
 import { generateChirp, type ChirpConfig } from './chirp';
 import { dlog } from '../../lib/debug/dlog';
 
@@ -41,6 +48,8 @@ export class OFDMEngine {
     chirpSpanHz?: number;
     qamScaleOverride?: number;
     toneStartHz?: number;
+    /** Per-tone pre-emphasis (linear); see OFDMQPSKModulatorConfig.toneGains. */
+    toneGains?: number[];
   }) {
     const toneCount = cfg.toneCount ?? OFDM_DEFAULTS.toneCount;
     this.toneCount = toneCount % 4 !== 0 ? 4 : toneCount;
@@ -65,6 +74,7 @@ export class OFDMEngine {
       pilotFreqHz,
       pilotAmplitude,
       qamScaleOverride: cfg.qamScaleOverride,
+      toneGains: cfg.toneGains,
     });
     this.toneOrders = new Array(this.toneCount).fill(2) as QamOrder[];
 
@@ -74,41 +84,153 @@ export class OFDMEngine {
     });
   }
 
+  /**
+   * RMS and peak of one training/sync OFDM symbol, as actually synthesized.
+   *
+   * Used to level-match the chirp to the data (see generateChirpBurst). Derived
+   * rather than assumed because it depends on toneCount and qamScale, both of
+   * which move: the worst-case-peak scale means a 32-tone symbol is ~4x quieter
+   * per tone than an 8-tone one, so any hardcoded chirp level can only be right
+   * for one configuration.
+   */
+  private syncSymbolLevels(): { rms: number; peak: number; coherentPeak: number } {
+    const measure = (): { rms: number; peak: number } => {
+      const sym = this.ofdm.generateSymbol();
+      let sumSq = 0;
+      let peak = 0;
+      for (let i = 0; i < sym.length; i++) {
+        sumSq += sym[i] * sym[i];
+        const a = Math.abs(sym[i]);
+        if (a > peak) peak = a;
+      }
+      return { rms: Math.sqrt(sumSq / sym.length), peak };
+    };
+
+    // The burst as actually transmitted (de-cohered — see syncQpskSymbols).
+    this.ofdm.setSymbols(syncQpskSymbols(this.toneCount));
+    const actual = measure();
+
+    // The same burst with every tone phase-aligned. This is what the TX scale
+    // is budgeted against, so it is stable regardless of the phase sequence —
+    // and it is what the chirp level is derived from. Deriving the chirp from
+    // the ACTUAL peak instead would silently drop it ~11 dB the moment the
+    // burst was de-cohered, which is precisely how 40-tone sync stopped
+    // locking (correlation fell to norm=0.36 against a 0.35 threshold).
+    this.ofdm.setSymbols(new Array(this.toneCount).fill(0));
+    const coherent = measure();
+
+    return { rms: actual.rms, peak: actual.peak, coherentPeak: coherent.peak };
+  }
+
   /** Chirped sync burst — linear sweep across chirpSpanHz for timing detection. */
   generateChirpBurst(symbolCount: number): { chirp: Float32Array; chirpCfg: ChirpConfig } {
     const durationSec = (symbolCount * this.symSamples) / this.sampleRate;
     const halfSpan = this.chirpSpanHz / 2;
+
+    // ── Level-match the chirp to the PREAMBLE's peak, not its RMS ──
+    // The invariant: the chirp must not ask the output stage for more headroom
+    // than the waveform immediately behind it already does. That waveform is
+    // the sync/training burst, whose carriers are phase-aligned by construction
+    // and which therefore peaks near the coherent bound (~0.63 at every tone
+    // count, since the TX scale is itself set by that bound).
+    //
+    // RMS-matching was tried first and is WRONG here, for a reason that only
+    // shows up at high tone counts: the OFDM RMS is qamScale * sqrt(N), and
+    // qamScale goes as 1/N, so the chirp got QUIETER as tones were added —
+    // 0.121 at 32 tones, 0.108 at 40 — while the channel and noise did not.
+    // Sync correlation fell to norm=0.36 against a 0.35 accept threshold at 40
+    // tones and stopped locking at all. It also left ~15 dB of headroom unused
+    // below the preamble's own peak.
+    //
+    // What makes the louder chirp safe is OFDM_TUNING.trainingSettleSymbols:
+    // the reason to keep the chirp quiet was that it compressed the chain
+    // during the training window that followed it immediately. The settle
+    // period now discards the first 8 symbols after sync, so the chain has
+    // ~200 ms to recover before any channel estimate is taken. That decouples
+    // chirp loudness from estimate accuracy, which is what the settle period
+    // was added for.
+    //
+    // In practice OFDM_TUNING.chirpAmplitude (0.6) binds at every tone count,
+    // so this lands just under the preamble peak — the level the chirp had
+    // before any of this, which is also the level at which sync was reliable
+    // (measured norm 0.67-0.72 at 32 tones).
+    const levels = this.syncSymbolLevels();
+    const matchedAmplitude = levels.coherentPeak;
+    const amplitude = Math.min(OFDM_TUNING.chirpAmplitude, matchedAmplitude);
+
     const chirpCfg: ChirpConfig = {
       fStart: this.pilotFreqHz - halfSpan,
       fEnd: this.pilotFreqHz + halfSpan,
       durationSec,
       sampleRate: this.sampleRate,
-      // Constant-envelope burst at reduced amplitude: a 0.6 peak (vs 1.0) keeps
-      // the 600ms sync burst from driving the speaker's limiter/compressor hard
-      // right before the channel-training window. Detection is a normalized
-      // cross-correlation (see rxEngine normScore), so this doesn't affect
-      // sync accuracy — only how hard the transmitting hardware is driven.
-      amplitude: OFDM_TUNING.chirpAmplitude,
+      amplitude,
     };
     const chirp = generateChirp(chirpCfg);
     dlog('TX-OFDM', {
       chirp: `${chirpCfg.fStart}-${chirpCfg.fEnd}Hz`,
       durMs: Math.round(durationSec * 1000),
       samples: chirp.length,
+      amp: amplitude.toFixed(4),
+      // The preamble's own levels, so a mismatch is visible without re-deriving.
+      symPeak: levels.peak.toFixed(4),
+      symRms: levels.rms.toFixed(4),
+      symCoherentPeak: levels.coherentPeak.toFixed(4),
     });
     return { chirp, chirpCfg };
   }
 
-  /** Training symbols — standard OFDM with all tones at QPSK 0° for channel estimation. */
+  /** Training symbols — de-cohered per-tone QPSK phases for channel estimation. */
   generateTrainingSymbols(count: number): Float32Array {
     return this.generateSyncBurst(count);
   }
 
+  /**
+   * Settle symbols — the ones the RX discards before it starts training (see
+   * OFDM_TUNING.trainingSettleSymbols). Deliberately NON-STATIONARY: every
+   * symbol carries different pseudo-random QPSK data.
+   *
+   * Their content is irrelevant to the receiver, which counts them and throws
+   * them away, so only the COUNT has to agree between the two sides. What the
+   * content is for is the microphone: laptop mic arrays run adaptive DSP that
+   * `noiseSuppression: false` does not fully disable, and a long stationary
+   * multi-tone signal is exactly what such a processor adapts to and starts
+   * attenuating per band. Measured: 400 ms of repeated identical sync symbols
+   * before training produced RANDOM per-tone channel estimates (phases
+   * scattered rather than smooth) and nothing decoded, while 200 ms did not.
+   * The envelope probe separately measured this mic attenuating a sustained
+   * tone by 14 dB with a ~350 ms adaptation.
+   *
+   * So the settle period has to load the output chain at data level — which is
+   * why it is signal and not silence — without looking stationary. Varying data
+   * does both, and is what real payload looks like anyway.
+   */
+  generateSettleSymbols(count: number): Float32Array {
+    const parts: Float32Array[] = [];
+    // Deterministic so a transmission is reproducible; the receiver never needs
+    // to know the sequence.
+    let seed = 0x9e3779b9;
+    const nextSymbol = (): number => {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      return (seed >>> 16) & 0x3;
+    };
+    for (let i = 0; i < count; i++) {
+      this.ofdm.setSymbols(Array.from({ length: this.toneCount }, () => nextSymbol()));
+      parts.push(this.ofdm.generateSymbol());
+    }
+    const totalLen = parts.reduce((a, b) => a + b.length, 0);
+    const audio = new Float32Array(totalLen);
+    let off = 0;
+    for (const p of parts) { audio.set(p, off); off += p.length; }
+    return audio;
+  }
+
   generateSyncBurst(count: number): Float32Array {
-    const zeros = new Array(this.toneCount).fill(0);
+    // De-cohered per-tone phases, NOT all-zeros — see syncQpskSymbols. The RX
+    // rotates them back out while training, so channel estimates are unchanged.
+    const symbols = syncQpskSymbols(this.toneCount);
     const parts: Float32Array[] = [];
     for (let i = 0; i < count; i++) {
-      this.ofdm.setSymbols(zeros);
+      this.ofdm.setSymbols(symbols);
       parts.push(this.ofdm.generateSymbol());
     }
     const totalLen = parts.reduce((a, b) => a + b.length, 0);

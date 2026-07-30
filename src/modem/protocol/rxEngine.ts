@@ -99,6 +99,15 @@ export class RxEngine {
   public ofdmDataSymbolCounter = 0;
   /** Detection (syncMinFrames) + boundary-alignment slack (1) + training (trainingSymbols) must fit in sync burst */
   private readonly OFDM_TRAINING_SYMBOLS = OFDM_TUNING.trainingSymbols;
+  /**
+   * Sync symbols to discard before training — see trainingSettleSymbols.
+   * Overridable from config so the two sides can be swept together during
+   * bring-up; it MUST equal what the TX emits, since the preamble/data boundary
+   * is found by counting and nothing else.
+   */
+  private readonly OFDM_SETTLE_SYMBOLS: number;
+  /** Settle windows discarded so far since the current sync. */
+  private ofdmSettleSymbols = 0;
 
   /** OFDM tone count (4 or 8 — multiples of 4 only) */
   private ofdmToneCount = 4;
@@ -364,6 +373,11 @@ export class RxEngine {
   constructor(cfg: Partial<ModemConfig & { useOFDM?: boolean }> = {}) {
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
     this.useOFDM = (cfg as any).useOFDM === true;
+    const settleOverride = (cfg as any).trainingSettleSymbols;
+    this.OFDM_SETTLE_SYMBOLS =
+      typeof settleOverride === 'number' && Number.isFinite(settleOverride)
+        ? Math.max(0, Math.round(settleOverride))
+        : OFDM_TUNING.trainingSettleSymbols;
 
     // Default SPS = 256 for atomic frame protocol (BPSK). OFDM may override.
     this.sps = 256;
@@ -565,6 +579,7 @@ export class RxEngine {
             this.state = RxState.FRAMES;
             this.ofdmWindowsSinceDetect = 0;
             this.ofdmTrainingSymbols = 0;
+            this.ofdmSettleSymbols = 0;
             this.ofdmDemod!.resetTraining();
             // 3c: same file-assembly + dedup resets the energy-sync path does
             // (below) — without these, a retry of the SAME fileID right after
@@ -675,6 +690,7 @@ export class RxEngine {
           this.totalFrames = 0;
           this.ofdmSyncFrames = 0;
           this.ofdmTrainingSymbols = 0;
+          this.ofdmSettleSymbols = 0;
           this.ofdmDemod?.resetTraining();
           // Phase 4: new sync detected — reset to the base link profile.
           this.resetLinkProfile();
@@ -927,6 +943,7 @@ export class RxEngine {
         this.ofdmSyncFrames = 0;
         this.ofdmNoiseEma = this.OFDM_EMA_SEED;
         this.ofdmTrainingSymbols = 0;
+        this.ofdmSettleSymbols = 0;
         this.ofdmDemod.discardMER();
         this.ofdmDemod.resetTraining();
         // Phase 4: watchdog reset — back to the base link profile.
@@ -934,6 +951,20 @@ export class RxEngine {
         this.buf = [];
         this.ofdmAlignBuf = [];
         return;
+      }
+
+      // Settling period: discard the first N sync symbols outright so channel
+      // estimates are taken with the transmitting chain in the same gain state
+      // the data will see, not the compressed one the chirp leaves behind (see
+      // OFDM_TUNING.trainingSettleSymbols). TX emits these ahead of the
+      // training symbols, so skipping them here consumes real signal, not
+      // silence, and the count must match the TX's exactly.
+      if (this.ofdmSettleSymbols < this.OFDM_SETTLE_SYMBOLS) {
+        this.ofdmSettleSymbols++;
+        if (this.ofdmSettleSymbols >= this.OFDM_SETTLE_SYMBOLS) {
+          dlog('OFDM-TRAIN', { settled: this.ofdmSettleSymbols });
+        }
+        return; // Not training yet, and definitely not data.
       }
 
       // OFDM training phase: use first N symbols of sync burst to train channel estimates
@@ -1279,13 +1310,22 @@ export class RxEngine {
     this.ofdmToneCount = ofdmToneCount;
     const demodToneFreqs = ofdmToneFrequencies({ toneCount: ofdmToneCount, pilotFreqHz: this.cfg.pilotFreqHz, startHz: this.cfg.toneStartHz });
     this.ofdmToneFreqs = demodToneFreqs;
+    // deCoheredSyncBurst: OFDMEngine de-coheres the sync/training burst, so the
+    // demodulator must divide the known per-tone phase back out. TX and RX must
+    // agree exactly — see OFDMQPSKDemodulatorConfig.deCoheredSyncBurst.
     this.ofdmDemod = new OFDMQPSKDemodulator({
+      deCoheredSyncBurst: true,
       sampleRate: this.cfg.sampleRate,
       toneFrequencies: demodToneFreqs,
       pilotFreqHz: this.cfg.pilotFreqHz,
     });
     // Pre-compute chirp template for sync detection
-    const chirpDurationSec = (OFDM_TUNING.syncBurstSymbols * symSamples) / this.cfg.sampleRate;
+    // MUST match what TxEngine transmits: OFDM_TUNING.chirpSymbols, not
+    // syncBurstSymbols. Those were the same value until the chirp length was
+    // decoupled from the sync-burst pool; reading the wrong one here produces a
+    // template of the wrong duration, the normalized correlation collapses, and
+    // nothing syncs at all.
+    const chirpDurationSec = (OFDM_TUNING.chirpSymbols * symSamples) / this.cfg.sampleRate;
     const halfSpan = this.chirpSpanHz / 2;
     const chirpCfg: ChirpConfig = {
       fStart: this.cfg.pilotFreqHz - halfSpan,
@@ -1603,7 +1643,11 @@ export class RxEngine {
           dlog('RX-OFDM', { adaptingToneCount: true, newCount: profile.toneCount }, { level: 'info' });
           this.ofdmToneCount = profile.toneCount;
           this.ofdmToneFreqs = ofdmToneFrequencies({ toneCount: profile.toneCount, pilotFreqHz: this.cfg.pilotFreqHz, startHz: this.cfg.toneStartHz });
-          this.ofdmDemod = new OFDMQPSKDemodulator({
+          // deCoheredSyncBurst: OFDMEngine de-coheres the sync/training burst, so the
+    // demodulator must divide the known per-tone phase back out. TX and RX must
+    // agree exactly — see OFDMQPSKDemodulatorConfig.deCoheredSyncBurst.
+    this.ofdmDemod = new OFDMQPSKDemodulator({
+      deCoheredSyncBurst: true,
             sampleRate: this.cfg.sampleRate,
             toneFrequencies: this.ofdmToneFreqs,
             pilotFreqHz: this.cfg.pilotFreqHz,
@@ -1611,6 +1655,7 @@ export class RxEngine {
           // Reset training so fresh symbols can be accumulated.
           this.ofdmDemod.resetTraining();
           this.ofdmTrainingSymbols = 0;
+          this.ofdmSettleSymbols = 0;
           // Re-initialize link profile for the new tone count.
           this.linkProfile = DEFAULT_LINK_PROFILE(profile.toneCount);
           this.toneOrders = new Array(profile.toneCount).fill(2) as QamOrder[];
@@ -1821,6 +1866,12 @@ export class RxEngine {
       this.ofdmSyncFrames = 0;
       this.ofdmNoiseEma = this.OFDM_EMA_SEED;
       this.ofdmTrainingSymbols = 0;
+      // Must re-arm alongside ofdmTrainingSymbols, or the NEXT transmission in
+      // the same session skips its settle period entirely (the counter is
+      // already at its limit) and trains straight off the chirp again — the
+      // exact failure the settle period exists to prevent, reappearing only on
+      // the second and subsequent transfers.
+      this.ofdmSettleSymbols = 0;
       this.ofdmDemod.discardMER();
       this.ofdmDemod.resetTraining();
       this.buf = [];

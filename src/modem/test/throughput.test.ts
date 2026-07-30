@@ -62,6 +62,15 @@ for (const toneCount of [16, 32]) {
       `[BENCH] tones=${toneCount} payloadBytes=${payloadBytes} audioSec=${audioSec.toFixed(2)} rate=${rate.toFixed(1)} B/s`,
     );
     // Floor guards against silent regression; raise it as levers land.
-    expect(rate).toBeGreaterThan(toneCount === 32 ? 150 : 75);
+    //
+    // Lowered from 150 to 145 (32 tones) when the training settle period landed:
+    // OFDM_TUNING.trainingSettleSymbols adds 8 symbols (200 ms) of preamble and
+    // the invariant that covers it raised syncBurstSymbols 24 -> 32, adding
+    // another 200 ms of chirp. ~400 ms of fixed overhead on a ~13 s transfer is
+    // ~3%, and measured rate went 150.0 -> 148.7 B/s. That is the intended
+    // price of taking channel estimates in the same gain state as the data —
+    // without it 16-QAM does not decode at all above 8 tones, so the trade is
+    // 1% throughput for the link existing.
+    expect(rate).toBeGreaterThan(toneCount === 32 ? 145 : 75);
   });
 }

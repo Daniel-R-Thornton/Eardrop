@@ -184,6 +184,40 @@ export function qamRefPhase(toneIndex: number, toneCount: number): number {
   return ((raw % twoPi) + twoPi) % twoPi;
 }
 
+/**
+ * QPSK symbol index (0-3) for tone `toneIndex` of the sync/training burst —
+ * qamRefPhase's quadratic sequence, quantized to the four phases the legacy
+ * QPSK synthesis path can actually produce.
+ *
+ * The burst used to set EVERY tone to symbol 0, so all carriers left the
+ * modulator phase-aligned and summed into a coherent pulse: measured crest
+ * factor 6.7 at 32 tones against ~2.6 for real data of identical RMS. The
+ * transmitting chain limits on that peak, so training — and every channel
+ * estimate taken from it — happened in a compressed gain state the data never
+ * sees. Measured directly by the chain diagnostic: a coherent burst and a
+ * de-cohered one at equal RMS differ by 6 dB in received pilot level, and over
+ * the air the preamble-to-data step reached 12 dB.
+ *
+ * Same defect and same remedy as modulateQamRefSymbols. Quantizing to QPSK
+ * (rather than the continuous rotation the ref symbols use) is forced by the
+ * legacy path, which selects a sin/cos table per tone and cannot express
+ * arbitrary phase — four phases still break the alignment.
+ *
+ * The RX applies the inverse rotation when accumulating channel estimates (see
+ * OFDMQPSKDemodulator.trainOnSyncSymbol), so channelEst remains the bare
+ * channel and nothing downstream changes.
+ */
+export function syncQpskSymbol(toneIndex: number, toneCount: number): number {
+  // qamRefPhase / (pi/2), rounded — the same quadratic on a 4-phase grid.
+  const quarterTurns = Math.round((-2 * toneIndex * (toneIndex - 1)) / toneCount);
+  return ((quarterTurns % 4) + 4) % 4;
+}
+
+/** Sync-burst QPSK symbols for every tone, in tone order. */
+export function syncQpskSymbols(toneCount: number): number[] {
+  return Array.from({ length: toneCount }, (_u, t) => syncQpskSymbol(t, toneCount));
+}
+
 /** Rotate a constellation point by `phase` (complex multiply by e^{jφ}) — magnitude unchanged. */
 export function rotatePoint(point: ConstellationPoint, phase: number): ConstellationPoint {
   const cos = Math.cos(phase);

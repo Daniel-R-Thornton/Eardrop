@@ -18,8 +18,30 @@ import {
   outerCornerPoint,
   qamRefPhase,
   rotatePoint,
+  syncQpskSymbol,
   type QamOrder,
 } from '../modulation/constellation';
+
+/**
+ * Population std of one component of a set of equalized tone points — the
+ * across-tone dispersion reported by the QAMD dump.
+ */
+function stdAcross(
+  points: ReadonlyArray<{ i: number; q: number }>,
+  pick: (p: { i: number; q: number }) => number,
+): number {
+  const n = points.length;
+  if (n === 0) return 0;
+  let mean = 0;
+  for (const p of points) mean += pick(p);
+  mean /= n;
+  let variance = 0;
+  for (const p of points) {
+    const d = pick(p) - mean;
+    variance += d * d;
+  }
+  return Math.sqrt(variance / n);
+}
 
 export interface OFDMQPSKDemodulatorConfig {
   sampleRate: number;
@@ -27,6 +49,20 @@ export interface OFDMQPSKDemodulatorConfig {
   pilotFreqHz: number;
   /** Leaky-integrator gain for decision-directed channel tracking (0 = off, default 0.05) */
   trackingAlpha?: number;
+  /**
+   * Whether the transmitter de-coheres its sync/training burst (see
+   * syncQpskSymbols). When true, trainOnSyncSymbol divides the known per-tone
+   * phase back out so channelEst stays the bare channel.
+   *
+   * Defaults FALSE — the legacy all-tones-at-0-degrees burst. This is an
+   * explicit flag rather than an assumption because TX and RX must agree
+   * exactly: de-rotating a burst that was not rotated (or failing to de-rotate
+   * one that was) folds a per-tone phase error into every channel estimate, and
+   * nothing downstream can detect it. Production RX sets it true to match
+   * OFDMEngine; unit tests that synthesise their own zero-phase burst leave it
+   * false.
+   */
+  deCoheredSyncBurst?: boolean;
 }
 
 export interface OFDMQPSKResult {
@@ -52,6 +88,8 @@ export class OFDMQPSKDemodulator {
   private diagCount = 0;
   /** Leaky-integrator gain for per-symbol channel tracking (0 = off) */
   private trackingAlpha: number = 0.003;
+  /** See OFDMQPSKDemodulatorConfig.deCoheredSyncBurst. */
+  private readonly deCoheredSyncBurst: boolean;
 
   // ── MER / EVM measurement (diagnostic only — never affects decoding) ──
   // Accumulates error power vs the ideal constellation point over a rolling
@@ -128,9 +166,24 @@ export class OFDMQPSKDemodulator {
   private readonly GAIN_WARMUP_SYMBOLS = 8;
   /** Symbol counter for the periodic OFDM-GAIN dlog (every 32 symbols). */
   private gainLogCount = 0;
-  /** One-shot-ish QAM constellation dump counter (first 2 data symbols +
-   *  every 128th after) — the QAM analog of the QPSK firstSym diag. */
+  /**
+   * QAM constellation dump counter — the QAM analog of the QPSK firstSym
+   * diag. Dumps every symbol for the first QAM_DIAG_DENSE symbols, then on a
+   * PRIME stride after that.
+   *
+   * The stride must not be a power of two. It was 16, which aliased against
+   * the (power-of-two-ish) frame symbol period: every sampled symbol landed
+   * at the same offset within a frame, so the dump showed the same
+   * near-identical-across-tones point every time and read as a collapsed
+   * constellation, when in fact the intervening symbols (never sampled) were
+   * ordinary varied data. A prime stride cannot stay phase-locked to a
+   * periodic frame structure, so consecutive dumps walk through the frame.
+   */
   private qamDiagCount = 0;
+  /** Symbols after QAM entry that get an unconditional per-symbol dump. */
+  private readonly QAM_DIAG_DENSE = 24;
+  /** Prime dump stride after the dense window — see qamDiagCount. */
+  private readonly QAM_DIAG_STRIDE = 7;
 
   // ── QAM reference-symbol calibration (post-training, pre-header) ──
   // Accumulates the implied channel estimate (see calibrateQamRef) across
@@ -164,6 +217,7 @@ export class OFDMQPSKDemodulator {
     this.cpSamples = cpSamples;
     this.toneOrders = new Array(this.toneCount).fill(2) as QamOrder[];
     if (config.trackingAlpha !== undefined) this.trackingAlpha = config.trackingAlpha;
+    this.deCoheredSyncBurst = config.deCoheredSyncBurst ?? false;
 
     // Initialize channel estimates to identity
     this.channelEstRe = new Array(this.toneCount).fill(1);
@@ -369,7 +423,35 @@ export class OFDMQPSKDemodulator {
 
     const buf = window instanceof Float32Array ? window : new Float32Array(window);
     const symSamples = buf.slice(this.cpSamples, this.cpSamples + this.fftSamples);
-    const { pilotRe, pilotIm, toneRe, toneIm } = this.analyze(symSamples);
+    const { pilotRe, pilotIm, toneRe: rawRe, toneIm: rawIm } = this.analyze(symSamples);
+
+    // ── undo the sync burst's per-tone phase rotation, if the TX applied one ──
+    // The TX de-coheres the training burst so it does not leave the modulator
+    // as a coherent pulse (see syncQpskSymbols). Each tone therefore carries a
+    // KNOWN QPSK phase rather than 0, and dividing it back out keeps channelEst
+    // equal to the bare channel — exactly what it was when the burst was
+    // all-zeros — so the equalizer, the QPSK slicer and the reported `h` all
+    // keep their previous meaning. Omitting this would fold the rotation into
+    // channelEst and rotate every decoded data symbol by its inverse.
+    //
+    // Convention: a transmitted symbol s measures as (i,q) rotated by s*90
+    // degrees, because synthesizeQpsk selects +sin/+cos/-sin/-cos. So the
+    // inverse is a rotation by -s*90 degrees. Unit magnitude, no rescaling.
+    let toneRe = rawRe;
+    let toneIm = rawIm;
+    if (this.deCoheredSyncBurst) {
+      const derotRe = new Array<number>(this.toneCount);
+      const derotIm = new Array<number>(this.toneCount);
+      for (let t = 0; t < this.toneCount; t++) {
+        const angle = -syncQpskSymbol(t, this.toneCount) * (Math.PI / 2);
+        const c = Math.cos(angle);
+        const sn = Math.sin(angle);
+        derotRe[t] = rawRe[t] * c - rawIm[t] * sn;
+        derotIm[t] = rawRe[t] * sn + rawIm[t] * c;
+      }
+      toneRe = derotRe;
+      toneIm = derotIm;
+    }
 
     if (this.trainingSymbols === 0) {
       this.channelEstRe = toneRe.slice();
@@ -921,12 +1003,46 @@ export class OFDMQPSKDemodulator {
         // tones empty/mis-scaled, on-grid-but-shifted = gain/rotation error,
         // random = noise/ISI. The QAM analog of the QPSK firstSym diag. ──
         this.qamDiagCount++;
-        if (this.qamDiagCount <= 2 || this.qamDiagCount % 16 === 0) {
+        if (
+          this.qamDiagCount <= this.QAM_DIAG_DENSE ||
+          this.qamDiagCount % this.QAM_DIAG_STRIDE === 0
+        ) {
           // QAMD p = centi-units (value*100), tone index = position
           const p = toneIQOut
             .map((iq) => `${Math.round(iq.i * 100)},${Math.round(iq.q * 100)}`)
             .join(';');
-          dlog('QAMD', { n: this.qamDiagCount, g: gainCorr.toFixed(3), p }, { level: 'warn' });
+          // Across-tone dispersion (centi-units): how spread the tones are
+          // over the constellation this symbol. A symbol carrying varied data
+          // reads on the order of the constellation's own RMS radius (~100).
+          //
+          // A LOW sd IS NOT A FAULT INDICATOR. It means the tones all carry
+          // the same constellation point, and the overwhelmingly common cause
+          // is simply constant payload content — zero padding in a short
+          // frame. Verified against a pure digital loopback (TX samples fed
+          // straight to RX, no speaker/mic): a 12-byte payload at 32
+          // tones/16-QAM reads sd 95 -> 68 -> 41 over the first symbols while
+          // MER is 156 dB and every frame decodes byte-exact. So a decaying
+          // sd on a mostly-padding frame is expected, and reading it as a
+          // collapsing channel estimate is a mistake this comment exists to
+          // prevent. Judge decode health by MER and the RS/BCH counts; use sd
+          // only to tell "tones spread" from "tones identical" when you
+          // already have another reason to suspect the equalizer.
+          //
+          // This applies to the first OFDM_TUNING.qamRefSymbols dumps (the
+          // QAM reference symbols) too: those carry the per-tone qamRefPhase
+          // rotation, so a correctly-aligned ref symbol reads a LARGE sd
+          // (~130-170 measured at 32 tones/16-QAM), not a small one. A ref
+          // symbol reading sd≈0 means the ref window is MISALIGNED — the
+          // countdown handed calibrateQamRef() preamble training symbols
+          // (identical across tones, hence flat) instead of the rotated ref
+          // symbols, so channelEst gets re-fit against the wrong reference.
+          const sd = `${Math.round(stdAcross(toneIQOut, (iq) => iq.i) * 100)},${
+            Math.round(stdAcross(toneIQOut, (iq) => iq.q) * 100)}`;
+          dlog(
+            'QAMD',
+            { n: this.qamDiagCount, g: gainCorr.toFixed(3), sd, p },
+            { level: 'warn' },
+          );
         }
 
         // frameBits has no meaningful generic encoding across mixed tone
