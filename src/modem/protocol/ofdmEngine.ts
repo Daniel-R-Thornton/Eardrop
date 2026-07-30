@@ -11,7 +11,7 @@
  */
 import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_TUNING } from '../types';
 import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
-import { outerCornerSymbol, type QamOrder } from '../modulation/constellation';
+import { outerCornerPoint, qamRefPhase, rotatePoint, type QamOrder } from '../modulation/constellation';
 import { generateChirp, type ChirpConfig } from './chirp';
 import { dlog } from '../../lib/debug/dlog';
 
@@ -173,19 +173,26 @@ export class OFDMEngine {
    * frames and setToneOrders(), before the header frame, ONLY when the
    * announced qamMap uses any tone above QPSK. Every tone transmits the
    * OUTER CORNER constellation point of its assigned order (e.g. (3,3)/
-   * sqrt(10) for 16-QAM — see outerCornerSymbol) through the exact same
-   * synthesis path as ordinary QAM data (setSymbols/generateSymbol at
-   * qamScale, pilot as usual, standard CP). Because RX knows this point
-   * exactly, it can invert its equalizer to re-fit each tone's channel
-   * estimate AT THE ACTUAL DATA AMPLITUDE, through whatever level-dependent
-   * nonlinearity the real audio chain applies — see
-   * OFDMQPSKDemodulator.calibrateQamRef.
+   * sqrt(10) for 16-QAM — see outerCornerPoint), rotated by a deterministic
+   * per-tone phase (qamRefPhase) before synthesis. Without that rotation,
+   * every tone lands on the SAME point, so all tones sum phase-aligned into
+   * a coherent pulse that hard-clips the DAC (measured peak 2.5+ at 32
+   * tones/16-QAM) — exactly on the symbols calibrateQamRef trains on. The
+   * rotation only changes phase (magnitude unchanged), and RX applies the
+   * identical rotation when computing its expected point (see
+   * OFDMQPSKDemodulator.calibrateQamRef), so calibration is unaffected.
+   * Synthesis otherwise goes through the exact same path as ordinary QAM
+   * data (qamScale, pilot as usual, standard CP) via the modulator's
+   * setPoints (a setSymbols variant that accepts rotated points directly,
+   * since these don't correspond to Gray-index constellation symbols).
    */
   modulateQamRefSymbols(): Float32Array {
-    const symbols = this.toneOrders.map((order) => outerCornerSymbol(order));
+    const points = this.toneOrders.map((order, t) =>
+      rotatePoint(outerCornerPoint(order), qamRefPhase(t, this.toneCount)),
+    );
     const parts: Float32Array[] = [];
     for (let i = 0; i < OFDM_TUNING.qamRefSymbols; i++) {
-      this.ofdm.setSymbols(symbols);
+      this.ofdm.setPoints(points);
       parts.push(this.ofdm.generateSymbol());
     }
     const totalLen = parts.reduce((a, b) => a + b.length, 0);

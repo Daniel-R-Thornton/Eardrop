@@ -12,7 +12,14 @@
 import { toneIQ } from '../pilot';
 import { ofdmSamples, OFDM_TUNING, OFDM_DEFAULTS } from '../types';
 import { dlog } from '../../lib/debug/dlog';
-import { mapSymbol, sliceSymbol, outerCornerPoint, type QamOrder } from '../modulation/constellation';
+import {
+  mapSymbol,
+  sliceSymbol,
+  outerCornerPoint,
+  qamRefPhase,
+  rotatePoint,
+  type QamOrder,
+} from '../modulation/constellation';
 
 export interface OFDMQPSKDemodulatorConfig {
   sampleRate: number;
@@ -542,7 +549,11 @@ export class OFDMQPSKDemodulator {
 
     for (let t = 0; t < this.toneCount; t++) {
       const order = this.toneOrders[t];
-      const ideal = outerCornerPoint(order);
+      // TX rotates each tone's outer-corner point by qamRefPhase(t) before
+      // synthesis to de-cohere the reference-symbol sum (see
+      // OFDMEngine.modulateQamRefSymbols) — apply the identical rotation
+      // here so `ideal` matches what was actually transmitted.
+      const ideal = rotatePoint(outerCornerPoint(order), qamRefPhase(t, this.toneCount));
       // Known transmitted point → expected pre-qamRefScale rotated value
       // (i0,q0), same convention as demodulate()'s iCorr/qCorr. gainCorr is
       // pinned to 1 (see method doc).

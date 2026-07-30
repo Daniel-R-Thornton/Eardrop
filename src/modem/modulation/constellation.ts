@@ -160,6 +160,40 @@ export function outerCornerPoint(order: QamOrder): ConstellationPoint {
   return mapSymbol(outerCornerSymbol(order), order);
 }
 
+/**
+ * Deterministic per-tone phase for de-cohering the QAM reference symbols
+ * (see OFDMEngine.modulateQamRefSymbols): without this, every tone transmits
+ * the SAME outer-corner point, so all tones land phase-aligned and sum
+ * coherently to a waveform peak that hard-clips the DAC (measured 2.5+ at 32
+ * tones/16-QAM).
+ *
+ * A per-tone hash phase (e.g. a golden-ratio integer hash) makes the phases
+ * look independent, but independence alone doesn't bound the peak: summing
+ * `toneCount` sinusoids with i.i.d.-looking random phases still has a peak
+ * that grows with toneCount (measured ~2.0–2.3 at 32 tones — not "well
+ * under" the DAC limit). This uses the classic Newman/Schroeder phase
+ * schedule instead — φ_t = −π·t·(t−1)/toneCount — a well-known deterministic
+ * phase assignment for multicarrier PAPR reduction that spreads energy over
+ * the symbol window rather than merely decorrelating it (measured peak
+ * ~0.47–0.57 at 32 tones for 16-/64-QAM, comfortably under 1.0). TX and RX
+ * both compute this from (toneIndex, toneCount) alone — no table to sync.
+ */
+export function qamRefPhase(toneIndex: number, toneCount: number): number {
+  const raw = (-Math.PI * toneIndex * (toneIndex - 1)) / toneCount;
+  const twoPi = 2 * Math.PI;
+  return ((raw % twoPi) + twoPi) % twoPi;
+}
+
+/** Rotate a constellation point by `phase` (complex multiply by e^{jφ}) — magnitude unchanged. */
+export function rotatePoint(point: ConstellationPoint, phase: number): ConstellationPoint {
+  const cos = Math.cos(phase);
+  const sin = Math.sin(phase);
+  return {
+    re: point.re * cos - point.im * sin,
+    im: point.re * sin + point.im * cos,
+  };
+}
+
 /** Phase-4 profile qamMap value (0/1/2) → bits-per-tone order. */
 export function qamMapValueToOrder(value: 0 | 1 | 2): QamOrder {
   return value === 0 ? 2 : value === 1 ? 4 : 6;

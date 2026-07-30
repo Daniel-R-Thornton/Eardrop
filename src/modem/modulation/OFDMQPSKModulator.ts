@@ -7,7 +7,7 @@
  * is the tail of the window copied to the front, exactly as before.
  */
 import { ofdmSamples } from '../types';
-import { mapSymbol, type QamOrder } from './constellation';
+import { mapSymbol, type ConstellationPoint, type QamOrder } from './constellation';
 
 export interface OFDMQPSKModulatorConfig {
   sampleRate: number;
@@ -170,6 +170,27 @@ export class OFDMQPSKModulator {
       const { re, im } = mapSymbol(symbols[t], this.toneOrders[t]);
       this.symRe[t] = re;
       this.symIm[t] = im;
+    }
+  }
+
+  /**
+   * Set per-tone constellation points directly, bypassing the Gray-index
+   * mapSymbol lookup — used ONLY by the QAM reference-symbol path (see
+   * OFDMEngine.modulateQamRefSymbols), which needs points rotated off the
+   * Gray lattice by a per-tone phase to de-cohere the sum. Requires the
+   * modulator already be in QAM mode (setToneOrders with a non-all-QPSK
+   * assignment); synthesis is otherwise identical to setSymbols's QAM
+   * branch — same qamScale, pilot, and cyclic prefix.
+   */
+  setPoints(points: ConstellationPoint[]): void {
+    if (points.length !== this.cfg.toneFrequencies.length) {
+      throw new Error(
+        `Expected ${this.cfg.toneFrequencies.length} points, got ${points.length}`,
+      );
+    }
+    for (let t = 0; t < points.length; t++) {
+      this.symRe[t] = points[t].re;
+      this.symIm[t] = points[t].im;
     }
   }
 
