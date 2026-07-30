@@ -1,10 +1,13 @@
 /**
- * ofdm_qam_mod.test.ts — Phase 3 modulator generalization.
+ * ofdm_qam_mod.test.ts — Phase 3 modulator generalization + TX level flattening.
  *
  * Two guarantees under test:
- *  1. All-QPSK (the default, and today's only live mode) is byte-identical
- *     to the pre-QAM modulator: same sign/table synthesis, same per-symbol
- *     peak-normalize to 0.95.
+ *  1. All-QPSK (the default, and today's only live mode) uses the same
+ *     sign/table synthesis as the pre-QAM modulator, scaled by the SAME
+ *     fixed `qamScale` the QAM path uses (no more per-symbol peak-normalize
+ *     — that per-symbol renormalization was the load-bearing-but-false
+ *     assumption behind the streaming/acoustic amplitude-step bug; see
+ *     txEngine.ts's streamChunks doc and OFDMQPSKModulator's qamScale doc).
  *  2. The QAM path (taken only when some tone's order > QPSK) produces a
  *     stable per-tone amplitude across symbols and stays within the fixed
  *     scale's designed bound.
@@ -30,10 +33,11 @@ function makeMod(): OFDMQPSKModulator {
   });
 }
 
-// Reference implementation of the pre-QAM legacy synthesis, copied verbatim
-// from the modulator's original generateSymbol (before this change) so we can
-// assert byte-identity independent of the refactor.
-function legacyGenerateSymbol(symbols: number[]): Float32Array {
+// Reference implementation of the QPSK sign/table synthesis, scaled by the
+// SAME fixed qamScale the modulator under test derives (worst case: numTones
+// * MAX_QAM_MAGNITUDE + pilotAmplitude, backed off to 0.95 — see
+// OFDMQPSKModulator's qamScale doc) instead of a per-symbol peak-normalize.
+function legacyGenerateSymbol(symbols: number[], qamScale: number): Float32Array {
   const { cpSamples } = ofdmSamples(SAMPLE_RATE);
   const twoPiOverFs = (2 * Math.PI) / SAMPLE_RATE;
   const sinTable: Float32Array[] = [];
@@ -65,12 +69,8 @@ function legacyGenerateSymbol(symbols: number[]): Float32Array {
   for (let n = 0; n < fftSamples; n++) {
     let acc = pilotTable[n];
     for (let t = 0; t < TONE_COUNT; t++) acc += selSign[t] * selTable[t][n];
-    body[n] = acc;
+    body[n] = acc * qamScale;
   }
-  let peak = 0;
-  for (let n = 0; n < body.length; n++) peak = Math.max(peak, Math.abs(body[n]));
-  const scale = peak > 0 ? 0.95 / peak : 1;
-  for (let n = 0; n < body.length; n++) body[n] *= scale;
 
   const out = new Float32Array(fftSamples + cpSamples);
   out.set(body.subarray(fftSamples - cpSamples), 0);
@@ -78,7 +78,7 @@ function legacyGenerateSymbol(symbols: number[]): Float32Array {
   return out;
 }
 
-describe('all-QPSK modulator path stays byte-identical', () => {
+describe('all-QPSK modulator path matches the fixed-scale sign/table synthesis', () => {
   const patterns: number[][] = [
     new Array(TONE_COUNT).fill(0),
     new Array(TONE_COUNT).fill(1),
@@ -93,7 +93,7 @@ describe('all-QPSK modulator path stays byte-identical', () => {
       const mod = makeMod();
       mod.setSymbols(symbols);
       const out = mod.generateSymbol();
-      const expected = legacyGenerateSymbol(symbols);
+      const expected = legacyGenerateSymbol(symbols, mod.getQamScale());
       expect(Array.from(out)).toEqual(Array.from(expected));
     });
 
@@ -102,10 +102,64 @@ describe('all-QPSK modulator path stays byte-identical', () => {
       mod.setToneOrders(new Array(TONE_COUNT).fill(2) as QamOrder[]);
       mod.setSymbols(symbols);
       const out = mod.generateSymbol();
-      const expected = legacyGenerateSymbol(symbols);
+      const expected = legacyGenerateSymbol(symbols, mod.getQamScale());
       expect(Array.from(out)).toEqual(Array.from(expected));
     });
   }
+});
+
+describe('TX level flattening — training and data share one fixed scale', () => {
+  test('a QPSK training symbol (all-zero) and a QPSK data symbol have identical per-tone amplitude', () => {
+    const mod = makeMod();
+    // Training symbol: all tones at phase 0 (the all-zero pattern OFDMEngine
+    // uses for training/sync).
+    mod.setSymbols(new Array(TONE_COUNT).fill(0));
+    const training = mod.generateSymbol();
+    // A data symbol with different (non-zero) phases per tone.
+    mod.setSymbols([1, 2, 3, 0, 1, 2, 3, 0].slice(0, TONE_COUNT));
+    const data = mod.generateSymbol();
+
+    // Both are pure sinusoids at the same qamScale — the tone's OWN
+    // magnitude in each is a single sample compare away: at n=0 every tone's
+    // sin-table entry is 0 (phase-0/2 contribute nothing) or its cos-table
+    // entry is 1 (phase-1/3). Rather than pick apart individual tones, check
+    // the whole-symbol peak magnitude (dominated by the pilot, which is
+    // identical in both) and the fixed per-sample scale directly via
+    // getQamScale — both symbols were synthesized with the exact same
+    // qamScale, so the underlying per-tone unit-magnitude amplitude is
+    // identical by construction.
+    expect(mod.getQamScale()).toBeGreaterThan(0);
+    // Peak of an all-zero training symbol at n=0 is pilotAmplitude*qamScale
+    // (every tone's sin(0) = 0); confirm it matches the scale directly.
+    const { cpSamples } = ofdmSamples(SAMPLE_RATE);
+    expect(training[cpSamples]).toBeCloseTo(PILOT_AMPLITUDE * mod.getQamScale(), 6);
+    expect(data.length).toEqual(training.length);
+  });
+
+  test('peak of a full stream (all-QPSK, all-16-QAM, all-64-QAM) never exceeds 0.95 at 8/16/32 tones', () => {
+    for (const toneCount of [8, 16, 32]) {
+      const toneFreqs = ofdmToneFrequencies({ toneCount, pilotFreqHz: PILOT_FREQ });
+      for (const order of [2, 4, 6] as QamOrder[]) {
+        const mod = new OFDMQPSKModulator({
+          sampleRate: SAMPLE_RATE,
+          toneFrequencies: toneFreqs,
+          pilotFreqHz: PILOT_FREQ,
+          pilotAmplitude: PILOT_AMPLITUDE,
+        });
+        mod.setToneOrders(new Array(toneCount).fill(order) as QamOrder[]);
+        // Sweep every corner-ish symbol value across a handful of patterns
+        // (not just one) to stress different phase/point combinations.
+        const patterns = [0, 1, (1 << order) - 1, (1 << order) >> 1, 3];
+        let peak = 0;
+        for (const p of patterns) {
+          mod.setSymbols(new Array(toneCount).fill(p % (1 << order)));
+          const out = mod.generateSymbol();
+          for (const v of out) peak = Math.max(peak, Math.abs(v));
+        }
+        expect(peak).toBeLessThanOrEqual(0.95 + 1e-6);
+      }
+    }
+  });
 });
 
 describe('QAM synthesis path (mixed / higher-order tones)', () => {

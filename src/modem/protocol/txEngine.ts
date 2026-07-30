@@ -184,9 +184,15 @@ export class TxEngine {
    * → trailing silence. Single source of truth for transmission layout; both
    * the batch (`transmitFile`) and streaming (`streamChunks`) paths consume it.
    *
-   * NB: NO global peak-normalize here — the batch path applies it after
-   * concatenation; the streaming path relies on each OFDM symbol already being
-   * peak-normed to 0.95 inside OFDMQPSKModulator.generateSymbol.
+   * NB: NO global peak-normalize here — the batch path applies a safety-net
+   * clamp after concatenation (see transmitFile), but should never actually
+   * fire: every OFDM symbol this generator yields is already at the SAME
+   * fixed, deterministic scale (see OFDMQPSKModulator's qamScale doc), with
+   * worst-case |sample| <= 0.95, so the streaming path needs no
+   * post-hoc normalization either — that is what makes chunked streaming
+   * (streamChunks) safe: each chunk leaves the transmitter at the same level
+   * as every other chunk, so the player's per-chunk clip guard never has
+   * reason to rescale one chunk differently from the next.
    */
   private *frameSegments(
     fileName: string,
@@ -297,7 +303,8 @@ export class TxEngine {
    * (the final chunk may be shorter). Consumes the same frameSegments layout as
    * transmitFile but emits incrementally, so peak memory is bounded to the
    * chunk size instead of the whole waveform. No global peak-normalize (see
-   * frameSegments); each OFDM symbol is already peak-normed to 0.95.
+   * frameSegments); every OFDM symbol already sits at the same fixed
+   * qamScale, so no chunk needs (or gets) independent rescaling.
    */
   *streamChunks(
     fileName: string,

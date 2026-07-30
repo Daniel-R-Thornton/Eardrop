@@ -10,7 +10,7 @@
  * of bin indices.
  */
 import { toneIQ } from '../pilot';
-import { ofdmSamples, OFDM_TUNING, OFDM_DEFAULTS } from '../types';
+import { ofdmSamples, OFDM_TUNING } from '../types';
 import { dlog } from '../../lib/debug/dlog';
 import {
   mapSymbol,
@@ -27,9 +27,6 @@ export interface OFDMQPSKDemodulatorConfig {
   pilotFreqHz: number;
   /** Leaky-integrator gain for decision-directed channel tracking (0 = off, default 0.05) */
   trackingAlpha?: number;
-  /** TX QAM scale override, if any. Must match the modulator so the QAM
-   *  reference scale used for slicing is correct. */
-  qamScaleOverride?: number;
 }
 
 export interface OFDMQPSKResult {
@@ -102,13 +99,6 @@ export class OFDMQPSKDemodulator {
    *  corrupted by decisions made on un-equalized (training-phase-like) data. */
   private postTrainingSymbols = 0;
   /**
-   * Correction ratio applied to the QAM path's channel-equalized tone
-   * reading before slicing (see computeQamRefScale doc). Recomputed whenever
-   * setToneOrders() switches away from all-QPSK; irrelevant (and unused)
-   * while allQpsk is true.
-   */
-  private qamRefScale = 1;
-  /**
    * Decision-directed tracking gain for the QAM channel-estimate tracker —
    * deliberately separate from (and much faster than) `trackingAlpha`, which
    * stays untouched for the QPSK path's byte-identical behavior. QAM frames
@@ -147,8 +137,9 @@ export class OFDMQPSKDemodulator {
   // OFDM_TUNING.qamRefSymbols known reference symbols (see
   // OFDMEngine.modulateQamRefSymbols) so channelEst can be re-fit at the
   // ACTUAL QAM data amplitude — through whatever level-dependent gain the
-  // real audio chain applies — instead of relying on computeQamRefScale's
-  // deterministic (channel-blind) ratio alone. Driven by rxEngine, which
+  // real audio chain applies, rather than trusting the trained (QPSK
+  // training burst) estimate to still hold once QAM data starts. Driven by
+  // rxEngine, which
   // sets a pending counter after a non-all-QPSK profile switch and calls
   // calibrateQamRef() for that many symbols instead of feeding demodulate()'s
   // bits to the scanner.
@@ -349,110 +340,6 @@ export class OFDMQPSKDemodulator {
     }
     this.toneOrders = orders.slice();
     this.allQpsk = orders.every((o) => o === 2);
-    if (!this.allQpsk) {
-      this.qamRefScale = this.computeQamRefScale();
-    }
-  }
-
-  /**
-   * Derives the correction ratio between the training burst's amplitude and
-   * the QAM data path's fixed amplitude — both TX scales are deterministic
-   * functions of shared config, not of the channel, so this needs no live
-   * measurement.
-   *
-   * Why a ratio is needed at all: per the plan's architecture, the training
-   * burst is ALWAYS synthesized via the legacy all-QPSK path
-   * (OFDMQPSKModulator.synthesizeQpsk), which peak-normalizes each symbol to
-   * 0.95 — call that per-symbol scale S0 (deterministic, since every training
-   * symbol is the same all-zero pattern). QAM data symbols use a different,
-   * FIXED scale (OFDMQPSKModulator.qamScale, see 3a) that is NOT equal to S0.
-   * The trained `channelEstRe/Im` therefore encodes (channel gain × S0), while
-   * a raw QAM tone reading encodes (channel gain × qamScale × point). Dividing
-   * the two directly leaves a residual (qamScale / S0) factor that must be
-   * corrected before the result can be compared against the constellation's
-   * designed (unit mean-power) scale.
-   *
-   * Derivation (toneIQ() is a linear matched filter: for x(n)=A·sin/cos(wn),
-   * it returns (i,q) = A·(∓0.5·[sin coeff], ±0.5·[cos coeff]) — a fixed,
-   * tone-independent 0.5 gain):
-   *   - Training tone (x(n)=1·sin(wn), scaled by the global S0): clean (no
-   *     channel) measurement = (0.5·S0, 0) — real, same for every tone.
-   *   - A QAM point (re,im) synthesized as re·cos(wn) − im·sin(wn), scaled
-   *     by qamScale: clean measurement = qamScale·(−0.5·im, 0.5·re).
-   *   - So: (re,im) = (2·q, −2·i) recovers the point from a CLEAN (channel-
-   *     free) measurement of scale 1; with channel + S0/qamScale scaling
-   *     folded in, the correction factor to apply before that 2·/−2· step is
-   *     κ = |clean training tone reading| / qamScale.
-   *
-   * The clean training tone reading is computed directly from the same
-   * synthesis math as the legacy all-QPSK path, without instantiating a
-   * throwaway modulator. It builds the all-zero symbol body, peak-normalizes
-   * it to 0.95 (replicating the exact Float32 rounding of the modulator), and
-   * applies toneIQ() to the first tone.
-   */
-  private computeQamRefScale(): number {
-    const refAmp = OFDMQPSKDemodulator.qpskTrainingToneAmplitude(
-      this.cfg.sampleRate,
-      this.cfg.toneFrequencies,
-      this.cfg.pilotFreqHz,
-      OFDM_DEFAULTS.pilotAmplitude,
-      this.fftSamples,
-    );
-    const numTones = this.toneCount;
-    const { pilotAmplitude } = OFDM_DEFAULTS;
-    const CREST = 3.5;
-    const rms = Math.sqrt(numTones + pilotAmplitude * pilotAmplitude);
-    const qamScale = this.cfg.qamScaleOverride ?? 0.95 / (CREST * rms);
-    return refAmp > 0 && qamScale > 0 ? refAmp / qamScale : 1;
-  }
-
-  /**
-   * Pure helper that computes the amplitude toneIQ() would measure for tone 0
-   * of an all-zero legacy QPSK training symbol. The math mirrors
-   * OFDMQPSKModulator.synthesizeQpsk exactly, including Float32 rounding, so
-   * the result is bit-identical to the throwaway-modulator reference it
-   * replaces.
-   */
-  private static qpskTrainingToneAmplitude(
-    sampleRate: number,
-    toneFrequencies: Float32Array,
-    pilotFreqHz: number,
-    pilotAmplitude: number,
-    fftSamples: number,
-  ): number {
-    const twoPiOverFs = (2 * Math.PI) / sampleRate;
-    const numTones = toneFrequencies.length;
-    const toneW = new Float64Array(numTones);
-    for (let t = 0; t < numTones; t++) toneW[t] = twoPiOverFs * toneFrequencies[t];
-    const pilotW = twoPiOverFs * pilotFreqHz;
-
-    // Build the unscaled all-zero QPSK symbol body and find its peak.
-    const body = new Float32Array(fftSamples);
-    let peak = 0;
-    for (let n = 0; n < fftSamples; n++) {
-      let acc = Math.fround(pilotAmplitude * Math.cos(pilotW * n));
-      for (let t = 0; t < numTones; t++) {
-        acc += Math.fround(Math.sin(toneW[t] * n));
-      }
-      body[n] = acc;
-      const a = Math.abs(body[n]);
-      if (a > peak) peak = a;
-    }
-    const scale = peak > 0 ? 0.95 / peak : 1;
-    for (let n = 0; n < fftSamples; n++) body[n] *= scale;
-
-    // toneIQ() of the first tone on the normalized body.
-    const f0 = toneFrequencies[0];
-    let i = 0;
-    let q = 0;
-    for (let n = 0; n < fftSamples; n++) {
-      const phase = (2 * Math.PI * f0 * n) / sampleRate;
-      i += body[n] * Math.sin(phase);
-      q += body[n] * Math.cos(phase);
-    }
-    i /= fftSamples;
-    q /= fftSamples;
-    return Math.hypot(i, q);
   }
 
   /**
@@ -582,13 +469,19 @@ export class OFDMQPSKDemodulator {
       // OFDMEngine.modulateQamRefSymbols) — apply the identical rotation
       // here so `ideal` matches what was actually transmitted.
       const ideal = rotatePoint(outerCornerPoint(order), qamRefPhase(t, this.toneCount));
-      // Known transmitted point → expected pre-qamRefScale rotated value
-      // (i0,q0), same convention as demodulate()'s iCorr/qCorr. gainCorr is
-      // pinned to 1 (see method doc).
-      const i0 = -ideal.im / 2;
-      const q0 = ideal.re / 2;
-      const expRotRe = i0 / this.qamRefScale;
-      const expRotIm = q0 / this.qamRefScale;
+      // Known transmitted point → expected rotated value, same convention as
+      // demodulate()'s re/im recovery below (toneIQ()'s inherent 0.5 gain
+      // means a clean point measures as (i,q) = (-0.5*im, 0.5*re); this is
+      // that same relationship inverted: given the point, the expected
+      // (i,q) is (-im, re) — see demodulate()'s `re = rotIm; im = -rotRe`
+      // for the forward direction). TX now uses the SAME fixed scale for
+      // training and QAM data (see OFDMQPSKModulator's qamScale doc), so
+      // there is no residual training-vs-data ratio beyond that structural
+      // 0.5 (the old qamRefScale mirror correctly reduces to a fixed 0.5,
+      // which is folded directly into this -im/re relationship rather than
+      // carried as a separate field). gainCorr is pinned to 1 (see method doc).
+      const expRotRe = -ideal.im;
+      const expRotIm = ideal.re;
       // Undo the drift rotation to get back to the training-snapshot frame
       // (inverse of demodulate()'s extraAngle rotation).
       const extraAngle = -driftPerHz * this.cfg.toneFrequencies[t];
@@ -869,10 +762,10 @@ export class OFDMQPSKDemodulator {
         // ── Per-tone QAM path (taken only when some tone's order > QPSK) ──
         // Full complex equalization (phase AND magnitude) instead of the
         // legacy phase-only correction — 16/64-QAM need amplitude as a
-        // decision axis, which only works because 3a gave the TX a fixed
-        // (not per-symbol-renormalized) amplitude. See computeQamRefScale's
-        // doc for why a fixed correction ratio is layered on top of the
-        // per-tone channel estimate. Decision-directed tracking (confidence-
+        // decision axis, which only works because the TX uses one fixed
+        // scale for every symbol (training and data alike — see
+        // OFDMQPSKModulator's qamScale doc), so no training-vs-data
+        // correction ratio is needed here. Decision-directed tracking (confidence-
         // gated, same idea as the QPSK path above but updating the FULL
         // complex channel estimate, not just phase) keeps channelEst from
         // drifting relative to the fixed κ/drift correction over a long
@@ -937,15 +830,20 @@ export class OFDMQPSKDemodulator {
           rotRe *= gainCorr;
           rotIm *= gainCorr;
 
-          // Correct the residual training-scale-vs-qamScale ratio (see
-          // computeQamRefScale), then undo the fixed rotation/scale baked
-          // into the re·cos − im·sin synthesis + toneIQ(sin,cos) convention:
-          // a clean (re,im) point measures as (i,q) = (−0.5·im, 0.5·re), so
-          // (re,im) = (2·q, −2·i) recovers it.
-          const iCorr = rotRe * this.qamRefScale;
-          const qCorr = rotIm * this.qamRefScale;
-          const re = 2 * qCorr;
-          const im = -2 * iCorr;
+          // Undo the fixed rotation/scale baked into the re·cos − im·sin
+          // synthesis + toneIQ(sin,cos) convention: a clean (re,im) point
+          // measures as (i,q) = (−0.5·im, 0.5·re). Dividing by channelEst
+          // (trained on a tone whose own toneIQ reading carries the SAME
+          // built-in 0.5 factor — see the class doc on training) cancels
+          // that 0.5 exactly, so (re,im) = (q, −i) recovers the point
+          // directly — no leftover factor of 2, and (now that training and
+          // QAM data share one fixed qamScale — see OFDMQPSKModulator's
+          // doc) no separate training-vs-data ratio either. This replaces
+          // the old `(2·q, −2·i)` recovery, which needed the extra ×2
+          // specifically to cancel the old qamRefScale mirror's built-in
+          // 0.5 (S0-vs-qamScale ratio was folded in at 2×; here it's gone).
+          const re = rotIm;
+          const im = -rotRe;
 
           toneIQOut.push({ i: re, q: im });
 
@@ -985,16 +883,19 @@ export class OFDMQPSKDemodulator {
           // against the normalized mean power (1) is amplitude-class-
           // independent across QPSK/16-QAM/64-QAM.
           if (refPow > 0 && errPow < 0.09) {
-            const i0 = -ideal.im / 2;
-            const q0 = ideal.re / 2;
+            // Expected pre-gain-correction rotRe/rotIm — the inverse of the
+            // forward `re = rotIm; im = -rotRe` recovery (see demodulate()'s
+            // QAM branch doc), i.e. rotRe = -ideal.im, rotIm = ideal.re.
+            const i0 = -ideal.im;
+            const q0 = ideal.re;
             // Undo the gain correction first (expRotRe/Im here is the
             // POST-gain-correction expected rotRe/rotIm; the reconstruction
             // must walk back through the same steps demodulate() applied
             // going forward, so gainCorr comes off before the drift
             // rotation is undone). gainCorr is clamped >= 0.5, so this is
             // always safe to divide by.
-            const expRotRe = (i0 / this.qamRefScale) / gainCorr;
-            const expRotIm = (q0 / this.qamRefScale) / gainCorr;
+            const expRotRe = i0 / gainCorr;
+            const expRotIm = q0 / gainCorr;
             // Undo the drift rotation (inverse of the forward rotRe/rotIm step).
             const expDivRe = expRotRe * cosE + expRotIm * sinE;
             const expDivIm = expRotIm * cosE - expRotRe * sinE;

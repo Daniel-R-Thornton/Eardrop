@@ -7,7 +7,7 @@
  * is the tail of the window copied to the front, exactly as before.
  */
 import { ofdmSamples } from '../types';
-import { mapSymbol, type ConstellationPoint, type QamOrder } from './constellation';
+import { mapSymbol, MAX_QAM_MAGNITUDE, type ConstellationPoint, type QamOrder } from './constellation';
 
 export interface OFDMQPSKModulatorConfig {
   sampleRate: number;
@@ -15,12 +15,13 @@ export interface OFDMQPSKModulatorConfig {
   pilotFreqHz: number;
   pilotAmplitude: number;
   /**
-   * Fixed per-tone TX scale used ONLY when at least one tone is above QPSK
-   * (see generateSymbol). Default: derived in the constructor from the
-   * worst-case fully-aligned sum of every tone at the largest QAM corner
-   * point plus the pilot, backed off to a 0.95 peak target — see the
-   * `qamScale` field doc below for the honest PAPR caveat. Override only for
-   * tuning against real hardware headroom.
+   * Fixed per-tone TX scale used for EVERY OFDM symbol this modulator emits —
+   * training, QPSK data, QAM data, and QAM reference symbols alike (see
+   * `qamScale` field doc below). Default: derived in the constructor from
+   * the true worst-case fully-aligned sum of every tone at the largest
+   * supported constellation's corner point plus the pilot, backed off to a
+   * 0.95 peak target. Override only for tuning against real hardware
+   * headroom.
    */
   qamScaleOverride?: number;
 }
@@ -50,8 +51,10 @@ export class OFDMQPSKModulator {
   private selSign: Float32Array;
 
   // Per-tone bit-loading (Phase 3). Default: every tone QPSK (order 2), which
-  // keeps generateSymbol on the untouched legacy sign/table path below —
-  // byte-identical to the pre-QAM modem. Only set by setToneOrders().
+  // keeps generateSymbol on the sign/table selection path below (the fixed
+  // TX scale — see qamScale doc — is now shared with the QAM path, so this
+  // is no longer byte-identical to the pre-flattening modem, only to the
+  // pre-QAM one's tone-selection logic). Only set by setToneOrders().
   private toneOrders: QamOrder[];
   private allQpsk: boolean;
   // Per-tone (re, im) constellation points for the current symbol, used ONLY
@@ -59,7 +62,8 @@ export class OFDMQPSKModulator {
   // to mirror sinTable/cosTable's access pattern.
   private symRe: Float32Array;
   private symIm: Float32Array;
-  // Fixed per-tone TX scale for the QAM path — see config doc + constructor.
+  // Fixed per-tone TX scale, applied uniformly to EVERY symbol this modulator
+  // emits (training, QPSK data, QAM data, QAM ref) — see config doc + constructor.
   private readonly qamScale: number;
 
   constructor(config: OFDMQPSKModulatorConfig) {
@@ -73,23 +77,39 @@ export class OFDMQPSKModulator {
     this.allQpsk = true;
     this.symRe = new Float32Array(numTones);
     this.symIm = new Float32Array(numTones);
-    // Fixed QAM-path scale (stable across symbols — the requirement for
-    // amplitude to be a usable decision axis; the demod derives its reference
-    // from this same value so raising it is safe).
+    // Fixed TX scale, identical for every symbol this modulator emits — the
+    // whole transmission (chirp aside, which is scaled independently) sits at
+    // ONE constant, deterministic amplitude. This used to be a per-symbol
+    // peak-normalize (QPSK path) mixed with a separate statistical CREST·RMS
+    // bound (QAM path); measured acoustic logs showed real transmissions
+    // stepping by up to 11 dB between chunks because per-symbol normalization
+    // makes the transmitted level depend on THAT symbol's data, and the
+    // player's clip guard then rescales each streamed chunk independently to
+    // its own local peak. QAM's amplitude decisions can't survive that; QPSK
+    // (phase-only decisions) happened to. A single fixed scale removes the
+    // dependency entirely, and — just as important — makes the training
+    // burst's per-tone amplitude identical to data's, which the receiver's
+    // channel estimate (trained on training, applied to data) requires.
     //
-    // PAPR back-off, not the worst case: an OFDM symbol is a sum of N
-    // independent tones, so by the CLT its peak sits at ~CREST·RMS, far below
-    // the all-tones-aligned worst case. Targeting the worst case made QAM data
-    // ~2.5× quieter than the per-symbol-normalized QPSK preamble → after the
-    // player normalizes the whole signal to the loud preamble, the QAM data
-    // lost ~8 dB of SNR and failed to decode even on a pristine link. Instead
-    // target a high-percentile peak at 0.95: RMS = sqrt(Σ tone power + pilot²)
-    // (constellation is unit average power), peak ≈ CREST·RMS. CREST=3.5
-    // (~11 dB) covers ~99.9% of symbols; the rare over-peak clips harmlessly.
-    // This makes QAM data as loud as QPSK so its SNR is fair.
-    const CREST = 3.5;
-    const rms = Math.sqrt(numTones + config.pilotAmplitude * config.pilotAmplitude);
-    this.qamScale = config.qamScaleOverride ?? 0.95 / (CREST * rms);
+    // Derivation — TRUE worst case, not a statistical percentile: this
+    // modulator's tone frequencies are exact integer multiples of 1/window,
+    // so at n=0 every tone's cos table reads exactly 1 (sin reads 0) — i.e.
+    // the coherent-worst-case alignment is actually reachable, not just a
+    // tail event, so a CLT/percentile bound is not safe here. The peak of
+    // Σ_t (re_t·cos − im_t·sin) + pilot·cos is bounded (triangle inequality)
+    // by Σ_t |point_t| + pilotAmplitude, and that bound is achieved (every
+    // tone's point real-valued and maximal, evaluated at n=0). Each tone's
+    // |point_t| is at most MAX_QAM_MAGNITUDE (the largest corner magnitude
+    // across every constellation order this modulator can be asked to carry
+    // — see constellation.ts; QPSK's unit-magnitude points are smaller, so
+    // this bound stays safe for a QPSK-only symbol too, and for any per-tone
+    // bit-loading mix). So:
+    //   worstCasePeak = numTones · MAX_QAM_MAGNITUDE + pilotAmplitude
+    //   qamScale = 0.95 / worstCasePeak
+    // guarantees |sample| <= 0.95 for every symbol this modulator can ever
+    // produce, for any data, any per-tone order assignment, any tone count.
+    const worstCasePeak = numTones * MAX_QAM_MAGNITUDE + config.pilotAmplitude;
+    this.qamScale = config.qamScaleOverride ?? 0.95 / worstCasePeak;
 
     const twoPiOverFs = (2 * Math.PI) / config.sampleRate;
     // Precomputed sin/cos tables: each is a Float32Array of fftSamples.
@@ -119,21 +139,22 @@ export class OFDMQPSKModulator {
   }
 
   /**
-   * Per-tone bit-loading (Phase 3): assign each tone's constellation order.
-   * Default (never called) is all-QPSK, which keeps generateSymbol on the
-   * legacy byte-identical path. Length must match toneFrequencies.
-   */
-  /**
-   * Fixed QAM-path scale (see the `qamScale` field/config doc above) — exposed
-   * so the demodulator can compute the correction ratio between the training
-   * burst's per-symbol peak-norm amplitude and this fixed scale (both are
-   * pure functions of shared config, no channel measurement needed; see
-   * OFDMQPSKDemodulator's `computeQamRefScale` doc for the derivation).
+   * Fixed TX scale (see the `qamScale` field/config doc above) — exposed so
+   * callers/tests can inspect the exact per-tone amplitude this modulator
+   * uses for every symbol it emits (training, QPSK data, QAM data, QAM ref).
+   * Now that training and data share this same scale, the demodulator no
+   * longer needs a correction ratio between them (see
+   * OFDMQPSKDemodulator — the old `computeQamRefScale`/`qamRefScale` mirror
+   * was removed; the ratio is trivially 1).
    */
   getQamScale(): number {
     return this.qamScale;
   }
 
+  /**
+   * Per-tone bit-loading (Phase 3): assign each tone's constellation order.
+   * Default (never called) is all-QPSK. Length must match toneFrequencies.
+   */
   setToneOrders(orders: QamOrder[]): void {
     if (orders.length !== this.cfg.toneFrequencies.length) {
       throw new Error(
@@ -151,9 +172,9 @@ export class OFDMQPSKModulator {
       );
     }
     if (this.allQpsk) {
-      // Legacy path: symbols are QPSK phase indices 0..3. UNCHANGED from the
-      // pre-QAM modem — this is what keeps generateSymbol byte-identical
-      // when every tone is QPSK (the default and today's only mode).
+      // Legacy path: symbols are QPSK phase indices 0..3. Tone-selection
+      // logic UNCHANGED from the pre-QAM modem; synthesizeQpsk now applies
+      // the shared fixed qamScale instead of a per-symbol peak-normalize.
       this.phases = symbols.map(qpskPhase);
       // sin(base + k·π/2): 0→+sin, 1→+cos, 2→−sin, 3→−cos
       for (let t = 0; t < symbols.length; t++) {
@@ -203,24 +224,26 @@ export class OFDMQPSKModulator {
     return out;
   }
 
-  /** Legacy all-QPSK synthesis — UNCHANGED, byte-identical to the pre-QAM modem. */
+  /**
+   * All-QPSK synthesis. Uses the SAME fixed `qamScale` as synthesizeQam (see
+   * the constructor doc) instead of a per-symbol peak-normalize — this is
+   * what makes training and QPSK/QAM data land at identical per-tone
+   * amplitude, and keeps the whole transmission at one constant level. NOT
+   * byte-identical to the pre-flattening modem (that per-symbol
+   * peak-normalize to 0.95 is exactly the bug this replaces).
+   */
   private synthesizeQpsk(): Float32Array {
     const { toneFrequencies } = this.cfg;
     const numTones = toneFrequencies.length;
     const body = new Float32Array(this.fftSamples);
-    const { pilotTable, selTable, selSign } = this;
+    const { pilotTable, selTable, selSign, qamScale } = this;
     for (let n = 0; n < this.fftSamples; n++) {
       let acc = pilotTable[n];
       for (let t = 0; t < numTones; t++) {
         acc += selSign[t] * selTable[t][n];
       }
-      body[n] = acc;
+      body[n] = acc * qamScale;
     }
-    // Peak-normalize to 0.95
-    let peak = 0;
-    for (let n = 0; n < body.length; n++) peak = Math.max(peak, Math.abs(body[n]));
-    const scale = peak > 0 ? 0.95 / peak : 1;
-    for (let n = 0; n < body.length; n++) body[n] *= scale;
     return body;
   }
 

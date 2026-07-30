@@ -149,15 +149,29 @@ export class RxEngine {
   /** Samples still to discard so the window grid lands on a symbol boundary */
   private ofdmSkip = 0;
   /** EMA of waiting-state tone energy — adapts the sync threshold to mic gain */
-  // Seed at 0.08 so the first windows don't false-trigger on room noise
-  // (typical e=0.2-0.3). Asymmetric update:
+  // Seed low so the first windows don't false-trigger AND the training burst
+  // reliably freezes the floor (needs totalE > 5x this seed — see below).
+  // Was 0.07 back when the OFDM training burst was per-symbol peak-normed to
+  // ~0.95 (total tone energy e~0.4+); TX level flattening (see
+  // OFDMQPSKModulator's qamScale doc) now uses one fixed, worst-case-safe
+  // scale so the burst never clips, at the cost of being quieter — clean
+  // training total-tone-energy is ~0.27-0.31 regardless of tone count (8/16/
+  // 32), not ~0.4+. Reseeded so the SAME margin architecture holds at the
+  // new level: 5x this seed (~0.10) sits well below the new signal
+  // (~0.27-0.31, >2.5x margin), so a clean burst still freezes the floor
+  // instead of the EMA chasing the signal upward and never latching sync
+  // (this chasing was an actual regression this reseed fixes — see
+  // ofdm_acoustic_path.test.ts's 100-sample-delay case). Asymmetric update:
   //   - Fast decay (α=0.20) when energy drops below ema
   //   - Slow rise (α=0.05) when ambient noise increases up to 5× ema
   //   - Freeze at >5× ema (sync burst, typically 10-30× noise)
-  // 0.07 → 5×=0.35. Test signals at e=0.403 still freeze (detect),
-  // room noise at 0.2-0.3 slow-rises to ~0.3 (thr≈0.9, suppressed).
-  private ofdmNoiseEma = 0.07;
-  private readonly OFDM_EMA_SEED = 0.07;
+  // CONCERN: this makes the training burst's absolute level closer to
+  // typical real-room ambient noise (previously e=0.403 vs ~0.2-0.3 noise,
+  // already a thin ~1.3-2x margin) — acoustic sync-detection margin over
+  // ambient noise is worse than before, not just numerically retuned to
+  // pass the in-memory test. Flagged for real-hardware validation.
+  private ofdmNoiseEma = 0.02;
+  private readonly OFDM_EMA_SEED = 0.02;
   /**
    * Windows processed since the last VALID (CRC-passing) decoded frame —
    * sliding sync-loss watchdog (3b). Reset on every valid frame in
@@ -1245,7 +1259,6 @@ export class RxEngine {
       sampleRate: this.cfg.sampleRate,
       toneFrequencies: demodToneFreqs,
       pilotFreqHz: this.cfg.pilotFreqHz,
-      qamScaleOverride: (this.cfg as any).qamScaleOverride,
     });
     // Pre-compute chirp template for sync detection
     const chirpDurationSec = (OFDM_TUNING.syncBurstSymbols * symSamples) / this.cfg.sampleRate;
@@ -1570,7 +1583,6 @@ export class RxEngine {
             sampleRate: this.cfg.sampleRate,
             toneFrequencies: this.ofdmToneFreqs,
             pilotFreqHz: this.cfg.pilotFreqHz,
-            qamScaleOverride: (this.cfg as any).qamScaleOverride,
           });
           // Reset training so fresh symbols can be accumulated.
           this.ofdmDemod.resetTraining();
