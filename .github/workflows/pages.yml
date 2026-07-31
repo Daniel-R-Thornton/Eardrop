@@ -23,7 +23,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
+      # eslint-config-airbnb pins eslint ^7/^8 while the repo is on eslint 10;
+      # local installs resolve with legacy peer handling, match that here.
+      - run: npm ci --legacy-peer-deps
       - run: npm run build
         env:
           VITE_BASE: /Eardrop/
