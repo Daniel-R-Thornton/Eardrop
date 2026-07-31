@@ -16,6 +16,22 @@ const RING_MAX = 500;
 const MAX_LINE_LEN = 100; // tight lines: max data, min context
 const ring: string[] = [];
 const rateCounters = new Map<string, number>();
+
+/**
+ * Structured mirror of the ring: the same events, but as {tag, fields} rather
+ * than formatted text.
+ *
+ * Exists so the LLM export can aggregate rather than re-parse. Console lines are
+ * wrapped at MAX_LINE_LEN, so a per-tone array arrives as several continuation
+ * lines with no key on them — recovering the values from that is fragile in a
+ * way that silently corrupts summaries. Capturing at emit time keeps the values
+ * intact and leaves console formatting free to change.
+ */
+export interface DlogRecord {
+  tag: string;
+  fields: Record<string, unknown>;
+}
+const records: DlogRecord[] = [];
 const disabledTags = new Set<string>();
 
 export type DlogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -31,6 +47,16 @@ export type DlogLevel = 'debug' | 'info' | 'warn' | 'error';
 export type DlogMode = 'lines' | 'redraw' | 'forward';
 let mode: DlogMode = 'lines';
 let forwardCb: ((line: string) => void) | null = null;
+/**
+ * Structured counterpart of forwardCb.
+ *
+ * Forwarding only the formatted lines loses every field: the receiving context's
+ * `records` array stays empty, so the LLM export — which aggregates records, not
+ * lines — silently reports just the handful of events that happened to be logged
+ * in that same context. Most of the modem logs in this app run in the worker, so
+ * without this the digest was nearly blank.
+ */
+let forwardRecordCb: ((rec: DlogRecord) => void) | null = null;
 let redrawPending = false;
 
 /** Lines from ring that have already been emitted as a console entry */
@@ -45,9 +71,14 @@ interface DupState {
 }
 const dupState = new Map<string, DupState>();
 
-export function dlogSetMode(next: DlogMode, onForward?: (line: string) => void): void {
+export function dlogSetMode(
+  next: DlogMode,
+  onForward?: (line: string) => void,
+  onForwardRecord?: (rec: DlogRecord) => void,
+): void {
   mode = next;
   forwardCb = onForward ?? null;
+  forwardRecordCb = onForwardRecord ?? null;
 }
 
 /**
@@ -83,6 +114,11 @@ export function dlogInject(line: string): void {
   if (mode === 'redraw') scheduleRedraw();
 }
 
+/** Add a structured event produced in another context to this record buffer. */
+export function dlogInjectRecord(rec: DlogRecord): void {
+  recordPush(rec);
+}
+
 /** Push to ring, evicting oldest when full. Adjusts redrawEmitted so
  *  incremental flushes stay aligned after ring shifts. */
 function ringPush(line: string): void {
@@ -91,6 +127,12 @@ function ringPush(line: string): void {
     ring.shift();
     if (redrawEmitted > 0) redrawEmitted--;
   }
+}
+
+/** Push to the record buffer, evicting oldest when full. */
+function recordPush(rec: DlogRecord): void {
+  records.push(rec);
+  if (records.length > RING_MAX) records.shift();
 }
 
 export interface DlogOptions {
@@ -201,6 +243,11 @@ export function dlog(
   const lines = formatLines(tag, fields, level);
   if (lines.length === 0) return null;
 
+  // Mirror the event structurally before any console formatting or dedup — the
+  // LLM export aggregates from these, not from the wrapped text.
+  recordPush({ tag, fields });
+  if (mode === 'forward' && forwardRecordCb) forwardRecordCb({ tag, fields });
+
   // Deduplication only applies to single-line logs (covers >99% of calls).
   const primary = lines[0];
   const prefix = buildPrefix(tag, level);
@@ -239,6 +286,11 @@ export function dlogDump(count = 200): string {
   return ring.slice(-count).join('\n');
 }
 
+/** Structured records, for aggregation (see DlogRecord). */
+export function dlogRecords(count = RING_MAX): DlogRecord[] {
+  return records.slice(-count);
+}
+
 /**
  * Ring capacity, exported so callers that COUNT events in a dump (rather than
  * just reading it) can ask for everything and detect saturation. Scraping a
@@ -255,6 +307,7 @@ export function dlogRingLength(): number {
 /** Reset rate counters, duplicate state, and ring (call when starting a fresh transmission test). */
 export function dlogReset(): void {
   ring.length = 0;
+  records.length = 0;
   rateCounters.clear();
   dupState.clear();
   redrawEmitted = 0;

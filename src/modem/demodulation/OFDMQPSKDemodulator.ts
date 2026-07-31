@@ -313,6 +313,35 @@ export class OFDMQPSKDemodulator {
   }
 
   /**
+   * Per-tone MER of the STAGED (uncommitted) run, in dB.
+   *
+   * The committed per-tone report only ever appears after a frame decodes, which
+   * makes it useless in the case that matters: a frame that failed. Whether a
+   * failure is flat across tones or tilted decides what to fix — flat points at
+   * level or common phase error, a ramp or spread points at the channel and is
+   * what pre-emphasis addresses — and that shape is available here, then thrown
+   * away by discardMER a moment later.
+   */
+  getStagedPerToneMER(): number[] {
+    const out = new Array<number>(this.toneCount).fill(0);
+    for (let t = 0; t < this.toneCount; t++) {
+      const ref = this.stagedToneRef[t];
+      const err = this.stagedToneErr[t];
+      if (!(ref > 0) || !(err > 0)) {
+        out[t] = 99;
+        continue;
+      }
+      out[t] = -10 * Math.log10(err / ref);
+    }
+    return out;
+  }
+
+  /** Whether any staged symbols exist to report on. */
+  hasStagedMER(): boolean {
+    return this.stagedCount > 0;
+  }
+
+  /**
    * Drop the current run's staged MER stats without committing — call when
    * the frame these symbols belonged to failed to decode, or sync was lost
    * (watchdog reset), so noise/silence never taints the committed report.

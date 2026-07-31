@@ -21,6 +21,7 @@
  */
 
 import { bch63Encode, bch63Decode, type Bch63Result } from '../ecc/bch63';
+import { whitenFrameBody } from './whiten';
 import { rsEncode, rsDecode } from '../ecc/reedsolomon';
 import { crc32 } from '../../crc32';
 
@@ -45,7 +46,7 @@ export const PAYLOAD_DATA_SIZE = RS_BLOCK_DATA * PAYLOAD_BLOCKS;
 /** Total frame size on the wire (bytes) */
 export const FRAME_SIZE = SENTINEL_SIZE + BCH_HEADER_SIZE + RS_PAYLOAD_SIZE;
 
-const SENTINEL_BYTES = new Uint8Array([0xe7, 0x9f, 0xe7]);
+export const SENTINEL_BYTES = new Uint8Array([0xe7, 0x9f, 0xe7]);
 
 // ─── Frame type constants ────────────────────────────
 
@@ -254,13 +255,21 @@ export function encodeFrame(header: AtomicHeader, payload: Uint8Array): Uint8Arr
     }
   }
 
+  // 6. Whiten everything after the sentinel — see whiten.ts for why. Applied
+  // LAST, over the BCH header and the striped RS region alike, so no part of
+  // the wire format can carry a long run of identical bytes (which becomes a
+  // run of identical OFDM symbols, hence a coherent peak and a biased receiver
+  // power estimate). The sentinel stays in the clear because the receiver finds
+  // frames by searching raw bytes for it.
+  whitenFrameBody(frame, SENTINEL_SIZE);
+
   return frame;
 }
 
 /**
  * Decode a frame. Returns header + payload + validity + failure diagnosis.
  */
-export function decodeFrame(frame: Uint8Array): DecodedFrame {
+export function decodeFrame(frameIn: Uint8Array): DecodedFrame {
   const emptyPayload = new Uint8Array(PAYLOAD_DATA_SIZE);
   const emptyResult = (reason: DecodedFrame['failureReason']): DecodedFrame => ({
     header: null,
@@ -272,16 +281,23 @@ export function decodeFrame(frame: Uint8Array): DecodedFrame {
     rsBlockErrors: [],
   });
 
-  if (frame.length < FRAME_SIZE) {
+  if (frameIn.length < FRAME_SIZE) {
     return emptyResult('short');
   }
 
-  // 1. Check sentinel
+  // 1. Check sentinel (never whitened — see encodeFrame step 6)
   for (let i = 0; i < SENTINEL_SIZE; i++) {
-    if (frame[i] !== SENTINEL_BYTES[i]) {
+    if (frameIn[i] !== SENTINEL_BYTES[i]) {
       return emptyResult('sentinel');
     }
   }
+
+  // 1b. De-whiten the body before any decoding. Same operation as whitening;
+  // done on a COPY because callers hand us frames sliced out of a live receive
+  // buffer and must not see them mutated (the scanner may re-examine the same
+  // bytes at a different offset).
+  const frame = new Uint8Array(frameIn);
+  whitenFrameBody(frame, SENTINEL_SIZE);
 
   // 2. BCH(63,30) × 3 decode header
   const bchStart = SENTINEL_SIZE;

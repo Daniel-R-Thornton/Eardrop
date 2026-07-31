@@ -10,7 +10,7 @@ import { ofdmSamples } from '../types';
 import {
   mapSymbol,
   MAX_QAM_MAGNITUDE,
-  maxConstellationMagnitude,
+  syncQpskSymbols,
   type ConstellationPoint,
   type QamOrder,
 } from './constellation';
@@ -57,10 +57,12 @@ function qpskPhase(symbol: number): number {
 /**
  * Peak-to-RMS budget (crest factor, linear) the fixed TX scale is sized for.
  *
- * 5.5 ~= 14.8 dB. NOTE this is not what sets the scale at 16 tones and above —
- * the phase-aligned sync burst's peak is larger there and wins (see the
- * syncCoherentPeak block). It still governs at low tone counts and would govern
- * everywhere if the preamble were ever de-cohered.
+ * 5.5 ~= 14.8 dB. This is what sets the scale at EVERY tone count now that the
+ * preamble term is measured off the de-cohered burst rather than assumed
+ * coherent (see the syncBurstPeak block): the real burst peaks well below a
+ * random payload, so payload crest is the binding constraint. It follows that
+ * this constant is now the single lever on transmitted level, and clipRate.test
+ * is the only thing standing behind it.
  *
  * Chosen from measurement, not theory: over 600 random symbols
  * at every supported tone count and constellation order, the highest crest
@@ -127,6 +129,38 @@ export class OFDMQPSKModulator {
     this.allQpsk = true;
     this.symRe = new Float32Array(numTones);
     this.symIm = new Float32Array(numTones);
+
+    // ── basis tables FIRST: the peak budget below is measured, not assumed ──
+    // Order matters. The preamble term of the budget is the peak of the actual
+    // sync burst, which has to be synthesized to be known, and synthesis needs
+    // these tables. Synthesis is linear in qamScale, so measuring at unit scale
+    // and dividing is exact — see unitPeakForQpskSymbols.
+    const twoPiOverFs = (2 * Math.PI) / config.sampleRate;
+    // Precomputed sin/cos tables: each is a Float32Array of fftSamples.
+    // Memory footprint is approximately 2 * toneCount * fftSamples * 4 bytes
+    // (plus one pilotTable of fftSamples * 4 bytes).
+    this.sinTable = new Array(numTones);
+    this.cosTable = new Array(numTones);
+    for (let t = 0; t < numTones; t++) {
+      const s = new Float32Array(fftSamples);
+      const c = new Float32Array(fftSamples);
+      const w = twoPiOverFs * config.toneFrequencies[t];
+      for (let n = 0; n < fftSamples; n++) {
+        s[n] = Math.sin(w * n);
+        c[n] = Math.cos(w * n);
+      }
+      this.sinTable[t] = s;
+      this.cosTable[t] = c;
+    }
+    this.pilotTable = new Float32Array(fftSamples);
+    const wp = twoPiOverFs * config.pilotFreqHz;
+    for (let n = 0; n < fftSamples; n++) {
+      this.pilotTable[n] = config.pilotAmplitude * Math.cos(wp * n);
+    }
+    // Default selectors: symbol 0 (0° ⇒ +sin) on every tone.
+    this.selTable = this.sinTable.slice();
+    this.selSign = new Float32Array(numTones).fill(1);
+
     // Fixed TX scale, identical for every symbol this modulator emits — the
     // whole transmission (chirp aside, which is scaled independently) sits at
     // ONE constant, deterministic amplitude. This used to be a per-symbol
@@ -215,50 +249,62 @@ export class OFDMQPSKModulator {
     );
     const paprPeak = PAPR_CREST * rmsSum;
 
+    // Pre-emphasis concentrates energy into the boosted tones, which raises the
+    // crest factor: the sum behaves like FEWER carriers than there are, and a
+    // budget built from RMS under-predicts the peak. Measured on real frames
+    // with a 17 dB-tilt calibration applied, an RMS-based budget produced peaks
+    // of 1.08-1.15 — clipping, which is the single failure that has broken this
+    // link most often.
+    //
+    // Attempts to correct it analytically (participation ratio, N_eff) got
+    // closer but still clipped at some tone counts, so this takes the
+    // conservative route: whenever the gains are non-uniform, fall back to the
+    // coherent bound, which cannot clip for any data. That costs the ~3.5 dB
+    // that whitening unlocked, but only while a calibration is active — and
+    // calibration buys a 26 dB -> 5 dB flattening of the per-tone response,
+    // which is worth far more than 3.5 dB of level.
+    //
+    // Reclaiming it needs the achievable crest WITH gains measured rather than
+    // predicted, the same way PAPR_CREST itself was arrived at.
+    const gainSpread = Math.max(...this.toneGains) / Math.max(Math.min(...this.toneGains), 1e-9);
+    const gainsAreUniform = gainSpread < 1.01;
+
     // ── the sync/training burst is NOT random data, and must be budgeted ──
-    // A crest budget derived from random payload does not cover the preamble.
-    // generateSyncBurst sets EVERY tone to the same QPSK symbol, so its
-    // carriers are phase-aligned by construction and it hits very nearly the
-    // coherent peak — measured crest 6.70 at 32 tones against ~2.6 for data.
-    // It is also transmitted on every single transmission, so it is a
-    // guaranteed event, not a tail one.
+    // A crest budget derived from random payload does not cover the preamble: it
+    // is a fixed waveform sent on every transmission, so its peak is a certainty
+    // rather than a tail event, and sizing to random data alone put it at 1.248
+    // at 32 tones — clipping the very symbols the channel estimate is built
+    // from, which turned a flat 6 dB h profile into a 22 dB ramp.
     //
-    // Sizing to random data alone put its peak at 1.248 at 32 tones: the
-    // preamble clipped on every transmission, which distorted the very symbols
-    // the channel estimate is built from and turned a flat 6 dB h profile into
-    // a 22 dB ramp. Take whichever budget is LARGER so both cases fit.
-    // Gains scale each tone's contribution to the coherent sum, so the budget
-    // uses their SUM rather than the tone count. With unity gains this is
-    // identical to numTones and the pre-emphasis path costs nothing.
-    const syncCoherentPeak =
-      gainSum * maxConstellationMagnitude(2) + config.pilotAmplitude;
+    // MEASURED, not derived. This used to be the analytic coherent bound
+    // (gainSum · maxMagnitude(QPSK) + pilot), correct when the burst set every
+    // tone to the same symbol and left the modulator phase-aligned. It has not
+    // done that since syncQpskSymbols de-cohered it, and the bound then
+    // over-charged by the factor the de-cohering won: at 32 tones it claimed 34
+    // units against the burst's actual 9.94, and — because it exceeds paprPeak
+    // at 16 tones and above — that stale term SET the scale, costing 4.2 dB
+    // against the level at which 16-QAM last worked at 32 tones. Measuring the
+    // real waveform cannot drift from it again: change the phase sequence and
+    // this number follows.
+    const syncBurstPeak = this.unitPeakForQpskSymbols(syncQpskSymbols(numTones));
 
-    // ── and PAYLOAD symbols can be coherent too, which forces the full bound ──
-    // A crest budget assumes de-correlated per-tone data. Padding breaks that:
-    // a short payload leaves most of the frame zero-filled, every tone maps to
-    // the SAME constellation point, and the symbol is as phase-aligned as the
-    // preamble. Measured on a 12-byte payload at 32 tones/16-QAM: the player's
-    // guard saw a 1.19 peak, i.e. ~42.7 of the 44.9 units the fully coherent
-    // case allows.
+    // PAYLOAD symbols used to force the full coherent bound as well: a short
+    // payload zero-filled the rest of the frame, every tone mapped to the SAME
+    // constellation point, and the symbol was as phase-aligned as the preamble
+    // (measured 1.19 at the player's clip guard on a 12-byte payload at 32
+    // tones). Payload whitening removed that case — see protocol/whiten.ts. A
+    // whitened frame carrying a 12-byte payload now measures a peak of 0.31 with
+    // crest 3.8 at 32 tones, so the crest budget genuinely applies to data.
+    // clipRate.test.ts exercises the real encodeFrame path rather than a
+    // hand-built symbol that can no longer occur.
     //
-    // So the binding term is the coherent bound after all, and this scale is
-    // currently identical to the pre-PAPR one. The machinery is kept because
-    // the terms name exactly what has to change to unlock the level: WHITEN THE
-    // PAYLOAD (so padding is not a constant symbol) and de-cohere the sync
-    // burst. With both done, paprPeak becomes the binding term and the crest
-    // budget is worth ~7 dB at 32 tones and ~9 dB at 48. Until then, raising
-    // the scale only converts headroom into clipping — and clipping the
-    // preamble is what corrupts the channel estimate every transmission.
-    const dataCoherentPeak = gainSum * MAX_QAM_MAGNITUDE + config.pilotAmplitude;
-
     // Never exceed the true worst case — at very low tone counts the coherent
     // bound is TIGHTER than the crest budget, and taking the looser of the two
     // there would clip deterministically rather than exceptionally.
     const worstCasePeak = gainSum * MAX_QAM_MAGNITUDE + config.pilotAmplitude;
-    const budget = Math.min(
-      Math.max(paprPeak, syncCoherentPeak, dataCoherentPeak),
-      worstCasePeak,
-    );
+    const budget = gainsAreUniform
+      ? Math.min(Math.max(paprPeak, syncBurstPeak), worstCasePeak)
+      : worstCasePeak;
     const safeScale = 0.95 / Math.max(budget, 1e-9);
     // qamScaleOverride is a user/tuning knob, not a way to bypass the safety
     // bound above — it now scales the WHOLE transmission (training included,
@@ -276,31 +322,34 @@ export class OFDMQPSKModulator {
     }
     this.qamScale = Math.min(config.qamScaleOverride ?? safeScale, safeScale);
 
-    const twoPiOverFs = (2 * Math.PI) / config.sampleRate;
-    // Precomputed sin/cos tables: each is a Float32Array of fftSamples.
-    // Memory footprint is approximately 2 * toneCount * fftSamples * 4 bytes
-    // (plus one pilotTable of fftSamples * 4 bytes).
-    this.sinTable = new Array(numTones);
-    this.cosTable = new Array(numTones);
-    for (let t = 0; t < numTones; t++) {
-      const s = new Float32Array(fftSamples);
-      const c = new Float32Array(fftSamples);
-      const w = twoPiOverFs * config.toneFrequencies[t];
-      for (let n = 0; n < fftSamples; n++) {
-        s[n] = Math.sin(w * n);
-        c[n] = Math.cos(w * n);
+  }
+
+  /**
+   * Peak of one all-QPSK symbol for `symbols`, synthesized at qamScale = 1.
+   *
+   * Mirrors synthesizeQpsk exactly (same tables, same gains, same pilot) minus
+   * the final multiply, so `peak · qamScale` is the peak that path will produce.
+   * The cyclic prefix is a copy of the window's tail, so the body's peak is the
+   * emitted symbol's peak.
+   *
+   * Used by the constructor before qamScale exists, which is why it cannot go
+   * through generateSymbol.
+   */
+  private unitPeakForQpskSymbols(symbols: number[]): number {
+    const numTones = symbols.length;
+    let peak = 0;
+    for (let n = 0; n < this.fftSamples; n++) {
+      let acc = this.pilotTable[n];
+      for (let t = 0; t < numTones; t++) {
+        const s = ((symbols[t] % 4) + 4) % 4;
+        const table = s === 1 || s === 3 ? this.cosTable[t] : this.sinTable[t];
+        const sign = s === 2 || s === 3 ? -1 : 1;
+        acc += this.toneGains[t] * sign * table[n];
       }
-      this.sinTable[t] = s;
-      this.cosTable[t] = c;
+      const a = Math.abs(acc);
+      if (a > peak) peak = a;
     }
-    this.pilotTable = new Float32Array(fftSamples);
-    const wp = twoPiOverFs * config.pilotFreqHz;
-    for (let n = 0; n < fftSamples; n++) {
-      this.pilotTable[n] = config.pilotAmplitude * Math.cos(wp * n);
-    }
-    // Default selectors: symbol 0 (0° ⇒ +sin) on every tone.
-    this.selTable = this.sinTable.slice();
-    this.selSign = new Float32Array(numTones).fill(1);
+    return peak;
   }
 
   /**

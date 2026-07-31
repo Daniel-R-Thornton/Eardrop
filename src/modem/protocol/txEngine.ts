@@ -292,7 +292,17 @@ export class TxEngine {
         // when some tone is actually above QPSK — an all-QPSK qamMap must
         // leave the waveform byte-identical to before this feature existed.
         if (!orders.every((o) => o === 2)) {
+          // Refs FIRST, warm-up AFTER. Measured (bench 2026-07-31, three
+          // runs): the received-gain droop starts AT the ref burst no matter
+          // what precedes it — 40 warm-up symbols at payload level and at
+          // near-ref level both left the gain correction flat at 1.0, and the
+          // droop then ate the ~20 symbols after the refs (header frames
+          // failed at MER 13.8 while later frames decoded at 15.9+). So the
+          // warm-up's job is not to pre-trigger the compressor (nothing did);
+          // it is to ABSORB the post-ref transient so the header frame
+          // arrives at the settled gain the later — decoding — frames saw.
           yield this.ofdmEngine.modulateQamRefSymbols();
+          yield this.ofdmEngine.modulateQamWarmupSymbols();
         }
       }
     }

@@ -15,8 +15,9 @@
 import { describe, it, expect } from 'vitest';
 import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
 import { OFDMEngine } from '../protocol/ofdmEngine';
-import { ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_TUNING } from '../types';
-import { QAM_ORDERS, type QamOrder } from '../modulation/constellation';
+import { encodeFrame } from '../protocol/atomicFrame';
+import { ofdmToneFrequencies, ofdmSamples, OFDM_DEFAULTS, OFDM_TUNING } from '../types';
+import { QAM_ORDERS, maxConstellationMagnitude, type QamOrder } from '../modulation/constellation';
 import { gainsDbToLinear, refinePreEmphasis } from '../diag/channelSweep';
 
 const SAMPLE_RATE = 48000;
@@ -98,22 +99,23 @@ describe('TX scale: clip rate under random payloads', () => {
       const oldScale =
         0.95 / (toneCount * MAX_QAM_MAGNITUDE_APPROX + OFDM_DEFAULTS.pilotAmplitude);
       const gainDb = 20 * Math.log10(scale / oldScale);
-      // Currently ZERO, deliberately. Coherent PADDING symbols (a short payload
-      // zero-fills the frame, putting every tone on the same point) reach the
-      // full coherent bound, so that term still binds and the crest budget buys
-      // nothing yet. Whitening the payload and de-cohering the sync burst are
-      // what unlock it — see OFDMQPSKModulator's scale derivation. Asserted as
-      // "no worse than before" so a future regression that quietly RAISES the
-      // level into clipping still fails here.
-      expect(gainDb).toBeGreaterThan(-0.01);
+      // Measured 6.8 dB at 32 tones and 8.6 dB at 48, in two steps: whitening
+      // removed the coherent-padding case, then the preamble term stopped being
+      // priced at a coherent bound the de-cohered burst does not reach. The bar
+      // sits at 6 so losing the second step fails here rather than showing up as
+      // an over-the-air MER regression (it did once: 4.2 dB, 16-QAM at 32 tones).
+      expect(gainDb).toBeGreaterThan(6);
     }
   });
 
   // THE PREAMBLE, not just payload. This is the case the first version of this
   // file missed, and missing it shipped a scale that clipped the sync burst on
-  // every single transmission: generateSyncBurst puts every tone on the SAME
-  // QPSK symbol, so its carriers are phase-aligned by construction (measured
-  // crest 6.70 at 32 tones vs ~2.6 for data) and it is guaranteed, not rare.
+  // every single transmission: back then generateSyncBurst put every tone on the
+  // SAME QPSK symbol, so its carriers were phase-aligned by construction
+  // (measured crest 6.70 at 32 tones vs ~2.6 for data) and it is guaranteed, not
+  // rare. syncQpskSymbols de-cohered it since, and the modulator now measures
+  // that burst instead of assuming the coherent peak — so this asserts the
+  // measurement is honest, not that a conservative bound is holding.
   // Clipping there is uniquely destructive because the channel estimate is
   // built from exactly those symbols — it turned a flat 6 dB h profile into a
   // 22 dB ramp over the air while every random-data test above still passed.
@@ -134,22 +136,54 @@ describe('TX scale: clip rate under random payloads', () => {
     });
   }
 
+  // The REAL path, replacing a hand-built all-padding symbol. That symbol used
+  // to be reachable — a short payload zero-filled the frame, every tone landed
+  // on the same constellation point, and the peak hit 1.19 at the player's clip
+  // guard. Payload whitening (protocol/whiten.ts) removed it for frame bytes and
+  // fillerByte removed it for the tone slots PAST the frame, which whitening
+  // never covered (those are not frame bytes: measured 1.29 here at 48
+  // tones/64-QAM once the scale stopped being conservative enough to hide it).
+  // So what matters is whether an ACTUAL encoded frame clips, not whether a
+  // symbol the encoder can no longer produce would.
   for (const toneCount of TONE_COUNTS) {
-    it(`${toneCount} tones: an all-padding (coherent) data symbol does not clip`, () => {
-      // The case that broke a working link and that the random-data tests above
-      // cannot produce: symbol index 0 on every tone, which is what zero
-      // padding encodes. All carriers phase-align and the sum approaches the
-      // coherent bound.
+    it(`${toneCount} tones: a real short-payload frame does not clip`, () => {
+      // 12 bytes of payload in a 160-byte field: mostly padding, the worst case
+      // for symbol statistics and the one that broke this before.
+      const payload = new Uint8Array(160);
+      for (let i = 0; i < 12; i++) payload[i] = i * 17;
+      const frame = encodeFrame({ type: 0x02, seqNum: 0, totalFrames: 1, crc: 0 }, payload);
+
       for (const order of QAM_ORDERS) {
-        const m = modulatorFor(toneCount, order as QamOrder);
-        m.setSymbols(new Array(toneCount).fill(0));
-        const sym = m.generateSymbol();
+        const engine = new OFDMEngine({
+          sampleRate: SAMPLE_RATE,
+          toneCount,
+          pilotFreqHz: 1850,
+          toneStartHz: OFDM_DEFAULTS.toneStartHz,
+        });
+        engine.setToneOrders(new Array(toneCount).fill(order) as QamOrder[]);
+        const audio = engine.modulateFrame(frame);
         let peak = 0;
-        for (let i = 0; i < sym.length; i++) peak = Math.max(peak, Math.abs(sym[i]));
+        for (let i = 0; i < audio.length; i++) peak = Math.max(peak, Math.abs(audio[i]));
         expect(peak).toBeLessThanOrEqual(CLIP_LEVEL);
       }
     });
   }
+
+  it('whitening leaves no long run of identical bytes on the wire', () => {
+    // The property the scale budget now depends on. Without it, padding makes
+    // runs of identical symbols, those sum coherently, and the crest budget is
+    // invalid — which is what forced the conservative bound before.
+    const payload = new Uint8Array(160);
+    for (let i = 0; i < 12; i++) payload[i] = i * 17;
+    const frame = encodeFrame({ type: 0x02, seqNum: 0, totalFrames: 1, crc: 0 }, payload);
+    let longest = 1;
+    let current = 1;
+    for (let i = 1; i < frame.length; i++) {
+      current = frame[i] === frame[i - 1] ? current + 1 : 1;
+      if (current > longest) longest = current;
+    }
+    expect(longest).toBeLessThan(4);
+  });
 
   // Pre-emphasis must not be able to reintroduce clipping. The gains scale each
   // tone's contribution to the coherent sum, so the peak budget is derived from
@@ -172,41 +206,152 @@ describe('TX scale: clip rate under random payloads', () => {
       }
       const toneGains = gainsDbToLinear(gainsDb);
 
+      // Real encoded frame, and the de-cohered preamble, both under the
+      // calibrated gains. A hand-built all-tones-same-symbol case is no longer
+      // reachable — whitening removed it from the payload and syncQpskSymbols
+      // removed it from the preamble — and asserting on it would hold the scale
+      // down for a waveform the encoder cannot produce.
+      const payload = new Uint8Array(160);
+      for (let i = 0; i < 12; i++) payload[i] = i * 17;
+      const frame = encodeFrame({ type: 0x02, seqNum: 0, totalFrames: 1, crc: 0 }, payload);
+
       for (const order of QAM_ORDERS) {
-        const m = new OFDMQPSKModulator({
+        const engine = new OFDMEngine({
           sampleRate: SAMPLE_RATE,
-          toneFrequencies: ofdmToneFrequencies({
-            toneCount, pilotFreqHz: 1850, startHz: OFDM_DEFAULTS.toneStartHz,
-          }),
+          toneCount,
           pilotFreqHz: 1850,
-          pilotAmplitude: OFDM_DEFAULTS.pilotAmplitude,
+          toneStartHz: OFDM_DEFAULTS.toneStartHz,
           toneGains,
         });
-        m.setToneOrders(new Array(toneCount).fill(order) as QamOrder[]);
-        // Worst case for the preamble: every tone on the same symbol.
-        m.setSymbols(new Array(toneCount).fill(0));
-        const sym = m.generateSymbol();
-        let peak = 0;
-        for (let i = 0; i < sym.length; i++) peak = Math.max(peak, Math.abs(sym[i]));
-        expect(peak).toBeLessThanOrEqual(CLIP_LEVEL);
+        engine.setToneOrders(new Array(toneCount).fill(order) as QamOrder[]);
+        const peakOf = (a: Float32Array): number => {
+          let p = 0;
+          for (let i = 0; i < a.length; i++) p = Math.max(p, Math.abs(a[i]));
+          return p;
+        };
+        expect(peakOf(engine.modulateFrame(frame))).toBeLessThanOrEqual(CLIP_LEVEL);
+        expect(peakOf(engine.generateTrainingSymbols(4))).toBeLessThanOrEqual(CLIP_LEVEL);
       }
     });
   }
 
-  it('leaves no adversarial overshoot at all while the coherent bound binds', () => {
-    // With the coherent term binding, even the fully phase-aligned all-corners
-    // symbol lands exactly on the 0.95 target — there is no overshoot to
-    // document. If a future change makes paprPeak the binding term (after
-    // payload whitening and preamble de-cohering), this becomes a real ratio
-    // and the assertion must be relaxed DELIBERATELY, with the new clip rate
-    // measured rather than assumed. That is the whole point of it being here.
+  it('bounds how far an adversarial symbol could overshoot full scale', () => {
+    // paprPeak is now the binding term at every tone count (the preamble term is
+    // measured off the de-cohered burst and comes out below it), so a
+    // hypothetical fully phase-aligned all-corners symbol WOULD overshoot. This
+    // is the deliberate relaxation the previous version of this comment asked
+    // for, with the numbers measured rather than assumed:
+    //
+    //   N=8 1.00, N=16 1.44, N=32 2.07, N=40 2.32, N=48 2.55
+    //
+    // The overshoot is bounded by construction, not by luck: it is exactly
+    // worstCasePeak/paprPeak = (N·1.5275 + pilot) / (5.5·sqrt((N + pilot²)/2)),
+    // which grows only as sqrt(N) and reaches 2.69 at the highest tone count the
+    // modem supports. Hence 3.0 here.
+    //
+    // What makes it safe is UNREACHABILITY, and every route to the modulator is
+    // de-correlated by construction: payload bytes are whitened, post-frame tone
+    // slots carry keystream filler (fillerByte — zero fill was the last coherent
+    // case and it clipped at 2.31 in the final symbol), the sync/training burst
+    // carries per-tone phases (syncQpskSymbols), and the QAM reference symbols
+    // are rotated per tone (qamRefPhase). The real-path tests above are what
+    // actually guard against clipping; this only keeps the margin visible if
+    // some future change makes uniform symbols reachable again.
     const MAX_QAM_MAGNITUDE_APPROX = 1.5275;
     for (const toneCount of TONE_COUNTS) {
       const m = modulatorFor(toneCount, 6);
       const scale = (m as unknown as { qamScale: number }).qamScale;
       const coherentPeak =
         (toneCount * MAX_QAM_MAGNITUDE_APPROX + OFDM_DEFAULTS.pilotAmplitude) * scale;
-      expect(coherentPeak).toBeLessThanOrEqual(0.951);
+      expect(coherentPeak).toBeLessThan(3.0);
+    }
+  });
+
+  /**
+   * The preamble's budget must be MEASURED off the burst, not assumed coherent.
+   *
+   * This is the regression that cost 4.2 dB at 32 tones and stopped 16-QAM
+   * working there. The burst was de-cohered (syncQpskSymbols) but the scale kept
+   * charging the analytic coherent bound for it — 34 units against the real
+   * 9.94 — and because that term exceeds paprPeak at 16 tones and above, the
+   * stale number SET the transmitted level for the whole session.
+   *
+   * Asserted as an inequality against that bound rather than against a scale
+   * constant, so it fails if the term is ever reinstated and passes for any
+   * budget honestly derived from the waveform.
+   */
+  it('does not price the preamble at the coherent bound it no longer reaches', () => {
+    for (const toneCount of [16, 32, 40, 48]) {
+      const m = modulatorFor(toneCount, 6);
+      const scale = (m as unknown as { qamScale: number }).qamScale;
+      // The old term: gainSum · maxMagnitude(QPSK) + pilot, unity gains.
+      const staleCoherentTerm =
+        toneCount * maxConstellationMagnitude(2) + OFDM_DEFAULTS.pilotAmplitude;
+      // Strict inequality only, no margin: how much is won depends on the tone
+      // count, because the stale term overtakes paprPeak right around 16 tones
+      // (0.3 dB there, 3.3 dB at 32, 5.0 dB at 48). The size of the win is
+      // asserted by the level-recovery test above; this one asserts the term is
+      // not what sets the scale.
+      expect(scale).toBeGreaterThan(0.95 / staleCoherentTerm);
+    }
+  });
+
+  /**
+   * A frame's LAST symbol is the one that used to clip, and nothing about it is
+   * special except its fill.
+   *
+   * Padding is not frame data, so whitening never covered it: zero fill put every
+   * padded tone on constellation index 0 — the same point — and they summed
+   * phase-aligned. Measured on frames identical but for whether the last symbol
+   * was full: 0.52-0.68 exact-fit against 1.06-2.31 padded, worst at 48
+   * tones/64-QAM. One symbol per frame was enough to force the scale down for
+   * every symbol in the transmission.
+   */
+  it('a partially-filled final symbol is no louder than a full one', () => {
+    const { symSamples } = ofdmSamples(SAMPLE_RATE);
+    const symbolPeaks = (audio: Float32Array): number[] => {
+      const peaks: number[] = [];
+      for (let s = 0; s * symSamples < audio.length; s++) {
+        let p = 0;
+        const end = Math.min((s + 1) * symSamples, audio.length);
+        for (let i = s * symSamples; i < end; i++) p = Math.max(p, Math.abs(audio[i]));
+        peaks.push(p);
+      }
+      return peaks;
+    };
+
+    for (const toneCount of TONE_COUNTS) {
+      for (const order of QAM_ORDERS) {
+        const bytesPerSymbol = (toneCount * order) / 8;
+        const rnd = prng(0xf111 + toneCount * 13 + order);
+        const bytesFor = (len: number): Uint8Array => {
+          const b = new Uint8Array(len);
+          for (let i = 0; i < len; i++) b[i] = Math.floor(rnd() * 256);
+          return b;
+        };
+        const engineFor = (): OFDMEngine => {
+          const e = new OFDMEngine({
+            sampleRate: SAMPLE_RATE,
+            toneCount,
+            pilotFreqHz: 1850,
+            toneStartHz: OFDM_DEFAULTS.toneStartHz,
+          });
+          e.setToneOrders(new Array(toneCount).fill(order) as QamOrder[]);
+          return e;
+        };
+
+        // Same symbol count; the second is one byte into its final symbol, so
+        // that symbol is almost entirely filler.
+        const exact = symbolPeaks(engineFor().modulateFrame(bytesFor(bytesPerSymbol * 6)));
+        const padded = symbolPeaks(engineFor().modulateFrame(bytesFor(bytesPerSymbol * 5 + 1)));
+
+        const lastPadded = padded[padded.length - 1];
+        const worstFull = Math.max(...exact);
+        // Filler is statistically data, so the padded tail must sit inside the
+        // spread of ordinary symbols rather than above it.
+        expect(lastPadded).toBeLessThan(worstFull * 1.25);
+        expect(lastPadded).toBeLessThanOrEqual(CLIP_LEVEL);
+      }
     }
   });
 });

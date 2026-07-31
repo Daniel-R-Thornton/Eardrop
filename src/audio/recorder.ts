@@ -163,9 +163,29 @@ export class AudioRecorder {
     }
   }
 
-  async start(_modemRate: number, onChunk?: ChunkCallback, deviceId?: string): Promise<void> {
+  async start(
+    _modemRate: number,
+    onChunk?: ChunkCallback,
+    deviceId?: string,
+    /**
+     * Human-readable device name, logged so a run states WHICH microphone it
+     * used. deviceId is a rotating salted hash, so 8 characters of it identifies
+     * nothing across sessions — and every "why is it different this time?"
+     * question needs this answered first.
+     */
+    deviceLabel?: string,
+  ): Promise<void> {
     if (this.running) return;
     this.micBoostNode = null;
+
+    if (!deviceId) {
+      // An empty id means the constraint is omitted below and the BROWSER
+      // chooses. That is a legitimate default, but it is also what a stale
+      // stored selection degrades into, and the two are worth telling apart:
+      // capturing from a different physical mic looks exactly like the channel
+      // having changed.
+      dlog('REC', { deviceFallback: 'browserDefault' }, { level: 'warn' });
+    }
 
     dlog('REC', {
       start: this.ctx.currentTime.toFixed(2),
@@ -173,6 +193,7 @@ export class AudioRecorder {
       ctxState: this.ctx.state,
       gain: this.micGain,
       device: (deviceId || 'default').slice(0, 8),
+      label: deviceLabel || '(unresolved)',
     });
 
     if (this.ctx.state === 'suspended') {

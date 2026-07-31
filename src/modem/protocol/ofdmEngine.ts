@@ -20,6 +20,7 @@ import {
   type QamOrder,
 } from '../modulation/constellation';
 import { generateChirp, type ChirpConfig } from './chirp';
+import { fillerByte } from './whiten';
 import { dlog } from '../../lib/debug/dlog';
 
 export class OFDMEngine {
@@ -159,8 +160,9 @@ export class OFDMEngine {
     const amplitude = Math.min(OFDM_TUNING.chirpAmplitude, matchedAmplitude);
 
     const chirpCfg: ChirpConfig = {
-      fStart: this.pilotFreqHz - halfSpan,
-      fEnd: this.pilotFreqHz + halfSpan,
+      // Centred on OFDM_TUNING.chirpCenterHz, NOT the pilot — see that field.
+      fStart: OFDM_TUNING.chirpCenterHz - halfSpan,
+      fEnd: OFDM_TUNING.chirpCenterHz + halfSpan,
       durationSec,
       sampleRate: this.sampleRate,
       amplitude,
@@ -279,7 +281,10 @@ export class OFDMEngine {
     for (let i = 0; i < frame.length; i += blockCount) {
       const symbols: number[] = new Array(this.toneCount).fill(0);
       for (let blk = 0; blk < blockCount; blk++) {
-        const byte = i + blk < frame.length ? frame[i + blk] : 0x00;
+        // Past the frame's end, keystream filler rather than 0x00 — zero fill
+        // puts every padded tone on the same constellation point and the symbol
+        // sums coherently (see fillerByte).
+        const byte = i + blk < frame.length ? frame[i + blk] : fillerByte(i + blk);
         const upper = (byte >> 4) & 0xf;
         const lower = byte & 0xf;
         for (let j = 0; j < 4; j++) {
@@ -333,11 +338,66 @@ export class OFDMEngine {
   }
 
   /**
+   * Warm-up symbols — inserted (by txEngine) after modulateQamRefSymbols(),
+   * BEFORE the header frame, only when some tone is above QPSK. Expendable
+   * audio that absorbs the post-ref received-gain transient so the header
+   * frame arrives at the settled gain — see OFDM_TUNING.qamWarmupSymbols
+   * for the bench measurements that fixed this ordering.
+   *
+   * Content is PAYLOAD-STATISTICS data: pseudo-random bits mapped through
+   * the current tone orders, exactly like a whitened data frame. It sits
+   * between the refs and the header, and its one job is to leave the chain
+   * in the gain state the DATA will see. Corner-loud content was tried here
+   * and measured WRONG (bench 2026-07-31, 40 tones): it settled the chain
+   * ~1.5 dB hotter than the payload, the gain then re-adapted downward
+   * across the header frames (QD g 0.84 -> 0.73) and the first header
+   * failed flat (SM spr=4, a pure level error). Varying data also keeps
+   * per-band energy non-stationary, so the mic's per-band NS has nothing
+   * sustained to lock onto. A per-symbol peak clamp guards the crest tail:
+   * unlike data symbols, warm-up is never equalized against the fixed
+   * qamScale (the RX discards it), so rescaling one symbol is harmless.
+   * Deterministic PRNG for reproducibility; the RX skips exactly this many
+   * windows (rxEngine.qamWarmupPending).
+   */
+  modulateQamWarmupSymbols(): Float32Array {
+    let seed = 0x243f6a88; // distinct from the settle-symbol seed
+    const nextBit = (): number => {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      return (seed >>> 16) & 1;
+    };
+    const parts: Float32Array[] = [];
+    for (let s = 0; s < OFDM_TUNING.qamWarmupSymbols; s++) {
+      const symbols: number[] = new Array(this.toneCount);
+      for (let t = 0; t < this.toneCount; t++) {
+        const order = this.toneOrders[t];
+        let value = 0;
+        for (let b = 0; b < order; b++) value = (value << 1) | nextBit();
+        symbols[t] = value;
+      }
+      this.ofdm.setSymbols(symbols);
+      const sym = this.ofdm.generateSymbol();
+      let pk = 0;
+      for (let i = 0; i < sym.length; i++) pk = Math.max(pk, Math.abs(sym[i]));
+      if (pk > 0.95) {
+        const k = 0.95 / pk;
+        for (let i = 0; i < sym.length; i++) sym[i] *= k;
+      }
+      parts.push(sym);
+    }
+    const totalLen = parts.reduce((a, b) => a + b.length, 0);
+    const audio = new Float32Array(totalLen);
+    let off = 0;
+    for (const p of parts) { audio.set(p, off); off += p.length; }
+    return audio;
+  }
+
+  /**
    * Generic per-tone bit-serializer — taken only when some tone's order is
    * above QPSK. Drains `frame` bytes MSB-first into a bit queue; per OFDM
    * symbol, each tone t takes `toneOrders[t]` bits off the queue (MSB-first)
    * and maps them to a constellation index. The final symbol of the frame is
-   * padded with zero bits (mirrors the legacy path's zero-byte padding).
+   * padded with keystream filler (mirrors the legacy path's filler byte) — NOT
+   * zero bits, which made that symbol coherent; see fillerByte.
    *
    * rxEngine.feedSample's generic path is the exact inverse: it accumulates
    * demodulated per-tone bits (same tone order, same MSB-first convention)
@@ -352,8 +412,11 @@ export class OFDMEngine {
     let byteIdx = 0;
     let bitInByte = 0; // 0 = MSB of frame[byteIdx]
     const nextBit = (): number => {
-      if (byteIdx >= frame.length) return 0; // pad past the frame's end
-      const bit = (frame[byteIdx] >> (7 - bitInByte)) & 1;
+      // Past the frame's end: keystream filler, NOT zeros — see fillerByte. The
+      // byte/bit cursor keeps advancing so the filler stays position-indexed and
+      // therefore reproducible.
+      const src = byteIdx < frame.length ? frame[byteIdx] : fillerByte(byteIdx);
+      const bit = (src >> (7 - bitInByte)) & 1;
       bitInByte++;
       if (bitInByte === 8) {
         bitInByte = 0;

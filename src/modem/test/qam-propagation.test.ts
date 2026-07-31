@@ -97,8 +97,13 @@ describe('TxEngine construction with 64-QAM config', () => {
     const qamAudio = qamTx.transmitFile('test.bin', new Uint8Array(320), 0, 320);
     const qamSymbols = Math.ceil(qamAudio.length / qamTx.getSymbolLengthInSamples());
 
-    // QAM packs more bits/symbol → fewer symbols for same frame
-    expect(qamSymbols).toBeLessThan(qpskSymbols);
+    // QAM packs more bits/symbol → fewer symbols for the same frames. The
+    // QAM path also carries FIXED per-transmission overhead the QPSK path
+    // does not (warm-up + reference symbols — see OFDM_TUNING), so compare
+    // net of that overhead: the claim under test is about data-rate, not
+    // total airtime on a small file.
+    const qamOverhead = OFDM_TUNING.qamWarmupSymbols + OFDM_TUNING.qamRefSymbols;
+    expect(qamSymbols - qamOverhead).toBeLessThan(qpskSymbols);
   });
 });
 

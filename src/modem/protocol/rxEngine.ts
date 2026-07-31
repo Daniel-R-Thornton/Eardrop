@@ -341,6 +341,15 @@ export class RxEngine {
    * resetLinkProfile() runs, so an all-QPSK stream never sees it.
    */
   private qamRefPending = 0;
+  /**
+   * Countdown of TX warm-up symbols (see OFDM_TUNING.qamWarmupSymbols) to
+   * DISCARD after the reference symbols, before the header frame. Their
+   * content is expendable audio that absorbs the post-ref received-gain
+   * transient (measured ~2.4 dB over ~20 symbols) so the header arrives at
+   * settled gain; decoding them would only feed garbage bits to the
+   * scanner. Set alongside qamRefPending; counted down after it drains.
+   */
+  private qamWarmupPending = 0;
 
   // Per-tone I/Q calibration references (from Gray code calibration)
   /** Reference vectors for bit=0 (ref0I/Q) and bit=1 (ref1I/Q) per tone */
@@ -1013,9 +1022,18 @@ export class RxEngine {
       // calibration instead of feeding their (meaningless-as-data) bits to
       // the scanner. demodulate() above still ran on this window — this
       // just re-derives the raw tone IQ separately (analyze() is pure).
+      // Ref symbols come FIRST, then the warm-up (see txEngine: the warm-up
+      // absorbs the post-ref gain transient, so it sits between the refs and
+      // the header frame). Consume refs for calibration, then discard the
+      // warm-up entirely (no scan, no calibration).
       if (this.qamRefPending > 0) {
         this.qamRefPending--;
         this.ofdmDemod.calibrateQamRef(window);
+        return;
+      }
+
+      if (this.qamWarmupPending > 0) {
+        this.qamWarmupPending--;
         return;
       }
 
@@ -1216,6 +1234,7 @@ export class RxEngine {
     this.qamSymbolCounter = 0;
     this.profileFramesSeen = 0;
     this.qamRefPending = 0;
+    this.qamWarmupPending = 0;
     this.profileSwitchPending = null;
     this.profileSwitchCountdown = 0;
     this.profileSwitchApplied = false;
@@ -1250,6 +1269,7 @@ export class RxEngine {
     // inserts these when some tone is above QPSK, so only wait for them in
     // that case — an all-QPSK stream is unaffected.
     this.qamRefPending = this.allQpsk ? 0 : OFDM_TUNING.qamRefSymbols;
+    this.qamWarmupPending = this.allQpsk ? 0 : OFDM_TUNING.qamWarmupSymbols;
     dlog('RX-PROFILE', {
       t: profile.toneCount,
       eccT: profile.eccT,
@@ -1328,8 +1348,11 @@ export class RxEngine {
     const chirpDurationSec = (OFDM_TUNING.chirpSymbols * symSamples) / this.cfg.sampleRate;
     const halfSpan = this.chirpSpanHz / 2;
     const chirpCfg: ChirpConfig = {
-      fStart: this.cfg.pilotFreqHz - halfSpan,
-      fEnd: this.cfg.pilotFreqHz + halfSpan,
+      // MUST match OFDMEngine.generateChirpBurst: centred on
+      // OFDM_TUNING.chirpCenterHz, not on the pilot. Deriving it from the pilot
+      // here would make the template the wrong shape the moment the pilot moves.
+      fStart: OFDM_TUNING.chirpCenterHz - halfSpan,
+      fEnd: OFDM_TUNING.chirpCenterHz + halfSpan,
       durationSec: chirpDurationSec,
       sampleRate: this.cfg.sampleRate,
     };
@@ -1591,8 +1614,20 @@ export class RxEngine {
     // frame — commit the staged stats on success, throw them away on failure,
     // so the "how much SNR headroom exists" number never includes garbage
     // demodulated during inter-send silence or a corrupt frame.
-    if (decoded.valid) this.ofdmDemod?.commitMER();
-    else this.ofdmDemod?.discardMER();
+    if (decoded.valid) {
+      this.ofdmDemod?.commitMER();
+    } else {
+      // Report the per-tone SHAPE before dropping it. A failing config never
+      // produces the committed per-tone report (that only runs after a decode),
+      // so without this the one question that decides the next fix — is the
+      // damage flat across tones or tilted? — has no answer in the log.
+      if (this.ofdmDemod?.hasStagedMER()) {
+        dlog('OFDM-STMER', {
+          db: this.ofdmDemod.getStagedPerToneMER().map((m) => Math.round(m)).join(','),
+        });
+      }
+      this.ofdmDemod?.discardMER();
+    }
 
     if (!decoded.valid) {
       this.logFrameFailure(decoded, stagedMer ? stagedMer.merDb : null);

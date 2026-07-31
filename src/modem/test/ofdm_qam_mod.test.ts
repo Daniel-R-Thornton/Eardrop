@@ -156,7 +156,33 @@ describe('TX level flattening — training and data share one fixed scale', () =
           const out = mod.generateSymbol();
           for (const v of out) peak = Math.max(peak, Math.abs(v));
         }
-        expect(peak).toBeLessThanOrEqual(0.95 + 1e-6);
+        // DELIBERATELY LOOSER THAN 0.95, and worth being clear about why.
+        //
+        // This asserted a provable bound: every tone on the same symbol is the
+        // coherent worst case, and the old TX scale was sized so that even that
+        // stayed under 0.95 for any data. That cost ~6 dB of per-tone level per
+        // doubling of tone count and is why 16-QAM did not work above 8 tones.
+        //
+        // The scale is now sized from a measured crest budget, and what makes
+        // that safe is that this pattern is no longer REACHABLE. Every path that
+        // reaches the modulator is de-correlated by construction: payload bytes
+        // are whitened (protocol/whiten.ts), the sync/training burst carries
+        // per-tone phases (syncQpskSymbols), and the QAM reference symbols are
+        // rotated per tone (qamRefPhase). The tests that guard the real paths —
+        // clipRate.test.ts and txLevelFlattening.test.ts — assert 0.95 against
+        // actual encoded frames and the actual preamble.
+        //
+        // Kept as a bounded-overshoot check so that if some future change makes
+        // uniform symbols reachable again, the margin is visible rather than
+        // silent.
+        //
+        // Measured 1.84 at the worst combination here (32 tones, 64-QAM), up
+        // from ~1.05 when the preamble term was still priced at its coherent
+        // bound and dragged the whole scale down with it. Both numbers describe
+        // the same unreachable symbol; the level around it changed. Post-frame
+        // tone slots — the one reachable uniform case left — carry keystream
+        // filler now (fillerByte), which clipRate.test.ts asserts directly.
+        expect(peak).toBeLessThan(2.2);
       }
     }
   });

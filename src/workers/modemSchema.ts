@@ -70,5 +70,6 @@ export type ModemEvent =
   | { type: 'bufferDump'; id: number; samples: ArrayBuffer; rms: number; peak: number }
   /** Reply to 'flush'. `fileReady` = a completed file was found by this barrier. */
   | { type: 'flushed'; id: number; fileReady: boolean }
-  | { type: 'dlog'; line: string }
+  /** Either a formatted console line or the structured event behind it. */
+  | { type: 'dlog'; line?: string; rec?: { tag: string; fields: Record<string, unknown> } }
   | { type: 'error'; id?: number; error: string };

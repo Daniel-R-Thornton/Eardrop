@@ -50,9 +50,17 @@ describe('chirp level matching', () => {
       // The regression this guards: RMS-matching tied the chirp to the OFDM RMS
       // (qamScale * sqrt(N) with qamScale ~ 1/N), so the chirp got quieter with
       // every tone added — 0.121 at 32 tones, 0.108 at 40 — and sync stopped
-      // locking at 40. Chirp level must be governed by the preamble's PEAK,
-      // which the TX scale pins near-constant across tone counts, not its RMS.
-      expect(peak(chirp)).toBeGreaterThan(0.4);
+      // locking at 40. The chirp level must be INDEPENDENT of tone count:
+      // OFDM_TUNING.chirpAmplitude is a fixed ceiling and the coherent peak it
+      // is min'd with sits above it at every tone count, so the ceiling binds.
+      //
+      // The ceiling itself is a MEASUREMENT, not "as loud as fits": a 0.6 chirp
+      // detected WORSE on the bench than 0.12 (2026-07-31, 32 tones — norm
+      // 0.476-0.581 with the correlation peak pinned at the probe-window edge,
+      // vs norm 0.686-0.703 and clean handoffs at 0.12). The detection score is
+      // normalized by input RMS, so a hotter chirp buys nothing once the chain
+      // starts compressing on it.
+      expect(peak(chirp)).toBeCloseTo(OFDM_TUNING.chirpAmplitude, 2);
     });
 
     it(`${toneCount} tones: chirp stays inside the coherent peak budget`, () => {
@@ -167,5 +175,75 @@ describe('settle period', () => {
       const engine = engineFor(toneCount);
       expect(peak(engine.generateSettleSymbols(8))).toBeLessThanOrEqual(1.0);
     }
+  });
+});
+
+/**
+ * The chirp must keep its own band, independent of where the pilot sits.
+ *
+ * Two independent constraints pull the pilot and the chirp in opposite
+ * directions, and tying them together satisfies neither:
+ *
+ *  - The pilot wants to be CLOSE to the data band. Drift correction measures
+ *    phase on the pilot and extrapolates by toneFreq/pilotFreq, so a pilot at
+ *    1850 with tones at 8850 amplifies a two-sample timing error into ~148
+ *    degrees. Moving the pilot to 6300 cut measured drift from -291 to -11.
+ *
+ *  - The chirp wants to be FAR from the data band. It is the loudest part of the
+ *    transmission and the chain compresses per band, so a chirp beside the data
+ *    band compresses that band and then releases across the frame — measured as
+ *    the received pilot going 0.367 (training) to 2.67 (data), a 17 dB swing,
+ *    with nothing decoding.
+ */
+describe('chirp band independence', () => {
+  it('stays on OFDM_TUNING.chirpCenterHz regardless of the pilot', () => {
+    const { symSamples } = ofdmSamples(SAMPLE_RATE);
+    const dominantFreq = (audio: Float32Array): number => {
+      // Coarse peak-pick over a window in the chirp's interior: the sweep spans
+      // chirpSpanHz, so the dominant component sits near the centre frequency.
+      const start = Math.floor(audio.length / 2);
+      const len = symSamples;
+      let bestF = 0;
+      let bestMag = 0;
+      for (let f = 500; f <= 9000; f += 25) {
+        let re = 0;
+        let im = 0;
+        for (let n = 0; n < len; n++) {
+          const ang = (2 * Math.PI * f * n) / SAMPLE_RATE;
+          re += audio[start + n] * Math.cos(ang);
+          im -= audio[start + n] * Math.sin(ang);
+        }
+        const mag = Math.hypot(re, im);
+        if (mag > bestMag) {
+          bestMag = mag;
+          bestF = f;
+        }
+      }
+      return bestF;
+    };
+
+    for (const pilotFreqHz of [1850, 6300]) {
+      const engine = new OFDMEngine({
+        sampleRate: SAMPLE_RATE,
+        toneCount: 40,
+        pilotFreqHz,
+        toneStartHz: 600,
+      });
+      const { chirp } = engine.generateChirpBurst(OFDM_TUNING.chirpSymbols);
+      // Within half a span of the configured centre, for BOTH pilots.
+      expect(Math.abs(dominantFreq(chirp) - OFDM_TUNING.chirpCenterHz)).toBeLessThan(150);
+    }
+  });
+
+  it('keeps the chirp clear of the data band at the pilot that needs it', () => {
+    // The pilot at 6300 puts tones at 6900+. The chirp must not land in there.
+    const engine = new OFDMEngine({
+      sampleRate: SAMPLE_RATE,
+      toneCount: 40,
+      pilotFreqHz: 6300,
+      toneStartHz: 600,
+    });
+    const { chirpCfg } = engine.generateChirpBurst(OFDM_TUNING.chirpSymbols);
+    expect(chirpCfg.fEnd).toBeLessThan(6900);
   });
 });

@@ -598,10 +598,12 @@ export interface PreEmphasisOptions {
 }
 
 export const PRE_EMPHASIS_DEFAULTS: PreEmphasisOptions = {
-  // 9 dB spans a 18 dB peak-to-trough correction, which covers the smooth
-  // tilts measured so far (17 dB) without letting a deep narrow null pull the
-  // whole budget toward one tone.
-  maxBoostDb: 9,
+  // 12 dB spans a 24 dB peak-to-trough correction. The 32-tone/pilot-1850
+  // bench channel measures 18.5 dB of smooth low-edge rolloff, which pinned
+  // the lowest tones at the previous 9 dB clamp with zero margin; 12 dB
+  // covers it while still preventing a deep narrow null from pulling the
+  // whole power budget toward one tone.
+  maxBoostDb: 12,
 };
 
 /**
@@ -678,6 +680,61 @@ export function responseSpreadDb(mags: number[]): number {
   const valid = mags.filter((m) => m > 0);
   if (valid.length < 2) return 0;
   return 20 * Math.log10(Math.max(...valid) / Math.min(...valid));
+}
+
+/** The flattest window of a sweep wide enough for a given tone grid. */
+export interface BestBand {
+  startHz: number;
+  endHz: number;
+  /** max-min dB inside the window — the thing being minimized */
+  spreadDb: number;
+  /** mean dB inside the window — the tie-breaker (louder wins) */
+  meanDb: number;
+}
+
+/**
+ * Slide a `bandWidthHz`-wide window across the sweep and return the flattest
+ * placement; among near-equally flat windows, the loudest wins. This is the
+ * "where should TONE START go" question made computable: the operator selects
+ * a tone count, the grid needs (toneCount-1)*toneSpacing Hz of usable band,
+ * and the sweep already measured which stretch of spectrum behaves.
+ *
+ * Returns null when the sweep does not cover a full window.
+ */
+export function findBestBand(
+  freqs: number[],
+  db: number[],
+  bandWidthHz: number,
+): BestBand | null {
+  if (freqs.length < 2) return null;
+  let best: BestBand | null = null;
+  for (let i = 0; i < freqs.length; i++) {
+    const endHz = freqs[i] + bandWidthHz;
+    if (endHz > freqs[freqs.length - 1]) break;
+    let min = Infinity;
+    let max = -Infinity;
+    let sum = 0;
+    let n = 0;
+    for (let j = i; j < freqs.length && freqs[j] <= endHz; j++) {
+      const v = db[j];
+      if (!Number.isFinite(v)) continue;
+      min = Math.min(min, v);
+      max = Math.max(max, v);
+      sum += v;
+      n++;
+    }
+    if (n < 2) continue;
+    const cand: BestBand = { startHz: freqs[i], endHz, spreadDb: max - min, meanDb: sum / n };
+    // Primary: flatter. Secondary: within 0.5 dB of equally flat, louder.
+    if (
+      best === null ||
+      cand.spreadDb < best.spreadDb - 0.5 ||
+      (Math.abs(cand.spreadDb - best.spreadDb) <= 0.5 && cand.meanDb > best.meanDb)
+    ) {
+      best = cand;
+    }
+  }
+  return best;
 }
 
 /**

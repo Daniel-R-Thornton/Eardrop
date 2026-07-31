@@ -26,6 +26,7 @@ test('current default values', () => {
   expect(OFDM_TUNING).toEqual({
     syncBurstSymbols: 40,
     chirpSymbols: 32,
+    chirpCenterHz: 1850,
     trainingSymbols: 12,
     trainingSettleSymbols: 16,
     syncMinFrames: 8,
@@ -33,6 +34,7 @@ test('current default values', () => {
     cpCorrelationMinScore: 0.35,
     cpCorrelationMinSharpness: 1.1,
     qamRefSymbols: 4,
-    chirpAmplitude: 0.6,
+    qamWarmupSymbols: 40,
+    chirpAmplitude: 0.12,
   });
 });

@@ -207,6 +207,31 @@ export const OFDM_TUNING = {
    *  above: 8 + 2 + 16 + 12 = 38, rounded up to 40. */
   syncBurstSymbols: 40,
   /**
+   * Centre frequency of the sync chirp, in Hz. DECOUPLED from pilotFreqHz.
+   *
+   * The chirp used to be centred on the pilot, which was harmless while the
+   * pilot sat far below the data band — but the pilot has to move close to the
+   * band for a different reason (the drift correction extrapolates pilot phase
+   * by toneFreq/pilotFreq, so a pilot at 1850 with tones at 8850 amplifies a
+   * two-sample timing error into ~148 degrees of rotation). Moving the pilot to
+   * 6300 cut measured drift from -291 to -11, and dragged the chirp to
+   * 6200-6400 Hz with it.
+   *
+   * That broke the link a different way. The chain compresses PER BAND (the
+   * chain diagnostic showed a single loud tone squashed 14 dB while a 40-tone
+   * grid of the same total power was untouched), and the chirp is the loudest
+   * thing in the transmission. Sitting it next to the data band compressed that
+   * band and then released across the frame: received pilot went 0.367 during
+   * training to 2.67 during data, a 17 dB swing, and no data frame decoded.
+   *
+   * So the chirp keeps its own low band, well away from any usable data
+   * frequency. It only provides coarse timing (see rxEngine's chirpCorrelate),
+   * so its frequency is unconstrained by anything else. TX and RX must agree —
+   * both read this value, and a mismatch makes the correlation template the
+   * wrong shape and nothing syncs.
+   */
+  chirpCenterHz: 1850,
+  /**
    * TX: chirp duration, in symbol periods. DECOUPLED from syncBurstSymbols.
    *
    * These were the same number, which coupled two unrelated things: raising the
@@ -272,18 +297,39 @@ export const OFDM_TUNING = {
    *  OFDMQPSKDemodulator.calibrateQamRef). */
   qamRefSymbols: 4,
   /**
-   * TX: CEILING on the chirped sync burst's peak amplitude (constant-envelope,
-   * so this is every sample's magnitude).
+   * TX/RX: expendable warm-up symbols inserted AFTER the QAM reference
+   * symbols, before the header frame (only when some tone is above QPSK —
+   * an all-QPSK waveform is unchanged). Near-corner magnitude, varying
+   * pseudo-random per-tone phase/magnitude.
    *
-   * No longer the value actually used. OFDMEngine.generateChirpBurst now
-   * level-matches the chirp to the RMS of the OFDM symbols that follow it and
-   * takes the smaller of the two, because a chirp louder than the data
-   * compresses the output chain during the training window and leaves every
-   * channel estimate wrong — see that function for the measurement. This value
-   * only caps the result, so a configuration whose data is louder than 0.6 RMS
-   * still cannot drive the speaker at full scale for 600 ms.
+   * Why: the received gain droops ~2.4 dB across the ~20 symbols following
+   * the ref burst (Meteor Lake DMIC bench, 2026-07-31 — QD g 1.0 -> 0.76),
+   * and header frames transmitted inside that transient failed RS decode at
+   * MER ~13.8 while frames sent after it decoded at 15.9+. Warm-up placed
+   * BEFORE the refs demonstrably does not preempt the transient (three runs:
+   * gain flat at 1.0 through 40 warm-up symbols at two different loudness
+   * levels, droop still started at the refs) — so the warm-up instead sits
+   * after them and absorbs the transient. 40 symbols = ~1 s, roughly twice
+   * the measured settle. The RX discards exactly this many windows between
+   * the ref symbols and the first data window.
    */
-  chirpAmplitude: 0.6,
+  qamWarmupSymbols: 40,
+  /**
+   * TX: CEILING on the chirped sync burst's peak amplitude (constant-envelope,
+   * so this is every sample's magnitude). generateChirpBurst takes
+   * min(this, the preamble's coherent peak); the coherent peak sits above this
+   * value at every tone count, so in practice this IS the chirp level.
+   *
+   * MEASURED, not derived (bench, 2026-07-31, 32 tones / pilot 1850): at 0.6
+   * the chirp detected WORSE than at 0.12 — correlation norm 0.476-0.581 with
+   * the peak pinned at the probe-window edge (idx=300) and handoff scores
+   * ~0.87-0.93, vs norm 0.686-0.703, boundary within a few samples, and
+   * handoff 0.947-0.969 at 0.12. The detection score is normalized by input
+   * RMS, so a hotter chirp gains nothing once the acoustic chain compresses
+   * on it; 0.12 is also the level at which the Jul-30 32-tone run decoded
+   * payload end-to-end.
+   */
+  chirpAmplitude: 0.12,
 } as const;
 
 /**
