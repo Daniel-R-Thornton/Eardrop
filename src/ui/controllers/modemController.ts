@@ -49,7 +49,7 @@ export class ModemController {
     this.post({ type: 'configure', config: cfg });
   }
 
-  async startListening(micGain: number, deviceId?: string): Promise<void> {
+  async startListening(micGain: number, deviceId?: string, deviceLabel?: string): Promise<void> {
     this.post({ type: 'startRx' });
     this.recorder = new AudioRecorder(this.audioCtx, micGain);
     await this.recorder.start(
@@ -60,6 +60,7 @@ export class ModemController {
         this.post({ type: 'feedChunk', samples: owned.buffer }, [owned.buffer]);
       },
       deviceId,
+      deviceLabel,
     );
   }
 

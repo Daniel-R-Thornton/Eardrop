@@ -18,9 +18,10 @@ import { encodeBlock, BLOCK_TYPE, getSentinel } from '../modem/protocol/framing'
 import { bch3116Encode } from '../modem/ecc/ecc';
 import { AudioPlayer } from '../audio/player';
 import { type AudioRecorder } from '../audio/recorder';
+import { runAutoCalibration } from './controllers/calibration';
 import { Visualizer } from '../modem/debug/visualizer';
 import { DEFAULT_CONFIG, OFDM_TUNING, ofdmSamples } from '../modem/types';
-import { enumerateDevices } from '../audio/devices';
+import { enumerateDevices, resolveInputDevice } from '../audio/devices';
 import { TxEngine } from '../modem/protocol/txEngine';
 import { encodeFrame, PAYLOAD_DATA_SIZE } from '../modem/protocol/atomicFrame';
 import { tryParsePreamble, verifyPayload } from '../protocol';
@@ -31,9 +32,41 @@ import { coordinateDescent, type DescentAxis } from './lib/coordinateDescent';
 import { scoreTrial } from './lib/speedTestScore';
 import { detectToneEnergy } from '../lib/scan/index';
 import { resample } from '../lib/math/index';
-import { dlog, dlogDump, dlogInject, dlogReset, dlogSetMode, DLOG_RING_MAX, dlogRingLength } from '../lib/debug/dlog';
+import { dlog, dlogDump, dlogInject, dlogInjectRecord, dlogReset, dlogSetMode, DLOG_RING_MAX, dlogRingLength } from '../lib/debug/dlog';
 import { ModemController } from './controllers/modemController';
 import { buildModemConfig } from './controllers/buildModemConfig';
+/**
+ * Resolve the persisted mic selection to an id that exists right now, and keep
+ * the store in step.
+ *
+ * Chrome's deviceId rotates (salted hash; the salt changes across restarts,
+ * profile changes and permission changes, and Linux device re-enumeration can
+ * change it too). A stale id does not error — getUserMedia simply omits the
+ * constraint and captures from the browser default, i.e. possibly a different
+ * physical microphone, which is indistinguishable from the channel changing.
+ * Matching on the stored LABEL survives that.
+ */
+async function resolveMic(): Promise<{ id: string | undefined; label: string }> {
+  const st = getState();
+  const resolved = await resolveInputDevice(st.selectedInputId, st.selectedInputLabel);
+  if (resolved.matchedBy === 'label' && resolved.id !== st.selectedInputId) {
+    dlog('REC', {
+      deviceIdRotated: true,
+      label: resolved.label,
+      note: 'stored deviceId no longer exists; matched by label',
+    }, { level: 'warn' });
+    setState({ selectedInputId: resolved.id });
+  }
+  if (resolved.matchedBy === 'default' && (st.selectedInputId || st.selectedInputLabel)) {
+    dlog('REC', {
+      deviceUnresolved: true,
+      storedLabel: st.selectedInputLabel || '(none)',
+      note: 'falling back to browser default — re-pick the mic',
+    }, { level: 'warn' });
+  }
+  return { id: resolved.id || undefined, label: resolved.label };
+}
+
 /**
  * Stored pre-emphasis for the current mic and band, or undefined.
  *
@@ -45,7 +78,12 @@ import { buildModemConfig } from './controllers/buildModemConfig';
 function currentToneGains(): number[] | undefined {
   const st = getState();
   const key = `${st.pilotFreqHz}:${st.toneStartHz}:${st.toneCount}`;
-  const gains = st.toneGainsByDevice?.[st.selectedInputId]?.[key];
+  // Label first — deviceId rotates, so an id-keyed lookup silently stops
+  // matching and the correction just stops being applied. Falls back to the id
+  // so calibrations measured before the key changed are still found.
+  const device = st.selectedInputLabel || st.selectedInputId;
+  const gains = st.toneGainsByDevice?.[device]?.[key]
+    ?? st.toneGainsByDevice?.[st.selectedInputId]?.[key];
   return gains && gains.length === st.toneCount ? gains : undefined;
 }
 
@@ -120,7 +158,10 @@ modem.on('fileComplete', (ev) => {
     receivedFiles: [...getState().receivedFiles, { name: ev.fileName, url, size: data.length }],
   });
 });
-modem.on('dlog', (ev) => dlogInject(ev.line));
+modem.on('dlog', (ev) => {
+  if (ev.line !== undefined) dlogInject(ev.line);
+  if (ev.rec) dlogInjectRecord(ev.rec);
+});
 modem.on('telemetry', (ev) => setTelemetry(ev.telemetry));
 
 dlog('APP', { hwRate: audioCtx.sampleRate });
@@ -216,6 +257,31 @@ window.addEventListener('eardrop-send', (async () => {
   await refreshDeviceList();
   if (!isListening) await startListening();
   try {
+    // Auto-calibrate when this mic+band has no stored pre-emphasis. An
+    // uncalibrated band measured 3-4 dB worse MER — the whole FEC margin at
+    // 32+ tones — so sending without it mostly wastes the transmission.
+    if (getState().useOFDM && !currentToneGains()) {
+      setState({
+        isSending: true,
+        sendStatus: { type: 'info', msg: '🎚 No calibration for this band — calibrating first…' },
+      });
+      const cal = await runAutoCalibration();
+      if (cal.failed) {
+        setState({
+          sendStatus: {
+            type: 'info',
+            msg: `⚠ Calibration failed (${cal.failed}) — sending uncalibrated`,
+          },
+        });
+      } else {
+        setState({
+          sendStatus: {
+            type: 'info',
+            msg: `🎚 Calibrated: spread ${cal.beforeSpread.toFixed(1)} → ${cal.afterSpread.toFixed(1)} dB`,
+          },
+        });
+      }
+    }
     setState({ isSending: true, sendStatus: { type: 'info', msg: 'Encoding…' } });
     const raw = new Uint8Array(await selectedFile.arrayBuffer());
     showTxPayload(raw, selectedFile.name);
@@ -674,7 +740,8 @@ async function startListening() {
       trainingSettleSymbols: getState().trainingSettleSymbols,
     });
     modem.configure(cfg);
-    await modem.startListening(getState().micGain, getState().selectedInputId || undefined);
+    const mic = await resolveMic();
+    await modem.startListening(getState().micGain, mic.id, mic.label);
 
     // Sync mic gain slider → live GainNode while listening
     let lastMicGain = getState().micGain;
@@ -2705,7 +2772,8 @@ async function runAcousticSpeedSweep() {
       trainingSettleSymbols: getState().trainingSettleSymbols,
     }),
   );
-  await modem.startListening(getState().micGain, getState().selectedInputId || undefined);
+  const mic = await resolveMic();
+  await modem.startListening(getState().micGain, mic.id, mic.label);
 }
 
 window.addEventListener('eardrop-acoustic-speed', (async () => {

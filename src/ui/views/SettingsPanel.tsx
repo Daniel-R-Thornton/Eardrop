@@ -2,12 +2,15 @@
  * SettingsPanel.tsx — real, usable controls wired to the Store.
  */
 import { useCallback, useEffect, useState } from 'react';
-import { useStore, setState } from '../Store';
+import {
+  useStore, setState, saveConfigPreset, loadConfigPreset, deleteConfigPreset,
+} from '../Store';
 import { enumerateDevices, type DeviceInfo } from '../../audio';
 import { Panel } from '../components/instrument/Panel';
 import { Toggle } from '../components/instrument/Toggle';
 import { Slider } from '../components/instrument/Slider';
 import { Select } from '../components/instrument/Select';
+import { Button } from '../components/instrument/Button';
 
 function deviceOptions(list: DeviceInfo[], defaultLabel: string) {
   return [
@@ -22,6 +25,8 @@ export function SettingsPanel() {
   const s = useStore((x) => x);
   const [inputs, setInputs] = useState<DeviceInfo[]>([]);
   const [outputs, setOutputs] = useState<DeviceInfo[]>([]);
+  const [presetName, setPresetName] = useState('');
+  const presetNames = Object.keys(s.configPresets);
 
   const refreshDevices = useCallback(async () => {
     try {
@@ -72,9 +77,17 @@ export function SettingsPanel() {
             : [2, 4, 8]
           ).map((n) => ({ value: String(n), label: `${n} tones` }))}
         />
+        {/* Pilot placement matters more than it looks. The drift correction
+            measures phase on the PILOT and extrapolates it linearly to each data
+            tone (driftPerHz * toneFreq), so the extrapolation factor is
+            toneFreq/pilotFreq. At pilot 1850 with tones at 6900-8850 that is
+            ~4.8x: a two-sample timing error on the pilot becomes ~148 degrees of
+            rotation at the top tone, which no amount of channel estimation
+            survives. Raising the ceiling to 7000 allows the pilot to sit just
+            below the band, where the factor approaches 1. */}
         <Slider
           label="PILOT" unit="Hz"
-          min={s.useOFDM ? 500 : 300} max={s.useOFDM ? 4000 : 1500} step={10}
+          min={s.useOFDM ? 500 : 300} max={s.useOFDM ? 7000 : 1500} step={10}
           value={s.pilotFreqHz}
           onChange={(v) => setState({ pilotFreqHz: v })}
         />
@@ -99,7 +112,12 @@ export function SettingsPanel() {
         <Select
           label="MIC"
           value={s.selectedInputId}
-          onChange={(v) => setState({ selectedInputId: v })}
+          onChange={(v) => setState({
+            selectedInputId: v,
+            // Store the label alongside the id — the id rotates, the label does
+            // not, and a stale id silently becomes "browser default".
+            selectedInputLabel: inputs.find((d) => d.id === v)?.label ?? '',
+          })}
           options={deviceOptions(inputs, 'Default Mic')}
         />
         <Select
@@ -108,6 +126,43 @@ export function SettingsPanel() {
           onChange={(v) => setState({ selectedOutputId: v })}
           options={deviceOptions(outputs, 'Default Speaker')}
         />
+
+        {/* Named config presets — snapshot every persisted config field
+            (band, tone count, QAM, gains, devices, calibration) under a name
+            so a known-good state is one click away after experimenting. */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <span className="lab-panel__title" style={{ padding: 0, background: 'transparent', border: 0 }}>
+            CONFIG PRESETS
+          </span>
+          <div style={{ display: 'flex', gap: 4 }}>
+            <input
+              className="lab-select"
+              style={{ flex: 1, minWidth: 0 }}
+              placeholder="preset name"
+              value={presetName}
+              onChange={(e) => setPresetName(e.target.value)}
+            />
+            <Button
+              primary
+              disabled={!presetName.trim()}
+              onClick={() => {
+                saveConfigPreset(presetName);
+                setPresetName('');
+              }}
+            >
+              SAVE
+            </Button>
+          </div>
+          {presetNames.map((name) => (
+            <div key={name} style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+              <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {name}
+              </span>
+              <Button onClick={() => loadConfigPreset(name)}>LOAD</Button>
+              <Button onClick={() => deleteConfigPreset(name)}>DEL</Button>
+            </div>
+          ))}
+        </div>
       </div>
     </Panel>
   );

@@ -36,6 +36,7 @@ import {
   sampleResponseAt,
   magsToRelativeDb,
   makeGainInterpolator,
+  findBestBand,
   SWEEP_DEFAULTS,
   type SweepResult,
 } from '../../modem/diag/channelSweep';
@@ -57,6 +58,8 @@ export function ChannelSweep({ onClose }: { onClose?: () => void }) {
   /** Last grid-burst run — all tones at once, at the modem's real per-tone level. */
   const [grid, setGrid] = useState<SweepResult | null>(null);
   const sweepRef = useRef<SweepResult | null>(null);
+  /** Hover cursor over the sweep chart, in chart-local px (null = not hovering). */
+  const [hoverPx, setHoverPx] = useState<number | null>(null);
 
   // One player/recorder for the panel's lifetime. Constructing an AudioRecorder
   // per run also constructs an AudioContext per run, and browsers cap those at
@@ -107,7 +110,7 @@ export function ChannelSweep({ onClose }: { onClose?: () => void }) {
     const { player, recorder } = io();
     const burst = gridBurst();
     try {
-      await recorder.start(48000, undefined, s.selectedInputId);
+      await recorder.start(48000, undefined, s.selectedInputId, s.selectedInputLabel);
       await new Promise((r) => setTimeout(r, 250));
       dlog('GRID', {
         tones: burst.freqs.length,
@@ -224,7 +227,7 @@ export function ChannelSweep({ onClose }: { onClose?: () => void }) {
     };
 
     try {
-      await recorder.start(SR, undefined, s.selectedInputId);
+      await recorder.start(SR, undefined, s.selectedInputId, s.selectedInputLabel);
       await new Promise((r) => setTimeout(r, 250));
       dlog('DIAG', {
         tones: s.toneCount,
@@ -414,7 +417,15 @@ export function ChannelSweep({ onClose }: { onClose?: () => void }) {
 
   /** Calibration key — see AppState.toneGainsByDevice for why both parts. */
   const calKey = `${s.pilotFreqHz}:${s.toneStartHz}:${s.toneCount}`;
-  const storedGains = s.toneGainsByDevice[s.selectedInputId]?.[calKey];
+  /**
+   * Device handle for calibration storage: the LABEL, because deviceId rotates.
+   * Falls back to the id so a calibration measured before this change is still
+   * found.
+   */
+  const calDevice = s.selectedInputLabel || s.selectedInputId;
+  const storedGains =
+    s.toneGainsByDevice[calDevice]?.[calKey]
+    ?? s.toneGainsByDevice[s.selectedInputId]?.[calKey];
 
   /**
    * Iteratively flatten the RECEIVED spectrum: measure the grid, correct the
@@ -464,7 +475,7 @@ export function ChannelSweep({ onClose }: { onClose?: () => void }) {
     };
 
     try {
-      await recorder.start(SR, undefined, s.selectedInputId);
+      await recorder.start(SR, undefined, s.selectedInputId, s.selectedInputLabel);
       await new Promise((r) => setTimeout(r, 250));
       dlog('CAL', { tones: s.toneCount, key: calKey, gridRounds: GRID_ROUNDS, maxBoostDb: 9 });
 
@@ -544,8 +555,8 @@ export function ChannelSweep({ onClose }: { onClose?: () => void }) {
       setState({
         toneGainsByDevice: {
           ...s.toneGainsByDevice,
-          [s.selectedInputId]: {
-            ...(s.toneGainsByDevice[s.selectedInputId] ?? {}),
+          [calDevice]: {
+            ...(s.toneGainsByDevice[calDevice] ?? {}),
             [calKey]: gainsDbToLinear(gainsDb),
           },
         },
@@ -570,7 +581,7 @@ export function ChannelSweep({ onClose }: { onClose?: () => void }) {
     }
   }, [
     io, calKey, s.toneCount, s.pilotFreqHz, s.toneStartHz, s.qamScaleOverride,
-    s.selectedInputId, s.selectedOutputId, s.toneGainsByDevice,
+    s.selectedInputId, s.selectedOutputId, s.toneGainsByDevice, calDevice,
   ]);
 
   const run = useCallback(async () => {
@@ -584,7 +595,7 @@ export function ChannelSweep({ onClose }: { onClose?: () => void }) {
     });
 
     try {
-      await recorder.start(48000, undefined, s.selectedInputId);
+      await recorder.start(48000, undefined, s.selectedInputId, s.selectedInputLabel);
       // Let the input stream settle before the first step, otherwise step 0
       // can be clipped by stream startup and alignment has nothing to lock to.
       await new Promise((r) => setTimeout(r, 250));
@@ -637,7 +648,9 @@ export function ChannelSweep({ onClose }: { onClose?: () => void }) {
         // assume the correction lands exactly as intended, which is the very
         // thing worth checking.
         const gainKey = `${s.pilotFreqHz}:${s.toneStartHz}:${s.toneCount}`;
-        const gains = s.toneGainsByDevice[s.selectedInputId]?.[gainKey];
+        const gains =
+          s.toneGainsByDevice[calDevice]?.[gainKey]
+          ?? s.toneGainsByDevice[s.selectedInputId]?.[gainKey];
         // Say why the second pass is or is not meaningful. "Both curves look
         // identical" has three quite different causes — no calibration stored,
         // a calibration stored under a different key, or a stored calibration
@@ -648,12 +661,12 @@ export function ChannelSweep({ onClose }: { onClose?: () => void }) {
           : 0;
         dlog('SWEEP-CAL', {
           key: gainKey,
-          device: (s.selectedInputId || 'default').slice(0, 8),
+          device: calDevice || 'default',
           haveGains: Boolean(gains),
           gainCount: gains?.length ?? 0,
           expected: s.toneCount,
           gainSpreadDb: gainSpreadDb.toFixed(1),
-          knownKeys: Object.keys(s.toneGainsByDevice[s.selectedInputId] ?? {}).join('|') || 'none',
+          knownKeys: Object.keys(s.toneGainsByDevice[calDevice] ?? {}).join('|') || 'none',
         });
         if (gains && gains.length === s.toneCount && gainSpreadDb < 0.5) {
           dlog(
@@ -781,8 +794,8 @@ export function ChannelSweep({ onClose }: { onClose?: () => void }) {
         </Button>
         <span style={{ color: storedGains ? T.phosphor : '#8a857a', fontSize: 11 }}>
           {storedGains
-            ? `calibrated: ${storedGains.length} tones @ ${calKey}`
-            : `uncalibrated @ ${calKey}`}
+            ? `calibrated: ${storedGains.length} tones @ ${calKey} · ${calDevice || 'default mic'}`
+            : `uncalibrated @ ${calKey} · ${calDevice || 'default mic'}`}
         </span>
         <span style={{ color: '#8a857a', fontSize: 11 }}>
           {SWEEP_DEFAULTS.startHz}–{SWEEP_DEFAULTS.endHz} Hz · {SWEEP_DEFAULTS.stepHz} Hz steps ·{' '}
@@ -858,9 +871,36 @@ export function ChannelSweep({ onClose }: { onClose?: () => void }) {
         );
       })()}
 
-      {result && (
+      {result && (() => {
+        const f0 = result.freqs[0];
+        const fN = result.freqs[result.freqs.length - 1];
+        const toX = (f: number) => ((f - f0) / (fN - f0)) * W;
+        const pxToF = (px: number) => f0 + (px / W) * (fN - f0);
+        // Flattest window wide enough for the SELECTED tone count on the
+        // 50 Hz grid — where TONE START wants to be.
+        const best = findBestBand(result.freqs, result.db, (s.toneCount - 1) * 50);
+        const hover = (() => {
+          if (hoverPx == null) return null;
+          const f = pxToF(hoverPx);
+          // nearest measured point for the dB readout
+          let bi = 0;
+          for (let i = 1; i < result.freqs.length; i++) {
+            if (Math.abs(result.freqs[i] - f) < Math.abs(result.freqs[bi] - f)) bi = i;
+          }
+          return { f, db: result.db[bi] };
+        })();
+        return (
         <>
-          <svg width={W} height={H} style={{ background: '#0a0b08', borderRadius: 4, display: 'block' }}>
+          <svg
+            width={W}
+            height={H}
+            style={{ background: '#0a0b08', borderRadius: 4, display: 'block', cursor: 'crosshair' }}
+            onMouseMove={(e) => {
+              const rect = (e.currentTarget as SVGSVGElement).getBoundingClientRect();
+              setHoverPx(Math.max(0, Math.min(W, e.clientX - rect.left)));
+            }}
+            onMouseLeave={() => setHoverPx(null)}
+          >
             {/* dB gridlines every 10 dB */}
             {[0, -10, -20, -30, -40].map((db) => (
               <g key={db}>
@@ -874,9 +914,6 @@ export function ChannelSweep({ onClose }: { onClose?: () => void }) {
             {(() => {
               const lo = s.pilotFreqHz + (s.toneStartHz ?? 0);
               const hi = lo + (s.toneCount - 1) * 50;
-              const f0 = result.freqs[0];
-              const fN = result.freqs[result.freqs.length - 1];
-              const toX = (f: number) => ((f - f0) / (fN - f0)) * W;
               return (
                 <rect
                   x={toX(lo)}
@@ -888,6 +925,24 @@ export function ChannelSweep({ onClose }: { onClose?: () => void }) {
                 />
               );
             })()}
+            {/* flattest window wide enough for the selected tone count */}
+            {best && (
+              <g>
+                <rect
+                  x={toX(best.startHz)}
+                  width={Math.max(1, toX(best.endHz) - toX(best.startHz))}
+                  y={0}
+                  height={H}
+                  fill="none"
+                  stroke="#ffd23d"
+                  strokeDasharray="4 3"
+                  strokeWidth={1}
+                />
+                <text x={toX(best.startHz) + 3} y={11} fill="#ffd23d" fontSize={9}>
+                  BEST {best.startHz.toFixed(0)}–{best.endHz.toFixed(0)} Hz · {best.spreadDb.toFixed(1)} dB
+                </text>
+              </g>
+            )}
             {prevRef.current && (
               <path d={path(prevRef.current)} fill="none" stroke="#5a5d50" strokeWidth={1} strokeDasharray="3 3" />
             )}
@@ -898,15 +953,39 @@ export function ChannelSweep({ onClose }: { onClose?: () => void }) {
             {grid && (() => {
               // Grid tones are a subset of the sweep's frequencies, so place
               // them on the sweep's x-axis rather than their own.
-              const f0 = result.freqs[0];
-              const fN = result.freqs[result.freqs.length - 1];
-              const toX = (f: number) => ((f - f0) / (fN - f0)) * W;
               const d = grid.freqs
                 .map((f, i) => `${i === 0 ? 'M' : 'L'}${toX(f).toFixed(1)},${y(grid.db[i]).toFixed(1)}`)
                 .join(' ');
               return <path d={d} fill="none" stroke="#ffb03d" strokeWidth={1.5} />;
             })()}
+            {/* hover cursor: frequency + measured dB at the mouse */}
+            {hover && hoverPx != null && (
+              <g pointerEvents="none">
+                <line x1={hoverPx} x2={hoverPx} y1={0} y2={H} stroke="#8a857a" strokeWidth={1} />
+                <text
+                  x={hoverPx + (hoverPx > W - 110 ? -6 : 6)}
+                  y={14}
+                  fill="#e8e4d8"
+                  fontSize={10}
+                  textAnchor={hoverPx > W - 110 ? 'end' : 'start'}
+                >
+                  {hover.f.toFixed(0)} Hz · {hover.db.toFixed(1)} dB
+                </text>
+              </g>
+            )}
           </svg>
+          {best && (() => {
+            // TONE START is an offset above the pilot; snap the suggestion to
+            // the 50 Hz tone grid.
+            const suggested = Math.max(0, Math.round((best.startHz - s.pilotFreqHz) / 50) * 50);
+            return (
+              <div style={{ marginTop: 4, fontSize: 11, color: '#ffd23d' }}>
+                best {s.toneCount}-tone band: {best.startHz.toFixed(0)}–{best.endHz.toFixed(0)} Hz
+                (spread {best.spreadDb.toFixed(1)} dB) → TONE START {suggested} Hz{' '}
+                <Button onClick={() => setState({ toneStartHz: suggested })}>APPLY</Button>
+              </div>
+            );
+          })()}
 
           <div style={{ display: 'flex', gap: 16, marginTop: 8, flexWrap: 'wrap' }}>
             <span>
@@ -980,9 +1059,13 @@ export function ChannelSweep({ onClose }: { onClose?: () => void }) {
             Run once, move the laptop or lift it off the desk, run again: notches that MOVE are
             acoustic cancellation (bit loading is the fix). Notches that STAY are fixed speaker or
             mic response (a permanent band choice can dodge them).
+            <br />
+            Dashed yellow box = flattest {s.toneCount}-tone-wide window of this sweep; APPLY moves
+            TONE START there (recalibrate after — gains are keyed per band).
           </div>
         </>
-      )}
+        );
+      })()}
     </div>
   );
 }

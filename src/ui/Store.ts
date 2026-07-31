@@ -75,6 +75,17 @@ export interface AppState {
   selectedFile: { name: string; size: number } | null;
   /** Persisted mic (input) device ID */
   selectedInputId: string;
+  /**
+   * Persisted mic LABEL, which is what actually survives.
+   *
+   * Chrome's deviceId is a salted hash whose salt rotates across restarts,
+   * profile changes and permission changes, and on Linux device re-enumeration
+   * can change it too — one debugging session saw four ids for two physical
+   * mics. A stale id degrades silently into "browser default", so the label is
+   * the durable handle and the id is resolved from it at start time (see
+   * resolveInputDevice). It is also what per-device calibrations are keyed by.
+   */
+  selectedInputLabel: string;
   /** Persisted speaker (output) device ID */
   selectedOutputId: string;
   receivedFiles: Array<{ name: string; url: string; size: number }>;
@@ -105,14 +116,20 @@ export interface AppState {
    *  the speaker/mic response. Default 2000 = today's behavior. */
   toneStartHz: number;
   /**
-   * Per-tone pre-emphasis calibrations, keyed by input device id, then by
+   * Per-tone pre-emphasis calibrations, keyed by microphone LABEL, then by
    * `pilotFreqHz:toneStartHz:toneCount`.
    *
    * Keyed by DEVICE because the measured response belongs to the microphone —
-   * three mics on this machine measured a flat band, a 17 dB tilt and a 21 dB
-   * comb respectively. Keyed by BAND because the gains are per tone INDEX, so
-   * reusing a set across a different grid would apply them to the wrong
-   * frequencies. Values are linear multipliers, mean-unity in dB.
+   * four mics on this machine measured a flat band, a 17 dB tilt, a 21 dB comb
+   * and a 20 dB tilt respectively. Keyed by BAND because the gains are per tone
+   * INDEX, so reusing a set across a different grid would apply them to the
+   * wrong frequencies. Values are linear multipliers, mean-unity in dB.
+   *
+   * By LABEL and not deviceId: Chrome's deviceId is a salted hash whose salt
+   * rotates, so id-keyed entries silently stop matching and the correction just
+   * stops being applied — with no error and no visible difference except a
+   * response that looks like it changed. Older id-keyed entries are still read
+   * as a fallback (see calibrationKeyFor) so nothing already measured is lost.
    */
   toneGainsByDevice: Record<string, Record<string, number[]>>;
   /**
@@ -196,6 +213,13 @@ export interface AppState {
    * move to the next, repeating passes until nothing improves.
    */
   speedTestMode: 'grid' | 'hunt';
+  /**
+   * Named "known-good" configuration snapshots, saved by the operator when a
+   * combination works so it can be restored with one click after further
+   * experimenting. Each preset holds the same fields the store persists
+   * (CONFIG_FIELDS), including the per-device calibration gains.
+   */
+  configPresets: Record<string, Partial<AppState>>;
 }
 
 const defaultDecoder: DecoderInfo = {
@@ -225,6 +249,7 @@ const defaultState: AppState = {
   isPlaying: false,
   selectedFile: null,
   selectedInputId: '',
+  selectedInputLabel: '',
   selectedOutputId: '',
   receivedFiles: [],
   progress: 0,
@@ -273,6 +298,7 @@ const defaultState: AppState = {
   speedTestBest: null,
   speedTestLoopback: false,
   speedTestMode: 'hunt',
+  configPresets: {},
 };
 
 // ─── Store ────────────────────────────────────────────
@@ -301,29 +327,36 @@ function loadPersistedState(): Partial<AppState> | null {
   }
 }
 
+/**
+ * The configuration-related fields — everything else is transient. This one
+ * list drives reload persistence, change detection in setState, AND what a
+ * named config preset captures, so the three can never drift apart.
+ */
+const CONFIG_FIELDS = [
+  'toneCount', 'toneStartHz', 'toneGainsByDevice', 'trainingSettleSymbols',
+  'dataQamBits', 'qamScaleOverride', 'pilotFreqHz', 'musicalMode',
+  'ampThresholdRatio', 'syncStrongMultiplier', 'diversityMode', 'useOFDM',
+  'symbolsPerSec', 'micGain', 'playbackVolume', 'selectedInputId',
+  'selectedInputLabel', 'selectedOutputId', 'theme',
+] as const satisfies readonly (keyof AppState)[];
+
+/** Deep-cloned snapshot of the configuration fields of `s`. */
+function snapshotConfig(s: AppState): Partial<AppState> {
+  const snap: Record<string, unknown> = {};
+  for (const k of CONFIG_FIELDS) {
+    // structuredClone so nested objects (toneGainsByDevice) are frozen at
+    // save time rather than aliased to live state.
+    snap[k] = s[k] === undefined ? undefined : structuredClone(s[k]);
+  }
+  return snap as Partial<AppState>;
+}
+
 /** Save the current UI state (only the fields we want to persist) */
 function persistState(s: AppState): void {
   try {
     const toSave: Partial<AppState> = {
-      // Persist only the configuration‑related fields – everything else is transient.
-      toneCount: s.toneCount,
-      toneStartHz: s.toneStartHz,
-      toneGainsByDevice: s.toneGainsByDevice,
-      trainingSettleSymbols: s.trainingSettleSymbols,
-      dataQamBits: s.dataQamBits,
-      qamScaleOverride: s.qamScaleOverride,
-      pilotFreqHz: s.pilotFreqHz,
-      musicalMode: s.musicalMode,
-      ampThresholdRatio: s.ampThresholdRatio,
-      syncStrongMultiplier: s.syncStrongMultiplier,
-      diversityMode: s.diversityMode,
-      useOFDM: s.useOFDM,
-      symbolsPerSec: s.symbolsPerSec,
-      micGain: s.micGain,
-      playbackVolume: s.playbackVolume,
-      selectedInputId: s.selectedInputId,
-      selectedOutputId: s.selectedOutputId,
-      theme: s.theme,
+      ...snapshotConfig(s),
+      configPresets: s.configPresets,
     };
     localStorage.setItem(PERSIST_KEY, JSON.stringify(toSave));
   } catch (_) {
@@ -345,15 +378,39 @@ export function getState(): AppState {
 export function setState(update: Partial<AppState>): void {
   state = { ...state, ...update };
   // Only persist when a persisted config key actually changed.
-  const persistedKeys: Array<keyof AppState> = [
-    'toneCount', 'toneStartHz', 'toneGainsByDevice', 'trainingSettleSymbols', 'dataQamBits', 'qamScaleOverride', 'pilotFreqHz', 'musicalMode', 'ampThresholdRatio',
-    'syncStrongMultiplier', 'diversityMode', 'useOFDM', 'symbolsPerSec',
-    'micGain', 'playbackVolume', 'selectedInputId', 'selectedOutputId', 'theme',
-  ];
-  if (persistedKeys.some((k) => k in update)) {
+  if (CONFIG_FIELDS.some((k) => k in update) || 'configPresets' in update) {
     persistState(state);
   }
   listeners.forEach((fn) => fn());
+}
+
+// ─── Named config presets ─────────────────────────────
+// One-click "get back to the working state": snapshot the CONFIG_FIELDS
+// (including per-device calibration gains) under a name, restore later
+// through the normal setState path so everything downstream reconfigures
+// exactly as if the controls were moved by hand.
+
+export function saveConfigPreset(name: string): void {
+  const trimmed = name.trim();
+  if (!trimmed) return;
+  setState({
+    configPresets: { ...state.configPresets, [trimmed]: snapshotConfig(state) },
+  });
+}
+
+export function loadConfigPreset(name: string): void {
+  const preset = state.configPresets[name];
+  if (!preset) return;
+  // Clone on the way out too — the loaded state must not alias the stored
+  // preset, or later edits would silently rewrite it.
+  setState(structuredClone(preset));
+}
+
+export function deleteConfigPreset(name: string): void {
+  if (!(name in state.configPresets)) return;
+  const next = { ...state.configPresets };
+  delete next[name];
+  setState({ configPresets: next });
 }
 
 export function resetState(): void {
