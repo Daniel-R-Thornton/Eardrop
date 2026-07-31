@@ -7,6 +7,8 @@ import { dlog } from '../lib/debug/dlog';
 export class AudioPlayer {
   private ctx: AudioContext;
   private currentSource: AudioBufferSourceNode | null = null;
+  /** Abort hook for an in-flight streaming playback (set by playStream). */
+  private streamStop: (() => void) | null = null;
   /** Playback volume multiplier (1.0 = unity). Default 2× (was 6× — reduced to prevent clipping). */
   public volume = 2.0;
 
@@ -56,8 +58,8 @@ export class AudioPlayer {
       } else {
         // Find peak to auto-normalize
         let peak = 0;
-        for (let i = 0; i < samples.length; i++) {
-          const abs = Math.abs(samples[i]);
+        for (const element of samples) {
+          const abs = Math.abs(element);
           if (abs > peak) peak = abs;
         }
         // Scale so that peak * volume * scale = 0.95 (no clipping)
@@ -102,8 +104,177 @@ export class AudioPlayer {
     });
   }
 
+  /**
+   * Stream playback: schedule audio chunks back-to-back as they are pulled,
+   * keeping ~2 s buffered ahead. `pull()` returns the next chunk or null at end.
+   * Gapless — chunks are contiguous slices scheduled at contiguous times.
+   * Samples are expected pre-normalized (≈0.95 peak); the UI `volume` control
+   * (see batch `play()`) is applied here via a gain node — streaming can't do
+   * the whole-signal peak analysis `play()` does, so each chunk is additionally
+   * guarded against exceeding unity peak before scheduling (see `schedule()`).
+   * Resolves when the last scheduled chunk finishes; rejects if pull() throws.
+   * @param onProgress optional — called with seconds of audio scheduled so far.
+   */
+  async playStream(
+    pull: () => Promise<Float32Array | null>,
+    sampleRate: number,
+    deviceId?: string,
+    onProgress?: (scheduledSec: number) => void,
+  ): Promise<void> {
+    const ctx = this.ensureCtx();
+    if (deviceId && typeof (ctx as any).setSinkId === 'function') {
+      try {
+        await (ctx as any).setSinkId(deviceId);
+      } catch (e: any) {
+        dlog('PLAY', { setSinkIdFailed: e.message || String(e) }, { level: 'warn' });
+      }
+    }
+
+    const gain = ctx.createGain();
+    // Streamed chunks are pre-normalized to ≈0.95 peak (see class doc above),
+    // with no whole-signal analysis to cancel `this.volume` the way batch
+    // play()'s auto-norm does (`scale = targetPeak/(peak*volume)`). Above
+    // unity, `this.volume` (default 2.0×) would push ≈0.95 peak samples to
+    // ≈1.9 post-gain and hard-clip at the DAC on every chunk. Cap the applied
+    // gain at 1.0 — volume < 1 (backing the speaker OUT of its compressor's
+    // range, the actual use case here) still works; > 1 on this path can only
+    // clip, so it's clamped rather than honored.
+    gain.gain.value = Math.min(this.volume, 1.0);
+    gain.connect(ctx.destination);
+
+    const LOOKAHEAD_SEC = 2.0;
+    const START_PAD_SEC = 0.15; // small lead so the first chunk isn't scheduled in the past
+    const sources = new Set<AudioBufferSourceNode>();
+    let nextTime = ctx.currentTime + START_PAD_SEC;
+    let scheduledSamples = 0;
+    let aborted = false;
+    let producerDone = false;
+
+    const schedule = (chunk: Float32Array): void => {
+      // Safety limiter: CLAMP the few offending samples. It must not rescale
+      // the chunk.
+      //
+      // This used to divide the whole chunk by its own peak, and the previous
+      // comment already named the flaw — "the scale factor is computed
+      // independently per chunk, so if it ever actually fires it would step the
+      // output level between chunks". It fired (measured peak 1.19 on a
+      // 32-tone/16-QAM run) and did exactly that: one chunk went out ~1.5 dB
+      // below the rest. For a QAM link that is far worse than clipping,
+      // because the receiver's amplitude reference is trained on the preamble
+      // and applied to the data — if those land in differently-scaled chunks,
+      // every channel estimate is wrong by the difference. Observed as a flat
+      // 6 dB per-tone profile turning into a 22 dB ramp with the ref-symbol
+      // calibration reporting 1.8-3x corrections.
+      //
+      // Clamping instead distorts only the handful of samples that overshoot,
+      // adds a little broadband noise, and leaves every level relationship in
+      // the transmission intact. Rare clipping is recoverable; a level step is
+      // not.
+      let clipped = 0;
+      let peak = 0;
+      let safeChunk = chunk;
+      for (let i = 0; i < chunk.length; i++) {
+        const abs = Math.abs(chunk[i]);
+        if (abs > peak) peak = abs;
+        if (abs > 1.0) clipped++;
+      }
+      if (clipped > 0) {
+        dlog(
+          'PLAYER',
+          { clipClamped: clipped, peak: Number(peak.toFixed(4)), of: chunk.length },
+          { level: 'warn' },
+        );
+        safeChunk = new Float32Array(chunk.length);
+        for (let i = 0; i < chunk.length; i++) {
+          const v = chunk[i];
+          safeChunk[i] = v > 1.0 ? 1.0 : v < -1.0 ? -1.0 : v;
+        }
+      }
+      const buffer = ctx.createBuffer(1, safeChunk.length, sampleRate);
+      buffer.getChannelData(0).set(safeChunk);
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(gain);
+      // Guard against underrun scheduling into the past (shouldn't happen — encode
+      // runs far faster than realtime — but keeps playback monotonic if it does).
+      const startAt = Math.max(nextTime, ctx.currentTime);
+      src.start(startAt);
+      nextTime = startAt + chunk.length / sampleRate;
+      scheduledSamples += chunk.length;
+      sources.add(src);
+      src.onended = () => sources.delete(src);
+    };
+
+    return new Promise<void>((resolve, reject) => {
+      const cleanup = (): void => {
+        this.streamStop = null;
+        try {
+          gain.disconnect();
+        } catch {
+          /* already disconnected */
+        }
+      };
+
+      this.streamStop = () => {
+        aborted = true;
+        for (const s of sources) {
+          try {
+            s.stop();
+          } catch {
+            /* already stopped */
+          }
+        }
+        sources.clear();
+        cleanup();
+        resolve();
+      };
+
+      let pumping = false;
+      const pump = async (): Promise<void> => {
+        if (pumping || aborted) return;
+        pumping = true;
+        try {
+          while (!aborted && !producerDone && nextTime - ctx.currentTime < LOOKAHEAD_SEC) {
+            const chunk = await pull();
+            if (aborted) return;
+            if (chunk === null) {
+              producerDone = true;
+              break;
+            }
+            schedule(chunk);
+            onProgress?.(scheduledSamples / sampleRate);
+          }
+        } catch (err) {
+          cleanup();
+          reject(err instanceof Error ? err : new Error(String(err)));
+          return;
+        } finally {
+          pumping = false;
+        }
+
+        if (aborted) return;
+        if (producerDone) {
+          // Everything is scheduled; resolve once playback reaches the end.
+          const remainingMs = Math.max(0, (nextTime - ctx.currentTime) * 1000) + 50;
+          setTimeout(() => {
+            cleanup();
+            resolve();
+          }, remainingMs);
+          return;
+        }
+        setTimeout(() => void pump(), 200);
+      };
+
+      void pump();
+    });
+  }
+
   /** Stop current playback immediately */
   stopPlayback(): void {
+    if (this.streamStop) {
+      console.debug('[AUDIO-PLAYER] ⏹️  Stopping stream playback');
+      this.streamStop();
+    }
     if (this.currentSource) {
       console.debug('[AUDIO-PLAYER] ⏹️  Stopping current playback');
       try {

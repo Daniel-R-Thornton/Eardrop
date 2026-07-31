@@ -5,6 +5,7 @@ import {
   ofdmSamples,
   ofdmToneFrequencies,
   OFDM_DEFAULTS,
+  OFDM_TUNING,
 } from '../types';
 import { OFDMQPSKModulator } from '../modulation/OFDMQPSKModulator';
 import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
@@ -126,7 +127,7 @@ test('engine @48k/16 tones: 2 bytes per symbol, sync burst sized in time', () =>
 test('cross-rate: TX @44100 decodes on RX @48000', () => {
   const engine = new OFDMEngine({ sampleRate: 44100, toneCount: 16 });
   const frame = encodeFrame({ type: 0x01, seqNum: 0, totalFrames: 1, crc: 0 }, new Uint8Array(40));
-  const sync = engine.generateSyncBurst(24);
+  const sync = engine.generateSyncBurst(OFDM_TUNING.syncBurstSymbols);
   const data = engine.modulateFrame(frame);
   const tx44 = new Float32Array(sync.length + data.length);
   tx44.set(sync, 0);
@@ -156,7 +157,7 @@ test('cross-rate: TX @44100 decodes on RX @48000', () => {
 test('50 Hz hum at high level neither triggers sync nor blocks decode', () => {
   const engine = new OFDMEngine({ sampleRate: 48000, toneCount: 16 });
   const frame = encodeFrame({ type: 0x01, seqNum: 0, totalFrames: 1, crc: 0 }, new Uint8Array(40));
-  const sync = engine.generateSyncBurst(24);
+  const sync = engine.generateSyncBurst(OFDM_TUNING.syncBurstSymbols);
   const data = engine.modulateFrame(frame);
 
   // 2 s of hum-only lead-in, then the burst riding on hum

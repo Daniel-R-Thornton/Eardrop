@@ -103,7 +103,7 @@ export class SentinelScanner {
         for (let i = 0; i < this.buf.length && i < FRAME_SIZE - 3; i++) {
           fullFrame[3 + i] = this.buf[i];
         }
-        dlog('RX-SCAN', { frame: this.buf.length, expect: FRAME_SIZE - 3 });
+        dlog('RX-SCAN', { frame: this.buf.length });
         if (this.onFrame) {
           this.onFrame(fullFrame);
         }
@@ -124,7 +124,6 @@ export class SentinelScanner {
     if (this.bitCount > 0 && this.bitCount % 8000 === 0 && !this.collecting) {
       dlog('RX-SCAN', {
         bits: this.bitCount,
-        sentinel: false,
         sr: `0x${this.shiftReg.toString(16)}`,
       });
     }

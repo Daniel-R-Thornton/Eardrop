@@ -3,7 +3,9 @@
  * hero and the RX view. Owns the pipeline playhead and mirrors its state + the
  * chosen speed into the Store.
  */
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
+import { dlogDump, dlogRecords, DLOG_RING_MAX } from '../lib/debug/dlog';
+import { compressRecords } from '../lib/debug/llmDump';
 import { useStore, setState } from './Store';
 import { Toggle } from './components/instrument/Toggle';
 import { usePipelinePlayhead } from './views/usePipelinePlayhead';
@@ -15,6 +17,8 @@ import { SettingsPanel } from './views/SettingsPanel';
 import { TxPanel } from './views/TxPanel';
 import { Panel } from './components/instrument/Panel';
 import { LED } from './components/instrument/LED';
+import { FrequencySweep } from './views/FrequencySweep';
+import { ChannelSweep } from './views/ChannelSweep';
 import { T } from './theme/labaccent/tokens';
 import { OFDM_DEFAULTS } from '../modem/types';
 import './theme/labaccent/labaccent.css';
@@ -28,6 +32,35 @@ export function BenchApp() {
   const ph = usePipelinePlayhead(s.demoRun, s.demoSpeed);
   const [enlargeFocused, setEnlargeFocused] = useState(false);
   const [presenting, setPresenting] = useState(false);
+  const [showFrequencySweep, setShowFrequencySweep] = useState(false);
+  const [showChannelSweep, setShowChannelSweep] = useState(false);
+  const [copiedLlm, setCopiedLlm] = useState(false);
+  const [copiedRaw, setCopiedRaw] = useState(false);
+
+  const copyLlmDump = useCallback(() => {
+    navigator.clipboard.writeText(compressRecords(dlogRecords())).then(() => {
+      setCopiedLlm(true);
+      setTimeout(() => setCopiedLlm(false), 1200);
+    });
+  }, []);
+  const copyRawLog = useCallback(() => {
+    navigator.clipboard.writeText(dlogDump(DLOG_RING_MAX)).then(() => {
+      setCopiedRaw(true);
+      setTimeout(() => setCopiedRaw(false), 1200);
+    });
+  }, []);
+
+  // Event listener for frequency sweep
+  useEffect(() => {
+    const handleFrequencySweep = () => setShowFrequencySweep(true);
+    const handleChannelSweep = () => setShowChannelSweep(true);
+    window.addEventListener('eardrop-test-frequency', handleFrequencySweep);
+    window.addEventListener('eardrop-channel-sweep', handleChannelSweep);
+    return () => {
+      window.removeEventListener('eardrop-test-frequency', handleFrequencySweep);
+      window.removeEventListener('eardrop-channel-sweep', handleChannelSweep);
+    };
+  }, []);
 
   // Mirror playhead position into the Store so any panel can read it.
   useEffect(() => {
@@ -76,6 +109,34 @@ export function BenchApp() {
           <span style={{ fontSize: 11, opacity: 0.7 }}>signal bench · sound ↔ data</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          {/* Session export. Lives in the main header rather than the
+              Ctrl+Shift+D debug overlay, because that overlay is not where the
+              work happens and a diagnostic nobody can find is a diagnostic
+              nobody uses. */}
+          <button
+            onClick={copyLlmDump}
+            title="Compressed session digest for an LLM — per-tone arrays reduced to stats (docs/dump-format.md)"
+            style={{
+              fontFamily: T.mono, fontSize: 12, padding: '5px 12px', borderRadius: T.radius,
+              cursor: 'pointer', border: `1px solid ${copiedLlm ? T.phosphor : T.panelEdge}`,
+              background: copiedLlm ? T.phosphorDim : 'rgba(0,0,0,0.04)',
+              color: copiedLlm ? T.phosphor : T.panelInk,
+            }}
+          >
+            {copiedLlm ? '✓ copied' : '⧉ LLM dump'}
+          </button>
+          <button
+            onClick={copyRawLog}
+            title="Copy the raw human-readable session log"
+            style={{
+              fontFamily: T.mono, fontSize: 12, padding: '5px 12px', borderRadius: T.radius,
+              cursor: 'pointer', border: `1px solid ${copiedRaw ? T.phosphor : T.panelEdge}`,
+              background: copiedRaw ? T.phosphorDim : 'rgba(0,0,0,0.04)',
+              color: copiedRaw ? T.phosphor : T.panelInk,
+            }}
+          >
+            {copiedRaw ? '✓ copied' : '⧉ raw log'}
+          </button>
           <button
             onClick={() => setPresenting((p) => !p)}
             style={{
@@ -134,6 +195,9 @@ export function BenchApp() {
       </Panel>
       </>
       )}
+
+      {showFrequencySweep && <FrequencySweep />}
+      {showChannelSweep && <ChannelSweep onClose={() => setShowChannelSweep(false)} />}
     </div>
   );
 }

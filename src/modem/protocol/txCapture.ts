@@ -70,7 +70,7 @@ export function captureTransmit(
   // OFDM lays tones at pilot + startHz + k*spacing (up to 32); BPSK uses the
   // fixed 4 relative offsets. Match the real encoder so the TONE MAP is accurate.
   const toneFreqs = config.useOFDM
-    ? Array.from(ofdmToneFrequencies({ toneCount, pilotFreqHz: pilotHz }))
+    ? Array.from(ofdmToneFrequencies({ toneCount, pilotFreqHz: pilotHz, startHz: config.toneStartHz }))
     : TONE_OFFSETS.slice(0, toneCount).map((o) => pilotHz + o);
   const samplesPerSymbol = 256;
 

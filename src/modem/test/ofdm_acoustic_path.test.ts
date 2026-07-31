@@ -8,12 +8,14 @@ import { expect, test } from 'vitest';
 import { RxEngine } from '../protocol/rxEngine';
 import { OFDMEngine } from '../protocol/ofdmEngine';
 import { encodeFrame } from '../protocol/atomicFrame';
-import { ofdmSamples } from '../types';
+import { ofdmSamples, OFDM_TUNING } from '../types';
 
 const PILOT_FREQ = 1900;
 const SAMPLE_RATE = 48000;
 const { symSamples: SYM_LEN } = ofdmSamples(SAMPLE_RATE);
-const SYNC_COUNT = 24;
+// Track the tuning lever rather than hardcoding it — the receiver's
+// settle+training requirement is derived from it (see OFDM_TUNING's INVARIANT).
+const SYNC_COUNT = OFDM_TUNING.syncBurstSymbols;
 
 function buildTransmission(toneCount = 16): { tx: Float32Array; frame: Uint8Array } {
   const engine = new OFDMEngine({ pilotFreqHz: PILOT_FREQ, sampleRate: SAMPLE_RATE, toneCount });

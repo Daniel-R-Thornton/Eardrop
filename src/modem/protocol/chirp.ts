@@ -16,20 +16,27 @@ export interface ChirpConfig {
   durationSec: number;
   /** Sample rate (Hz) */
   sampleRate: number;
+  /** Peak amplitude of the generated waveform (default 1.0). Constant-envelope
+   *  (PAPR = 0 dB), so this scales every sample equally — detection is a
+   *  normalized correlation, so a lower amplitude does not affect timing
+   *  accuracy, only how hard it drives the transmitting speaker. */
+  amplitude?: number;
 }
 
 /**
  * Generate a linear chirp signal:  cos(2π (fStart⋅t + k/2 ⋅ t²))
- * Constant envelope (PAPR = 0 dB) — safe to transmit at full amplitude.
+ * Constant envelope (PAPR = 0 dB) — every sample has the same magnitude, so
+ * `amplitude` (default 1.0) sets that magnitude directly.
  */
 export function generateChirp(cfg: ChirpConfig): Float32Array {
   const nSamples = Math.round(cfg.durationSec * cfg.sampleRate);
   const chirp = new Float32Array(nSamples);
   const k = (cfg.fEnd - cfg.fStart) / cfg.durationSec; // chirp rate (Hz/s)
+  const amplitude = cfg.amplitude ?? 1.0;
 
   for (let n = 0; n < nSamples; n++) {
     const t = n / cfg.sampleRate;
-    chirp[n] = Math.cos(2 * Math.PI * (cfg.fStart * t + 0.5 * k * t * t));
+    chirp[n] = amplitude * Math.cos(2 * Math.PI * (cfg.fStart * t + 0.5 * k * t * t));
   }
   return chirp;
 }

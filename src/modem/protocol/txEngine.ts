@@ -15,9 +15,26 @@
 
 import { type ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG, ofdmSamples, OFDM_DEFAULTS, OFDM_TUNING } from '../types';
 import { generatePreamble, type PreambleConfig } from '../protocol/preamble';
-import { encodeFrame, type AtomicHeader, FRAME_SIZE, PAYLOAD_DATA_SIZE } from '../protocol/atomicFrame';
+import {
+  encodeFrame,
+  type AtomicHeader,
+  FRAME_SIZE,
+  PAYLOAD_DATA_SIZE,
+  FRAME_TYPE_HEADER,
+  FRAME_TYPE_PAYLOAD,
+  FRAME_TYPE_TAIL,
+  FRAME_TYPE_PROFILE,
+  HEADER_FRAME_REPEATS,
+} from '../protocol/atomicFrame';
 import { BPSKModulator, type BPSKModulatorConfig } from '../modulation/BPSKModulator';
 import { OFDMEngine } from './ofdmEngine';
+import {
+  packLinkProfile,
+  DEFAULT_LINK_PROFILE,
+  qamMapToOrders,
+  PROFILE_FRAME_REPEATS,
+  type LinkProfile,
+} from '../protocol/linkProfile';
 import { dlog } from '../../lib/debug/dlog';
 
 
@@ -39,11 +56,41 @@ export class TxEngine {
   private ofdmEngine: OFDMEngine | null = null;
   /** Whether to use OFDM/QPSK for frame payloads */
   private useOFDM = false;
+  /**
+   * Whether to emit the link-profile frame (Phase 4). Default FALSE —
+   * live transmission is byte-identical to today unless explicitly opted in.
+   */
+  private emitLinkProfile = false;
+  /**
+   * Phase 3 per-tone qamMap (2-bit codes, see linkProfile.ts), supplied by
+   * config/bit-loading policy. Only consulted when emitLinkProfile is true;
+   * undefined ⇒ the announced (and used) profile is the all-QPSK default.
+   */
+  private qamMap: number[] | undefined;
+  private qamScaleOverride: number | undefined;
+  private toneGains: number[] | undefined;
+  /**
+   * Settle symbols emitted before the training symbols. The RX must discard
+   * exactly this many (see OFDM_TUNING.trainingSettleSymbols) — the receiver
+   * finds the preamble/data boundary by counting and nothing else.
+   */
+  private settleSymbols: number;
 
-  constructor(cfg: Partial<ModemConfig> & { useOFDM?: boolean } = {}) {
+  constructor(
+    cfg: Partial<ModemConfig> & { useOFDM?: boolean; emitLinkProfile?: boolean; qamMap?: number[]; qamScaleOverride?: number; toneGains?: number[];
+      trainingSettleSymbols?: number } = {},
+  ) {
     // Check for OFDM flag before merging into ModemConfig
     this.useOFDM = (cfg as any).useOFDM === true;
-    
+    this.emitLinkProfile = (cfg as any).emitLinkProfile === true;
+    this.qamMap = (cfg as any).qamMap;
+    this.qamScaleOverride = (cfg as any).qamScaleOverride;
+    this.toneGains = (cfg as any).toneGains;
+    const settleOverride = (cfg as any).trainingSettleSymbols;
+    this.settleSymbols = typeof settleOverride === 'number' && Number.isFinite(settleOverride)
+      ? Math.max(0, Math.round(settleOverride))
+      : OFDM_TUNING.trainingSettleSymbols;
+
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
     const offsets = this.cfg.musical ? [87.5, 162.5, 287.5, 487.5] : TONE_OFFSETS;
     this.toneFreqs = [
@@ -79,6 +126,9 @@ export class TxEngine {
         // OFDM-scaled value or it vanishes at high tone counts.
         pilotAmplitude: OFDM_DEFAULTS.pilotAmplitude,
         toneCount: this.cfg.toneCount,
+        qamScaleOverride: this.qamScaleOverride,
+        toneGains: this.toneGains,
+        toneStartHz: this.cfg.toneStartHz,
       });
     }
   }
@@ -112,33 +162,96 @@ export class TxEngine {
   /**
    * Generate complete audio for a file transfer.
    */
-  transmitFile(fileName: string, data: Uint8Array): Float32Array {
-    this.reset();
-
-    // 1. Generate preamble: chirp (sync) + training symbols (channel est)
-    let preamble: Float32Array;
-    if (this.useOFDM && this.ofdmEngine) {
-      const syncCount = OFDM_TUNING.syncBurstSymbols;
-      const trainCount = OFDM_TUNING.trainingSymbols;
-      const { chirp } = this.ofdmEngine.generateChirpBurst(syncCount);
-      const training = this.ofdmEngine.generateTrainingSymbols(trainCount);
-      const combined = new Float32Array(chirp.length + training.length);
-      combined.set(chirp, 0);
-      combined.set(training, chirp.length);
-      preamble = combined;
-      dlog('TX-OFDM', {
-        chirpSamples: chirp.length,
-        trainingSymbols: trainCount,
-        preambleMs: Math.round((combined.length / (this.cfg.sampleRate || 48000)) * 1000),
-      });
-    } else {
-      preamble = this.transmitPreamble();
+  transmitFile(
+    fileName: string,
+    data: Uint8Array,
+    schemeId = 0,
+    origSize = data.length,
+  ): Float32Array {
+    // Concatenate every segment, then peak-normalize the whole signal.
+    // Behaviourally identical to the pre-generator implementation.
+    const segments = [...this.frameSegments(fileName, data, schemeId, origSize)];
+    const totalLen = segments.reduce((a, b) => a + b.length, 0);
+    const result = new Float32Array(totalLen);
+    let offset = 0;
+    for (const seg of segments) {
+      result.set(seg, offset);
+      offset += seg.length;
     }
 
-    // 2. Build atomic frames
-    const totalFrames = this.calcFrameCount(data.length);
-    const frameAudios: Float32Array[] = [preamble];
+    // Peak-normalize
+    let peak = 0;
+    for (let i = 0; i < result.length; i++) {
+      const abs = Math.abs(result[i]);
+      if (abs > peak) peak = abs;
+    }
+    if (peak > 1.0) {
+      const scale = 1.0 / peak;
+      for (let i = 0; i < result.length; i++) result[i] *= scale;
+    }
 
+    return result;
+  }
+
+  /**
+   * Yield the audio segments of a complete file transfer, in order:
+   * preamble → header (×repeats) → data frames (×repeats) → tail (×repeats)
+   * → trailing silence. Single source of truth for transmission layout; both
+   * the batch (`transmitFile`) and streaming (`streamChunks`) paths consume it.
+   *
+   * NB: NO global peak-normalize here — the batch path applies a safety-net
+   * clamp after concatenation (see transmitFile), but should never actually
+   * fire: every OFDM symbol this generator yields is already at the SAME
+   * fixed, deterministic scale (see OFDMQPSKModulator's qamScale doc), with
+   * worst-case |sample| <= 0.95, so the streaming path needs no
+   * post-hoc normalization either — that is what makes chunked streaming
+   * (streamChunks) safe: each chunk leaves the transmitter at the same level
+   * as every other chunk, so the player's per-chunk clip guard never has
+   * reason to rescale one chunk differently from the next.
+   */
+  private *frameSegments(
+    fileName: string,
+    data: Uint8Array,
+    schemeId = 0,
+    origSize = data.length,
+  ): Generator<Float32Array> {
+    this.reset();
+    // Phase 3: always start a transmission at the base (all-QPSK) rate —
+    // preamble, training, and the profile frame are always base-rate; a
+    // previous transmission on this same engine instance may have left the
+    // OFDM engine switched to a QAM map.
+    if (this.useOFDM && this.ofdmEngine) this.ofdmEngine.resetToneOrders();
+
+    // 1. Preamble: chirp (sync) + training symbols (channel est)
+    if (this.useOFDM && this.ofdmEngine) {
+      // Settle symbols first, then the ones the RX actually trains on — see
+      // OFDM_TUNING.trainingSettleSymbols. The RX discards exactly the same
+      // count, so both sides must read it from there.
+      // Chirp length is its own lever — see OFDM_TUNING.chirpSymbols. Tying it
+      // to the sync-burst pool meant raising the settle period lengthened the
+      // chirp, i.e. more of the thing the settle period exists to recover from.
+      const { chirp } = this.ofdmEngine.generateChirpBurst(OFDM_TUNING.chirpSymbols);
+      // Settle symbols carry VARYING data and are discarded by the RX; only the
+      // training symbols that follow are identical. See generateSettleSymbols
+      // for why a stationary settle period breaks the channel estimate.
+      const settle = this.ofdmEngine.generateSettleSymbols(this.settleSymbols);
+      const training = this.ofdmEngine.generateTrainingSymbols(OFDM_TUNING.trainingSymbols);
+      const combined = new Float32Array(chirp.length + settle.length + training.length);
+      combined.set(chirp, 0);
+      combined.set(settle, chirp.length);
+      combined.set(training, chirp.length + settle.length);
+      dlog('TX-OFDM', {
+        chirpSamples: chirp.length,
+        trainingSymbols: OFDM_TUNING.trainingSymbols,
+        settleSymbols: this.settleSymbols,
+        preambleMs: Math.round((combined.length / (this.cfg.sampleRate || 48000)) * 1000),
+      });
+      yield combined;
+    } else {
+      yield this.transmitPreamble();
+    }
+
+    const totalFrames = this.calcFrameCount(data.length);
     const repeats = this.cfg.diversityMode ? 3 : 1;
 
     // ── Helper: dispatch to BPSK or OFDM ──
@@ -151,70 +264,153 @@ export class TxEngine {
       return this.transmitFrame(header, payload);
     };
 
-    // Header frame (type 0x01) — repeat 3× if diversity mode
-    const headerPayload = this.buildHeaderPayload(fileName, data.length);
-    const headerFrame = modulate(
-      {
-        type: 0x01,
-        seqNum: 0,
-        totalFrames,
-        crc: 0,
-      },
-      headerPayload,
-    );
-    for (let r = 0; r < repeats; r++) frameAudios.push(headerFrame);
+    // 1b. Link-profile frame (Phase 4, flag-gated) — sent AFTER training,
+    // BEFORE the header, always at the base rate (today's exact modulation:
+    // all-QPSK, RS t=6, 5ms CP) so it decodes before any profile is known.
+    // Sent ×2 (cheap insurance — a lost profile kills interpretation of the
+    // whole transmission). Default OFF: emits nothing, waveform unchanged.
+    if (this.emitLinkProfile) {
+      const profile: LinkProfile = this.qamMap
+        ? { ...DEFAULT_LINK_PROFILE(this.cfg.toneCount), qamMap: this.qamMap }
+        : DEFAULT_LINK_PROFILE(this.cfg.toneCount);
+      const profilePayload = packLinkProfile(profile);
+      const profileFrame = modulate(
+        { type: FRAME_TYPE_PROFILE, seqNum: 0, totalFrames, crc: 0 },
+        profilePayload,
+      );
+      for (let r = 0; r < PROFILE_FRAME_REPEATS; r++) yield profileFrame;
 
-    // Data frames (type 0x02) — repeat 3× if diversity mode
+      // Phase 3: NOW switch the OFDM engine to the announced qamMap — after
+      // the profile itself (base-rate) but before header/data/tail, which
+      // are the frames the profile describes. This is the ONE switch point
+      // on the TX side (see plan deviation doc at the top of this file's
+      // sibling rxEngine.ts for the matching RX-side switch point).
+      if (this.useOFDM && this.ofdmEngine && this.qamMap) {
+        const orders = qamMapToOrders(this.qamMap);
+        this.ofdmEngine.setToneOrders(orders);
+        // QAM reference symbols (see OFDM_TUNING.qamRefSymbols doc): only
+        // when some tone is actually above QPSK — an all-QPSK qamMap must
+        // leave the waveform byte-identical to before this feature existed.
+        if (!orders.every((o) => o === 2)) {
+          // Refs FIRST, warm-up AFTER. Measured (bench 2026-07-31, three
+          // runs): the received-gain droop starts AT the ref burst no matter
+          // what precedes it — 40 warm-up symbols at payload level and at
+          // near-ref level both left the gain correction flat at 1.0, and the
+          // droop then ate the ~20 symbols after the refs (header frames
+          // failed at MER 13.8 while later frames decoded at 15.9+). So the
+          // warm-up's job is not to pre-trigger the compressor (nothing did);
+          // it is to ABSORB the post-ref transient so the header frame
+          // arrives at the settled gain the later — decoding — frames saw.
+          yield this.ofdmEngine.modulateQamRefSymbols();
+          yield this.ofdmEngine.modulateQamWarmupSymbols();
+        }
+      }
+    }
+
+    // 2. Header frame (type 0x01) — repeated at least HEADER_FRAME_REPEATS
+    // times unconditionally (a lost header kills the whole transfer), or
+    // `repeats` times when diversity mode already sends more than that.
+    const headerPayload = this.buildHeaderPayload(fileName, data.length, schemeId, origSize);
+    const headerFrame = modulate({ type: FRAME_TYPE_HEADER, seqNum: 0, totalFrames, crc: 0 }, headerPayload);
+    const headerRepeats = Math.max(repeats, HEADER_FRAME_REPEATS);
+    for (let r = 0; r < headerRepeats; r++) yield headerFrame;
+
+    // 3. Data frames (type 0x02) — repeat if diversity mode
     const dataFrames = this.splitDataIntoFrames(data);
     for (let i = 0; i < dataFrames.length; i++) {
-      const frameAudio = modulate(
-        {
-          type: 0x02,
-          seqNum: 1 + i,
-          totalFrames,
-          crc: 0,
-        },
-        dataFrames[i],
-      );
-      for (let r = 0; r < repeats; r++) frameAudios.push(frameAudio);
+      const frameAudio = modulate({ type: FRAME_TYPE_PAYLOAD, seqNum: 1 + i, totalFrames, crc: 0 }, dataFrames[i]);
+      for (let r = 0; r < repeats; r++) yield frameAudio;
     }
 
-    // Tail frame (type 0x03)
+    // 4. Tail frame (type 0x03)
     const tailFrame = modulate(
-      {
-        type: 0x03,
-        seqNum: totalFrames - 1,
-        totalFrames,
-        crc: 0,
-      },
+      { type: FRAME_TYPE_TAIL, seqNum: totalFrames - 1, totalFrames, crc: 0 },
       new Uint8Array(PAYLOAD_DATA_SIZE),
     );
-    for (let r = 0; r < repeats; r++) frameAudios.push(tailFrame);
+    for (let r = 0; r < repeats; r++) yield tailFrame;
 
-    // 3. Add tail silence
-    frameAudios.push(new Float32Array(this.getSymbolLengthInSamples() * OFDM_TUNING.tailSilenceSymbols));
+    // 5. Trailing silence
+    yield new Float32Array(this.getSymbolLengthInSamples() * OFDM_TUNING.tailSilenceSymbols);
+  }
 
-    // 4. Concatenate all audio segments
-    const totalLen = frameAudios.reduce((a, b) => a + b.length, 0);
-    const result = new Float32Array(totalLen);
-    let offset = 0;
-    for (const seg of frameAudios) {
-      result.set(seg, offset);
-      offset += seg.length;
+  /**
+   * Stream a file transfer as a sequence of audio chunks of ≈chunkSamples each
+   * (the final chunk may be shorter). Consumes the same frameSegments layout as
+   * transmitFile but emits incrementally, so peak memory is bounded to the
+   * chunk size instead of the whole waveform. No global peak-normalize (see
+   * frameSegments); every OFDM symbol already sits at the same fixed
+   * qamScale, so no chunk needs (or gets) independent rescaling.
+   */
+  *streamChunks(
+    fileName: string,
+    data: Uint8Array,
+    chunkSamples: number,
+    schemeId = 0,
+    origSize = data.length,
+  ): Generator<Float32Array> {
+    const target = Math.max(1, Math.floor(chunkSamples));
+    let buf = new Float32Array(target);
+    let filled = 0;
+    for (const seg of this.frameSegments(fileName, data, schemeId, origSize)) {
+      let segOff = 0;
+      while (segOff < seg.length) {
+        const take = Math.min(target - filled, seg.length - segOff);
+        buf.set(seg.subarray(segOff, segOff + take), filled);
+        filled += take;
+        segOff += take;
+        if (filled === target) {
+          yield buf;
+          buf = new Float32Array(target);
+          filled = 0;
+        }
+      }
     }
+    if (filled > 0) yield buf.subarray(0, filled);
+  }
 
-    // 5. Peak-normalize
-    let peak = 0;
-    for (let i = 0; i < result.length; i++) {
-      const abs = Math.abs(result[i]);
-      if (abs > peak) peak = abs;
+  /**
+   * Cheap upper-ish estimate of total samples for a streamed transfer, used to
+   * drive the progress bar. Approximate — never used for correctness.
+   */
+  estimateStreamSamples(dataLen: number): number {
+    const symLen = this.getSymbolLengthInSamples();
+    const repeats = this.cfg.diversityMode ? 3 : 1;
+    const headerRepeats = Math.max(repeats, HEADER_FRAME_REPEATS);
+    const totalFrames = this.calcFrameCount(dataLen); // header + data + tail
+    const dataAndTailFrames = totalFrames - 1; // everything except the header
+    let symbolsPerFrame: number;
+    if (this.useOFDM && this.ofdmEngine) {
+      const blockCount = Math.max(1, Math.floor(this.cfg.toneCount / 4));
+      symbolsPerFrame = Math.ceil(FRAME_SIZE / blockCount);
+    } else {
+      symbolsPerFrame = (FRAME_SIZE * 8) / TONE_COUNT;
     }
-    if (peak > 1.0) {
-      const scale = 1.0 / peak;
-      for (let i = 0; i < result.length; i++) result[i] *= scale;
+    const preambleSamples =
+      this.useOFDM && this.ofdmEngine
+        // chirpSymbols, not syncBurstSymbols — this must mirror what the
+        // preamble actually emits (chirp + settle + training), or the
+        // speed-test's duration estimate drifts from reality.
+        ? (OFDM_TUNING.chirpSymbols
+            + OFDM_TUNING.trainingSymbols
+            + this.settleSymbols) * symLen
+        : this.transmitPreamble().length;
+    // Header is repeated `headerRepeats` times (>= HEADER_FRAME_REPEATS,
+    // unconditionally); data + tail frames repeated `repeats` times each
+    // (diversity mode only).
+    const frameSamples =
+      (headerRepeats + dataAndTailFrames * repeats) * symbolsPerFrame * symLen;
+    // Link-profile frame (Phase 4, flag-gated): sent PROFILE_FRAME_REPEATS
+    // times at the base rate, plus OFDM_TUNING.qamRefSymbols training symbols
+    // when the announced qamMap uses anything above QPSK.
+    let profileSamples = 0;
+    if (this.emitLinkProfile) {
+      profileSamples += PROFILE_FRAME_REPEATS * symbolsPerFrame * symLen;
+      if (this.useOFDM && this.qamMap && !qamMapToOrders(this.qamMap).every((o) => o === 2)) {
+        profileSamples += OFDM_TUNING.qamRefSymbols * symLen;
+      }
     }
-
-    return result;
+    const silence = OFDM_TUNING.tailSilenceSymbols * symLen;
+    return preambleSamples + frameSamples + profileSamples + silence;
   }
 
   /**
@@ -275,10 +471,22 @@ export class TxEngine {
   // ─── Private helpers ────────────────────────────────
 
   /**
-   * Build the 40-byte header frame payload.
-   * Format: [fileID:4B][totalSize:4B][fileNameLen:1B][fileName...][padding...]
+   * Build the header frame payload (PAYLOAD_DATA_SIZE bytes, currently 160).
+   * Format: [fileID:4B][totalSize:4B][fileNameLen:1B][fileName...][schemeId:1B][origSize:4B LE][padding...]
+   *
+   * `totalSize` is the WIRE (post-compression) size — legacy progress math
+   * depends on this remaining the size of what's actually transmitted.
+   * `schemeId`/`origSize` (Phase 6 compression) are appended immediately
+   * after the file name, ahead of the zero-pad, so a legacy RX (which only
+   * reads up to the name and ignores the rest as padding) stays compatible;
+   * a new RX reads them back to restore the true (decompressed) size.
    */
-  private buildHeaderPayload(fileName: string, totalSize: number): Uint8Array {
+  private buildHeaderPayload(
+    fileName: string,
+    totalSize: number,
+    schemeId = 0,
+    origSize = totalSize,
+  ): Uint8Array {
     const nameBytes = new TextEncoder().encode(fileName);
     const payload = new Uint8Array(PAYLOAD_DATA_SIZE);
     let off = 0;
@@ -301,14 +509,22 @@ export class TxEngine {
     payload[off++] = (totalSize >> 16) & 0xff;
     payload[off++] = (totalSize >> 24) & 0xff;
 
-    // File name length (1 byte, max 31)
-    const nameLen = Math.min(nameBytes.length, PAYLOAD_DATA_SIZE - 9);
+    // File name length (1 byte) — reserve 5 trailing bytes for
+    // [schemeId:1][origSize:4] appended right after the name.
+    const nameLen = Math.min(nameBytes.length, PAYLOAD_DATA_SIZE - 9 - 5);
     payload[off++] = nameLen & 0xff;
 
     // File name
     for (let i = 0; i < nameLen && off < PAYLOAD_DATA_SIZE; i++) {
       payload[off++] = nameBytes[i];
     }
+
+    // Compression scheme id (1 byte) + original (decompressed) size (4 bytes LE)
+    if (off < PAYLOAD_DATA_SIZE) payload[off++] = schemeId & 0xff;
+    payload[off++] = origSize & 0xff;
+    payload[off++] = (origSize >> 8) & 0xff;
+    payload[off++] = (origSize >> 16) & 0xff;
+    payload[off++] = (origSize >> 24) & 0xff;
 
     // Zero-pad remaining
     while (off < PAYLOAD_DATA_SIZE) {

@@ -20,7 +20,8 @@
  * chunks (last chunk padded) and BCH encode each.
  */
 
-import { bch63Encode, bch63Decode } from '../ecc/bch63';
+import { bch63Encode, bch63Decode, type Bch63Result } from '../ecc/bch63';
+import { whitenFrameBody } from './whiten';
 import { rsEncode, rsDecode } from '../ecc/reedsolomon';
 import { crc32 } from '../../crc32';
 
@@ -45,12 +46,36 @@ export const PAYLOAD_DATA_SIZE = RS_BLOCK_DATA * PAYLOAD_BLOCKS;
 /** Total frame size on the wire (bytes) */
 export const FRAME_SIZE = SENTINEL_SIZE + BCH_HEADER_SIZE + RS_PAYLOAD_SIZE;
 
-const SENTINEL_BYTES = new Uint8Array([0xe7, 0x9f, 0xe7]);
+export const SENTINEL_BYTES = new Uint8Array([0xe7, 0x9f, 0xe7]);
+
+// ─── Frame type constants ────────────────────────────
+
+/** Header frame — file metadata. */
+export const FRAME_TYPE_HEADER = 0x01;
+/**
+ * Minimum number of times the header frame is transmitted, mirroring
+ * `PROFILE_FRAME_REPEATS` in linkProfile.ts — a lost header currently kills
+ * the whole transfer (RX only learns fileID/size/name from it), so it's
+ * cheap insurance to send it twice unconditionally. RX dedups repeats via
+ * `processHeader`'s fileID check, so this is free on the receive side.
+ */
+export const HEADER_FRAME_REPEATS = 2;
+/** Data (payload) frame. */
+export const FRAME_TYPE_PAYLOAD = 0x02;
+/** Tail frame — end-of-transmission marker. */
+export const FRAME_TYPE_TAIL = 0x03;
+/**
+ * Link-profile frame (Phase 4). Always sent at the base rate (all-QPSK,
+ * RS t=6, 5ms CP) so it decodes before any adaptive profile is known.
+ * Carries a `linkProfile.ts`-packed payload describing how the REST of the
+ * transmission is encoded (per-tone QAM map, ECC rate, CP id).
+ */
+export const FRAME_TYPE_PROFILE = 0x04;
 
 // ─── Types ───────────────────────────────────────────
 
 export interface AtomicHeader {
-  /** Block type: 0x01=HEADER, 0x02=PAYLOAD, 0x03=TAIL */
+  /** Block type: 0x01=HEADER, 0x02=PAYLOAD, 0x03=TAIL, 0x04=PROFILE */
   type: number;
   /** Sequence number (0-based) */
   seqNum: number;
@@ -66,6 +91,14 @@ export interface DecodedFrame {
   payload: Uint8Array;
   /** True if CRC verified AND RS/BCH decoding succeeded */
   valid: boolean;
+  /** Why the frame failed, or 'ok'. */
+  failureReason: 'short' | 'sentinel' | 'bch' | 'crc' | 'rs' | 'ok';
+  /** True when the stored header CRC did not match the recomputed CRC. */
+  crcMismatch: boolean;
+  /** Corrected bit errors per BCH codeword (-1 if uncorrectable). */
+  bchErrorCounts: number[];
+  /** Corrected byte errors per RS block (-1 if uncorrectable/invalid length). */
+  rsBlockErrors: number[];
 }
 
 // ─── Header Packing ──────────────────────────────────
@@ -196,36 +229,94 @@ export function encodeFrame(header: AtomicHeader, payload: Uint8Array): Uint8Arr
   const fullPayload = new Uint8Array(PAYLOAD_DATA_SIZE);
   fullPayload.set(payload.slice(0, PAYLOAD_DATA_SIZE), 0);
 
-  // 5. RS(52,40) encode each 40-byte chunk and assemble the frame
+  // 5. RS(52,40) encode each 40-byte chunk, then STRIPE the resulting bytes
+  // round-robin across the 4 blocks on the wire instead of laying them out
+  // contiguously: wire byte j (within the RS region) carries block (j %
+  // PAYLOAD_BLOCKS)'s byte at index floor(j / PAYLOAD_BLOCKS). One corrupted
+  // 25ms OFDM symbol is ~8 consecutive wire bytes; contiguous block layout
+  // would dump all 8 into one RS(52,40) block (t=6 correction limit — the
+  // frame dies). Striped, those 8 consecutive wire bytes land ≤2 per block
+  // (8 / PAYLOAD_BLOCKS), well inside t=6. De-striped before RS decode below.
+  // (This is a local, wire-format-only interleave — unrelated to the dead
+  // `interleaveDepth`/`interleave()` config in types.ts/ecc.ts, which stays
+  // untouched.)
+  const rsBlocks: Uint8Array[] = [];
+  for (let b = 0; b < PAYLOAD_BLOCKS; b++) {
+    const chunk = fullPayload.slice(b * RS_BLOCK_DATA, (b + 1) * RS_BLOCK_DATA);
+    rsBlocks.push(rsEncode(chunk));
+  }
   const frame = new Uint8Array(FRAME_SIZE);
   frame.set(SENTINEL_BYTES, 0);
   frame.set(bchHeader, SENTINEL_SIZE);
-  for (let b = 0; b < PAYLOAD_BLOCKS; b++) {
-    const chunk = fullPayload.slice(b * RS_BLOCK_DATA, (b + 1) * RS_BLOCK_DATA);
-    frame.set(rsEncode(chunk), SENTINEL_SIZE + BCH_HEADER_SIZE + b * RS_BLOCK_SIZE);
+  const rsStart = SENTINEL_SIZE + BCH_HEADER_SIZE;
+  for (let idx = 0; idx < RS_BLOCK_SIZE; idx++) {
+    for (let b = 0; b < PAYLOAD_BLOCKS; b++) {
+      frame[rsStart + idx * PAYLOAD_BLOCKS + b] = rsBlocks[b][idx];
+    }
   }
+
+  // 6. Whiten everything after the sentinel — see whiten.ts for why. Applied
+  // LAST, over the BCH header and the striped RS region alike, so no part of
+  // the wire format can carry a long run of identical bytes (which becomes a
+  // run of identical OFDM symbols, hence a coherent peak and a biased receiver
+  // power estimate). The sentinel stays in the clear because the receiver finds
+  // frames by searching raw bytes for it.
+  whitenFrameBody(frame, SENTINEL_SIZE);
 
   return frame;
 }
 
 /**
- * Decode a frame. Returns header + payload + validity.
+ * Decode a frame. Returns header + payload + validity + failure diagnosis.
  */
-export function decodeFrame(frame: Uint8Array): DecodedFrame {
-  if (frame.length < FRAME_SIZE) {
-    return { header: null, payload: new Uint8Array(PAYLOAD_DATA_SIZE), valid: false };
+export function decodeFrame(frameIn: Uint8Array): DecodedFrame {
+  const emptyPayload = new Uint8Array(PAYLOAD_DATA_SIZE);
+  const emptyResult = (reason: DecodedFrame['failureReason']): DecodedFrame => ({
+    header: null,
+    payload: emptyPayload,
+    valid: false,
+    failureReason: reason,
+    crcMismatch: false,
+    bchErrorCounts: [],
+    rsBlockErrors: [],
+  });
+
+  if (frameIn.length < FRAME_SIZE) {
+    return emptyResult('short');
   }
 
-  // 1. Check sentinel
+  // 1. Check sentinel (never whitened — see encodeFrame step 6)
   for (let i = 0; i < SENTINEL_SIZE; i++) {
-    if (frame[i] !== SENTINEL_BYTES[i]) {
-      return { header: null, payload: new Uint8Array(PAYLOAD_DATA_SIZE), valid: false };
+    if (frameIn[i] !== SENTINEL_BYTES[i]) {
+      return emptyResult('sentinel');
     }
   }
 
+  // 1b. De-whiten the body before any decoding. Same operation as whitening;
+  // done on a COPY because callers hand us frames sliced out of a live receive
+  // buffer and must not see them mutated (the scanner may re-examine the same
+  // bytes at a different offset).
+  const frame = new Uint8Array(frameIn);
+  whitenFrameBody(frame, SENTINEL_SIZE);
+
   // 2. BCH(63,30) × 3 decode header
   const bchStart = SENTINEL_SIZE;
-  const decodedHeader = decodeBCHHeader(frame.slice(bchStart, bchStart + BCH_HEADER_SIZE));
+  const bchEncoded = frame.slice(bchStart, bchStart + BCH_HEADER_SIZE);
+  const bchResults: Bch63Result[] = [];
+  for (let i = 0; i < 3; i++) {
+    bchResults.push(bch63Decode(bchEncoded.slice(i * 8, (i + 1) * 8)));
+  }
+  const bchErrorCounts = bchResults.map((r) => r.errors);
+  const bchOk = bchResults.every((r) => r.valid && r.errors >= 0);
+  if (!bchOk) {
+    return { ...emptyResult('bch'), bchErrorCounts };
+  }
+
+  // Reconstruct decoded header from the three BCH codewords.
+  const decodedHeader = new Uint8Array(RAW_HEADER_SIZE);
+  decodedHeader.set(bchResults[0].data.slice(0, 3), 0);
+  decodedHeader.set(bchResults[1].data.slice(0, 3), 3);
+  decodedHeader.set(bchResults[2].data.slice(0, 3), 6);
 
   // 3. Parse AtomicHeader from decoded bytes
   const header = unpackHeader(decodedHeader);
@@ -236,21 +327,45 @@ export function decodeFrame(frame: Uint8Array): DecodedFrame {
   const fieldBytes = decodedHeader.slice(0, 5);
   const expectedCrc = crc32(fieldBytes);
   const maskedExpected = (expectedCrc & 0xfcffffff) >>> 0;
-  const crcOk = maskedExpected === header.crc;
+  const crcMismatch = maskedExpected !== header.crc;
+  if (crcMismatch) {
+    return {
+      header,
+      payload: emptyPayload,
+      valid: false,
+      failureReason: 'crc',
+      crcMismatch: true,
+      bchErrorCounts,
+      rsBlockErrors: [],
+    };
+  }
 
-  // 5. RS(52,40) decode each block
+  // 5. De-stripe the RS region back into contiguous blocks, then RS(52,40)
+  // decode each block (inverse of the stripe in encodeFrame above).
   const rsStart = SENTINEL_SIZE + BCH_HEADER_SIZE;
   const payload = new Uint8Array(PAYLOAD_DATA_SIZE);
+  const rsBlockErrors: number[] = [];
   let allBlocksValid = true;
   for (let b = 0; b < PAYLOAD_BLOCKS; b++) {
-    const rsResult = rsDecode(
-      frame.slice(rsStart + b * RS_BLOCK_SIZE, rsStart + (b + 1) * RS_BLOCK_SIZE),
-    );
+    const block = new Uint8Array(RS_BLOCK_SIZE);
+    for (let idx = 0; idx < RS_BLOCK_SIZE; idx++) {
+      block[idx] = frame[rsStart + idx * PAYLOAD_BLOCKS + b];
+    }
+    const rsResult = rsDecode(block);
+    rsBlockErrors.push(rsResult.errors);
     payload.set(rsResult.data.slice(0, RS_BLOCK_DATA), b * RS_BLOCK_DATA);
     if (!rsResult.valid || rsResult.errors < 0) allBlocksValid = false;
   }
 
   // 6. Return result
-  const valid = crcOk && allBlocksValid;
-  return { header, payload, valid };
+  const valid = !crcMismatch && allBlocksValid;
+  return {
+    header,
+    payload,
+    valid,
+    failureReason: valid ? 'ok' : 'rs',
+    crcMismatch,
+    bchErrorCounts,
+    rsBlockErrors,
+  };
 }

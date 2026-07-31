@@ -11,27 +11,82 @@
  */
 
 import '../style.css';
-import { setState, getState, subscribe } from './Store';
+import { setState, getState, subscribe, type SpeedTestResult } from './Store';
 import { Encoder } from '../modem/protocol/encoder';
 import { Decoder } from '../modem/protocol/decoder';
 import { encodeBlock, BLOCK_TYPE, getSentinel } from '../modem/protocol/framing';
 import { bch3116Encode } from '../modem/ecc/ecc';
 import { AudioPlayer } from '../audio/player';
 import { type AudioRecorder } from '../audio/recorder';
+import { runAutoCalibration } from './controllers/calibration';
 import { Visualizer } from '../modem/debug/visualizer';
-import { DEFAULT_CONFIG, OFDM_TUNING } from '../modem/types';
-import { enumerateDevices } from '../audio/devices';
+import { DEFAULT_CONFIG, OFDM_TUNING, ofdmSamples } from '../modem/types';
+import { enumerateDevices, resolveInputDevice } from '../audio/devices';
 import { TxEngine } from '../modem/protocol/txEngine';
-import { encodeFrame } from '../modem/protocol/atomicFrame';
+import { encodeFrame, PAYLOAD_DATA_SIZE } from '../modem/protocol/atomicFrame';
 import { tryParsePreamble, verifyPayload } from '../protocol';
 import { mountReactDebug } from './react';
 import { runSelfTest } from './controllers/selfTest';
 import { TONE_FREQUENCIES, formatPayloadHex } from './lib';
+import { coordinateDescent, type DescentAxis } from './lib/coordinateDescent';
+import { scoreTrial } from './lib/speedTestScore';
 import { detectToneEnergy } from '../lib/scan/index';
 import { resample } from '../lib/math/index';
-import { dlog, dlogInject, dlogSetMode } from '../lib/debug/dlog';
+import { dlog, dlogDump, dlogInject, dlogInjectRecord, dlogReset, dlogSetMode, DLOG_RING_MAX, dlogRingLength } from '../lib/debug/dlog';
 import { ModemController } from './controllers/modemController';
 import { buildModemConfig } from './controllers/buildModemConfig';
+/**
+ * Resolve the persisted mic selection to an id that exists right now, and keep
+ * the store in step.
+ *
+ * Chrome's deviceId rotates (salted hash; the salt changes across restarts,
+ * profile changes and permission changes, and Linux device re-enumeration can
+ * change it too). A stale id does not error — getUserMedia simply omits the
+ * constraint and captures from the browser default, i.e. possibly a different
+ * physical microphone, which is indistinguishable from the channel changing.
+ * Matching on the stored LABEL survives that.
+ */
+async function resolveMic(): Promise<{ id: string | undefined; label: string }> {
+  const st = getState();
+  const resolved = await resolveInputDevice(st.selectedInputId, st.selectedInputLabel);
+  if (resolved.matchedBy === 'label' && resolved.id !== st.selectedInputId) {
+    dlog('REC', {
+      deviceIdRotated: true,
+      label: resolved.label,
+      note: 'stored deviceId no longer exists; matched by label',
+    }, { level: 'warn' });
+    setState({ selectedInputId: resolved.id });
+  }
+  if (resolved.matchedBy === 'default' && (st.selectedInputId || st.selectedInputLabel)) {
+    dlog('REC', {
+      deviceUnresolved: true,
+      storedLabel: st.selectedInputLabel || '(none)',
+      note: 'falling back to browser default — re-pick the mic',
+    }, { level: 'warn' });
+  }
+  return { id: resolved.id || undefined, label: resolved.label };
+}
+
+/**
+ * Stored pre-emphasis for the current mic and band, or undefined.
+ *
+ * Keyed by input device AND band because the gains are per tone index — see
+ * AppState.toneGainsByDevice. Applied to TX only; the receiver needs no
+ * knowledge of it, since it trains its channel estimate on a preamble that
+ * carries the same gains as the data.
+ */
+function currentToneGains(): number[] | undefined {
+  const st = getState();
+  const key = `${st.pilotFreqHz}:${st.toneStartHz}:${st.toneCount}`;
+  // Label first — deviceId rotates, so an id-keyed lookup silently stops
+  // matching and the correction just stops being applied. Falls back to the id
+  // so calibrations measured before the key changed are still found.
+  const device = st.selectedInputLabel || st.selectedInputId;
+  const gains = st.toneGainsByDevice?.[device]?.[key]
+    ?? st.toneGainsByDevice?.[st.selectedInputId]?.[key];
+  return gains && gains.length === st.toneCount ? gains : undefined;
+}
+
 import { setTelemetry } from './telemetryStore';
 import { DEMO_PAYLOAD } from './demoPayload';
 
@@ -87,7 +142,14 @@ const viz = new Visualizer();
 const player = new AudioPlayer(audioCtx);
 
 const modem = new ModemController(audioCtx);
+
+let speedTestActive = false;
+let speedTestExpectedFile: string | null = null;
+
 modem.on('fileComplete', (ev) => {
+  if (speedTestActive && ev.fileName === speedTestExpectedFile) {
+    return;
+  }
   const data = new Uint8Array(ev.data);
   const blob = new Blob([data]);
   const url = URL.createObjectURL(blob);
@@ -96,7 +158,10 @@ modem.on('fileComplete', (ev) => {
     receivedFiles: [...getState().receivedFiles, { name: ev.fileName, url, size: data.length }],
   });
 });
-modem.on('dlog', (ev) => dlogInject(ev.line));
+modem.on('dlog', (ev) => {
+  if (ev.line !== undefined) dlogInject(ev.line);
+  if (ev.rec) dlogInjectRecord(ev.rec);
+});
 modem.on('telemetry', (ev) => setTelemetry(ev.telemetry));
 
 dlog('APP', { hwRate: audioCtx.sampleRate });
@@ -151,11 +216,16 @@ window.addEventListener('eardrop-demo-encode', (async () => {
     buildModemConfig({
       useOFDM: getState().useOFDM,
       pilotFreqHz: getState().pilotFreqHz,
+      toneStartHz: getState().toneStartHz,
       toneCount: getState().toneCount,
       symbolsPerSec: getState().symbolsPerSec,
       musicalMode: getState().musicalMode,
       diversityMode: getState().diversityMode,
       hwSampleRate: audioCtx.sampleRate,
+      dataQamBits: getState().dataQamBits,
+      qamScaleOverride: getState().qamScaleOverride,
+      toneGains: currentToneGains(),
+      trainingSettleSymbols: getState().trainingSettleSymbols,
     }),
   );
   showTxPayload(DEMO_PAYLOAD.bytes, DEMO_PAYLOAD.name);
@@ -187,6 +257,31 @@ window.addEventListener('eardrop-send', (async () => {
   await refreshDeviceList();
   if (!isListening) await startListening();
   try {
+    // Auto-calibrate when this mic+band has no stored pre-emphasis. An
+    // uncalibrated band measured 3-4 dB worse MER — the whole FEC margin at
+    // 32+ tones — so sending without it mostly wastes the transmission.
+    if (getState().useOFDM && !currentToneGains()) {
+      setState({
+        isSending: true,
+        sendStatus: { type: 'info', msg: '🎚 No calibration for this band — calibrating first…' },
+      });
+      const cal = await runAutoCalibration();
+      if (cal.failed) {
+        setState({
+          sendStatus: {
+            type: 'info',
+            msg: `⚠ Calibration failed (${cal.failed}) — sending uncalibrated`,
+          },
+        });
+      } else {
+        setState({
+          sendStatus: {
+            type: 'info',
+            msg: `🎚 Calibrated: spread ${cal.beforeSpread.toFixed(1)} → ${cal.afterSpread.toFixed(1)} dB`,
+          },
+        });
+      }
+    }
     setState({ isSending: true, sendStatus: { type: 'info', msg: 'Encoding…' } });
     const raw = new Uint8Array(await selectedFile.arrayBuffer());
     showTxPayload(raw, selectedFile.name);
@@ -195,25 +290,21 @@ window.addEventListener('eardrop-send', (async () => {
       buildModemConfig({
         useOFDM: getState().useOFDM,
         pilotFreqHz: getState().pilotFreqHz,
+        toneStartHz: getState().toneStartHz,
         toneCount: getState().toneCount,
         symbolsPerSec: getState().symbolsPerSec,
         musicalMode: getState().musicalMode,
         diversityMode: getState().diversityMode,
         hwSampleRate: audioCtx.sampleRate,
+        dataQamBits: getState().dataQamBits,
+      qamScaleOverride: getState().qamScaleOverride,
+      toneGains: currentToneGains(),
+      trainingSettleSymbols: getState().trainingSettleSymbols,
       }),
     );
-    const { samples: playSamples, sampleRate: actualRate } = await modem.encodeFile(
-      selectedFile.name,
-      raw,
-    );
     setState({ isPlaying: true, progress: 0 });
-    const cleanPlay = getState().musicalMode;
-    await playWithProgress(
-      playSamples,
-      actualRate,
-      getState().selectedOutputId || undefined,
-      cleanPlay,
-    );
+    // Stream-encode + play: memory stays bounded for large files.
+    await playFileStreaming(selectedFile.name, raw, getState().selectedOutputId || undefined);
     setState({
       isSending: false,
       isPlaying: false,
@@ -237,6 +328,44 @@ window.addEventListener('eardrop-record', (async () => {
   }
   await startListening();
 }) as EventListener);
+
+/** Cancel hook for an in-flight streaming send (aborts the worker generator). */
+let currentStreamCancel: (() => void) | null = null;
+
+/**
+ * Stream-encode a file in the worker and play it as chunks arrive. Memory stays
+ * bounded regardless of file size (unlike the batch encodeFile path, which
+ * builds the whole waveform up front). Progress/ETA from wall-clock vs the
+ * estimated total duration; playback runs in realtime so the two track closely.
+ */
+async function playFileStreaming(
+  fileName: string,
+  raw: Uint8Array,
+  deviceId?: string,
+): Promise<void> {
+  const { sampleRate, totalSamples, pull, cancel } = await modem.startFileStream(fileName, raw);
+  currentStreamCancel = cancel;
+  const totalSec = totalSamples / sampleRate;
+  const startTime = Date.now();
+  const interval = setInterval(() => {
+    const elapsedSec = (Date.now() - startTime) / 1000;
+    const pct = totalSec > 0 ? Math.min(99, Math.round((elapsedSec / totalSec) * 100)) : 0;
+    const remainingSec = Math.max(0, totalSec - elapsedSec);
+    setState({
+      progress: pct,
+      sendStatus: {
+        type: 'info',
+        msg: `📤 ${pct}% · ${remainingSec < 60 ? `${remainingSec.toFixed(0)}s` : `${(remainingSec / 60).toFixed(1)}m`} remaining`,
+      },
+    });
+  }, 200);
+  try {
+    await player.playStream(pull, sampleRate, deviceId);
+  } finally {
+    clearInterval(interval);
+    currentStreamCancel = null;
+  }
+}
 
 /** Play audio with progress tracking and ETA display. */
 async function playWithProgress(
@@ -298,24 +427,20 @@ window.addEventListener('eardrop-send-test', (async () => {
       buildModemConfig({
         useOFDM: getState().useOFDM,
         pilotFreqHz: getState().pilotFreqHz,
+        toneStartHz: getState().toneStartHz,
         toneCount: getState().toneCount,
         symbolsPerSec: getState().symbolsPerSec,
         musicalMode: getState().musicalMode,
         diversityMode: getState().diversityMode,
         hwSampleRate: audioCtx.sampleRate,
+        dataQamBits: getState().dataQamBits,
+      qamScaleOverride: getState().qamScaleOverride,
+      toneGains: currentToneGains(),
+      trainingSettleSymbols: getState().trainingSettleSymbols,
       }),
     );
-    const { samples: playSamples, sampleRate: actualRate } = await modem.encodeFile(
-      'hello.txt',
-      raw,
-    );
     setState({ isPlaying: true, progress: 0 });
-    await playWithProgress(
-      playSamples,
-      actualRate,
-      getState().selectedOutputId || undefined,
-      getState().musicalMode,
-    );
+    await playFileStreaming('hello.txt', raw, getState().selectedOutputId || undefined);
     setState({ progress: 100, sendStatus: { type: 'success', msg: '✅ Test sent' } });
   } catch (err: any) {
     setState({ sendStatus: { type: 'error', msg: `❌ ${err.message}` } });
@@ -324,6 +449,8 @@ window.addEventListener('eardrop-send-test', (async () => {
 
 // Stop playback
 window.addEventListener('eardrop-stop-playback', (() => {
+  currentStreamCancel?.();
+  currentStreamCancel = null;
   player.stopPlayback();
   setState({
     isSending: false,
@@ -601,14 +728,20 @@ async function startListening() {
     const cfg = buildModemConfig({
       useOFDM: getState().useOFDM,
       pilotFreqHz: getState().pilotFreqHz,
+      toneStartHz: getState().toneStartHz,
       toneCount: getState().toneCount,
       symbolsPerSec: getState().symbolsPerSec,
       musicalMode: getState().musicalMode,
       diversityMode: getState().diversityMode,
       hwSampleRate: audioCtx.sampleRate,
+      dataQamBits: getState().dataQamBits,
+      qamScaleOverride: getState().qamScaleOverride,
+      toneGains: currentToneGains(),
+      trainingSettleSymbols: getState().trainingSettleSymbols,
     });
     modem.configure(cfg);
-    await modem.startListening(getState().micGain, getState().selectedInputId || undefined);
+    const mic = await resolveMic();
+    await modem.startListening(getState().micGain, mic.id, mic.label);
 
     // Sync mic gain slider → live GainNode while listening
     let lastMicGain = getState().micGain;
@@ -1045,6 +1178,560 @@ async function sendSentinelOnly() {
     isPlaying: false,
     sendStatus: { type: 'success', msg: '✅ Sentinel sent — check console' },
   });
+}
+
+// ─── Speed / auto-tune sweep ─────────────────────────
+
+const sleep = (ms: number) => new Promise<void>((r) => { window.setTimeout(r, ms); });
+
+/** Speaker→mic→worklet→worker latency to absorb after playback ends. */
+const ACOUSTIC_DRAIN_MS = 250;
+/** Ceiling on the post-flush wait for the async decompress + fileComplete hop. */
+const DECODE_GRACE_MS = 300;
+/**
+ * Quiet gap between acoustic trials. Room reverb and late-arriving audio from
+ * the previous transmission would otherwise reach the next trial's freshly
+ * constructed RxEngine, which can sync onto the tail of the wrong signal.
+ */
+const ACOUSTIC_SETTLE_MS = 300;
+/** Repeats per point on the acoustic path — it is not a repeatable measurement. */
+const ACOUSTIC_ATTEMPTS = 2;
+
+function parseLastMer(log: string): { merDb: number; evmPct: number; verdict: string } | null {
+  const lines = log.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = lines[i].match(
+      /\[OFDM-MER\]\s+merDb=([\d.]+)\s+evmPct=([\d.]+)\s+symbols=\d+\s+verdict=(.+)/,
+    );
+    if (m) {
+      return { merDb: parseFloat(m[1]), evmPct: parseFloat(m[2]), verdict: m[3].trim() };
+    }
+  }
+  return null;
+}
+
+/**
+ * Best staged MER seen across the failed frames of a trial (`smer=` on RX-FAIL).
+ * Unlike the committed OFDM-MER report this exists even when every frame fails,
+ * which is what makes a gradient available in the region the hunt cares about.
+ */
+function parseRawMer(log: string): number | null {
+  let best: number | null = null;
+  for (const m of log.matchAll(/\[RX-FAIL\][^\n]*\bsmer=(-?[\d.]+)/g)) {
+    const v = parseFloat(m[1]);
+    if (Number.isFinite(v) && (best === null || v > best)) best = v;
+  }
+  return best;
+}
+
+/**
+ * How far the receiver got, so trials that decode nothing still rank against
+ * each other: 0 nothing · 1 chirp seen · 2 boundary handoff · 3 trained.
+ *
+ * Deliberately tops out at 3. A decoded PROFILE frame also means "trained" and
+ * nothing more — and only 16/64-QAM emit profiles at all (QPSK must not, or the
+ * waveform changes), so scoring it as a separate higher level handed every QAM
+ * trial a free bonus over every QPSK trial.
+ */
+function parseSyncLevel(log: string): number {
+  if (/\[RX-PROFILE\]\s+(?!invalid)/.test(log)) return 3;
+  if (log.includes('[OFDM-TRAIN]')) return 3;
+  if (/\[OFDM-SYNC\][^\n]*\b(chirpHandoff|aligned)=true/.test(log)) return 2;
+  if (/\[OFDM-SYNC\][^\n]*\b(chirp|detected)=true/.test(log)) return 1;
+  return 0;
+}
+
+
+function parseFrameStats(log: string): { ok: number; fail: number; total: number; dataOk: number } {
+  const ok = (log.match(/\[RX-FRAME\]\s+ok=true/g) ?? []).length;
+  const fail = (log.match(/\[RX-FRAME\]\s+ok=false/g) ?? []).length;
+  // PROFILE frames (0x04) are sent at the base QPSK rate whatever the data
+  // constellation is, so they decode even when every data frame fails. Counting
+  // them as progress let a 16-QAM config that carried zero payload score as if
+  // it were partly working. Only header/payload/tail frames prove data got
+  // through at the constellation under test.
+  let dataOk = 0;
+  for (const m of log.matchAll(/\[RX-FRAME\]\s+ok=true\s+t=(0x[0-9a-f]+)/g)) {
+    if (m[1] !== '0x4' && m[1] !== '0x04') dataOk++;
+  }
+  return { ok, fail, total: ok + fail, dataOk };
+}
+
+async function runSpeedTest() {
+  if (speedTestActive) return;
+  if (!getState().useOFDM) {
+    setState({ sendStatus: { type: 'error', msg: 'TEST SPEED is OFDM-only' } });
+    return;
+  }
+
+  speedTestActive = true;
+  setState({ speedTestRunning: true, speedTestResults: [], speedTestBest: null });
+
+  const state = getState();
+  const loopback = state.speedTestLoopback;
+
+  if (loopback) {
+    if (isListening) stopListening();
+  } else {
+    await refreshDeviceList();
+    if (!isListening) await startListening();
+  }
+
+  const originalMicGain = state.micGain;
+  const originalCfg = buildModemConfig({
+    useOFDM: true,
+    pilotFreqHz: state.pilotFreqHz,
+    toneStartHz: state.toneStartHz,
+    toneCount: state.toneCount,
+    symbolsPerSec: state.symbolsPerSec,
+    musicalMode: state.musicalMode,
+    diversityMode: state.diversityMode,
+    hwSampleRate: audioCtx.sampleRate,
+    dataQamBits: state.dataQamBits,
+    qamScaleOverride: state.qamScaleOverride,
+  });
+
+  const hunt = state.speedTestMode === 'hunt';
+
+  // Tune these arrays to sweep wider or finer. In hunt mode they are the ladder
+  // of values each axis may step along, so a longer, finer list costs nothing
+  // unless the climb actually walks into it.
+  const toneCounts = [state.toneCount];
+  // Mic gain is applied by the recorder, which loopback bypasses entirely —
+  // sweeping it there would just re-run identical trials.
+  // Spans the UI slider's full 1-20 range: a hunt that settles on the ladder's
+  // last value has not found a maximum, it has hit the edge of the search.
+  const micGains = loopback ? [state.micGain] : [1, 2, 4, 6, 8, 12, 16, 20];
+  const basePilot = state.pilotFreqHz;
+  // Pilot steps must be whole FFT bins. buildModemConfig snaps the pilot to the
+  // nearest bin (CP continuity needs integer cycles per symbol), so a sub-bin
+  // ladder entry silently becomes its neighbour — the hunt would then "probe" a
+  // config identical to the incumbent, score it equal, and call that a local
+  // maximum. Build the ladder in bin units and dedupe instead.
+  const pilotBinHz = audioCtx.sampleRate / ofdmSamples(audioCtx.sampleRate).fftSamples;
+  const snapPilot = (f: number) => Math.round(f / pilotBinHz) * pilotBinHz;
+  const pilotFreqs = [...new Set(
+    [-3, -2, -1, 0, 1, 2, 3].map((bins) => snapPilot(basePilot) + bins * pilotBinHz),
+  )].filter((f) => f >= 200 && f <= 3500).sort((a, b) => a - b);
+  const qamBitsList: Array<2 | 4 | 6> = [2, 4, 6];
+  // Sentinel meaning "no override" — buildModemConfig omits qamScaleOverride
+  // entirely (see runOnce), so the modulator falls back to its own derived
+  // safe scale (0.95/worstCasePeak). Never a real transmitted scale (0 would
+  // silence the signal), so it can't collide with a ladder rung.
+  const AUTO_SCALE = 0;
+  const qamScales = [AUTO_SCALE, 0.01, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2];
+  const scaleLabel = (s: number) => (s === AUTO_SCALE ? 'auto' : s.toFixed(3));
+
+  // Short payload: enough frames to exercise the pipeline but short enough
+  // that the loopback path finishes processing well inside the wait window.
+  const dataLen = PAYLOAD_DATA_SIZE * 4;
+  const data = new Uint8Array(dataLen);
+  for (let i = 0; i < dataLen; i++) data[i] = Math.floor(Math.random() * 256);
+
+  const results: SpeedTestResult[] = [];
+
+  interface Combo { toneCount: number; micGain: number; pilotFreqHz: number; qamBits: 2 | 4 | 6; qamScale: number }
+
+  // qamScale is now part of the transmission for EVERY constellation order,
+  // QPSK included: Task 8 (TX level flattening) removed the per-symbol
+  // peak-normalize QPSK used to rely on, so a QPSK combo differing only in
+  // scale is now a physically different transmission and must NOT share a
+  // cache entry with another scale (that used to be true and isn't anymore —
+  // merging them silently biased the hunt's QPSK trials to whatever scale
+  // the search happened to be carrying).
+  //
+  // The pilot is keyed post-snap, since that is the config that actually runs.
+  // toneStartHz is read live from state per trial (see runOnce), not carried
+  // on Combo itself — but the cache still has to key on it, or dragging the
+  // slider mid-hunt makes a later re-probe of an otherwise-identical combo
+  // silently reuse a result computed under a different tone grid.
+  const keyOf = (c: Combo) =>
+    `${c.toneCount}|${c.micGain}|${snapPilot(c.pilotFreqHz)}|${c.qamBits}|${c.qamScale}|${state.toneStartHz}`;
+
+  let currentCombo = 0;
+  let lastMicGain: number | null = null;
+  const cache = new Map<string, SpeedTestResult>();
+  const attemptsPerPoint = loopback ? 1 : ACOUSTIC_ATTEMPTS;
+
+  if (!loopback) player.volume = state.playbackVolume;
+
+  /**
+   * Run one trial and report whether the file decoded.
+   *
+   * Both paths use the worker's `flush()` barrier instead of waiting out a
+   * timeout: once flush resolves, every sample posted has already been
+   * demodulated, so `fileReady === false` means the trial failed and no file is
+   * coming. Only the success path waits, and only for the short async
+   * decompress + postMessage hop. A failed trial used to cost 1.5–5 s.
+   */
+  async function transmitAndWait(
+    samples: Float32Array,
+    fileName: string,
+    cfg: ReturnType<typeof buildModemConfig>,
+    graceMs: number,
+  ): Promise<boolean> {
+    speedTestExpectedFile = fileName;
+    dlogReset();
+    let done = false;
+    const off = modem.on('fileComplete', (ev) => { if (ev.fileName === fileName) done = true; });
+    try {
+      modem.configure(cfg);
+      if (loopback) {
+        // Commands run in post order, so configure is applied before the feed.
+        modem.feedSamples(samples);
+      } else {
+        setState({ isPlaying: true });
+        await player.play(samples, cfg.sampleRate, state.selectedOutputId || undefined);
+        setState({ isPlaying: false });
+        // Let the last of the audio travel speaker→mic→worklet→worker.
+        await sleep(ACOUSTIC_DRAIN_MS);
+      }
+      const ready = await modem.flush();
+      if (!ready && !done) return false;
+      for (let waited = 0; waited < graceMs && !done; waited += 5) await sleep(5);
+      return done;
+    } finally {
+      off();
+    }
+  }
+
+  /**
+   * Run one combo `attempts` times and keep the WORST-scoring attempt, or return
+   * the cached result if this exact combo already ran.
+   *
+   * Repeats exist because the acoustic path is not repeatable: across two runs
+   * the identical config (1900 Hz, gain 6, QPSK) scored 25.0 dB with 6/6 frames
+   * once and 7.2 dB with 0 frames the next. Coordinate descent assumes a stable
+   * score per point, so a single lucky trial can anchor the whole climb and make
+   * consecutive runs disagree. Taking the worst attempt is deliberately
+   * pessimistic: a config only wins if it works when it is not lucky.
+   * Loopback is deterministic, so it stays at one attempt.
+   */
+  async function runTrial(combo: Combo, phase: string, total: number): Promise<SpeedTestResult> {
+    const key = keyOf(combo);
+    const hit = cache.get(key);
+    if (hit) return hit;
+
+    let worst: SpeedTestResult | null = null;
+    const scores: number[] = [];
+    for (let attempt = 0; attempt < attemptsPerPoint; attempt++) {
+      const r = await runOnce(combo, phase, total);
+      scores.push(r.score ?? 0);
+      if (!worst || (r.score ?? 0) < (worst.score ?? 0)) worst = r;
+    }
+    const chosen: SpeedTestResult = { ...worst!, attempts: attemptsPerPoint, attemptScores: scores };
+    cache.set(key, chosen);
+    return chosen;
+  }
+
+  /** One transmission + decode + parse. */
+  async function runOnce(combo: Combo, phase: string, total: number): Promise<SpeedTestResult> {
+    const { toneCount, micGain, pilotFreqHz, qamBits, qamScale } = combo;
+    if (!loopback && micGain !== lastMicGain) {
+      modem.setMicGain(micGain);
+      lastMicGain = micGain;
+      await sleep(50);
+    }
+    currentCombo++;
+    setState({ speedTestProgress: { current: currentCombo, total } });
+
+    const fileName = `__speed_${pilotFreqHz.toFixed(0)}_${qamBits}_${scaleLabel(qamScale)}_${micGain}_${toneCount}.txt`;
+    const cfg = buildModemConfig({
+      useOFDM: true,
+      pilotFreqHz,
+      toneStartHz: state.toneStartHz,
+      toneCount,
+      symbolsPerSec: state.symbolsPerSec,
+      musicalMode: state.musicalMode,
+      diversityMode: state.diversityMode,
+      hwSampleRate: audioCtx.sampleRate,
+      dataQamBits: qamBits,
+      // AUTO_SCALE (0) means "no override" — omit the field so the modulator
+      // falls back to its own derived safe scale, instead of materialising an
+      // explicit (and possibly suboptimal) scale for every trial.
+      qamScaleOverride: qamScale === AUTO_SCALE ? undefined : qamScale,
+    });
+
+    const tx = new TxEngine(cfg);
+    const samples = tx.transmitFile(fileName, data, 0, data.length);
+    const durationMs = (samples.length / cfg.sampleRate) * 1000;
+
+    const decoded = await transmitAndWait(samples, fileName, cfg, DECODE_GRACE_MS);
+
+    // Take the WHOLE ring: these lines get counted, not just eyeballed, and a
+    // short tail silently evicts early RX-FRAME lines while keeping later
+    // OFDM-MER ones — producing "0 frames, MER 21 dB" nonsense. If the ring
+    // saturated, the counts are still suspect, so flag it rather than trust it.
+    const log = dlogDump(DLOG_RING_MAX);
+    const logTruncated = dlogRingLength() >= DLOG_RING_MAX;
+    const mer = parseLastMer(log);
+    const frames = parseFrameStats(log);
+    const throughputKbps = (dataLen * 8) / 1000 / (durationMs / 1000);
+
+    const result: SpeedTestResult = {
+      toneCount,
+      micGain,
+      pilotFreqHz,
+      qamBits,
+      qamScale,
+      success: decoded,
+      passes: decoded ? 1 : 0,
+      framesOk: frames.ok,
+      framesTotal: frames.total,
+      dataFramesOk: frames.dataOk,
+      merDb: mer?.merDb ?? null,
+      evmPct: mer?.evmPct ?? null,
+      throughputKbps,
+      durationMs,
+      rawMerDb: parseRawMer(log),
+      syncLevel: parseSyncLevel(log),
+      logTruncated,
+      phase,
+    };
+    result.score = scoreTrial(result);
+    results.push(result);
+    setState({ speedTestResults: [...results] });
+
+    dlog('SPEED-TEST', {
+      combo: `${currentCombo}/${total}`,
+      ax: phase,
+      tones: toneCount,
+      gain: micGain,
+      pilot: pilotFreqHz,
+      qam: qamBits,
+      scale: scaleLabel(qamScale),
+      ok: decoded,
+      f: `${frames.dataOk}d ${frames.ok}/${frames.total}`,
+      sync: result.syncLevel,
+      mer: mer ? mer.merDb.toFixed(1) : '—',
+      raw: result.rawMerDb?.toFixed(1) ?? '—',
+      ...(logTruncated ? { logTruncated: 1 } : {}),
+      score: result.score!.toFixed(1),
+      kbps: throughputKbps.toFixed(1),
+    });
+
+    // Loopback needs no settle between trials. The acoustic path does: room
+    // reverb and late-arriving audio from this trial otherwise bleed into the
+    // next one's fresh RxEngine and corrupt its sync.
+    if (!loopback) await sleep(ACOUSTIC_SETTLE_MS);
+    return result;
+  }
+
+  /**
+   * Coordinate descent (a.k.a. compass/pattern search) over the sweep axes.
+   *
+   * Axes are ordered by what has to work first: sync (pilot, then mic gain)
+   * before the QAM slicer (scale), before pushing constellation density. For
+   * each axis we probe one step either side of the incumbent; if a probe scores
+   * better we keep stepping that same direction until it stops improving —
+   * i.e. we walk to the local maximum on that axis — then move to the next. A
+   * full pass that moves nothing means converged.
+   *
+   * Caveat worth knowing: on the acoustic path a single trial per point is a
+   * noisy measurement, so a marginal config can win a probe by luck and anchor
+   * the rest of the climb. Loopback is deterministic and has no such problem.
+   */
+  async function runHunt(): Promise<void> {
+    // Scales tried when stepping the qam axis up (see probeVariants below).
+    // Spread across the ladder rather than adjacent, because the right scale for
+    // a new constellation order is not near the old order's — and reaching the
+    // TOP of the ladder, because 16-QAM's first success came at the highest
+    // scale probed, which means the real optimum may be past it. AUTO_SCALE
+    // (no override, modulator's own derived safe scale) is included and
+    // tried FIRST — it's a reasonable default for any order, not just QPSK,
+    // and cheaper to rule in/out than assuming an explicit small scale is
+    // always better.
+    const QAM_PROBE_SCALES = [AUTO_SCALE, 0.02, 0.03, 0.05, 0.1, 0.15, 0.2];
+
+    const allAxes: Array<DescentAxis<Combo>> = [
+      { name: 'pilot', values: pilotFreqs, get: (c) => c.pilotFreqHz, set: (c, v) => ({ ...c, pilotFreqHz: v }) },
+      { name: 'gain', values: micGains, get: (c) => c.micGain, set: (c, v) => ({ ...c, micGain: v }) },
+      { name: 'scale', values: qamScales, get: (c) => c.qamScale, set: (c, v) => ({ ...c, qamScale: v }) },
+      {
+        name: 'qam',
+        values: qamBitsList,
+        get: (c) => c.qamBits,
+        set: (c, v) => ({ ...c, qamBits: v as 2 | 4 | 6 }),
+        // qamScale and qamBits are coupled: scale is meaningless at QPSK and
+        // order-specific above it. Judging a step to 16/64-QAM at whatever scale
+        // the QPSK incumbent happened to hold rejects the denser constellation
+        // for the wrong reason. Try a spread of scales and let the order be
+        // judged at its own best.
+        probeVariants: (c, v) => {
+          const bits = v as 2 | 4 | 6;
+          if (bits === 2) return [{ ...c, qamBits: bits }];
+          return QAM_PROBE_SCALES.map((qamScale) => ({ ...c, qamBits: bits, qamScale }));
+        },
+      },
+      { name: 'tones', values: toneCounts, get: (c) => c.toneCount, set: (c, v) => ({ ...c, toneCount: v }) },
+    ];
+
+    // Start from the most robust corner that still resembles the user's
+    // settings: QPSK, current pilot/gain/tone count. Climbing from a config
+    // that at least syncs gives the score something to improve on.
+    const nearest = (values: number[], want: number) =>
+      values.reduce((best, v) => (Math.abs(v - want) < Math.abs(best - want) ? v : best), values[0]);
+    const start: Combo = {
+      toneCount: state.toneCount,
+      micGain: nearest(micGains, state.micGain),
+      pilotFreqHz: snapPilot(basePilot),
+      qamBits: 2,
+      // Prefer Auto (no override -> the modulator's own derived worst-case-safe
+      // scale) as the starting candidate rather than always materialising an
+      // explicit small scale: Task 8 made that derived scale the safe default
+      // for every constellation order, including QPSK, so it's the natural
+      // place to start refining from. Only start away from Auto if the user
+      // has actually dialed in an override.
+      qamScale: state.qamScaleOverride === undefined
+        ? AUTO_SCALE
+        : nearest(qamScales, state.qamScaleOverride),
+    };
+
+    // Budget is an upper bound on trials, not a target: convergence usually
+    // stops the hunt far earlier. Sized so a worst case still beats a grid,
+    // with headroom for the qam axis's multi-scale probes.
+    const budget = Math.max(
+      32,
+      allAxes.reduce((n, a) => n + a.values.length, 0) * 2 + qamBitsList.length * QAM_PROBE_SCALES.length,
+    );
+
+    // The budget counts points evaluated; each point costs `attemptsPerPoint`
+    // transmissions, and the progress counter counts transmissions.
+    const shownTotal = budget * attemptsPerPoint;
+
+    const outcome = await coordinateDescent<Combo>({
+      axes: allAxes,
+      start,
+      budget,
+      // runTrial caches by config-identity, so a re-probed point costs nothing
+      // and the walk sees a stable score for it.
+      evaluate: async (point, axisName) => (await runTrial(point, axisName, shownTotal)).score ?? 0,
+      onAxisSettled: (name, at, score) => {
+        // Settling on the first/last rung means the climb ran out of ladder, not
+        // that it found a peak — the real optimum may lie outside the range.
+        const values = allAxes.find((a) => a.name === name)?.values ?? [];
+        const atEdge = values.length > 1 && (at === values[0] || at === values[values.length - 1]);
+        dlog('SPEED-HUNT', {
+          axis: name,
+          at,
+          score: score.toFixed(1),
+          ...(atEdge ? { atLadderEdge: true } : {}),
+        });
+      },
+    });
+
+    dlog('SPEED-HUNT', {
+      done: true,
+      converged: outcome.converged,
+      passes: outcome.passes,
+      trials: currentCombo,
+      score: outcome.score.toFixed(1),
+    });
+  }
+
+  let aborted: string | null = null;
+  try {
+    if (hunt) {
+      await runHunt();
+    } else {
+      const combos: Combo[] = [];
+      for (const toneCount of toneCounts) {
+        for (const micGain of micGains) {
+          for (const pilotFreqHz of pilotFreqs) {
+            // qamScale now affects QPSK too (Task 8 removed QPSK's per-symbol
+            // peak-normalize), so it's swept across the full ladder for every
+            // order — QPSK is no longer special-cased to a single scale.
+            for (const qamBits of qamBitsList) {
+              for (const qamScale of qamScales) combos.push({ toneCount, micGain, pilotFreqHz, qamBits, qamScale });
+            }
+          }
+        }
+      }
+      for (const combo of combos) await runTrial(combo, 'grid', combos.length * attemptsPerPoint);
+    }
+  } catch (err) {
+    // A throw part-way through used to end the sweep silently, which looked
+    // exactly like an early convergence. Keep the results gathered so far and
+    // say plainly that it stopped.
+    aborted = (err as Error).message;
+    dlog('SPEED-TEST', { aborted: aborted }, { level: 'warn' });
+  } finally {
+    speedTestActive = false;
+    speedTestExpectedFile = null;
+    setState({ speedTestRunning: false, speedTestProgress: null });
+    if (!loopback) {
+      modem.configure(originalCfg);
+      modem.setMicGain(originalMicGain);
+    }
+    setState({
+      sendStatus: aborted
+        ? { type: 'error', msg: `Speed test stopped after ${results.length} trials: ${aborted}` }
+        : { type: 'info', msg: `Speed test done — ${results.length} trials` },
+    });
+  }
+
+  // Same objective the hunt climbed, so "best" means the same thing in both
+  // modes. Only successes can be "best"; a run where nothing decoded reports
+  // no winner (the results table still shows how close each trial got).
+  const passing = results
+    .filter((r) => r.success)
+    .sort((a, b) => (b.score ?? scoreTrial(b)) - (a.score ?? scoreTrial(a)));
+  const best = passing[0] ?? null;
+  setState({ speedTestBest: best });
+
+  if (!best) {
+    const closest = [...results].sort((a, b) => (b.score ?? 0) - (a.score ?? 0))[0];
+    if (closest) {
+      dlog('SPEED-TEST', {
+        nothingDecoded: true,
+        closest: `pilot=${closest.pilotFreqHz} qam=${closest.qamBits} scale=${scaleLabel(closest.qamScale)}`,
+        sync: closest.syncLevel,
+        frames: `${closest.framesOk}/${closest.framesTotal}`,
+        mer: (closest.merDb ?? closest.rawMerDb)?.toFixed(1) ?? '—',
+      });
+    }
+  }
+
+  // eslint-disable-next-line no-console -- debug summary
+  console.table(results.map((r) => ({
+    // The constellation name, not the bit count: qamBits=4 is 16-QAM.
+    QAM: r.qamBits === 2 ? 'QPSK' : r.qamBits === 4 ? '16-QAM' : '64-QAM',
+    Hz: r.pilotFreqHz,
+    // qamScale now affects every order, QPSK included (Task 8) — no more
+    // em-dash special-case for QPSK.
+    Scale: scaleLabel(r.qamScale),
+    Gain: r.micGain,
+    Tones: r.toneCount,
+    OK: r.success ? 'Y' : 'N',
+    // Data frames are the honest count; profile frames ride at QPSK regardless
+    // of the constellation under test, so they decode even when nothing works.
+    Data: `${r.dataFramesOk ?? r.framesOk}`,
+    Frames: `${r.framesOk}/${r.framesTotal}`,
+    // MER is committed-only, i.e. measured on frames that PASSED — survivor
+    // biased. rawMER is the staged MER of frames that FAILED, which is the
+    // number that explains a failure.
+    MER: r.merDb?.toFixed(1) ?? '—',
+    rawMER: r.rawMerDb?.toFixed(1) ?? '—',
+    Sync: r.syncLevel ?? 0,
+    // 2dp: at 8 tones QPSK and 16-QAM both round to 0.3 at 1dp, which hid the
+    // throughput difference the ranking depends on.
+    kbps: r.throughputKbps.toFixed(2),
+    // Worst of N attempts is what ranked; spread shows how unrepeatable the
+    // point is. '!' marks counts parsed from a saturated debug ring.
+    Tries: r.attemptScores?.length ?? 1,
+    Trunc: r.logTruncated ? '!' : '',
+  })));
+  if (best) {
+    dlog('SPEED-TEST', {
+      best: `${best.qamBits === 2 ? 'QPSK' : `${best.qamBits}-QAM`}`,
+      pilot: best.pilotFreqHz,
+      scale: scaleLabel(best.qamScale),
+      gain: best.micGain,
+      tones: best.toneCount,
+      kbps: best.throughputKbps.toFixed(1),
+      mer: best.merDb?.toFixed(1) ?? '—',
+    });
+  }
 }
 
 // ─── Audio Path Validation Sweep ─────────────────────
@@ -1540,10 +2227,15 @@ window.addEventListener('eardrop-sentinel-only', (async () => {
   await sendSentinelOnly();
 }) as EventListener);
 
+window.addEventListener('eardrop-speed-test', (async () => {
+  await runSpeedTest();
+}) as EventListener);
+
 // Expose for console
 (window as any).sendCalibrationOnly = sendCalibrationOnly;
 (window as any).sendSingleFrame = sendSingleFrame;
 (window as any).sendSentinelOnly = sendSentinelOnly;
+(window as any).runSpeedTest = runSpeedTest;
 
 // ─── Interference Matrix Sweep ────────────────────────
 
@@ -2068,14 +2760,20 @@ async function runAcousticSpeedSweep() {
     buildModemConfig({
       useOFDM: getState().useOFDM,
       pilotFreqHz: getState().pilotFreqHz,
+      toneStartHz: getState().toneStartHz,
       toneCount: getState().toneCount,
       symbolsPerSec: getState().symbolsPerSec,
       musicalMode: getState().musicalMode,
       diversityMode: getState().diversityMode,
       hwSampleRate: audioCtx.sampleRate,
+      dataQamBits: getState().dataQamBits,
+      qamScaleOverride: getState().qamScaleOverride,
+      toneGains: currentToneGains(),
+      trainingSettleSymbols: getState().trainingSettleSymbols,
     }),
   );
-  await modem.startListening(getState().micGain, getState().selectedInputId || undefined);
+  const mic = await resolveMic();
+  await modem.startListening(getState().micGain, mic.id, mic.label);
 }
 
 window.addEventListener('eardrop-acoustic-speed', (async () => {
@@ -2221,11 +2919,16 @@ window.addEventListener('eardrop-export-wav', (async () => {
     const modemConfig = buildModemConfig({
       useOFDM: getState().useOFDM,
       pilotFreqHz: getState().pilotFreqHz,
+      toneStartHz: getState().toneStartHz,
       toneCount: getState().toneCount,
       symbolsPerSec: getState().symbolsPerSec,
       musicalMode: getState().musicalMode,
       diversityMode: getState().diversityMode,
       hwSampleRate: audioCtx.sampleRate,
+      dataQamBits: getState().dataQamBits,
+      qamScaleOverride: getState().qamScaleOverride,
+      toneGains: currentToneGains(),
+      trainingSettleSymbols: getState().trainingSettleSymbols,
     });
     modem.configure(modemConfig);
     const { samples: audioSamples, sampleRate: actualRate } = await modem.encodeFile(
@@ -2275,11 +2978,16 @@ window.addEventListener('eardrop-load-wav', (async () => {
       modem.configure(buildModemConfig({
         useOFDM: getState().useOFDM,
         pilotFreqHz: getState().pilotFreqHz,
+        toneStartHz: getState().toneStartHz,
         toneCount: getState().toneCount,
         symbolsPerSec: getState().symbolsPerSec,
         musicalMode: getState().musicalMode,
         diversityMode: getState().diversityMode,
         hwSampleRate: audioCtx.sampleRate,
+        dataQamBits: getState().dataQamBits,
+      qamScaleOverride: getState().qamScaleOverride,
+      toneGains: currentToneGains(),
+      trainingSettleSymbols: getState().trainingSettleSymbols,
       }));
       // Poll for fileComplete
       const filePromise = new Promise<{ fileName: string; data: Uint8Array }>((resolve, reject) => {

@@ -7,6 +7,8 @@ import { TxEngine } from '../modem/protocol/txEngine';
 import { captureTransmit } from '../modem/protocol/txCapture';
 import { toneIQ } from '../modem/pilot';
 import { DEFAULT_CONFIG, ofdmToneFrequencies, type ModemConfig } from '../modem/types';
+import { compressBest, decompressScheme } from '../modem/compression';
+import { dlog } from '../lib/debug/dlog';
 import type { ModemCommand, ModemEvent, ModemTelemetry } from './modemSchema';
 
 const RING_SECONDS = 10;
@@ -14,9 +16,35 @@ const SPECTRUM_BINS = 64;
 
 export class ModemService {
   private emit: (ev: ModemEvent, transfer?: Transferable[]) => void;
-  private config: (ModemConfig & { useOFDM?: boolean }) | null = null;
+  private config:
+    | (ModemConfig & {
+        useOFDM?: boolean;
+        emitLinkProfile?: boolean;
+        qamMap?: number[];
+        toneGains?: number[];
+        trainingSettleSymbols?: number;
+      })
+    | null = null;
   private rx: RxEngine | null = null;
-  private fileSent = false;
+  /**
+   * Completion count (RxEngine.getCompletionCount()) already delivered to the
+   * consumer. Gating on this identity — rather than a one-shot "fileSent"
+   * boolean — lets a single configured session deliver MULTIPLE files: after
+   * RxEngine returns to WAITING post-tail, getFile() keeps returning the same
+   * completedFile until the next header arrives, so a boolean latch would
+   * either never re-arm or re-deliver the same file. Comparing against the
+   * monotonic counter means "new completion" is unambiguous.
+   */
+  private lastDeliveredCompletion = 0;
+
+  // Active streaming-encode generator + its request id (one at a time).
+  private stream: { id: number; gen: Generator<Float32Array> } | null = null;
+
+  /** Chunk size for streaming encode ≈ 0.5 s of audio at the configured rate. */
+  private streamChunkSamples(): number {
+    const sr = this.config?.sampleRate ?? DEFAULT_CONFIG.sampleRate;
+    return Math.max(1, Math.floor(sr * 0.5));
+  }
 
   // Rolling ring of recent samples (Float32, telemetry + dumpBuffer)
   private ring: Float32Array = new Float32Array(0);
@@ -35,7 +63,7 @@ export class ModemService {
         // Listening restarts pick up the new config
         if (this.rx) {
           this.rx = new RxEngine(this.config as ConstructorParameters<typeof RxEngine>[0]);
-          this.fileSent = false;
+          this.lastDeliveredCompletion = 0;
         }
         this.emit({ type: 'configured' });
         break;
@@ -43,7 +71,7 @@ export class ModemService {
       case 'startRx': {
         if (!this.config) { this.emit({ type: 'error', error: 'startRx before configure' }); return; }
         this.rx = new RxEngine(this.config as ConstructorParameters<typeof RxEngine>[0]);
-        this.fileSent = false;
+        this.lastDeliveredCompletion = 0;
         this.emit({ type: 'rxStarted' });
         break;
       }
@@ -66,17 +94,39 @@ export class ModemService {
         break;
       }
       case 'encodeFile': {
-        if (!this.config) { this.emit({ type: 'error', id: cmd.id, error: 'encodeFile before configure' }); return; }
+        void this.encodeFileAsync(cmd);
+        break;
+      }
+      case 'encodeStreamStart': {
+        void this.encodeStreamStartAsync(cmd);
+        break;
+      }
+      case 'encodeStreamPull': {
+        if (!this.stream || this.stream.id !== cmd.id) {
+          // Stale pull (cancelled or already ended) — ignore.
+          return;
+        }
         try {
-          const tx = new TxEngine(this.config as ConstructorParameters<typeof TxEngine>[0]);
-          const samples = tx.transmitFile(cmd.fileName, new Uint8Array(cmd.data));
-          this.emit(
-            { type: 'encoded', id: cmd.id, samples: samples.buffer as ArrayBuffer, sampleRate: this.config.sampleRate },
-            [samples.buffer as ArrayBuffer],
-          );
+          const next = this.stream.gen.next();
+          if (next.done) {
+            this.stream = null;
+            this.emit({ type: 'streamEnd', id: cmd.id });
+          } else {
+            // Copy out of the generator's internal buffer so it is safe to transfer.
+            const chunk = next.value.slice();
+            this.emit(
+              { type: 'streamChunk', id: cmd.id, samples: chunk.buffer as ArrayBuffer },
+              [chunk.buffer as ArrayBuffer],
+            );
+          }
         } catch (err) {
+          this.stream = null;
           this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
         }
+        break;
+      }
+      case 'encodeStreamCancel': {
+        if (this.stream && this.stream.id === cmd.id) this.stream = null;
         break;
       }
       case 'demoEncode': {
@@ -103,6 +153,15 @@ export class ModemService {
         this.emit({ type: 'bufferDump', id: cmd.id, samples: out.buffer as ArrayBuffer, rms, peak }, [out.buffer as ArrayBuffer]);
         break;
       }
+      case 'flush': {
+        // Every feedChunk posted before this command has already run (single
+        // message queue), so poll for a completed file now instead of making
+        // the caller wait for the next 20 Hz tick — or for a timeout when the
+        // decode failed and no file will ever arrive.
+        const fileReady = this.pollAndDeliverFile();
+        this.emit({ type: 'flushed', id: cmd.id, fileReady });
+        break;
+      }
       case 'setVerboseLogging': {
         RxEngine.verboseRxLogging = cmd.enabled;
         break;
@@ -114,18 +173,106 @@ export class ModemService {
   tick(): void {
     if (!this.rx || !this.config) return;
 
-    if (!this.fileSent) {
-      const file = this.rx.getFile();
-      if (file) {
-        this.fileSent = true;
-        this.emit(
-          { type: 'fileComplete', fileName: file.fileName, data: file.data.buffer as ArrayBuffer },
-          [file.data.buffer as ArrayBuffer],
-        );
-      }
-    }
+    this.pollAndDeliverFile();
 
     this.emit({ type: 'telemetry', telemetry: this.computeTelemetry() });
+  }
+
+  /**
+   * Poll the RxEngine for a newly-completed file (identified by its
+   * monotonic completion counter, not a one-shot boolean — see
+   * lastDeliveredCompletion) and deliver it if not already delivered.
+   * Returns true if a completed file has been delivered (now or previously)
+   * for the current completion count.
+   */
+  private pollAndDeliverFile(): boolean {
+    if (!this.rx) return false;
+    const count = this.rx.getCompletionCount();
+    if (count > this.lastDeliveredCompletion) {
+      const file = this.rx.getFile();
+      if (file) {
+        this.lastDeliveredCompletion = count;
+        void this.deliverCompletedFile(file);
+        return true;
+      }
+      return false;
+    }
+    return count > 0;
+  }
+
+  /** Compress (async gzip) then encode a one-shot file → 'encoded'. */
+  private async encodeFileAsync(cmd: Extract<ModemCommand, { type: 'encodeFile' }>): Promise<void> {
+    if (!this.config) { this.emit({ type: 'error', id: cmd.id, error: 'encodeFile before configure' }); return; }
+    try {
+      const tx = new TxEngine(this.config as ConstructorParameters<typeof TxEngine>[0]);
+      const rawData = new Uint8Array(cmd.data);
+      const { bytes: wireData, scheme: schemeId } = await compressBest(rawData, cmd.fileName);
+      dlog('TX-COMP', {
+        scheme: schemeId,
+        raw: rawData.length,
+        wire: wireData.length,
+        ratio: rawData.length ? (wireData.length / rawData.length).toFixed(2) : '1.00',
+        saved: rawData.length - wireData.length,
+      });
+      const samples = tx.transmitFile(cmd.fileName, wireData, schemeId, rawData.length);
+      this.emit(
+        { type: 'encoded', id: cmd.id, samples: samples.buffer as ArrayBuffer, sampleRate: this.config.sampleRate },
+        [samples.buffer as ArrayBuffer],
+      );
+    } catch (err) {
+      this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
+    }
+  }
+
+  /** Compress (async gzip) then set up the streaming generator → 'streamStart'. */
+  private async encodeStreamStartAsync(cmd: Extract<ModemCommand, { type: 'encodeStreamStart' }>): Promise<void> {
+    if (!this.config) { this.emit({ type: 'error', id: cmd.id, error: 'encodeStreamStart before configure' }); return; }
+    try {
+      const tx = new TxEngine(this.config as ConstructorParameters<typeof TxEngine>[0]);
+      const rawData = new Uint8Array(cmd.data);
+      const { bytes: wireData, scheme: schemeId } = await compressBest(rawData, cmd.fileName);
+      dlog('TX-COMP', {
+        scheme: schemeId,
+        raw: rawData.length,
+        wire: wireData.length,
+        ratio: rawData.length ? (wireData.length / rawData.length).toFixed(2) : '1.00',
+        saved: rawData.length - wireData.length,
+      });
+      const totalSamples = tx.estimateStreamSamples(wireData.length);
+      this.stream = {
+        id: cmd.id,
+        gen: tx.streamChunks(cmd.fileName, wireData, this.streamChunkSamples(), schemeId, rawData.length),
+      };
+      this.emit({ type: 'streamStart', id: cmd.id, sampleRate: this.config.sampleRate, totalSamples });
+    } catch (err) {
+      this.stream = null;
+      this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
+    }
+  }
+
+  /** Decompress a completed file (async — gzip) and emit fileComplete once. */
+  private async deliverCompletedFile(file: {
+    fileName: string;
+    data: Uint8Array;
+    schemeId: number;
+    origSize: number;
+  }): Promise<void> {
+    let out = file.data;
+    if (file.schemeId !== 0) {
+      try {
+        out = await decompressScheme(file.data, file.schemeId);
+        dlog('RX-COMP', { scheme: file.schemeId, wire: file.data.length, decompressed: out.length });
+      } catch (err) {
+        dlog('RX-FRAME', { decompressError: (err as Error).message });
+        out = file.data; // fall back to wire bytes rather than corrupting silently
+      }
+    }
+    // Own a transferable copy so the underlying buffer is safe to hand off.
+    const owned = out.slice();
+    this.emit(
+      { type: 'fileComplete', fileName: file.fileName, data: owned.buffer as ArrayBuffer },
+      [owned.buffer as ArrayBuffer],
+    );
   }
 
   private pushRing(chunk: Float32Array): void {
@@ -174,7 +321,7 @@ export class ModemService {
     }
 
     const toneFreqs = this.config!.useOFDM
-      ? ofdmToneFrequencies({ toneCount: this.config!.toneCount, pilotFreqHz: this.config!.pilotFreqHz })
+      ? ofdmToneFrequencies({ toneCount: this.config!.toneCount, pilotFreqHz: this.config!.pilotFreqHz, startHz: this.config!.toneStartHz })
       : new Float32Array(0);
     const toneEnergies: number[] = [];
     for (const f of toneFreqs) {
