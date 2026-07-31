@@ -36,6 +36,7 @@ export type ModemCommand =
       config: ModemConfig & {
         useOFDM?: boolean;
         emitLinkProfile?: boolean;
+        bandHandshake?: boolean;
         qamMap?: number[];
         toneGains?: number[];
         trainingSettleSymbols?: number;

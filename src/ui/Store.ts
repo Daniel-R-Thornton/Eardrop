@@ -214,6 +214,13 @@ export interface AppState {
    */
   speedTestMode: 'grid' | 'hunt';
   /**
+   * Band handshake: TX sends its preamble + profile on the fixed
+   * OFDM_HANDSHAKE band and announces the real band in the v2 profile; RX
+   * only ever listens on the handshake band. Kills the "match pilot/tone
+   * start in both windows by hand" requirement.
+   */
+  bandHandshake: boolean;
+  /**
    * Named "known-good" configuration snapshots, saved by the operator when a
    * combination works so it can be restored with one click after further
    * experimenting. Each preset holds the same fields the store persists
@@ -298,6 +305,7 @@ const defaultState: AppState = {
   speedTestBest: null,
   speedTestLoopback: false,
   speedTestMode: 'hunt',
+  bandHandshake: false,
   configPresets: {},
 };
 
@@ -337,7 +345,7 @@ const CONFIG_FIELDS = [
   'dataQamBits', 'qamScaleOverride', 'pilotFreqHz', 'musicalMode',
   'ampThresholdRatio', 'syncStrongMultiplier', 'diversityMode', 'useOFDM',
   'symbolsPerSec', 'micGain', 'playbackVolume', 'selectedInputId',
-  'selectedInputLabel', 'selectedOutputId', 'theme',
+  'selectedInputLabel', 'selectedOutputId', 'theme', 'bandHandshake',
 ] as const satisfies readonly (keyof AppState)[];
 
 /** Deep-cloned snapshot of the configuration fields of `s`. */

@@ -29,14 +29,16 @@ test('default profile: all-QPSK, t=6, cpId=0', () => {
 const cases: LinkProfile[] = [
   DEFAULT_LINK_PROFILE(4),
   DEFAULT_LINK_PROFILE(32),
-  { ver: 1, flags: 0, eccT: 2, cpId: 1, toneCount: 8, qamMap: [0, 1, 2, 3, 0, 1, 2, 3] },
-  { ver: 1, flags: 0, eccT: 4, cpId: 0, toneCount: 1, qamMap: [2] },
+  { ver: 2, flags: 0, eccT: 2, cpId: 1, toneCount: 8, pilotFreqHz: 0, toneStartHz: 0, qamMap: [0, 1, 2, 3, 0, 1, 2, 3] },
+  { ver: 2, flags: 0, eccT: 4, cpId: 0, toneCount: 1, pilotFreqHz: 0, toneStartHz: 0, qamMap: [2] },
   {
-    ver: 1,
+    ver: 2,
     flags: 0,
     eccT: 6,
     cpId: 0,
     toneCount: 32,
+    pilotFreqHz: 0,
+    toneStartHz: 0,
     qamMap: Array.from({ length: 32 }, (_, i) => i % 4),
   },
 ];
@@ -72,7 +74,7 @@ test('unsupported version returns null', () => {
   const profile = DEFAULT_LINK_PROFILE(4);
   const packed = packLinkProfile(profile);
   const bumped = new Uint8Array(packed);
-  bumped[0] = 2; // ver
+  bumped[0] = 3; // ver — one past LINK_PROFILE_VERSION
   expect(parseLinkProfile(bumped)).toBeNull();
 });
 
@@ -93,11 +95,13 @@ test('truncated/short payload → null, no throw', () => {
 test('mixed qamMap values pack/unpack bit-exact across a byte boundary (5 tones)', () => {
   // 5 tones × 2 bits = 10 bits → 2 bytes; exercises the partial top byte.
   const profile: LinkProfile = {
-    ver: 1,
+    ver: 2,
     flags: 0,
     eccT: 6,
     cpId: 0,
     toneCount: 5,
+    pilotFreqHz: 0,
+    toneStartHz: 0,
     qamMap: [3, 2, 1, 0, 3],
   };
   const packed = packLinkProfile(profile);

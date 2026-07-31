@@ -187,6 +187,25 @@ export const OFDM_DEFAULTS = {
 } as const;
 
 /**
+ * The FIXED handshake config — the only band knowledge a receiver needs when
+ * bandHandshake is enabled. TX transmits chirp + preamble + profile frames
+ * here; the v2 profile announces the real band (LINK_PROFILE_FLAG_BAND_HOP)
+ * and both sides hop.
+ *
+ * Values chosen from bench measurements, not aesthetics: 8 QPSK tones at
+ * 6900-7250 Hz decoded at MER 21-22 dB on the weakest hardware measured (a
+ * laptop DMIC + micro-speaker) — QPSK needs ~10 dB, so the handshake carries
+ * ~11 dB of margin. Few tones = maximum power per tone. CHANGING ANY VALUE
+ * BREAKS COMPATIBILITY with every deployed receiver — this is a wire
+ * constant, not a tuning knob.
+ */
+export const OFDM_HANDSHAKE = {
+  pilotFreqHz: 1850,
+  toneStartHz: 5050, // tones at 6900-7250 Hz
+  toneCount: 8,
+} as const;
+
+/**
  * OFDM tuning levers — every knob that trades robustness for speed, in one
  * place.
  *

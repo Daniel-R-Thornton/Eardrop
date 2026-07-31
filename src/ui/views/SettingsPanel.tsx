@@ -61,6 +61,13 @@ export function SettingsPanel() {
             ...(v ? {} : { toneCount: Math.min(8, s.toneCount) }),
           })}
         />
+        {s.useOFDM && (
+          <Toggle
+            label="Band handshake (RX auto-tunes)"
+            checked={s.bandHandshake}
+            onChange={(v) => setState({ bandHandshake: v })}
+          />
+        )}
         <Select
           label="TONES"
           value={String(s.toneCount)}

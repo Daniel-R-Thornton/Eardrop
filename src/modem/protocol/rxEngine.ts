@@ -31,12 +31,13 @@ import {
   DEFAULT_LINK_PROFILE,
   qamMapToOrders,
   PROFILE_FRAME_REPEATS,
+  LINK_PROFILE_FLAG_BAND_HOP,
   type LinkProfile,
 } from '../protocol/linkProfile';
 import { SentinelScanner } from '../receiver/SentinelScanner';
 import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
 import type { QamOrder } from '../modulation/constellation';
-import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_SYMBOL_MS, OFDM_CP_MS, OFDM_TUNING } from '../types';
+import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_HANDSHAKE, OFDM_SYMBOL_MS, OFDM_CP_MS, OFDM_TUNING } from '../types';
 import { generateChirp, chirpCorrelate, type ChirpConfig } from './chirp';
 import { dlog, dlogFmt } from '../../lib/debug/dlog';
 
@@ -350,6 +351,12 @@ export class RxEngine {
    * scanner. Set alongside qamRefPending; counted down after it drains.
    */
   private qamWarmupPending = 0;
+  /**
+   * Band-handshake mode (see OFDM_HANDSHAKE): listen on the fixed handshake
+   * band; a v2 profile with LINK_PROFILE_FLAG_BAND_HOP retunes this receiver
+   * to the announced band and retrains on the second preamble.
+   */
+  private bandHandshake = false;
 
   // Per-tone I/Q calibration references (from Gray code calibration)
   /** Reference vectors for bit=0 (ref0I/Q) and bit=1 (ref1I/Q) per tone */
@@ -382,6 +389,17 @@ export class RxEngine {
   constructor(cfg: Partial<ModemConfig & { useOFDM?: boolean }> = {}) {
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
     this.useOFDM = (cfg as any).useOFDM === true;
+    this.bandHandshake = (cfg as any).bandHandshake === true;
+    if (this.bandHandshake) {
+      // Band handshake: LISTEN on the fixed handshake band regardless of the
+      // configured band — the v2 profile announces the real one and
+      // applyProfileSwitch retunes (see the FRAME_TYPE_PROFILE handler). The
+      // configured band fields are TX-side knowledge only in this mode.
+      this.cfg.pilotFreqHz = OFDM_HANDSHAKE.pilotFreqHz;
+      this.cfg.toneStartHz = OFDM_HANDSHAKE.toneStartHz;
+      this.cfg.toneCount = OFDM_HANDSHAKE.toneCount;
+      dlog('RX-OFDM', { handshakeBand: true, pilot: this.cfg.pilotFreqHz });
+    }
     const settleOverride = (cfg as any).trainingSettleSymbols;
     this.OFDM_SETTLE_SYMBOLS =
       typeof settleOverride === 'number' && Number.isFinite(settleOverride)
@@ -1262,6 +1280,32 @@ export class RxEngine {
    * case and the 3e countdown in feedSample for WHEN this is called).
    */
   private applyProfileSwitch(profile: LinkProfile): void {
+    // Band hop (v2 handshake): retune to the ANNOUNCED band and retrain on
+    // the second preamble the TX emits right after the profile frames.
+    // Resetting the settle/training counters re-enters the existing
+    // settle→train guards in feedSample, so the next windows are consumed
+    // as the hop preamble rather than data; the refs/warmup countdowns set
+    // below then apply after training completes — the same sequencing the
+    // first preamble uses.
+    if (profile.flags & LINK_PROFILE_FLAG_BAND_HOP && profile.pilotFreqHz > 0) {
+      dlog('RX-OFDM', {
+        bandHop: true,
+        pilot: profile.pilotFreqHz,
+        toneStart: profile.toneStartHz,
+        tones: profile.toneCount,
+      }, { level: 'info' });
+      this.cfg.pilotFreqHz = profile.pilotFreqHz;
+      this.cfg.toneStartHz = profile.toneStartHz;
+      this.cfg.toneCount = profile.toneCount;
+      // PLL is lazily rebuilt from cfg on the next sample — see feedSample.
+      this.pll = null;
+      this.initOfdmDemod();
+      this.ofdmDemod?.resetTraining();
+      this.ofdmDemod?.discardMER();
+      this.ofdmSettleSymbols = 0;
+      this.ofdmTrainingSymbols = 0;
+      this.linkProfile = profile;
+    }
     this.toneOrders = qamMapToOrders(profile.qamMap);
     this.allQpsk = this.toneOrders.every((o) => o === 2);
     this.ofdmDemod?.setToneOrders(this.toneOrders);
@@ -1663,10 +1707,16 @@ export class RxEngine {
           dlog('RX-PROFILE', { invalid: true }, { level: 'warn' });
           break;
         }
-        if (profile.toneCount !== this.ofdmToneCount) {
-          dlog('RX-PROFILE', { 
-            tcMismatch: true, 
-            got: profile.toneCount, 
+        if (profile.toneCount !== this.ofdmToneCount
+            && !(profile.flags & LINK_PROFILE_FLAG_BAND_HOP)) {
+          // Band-hop profiles ALWAYS have a different tone count (the
+          // handshake band is 8 tones) — that mismatch is the design, not a
+          // misconfiguration, and the retune happens at the switch point
+          // (applyProfileSwitch) so the second profile copy still decodes at
+          // the handshake rate. Only legacy (non-hop) streams adapt here.
+          dlog('RX-PROFILE', {
+            tcMismatch: true,
+            got: profile.toneCount,
             want: this.ofdmToneCount,
             eccT: profile.eccT,
             qamMap: profile.qamMap.slice(0, 8).join(','),

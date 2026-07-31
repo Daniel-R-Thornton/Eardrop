@@ -6,12 +6,20 @@
  * (all-QPSK, RS t=6, 5ms CP) 160-byte atomic frame payload so it always
  * decodes before the receiver knows anything about the adaptive scheme.
  *
- * Wire layout (see plan Phase 4):
+ * Wire layout v2 (v1 in parentheses where it differs):
  *   [ver:1][flags:1][eccT:1][cpId:1][toneCount:1]
+ *   [pilotFreqHz:2 LE][toneStartHz:2 LE]  // v2 only — the TARGET BAND, so a
+ *                                         // receiver listening on the fixed
+ *                                         // handshake band learns where the
+ *                                         // data band is from the air
  *   [qamMap: ceil(toneCount*2/8) bytes]  // 2 bits/tone, LSB-first within byte
  *                                        // 0=QPSK 1=16QAM 2=64QAM 3=reserved
  *   [crc32:4 LE]                         // over all preceding profile bytes
  *   [zero pad to 160]
+ *
+ * flags bit 0 (LINK_PROFILE_FLAG_BAND_HOP): a second preamble (settle +
+ * training) follows the profile frames IN THE ANNOUNCED BAND — the receiver
+ * must retune and retrain before the header frame.
  */
 
 import { crc32 } from '../../crc32';
@@ -23,7 +31,17 @@ import {
 } from '../modulation/constellation';
 
 /** Current profile payload version. */
-export const LINK_PROFILE_VERSION = 1;
+export const LINK_PROFILE_VERSION = 2;
+
+/** Oldest payload version parseLinkProfile still accepts. */
+export const LINK_PROFILE_MIN_VERSION = 1;
+
+/**
+ * flags bit 0: the transmission hops to the announced band after the profile
+ * frames — a second settle+training preamble follows at pilotFreqHz /
+ * toneStartHz / toneCount, then the data frames.
+ */
+export const LINK_PROFILE_FLAG_BAND_HOP = 0x01;
 
 /**
  * Repeat count for the PROFILE frame on the wire — cheap insurance since a
@@ -54,6 +72,13 @@ export interface LinkProfile {
   cpId: number;
   /** Number of OFDM data tones this profile describes. */
   toneCount: number;
+  /**
+   * TARGET pilot frequency in Hz (v2). 0 = not announced (v1 payloads) —
+   * receiver stays on its configured band.
+   */
+  pilotFreqHz: number;
+  /** TARGET tone-grid start, Hz above the pilot (v2). 0 = not announced. */
+  toneStartHz: number;
   /** Per-tone QAM order (length === toneCount), values 0-3 (see QamOrder). */
   qamMap: number[];
 }
@@ -66,14 +91,22 @@ export function DEFAULT_LINK_PROFILE(toneCount: number): LinkProfile {
     eccT: 6,
     cpId: 0,
     toneCount,
+    pilotFreqHz: 0,
+    toneStartHz: 0,
     qamMap: new Array(toneCount).fill(QamOrder.QPSK),
   };
 }
 
-/** Fixed header length (ver+flags+eccT+cpId+toneCount) before the qamMap. */
-const PROFILE_HEADER_LEN = 5;
+/** Fixed v1 header length (ver+flags+eccT+cpId+toneCount) before the qamMap. */
+const PROFILE_HEADER_LEN_V1 = 5;
+/** v2 adds pilotFreqHz + toneStartHz, 2 bytes LE each. */
+const PROFILE_HEADER_LEN_V2 = PROFILE_HEADER_LEN_V1 + 4;
 /** crc32 field length. */
 const CRC_LEN = 4;
+
+function headerLen(ver: number): number {
+  return ver >= 2 ? PROFILE_HEADER_LEN_V2 : PROFILE_HEADER_LEN_V1;
+}
 
 /** Bytes needed to pack `toneCount` tones at 2 bits/tone. */
 function qamMapBytes(toneCount: number): number {
@@ -85,18 +118,25 @@ function qamMapBytes(toneCount: number): number {
  * zero-padded at the end.
  */
 export function packLinkProfile(p: LinkProfile): Uint8Array {
+  // Always emit the CURRENT version — v1 exists only on the parse side.
+  const ver = LINK_PROFILE_VERSION;
+  const hdrLen = headerLen(ver);
   const mapLen = qamMapBytes(p.toneCount);
-  const preCrcLen = PROFILE_HEADER_LEN + mapLen;
+  const preCrcLen = hdrLen + mapLen;
   const buf = new Uint8Array(PAYLOAD_DATA_SIZE);
 
-  buf[0] = p.ver & 0xff;
+  buf[0] = ver & 0xff;
   buf[1] = p.flags & 0xff;
   buf[2] = p.eccT & 0xff;
   buf[3] = p.cpId & 0xff;
   buf[4] = p.toneCount & 0xff;
+  buf[5] = p.pilotFreqHz & 0xff;
+  buf[6] = (p.pilotFreqHz >> 8) & 0xff;
+  buf[7] = p.toneStartHz & 0xff;
+  buf[8] = (p.toneStartHz >> 8) & 0xff;
 
   for (let t = 0; t < p.toneCount; t++) {
-    const byteIdx = PROFILE_HEADER_LEN + (t >> 2);
+    const byteIdx = hdrLen + (t >> 2);
     const bitOff = (t & 3) * 2;
     const order = (p.qamMap[t] ?? QamOrder.QPSK) & 0x3;
     buf[byteIdx] |= order << bitOff;
@@ -120,18 +160,24 @@ export function packLinkProfile(p: LinkProfile): Uint8Array {
  *   - crc32 mismatch.
  */
 export function parseLinkProfile(payload: Uint8Array): LinkProfile | null {
-  if (!payload || payload.length < PROFILE_HEADER_LEN) return null;
+  if (!payload || payload.length < PROFILE_HEADER_LEN_V1) return null;
 
   const ver = payload[0];
-  if (ver !== LINK_PROFILE_VERSION) return null;
+  if (ver < LINK_PROFILE_MIN_VERSION || ver > LINK_PROFILE_VERSION) return null;
 
   const flags = payload[1];
   const eccT = payload[2];
   const cpId = payload[3];
   const toneCount = payload[4];
+  const hdrLen = headerLen(ver);
+  if (payload.length < hdrLen) return null;
+
+  // v1 has no band fields — 0 means "not announced".
+  const pilotFreqHz = ver >= 2 ? payload[5] | (payload[6] << 8) : 0;
+  const toneStartHz = ver >= 2 ? payload[7] | (payload[8] << 8) : 0;
 
   const mapLen = qamMapBytes(toneCount);
-  const preCrcLen = PROFILE_HEADER_LEN + mapLen;
+  const preCrcLen = hdrLen + mapLen;
   if (payload.length < preCrcLen + CRC_LEN) return null;
 
   const storedCrc =
@@ -145,12 +191,12 @@ export function parseLinkProfile(payload: Uint8Array): LinkProfile | null {
 
   const qamMap: number[] = new Array(toneCount);
   for (let t = 0; t < toneCount; t++) {
-    const byteIdx = PROFILE_HEADER_LEN + (t >> 2);
+    const byteIdx = hdrLen + (t >> 2);
     const bitOff = (t & 3) * 2;
     qamMap[t] = (payload[byteIdx] >> bitOff) & 0x3;
   }
 
-  return { ver, flags, eccT, cpId, toneCount, qamMap };
+  return { ver, flags, eccT, cpId, toneCount, pilotFreqHz, toneStartHz, qamMap };
 }
 
 /**
