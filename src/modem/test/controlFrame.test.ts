@@ -68,4 +68,31 @@ describe('control frame', () => {
     const wire = encodeControlMessage(msg);
     expect(wire.length).toBe(CONTROL_HEADER_WIRE + controlPayloadWireSize(msg.payload.length));
   });
+
+  // --- validation: encode should throw on config errors, not silently corrupt the wire ---
+
+  it('rejects senderId out of range', () => {
+    expect(() => encodeControlMessage({ type: ControlType.Bye, senderId: 0, targetId: 0, payload: new Uint8Array(0) })).toThrow();
+    expect(() => encodeControlMessage({ type: ControlType.Bye, senderId: 256, targetId: 0, payload: new Uint8Array(0) })).toThrow();
+  });
+
+  it('rejects targetId out of range', () => {
+    expect(() => encodeControlMessage({ type: ControlType.Bye, senderId: 1, targetId: -1, payload: new Uint8Array(0) })).toThrow();
+    expect(() => encodeControlMessage({ type: ControlType.Bye, senderId: 1, targetId: 256, payload: new Uint8Array(0) })).toThrow();
+  });
+
+  it('rejects a payload over the 48 B cap', () => {
+    expect(() => encodeControlMessage({ type: ControlType.Bye, senderId: 1, targetId: 0, payload: new Uint8Array(49) })).toThrow();
+  });
+
+  it('rejects a WELCOME claim with out-of-range Hz instead of silently truncating', () => {
+    // 12750 Hz (bin 255) is the largest representable bin; 12800 Hz would wrap to bin 0 mod 256.
+    expect(() => packWelcome({ claim: { lowHz: 1500, highHz: 12800, maxQamOrder: 4 }, grid: grid64 })).toThrow();
+    expect(() => packWelcome({ claim: { lowHz: 0, highHz: 6000, maxQamOrder: 4 }, grid: grid64 })).toThrow();
+  });
+
+  it('rejects FILE_COMING pilot/tone-start Hz out of range instead of silently truncating', () => {
+    expect(() => packFileComing({ pilotFreqHz: 12800, toneStartHz: 600, toneCount: 32, settleSymbols: 16, fileBytes: 1, durationMs: 1 })).toThrow();
+    expect(() => packFileComing({ pilotFreqHz: 6300, toneStartHz: 0, toneCount: 32, settleSymbols: 16, fileBytes: 1, durationMs: 1 })).toThrow();
+  });
 });

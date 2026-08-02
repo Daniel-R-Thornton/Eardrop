@@ -127,7 +127,7 @@ export function encodeControlMessage(msg: ControlMessage): Uint8Array {
   raw[4] = msg.payload.length;
   raw[5] = crc8(raw, 0, 5);
 
-  const headerWire = bchEncodeChunks(raw.slice(0, 9));
+  const headerWire = bchEncodeChunks(raw);
 
   const crc16 = crc32(msg.payload) & 0xffff;
   const payloadRaw = new Uint8Array(msg.payload.length + 2);
@@ -247,11 +247,25 @@ function unpackGrid(bytes: Uint8Array): number[] {
   return q;
 }
 
+/**
+ * Round a Hz value to a 1-255 bin on the BAND_CARD_BIN_HZ grid, throwing on
+ * out-of-range values instead of silently truncating mod 256 (config error,
+ * not a channel condition) — same discipline as `encodeBandCard`.
+ */
+function toBin(hz: number, label: string): number {
+  const bin = Math.round(hz / BAND_CARD_BIN_HZ);
+  if (bin < 1 || bin > 255) throw new Error(`control frame: ${label} ${hz} Hz out of range`);
+  return bin;
+}
+
 /** Pack a BestRangeClaim into 3 bytes: lowBin, highBin, maxQamOrder. */
 function packClaim(claim: BestRangeClaim): Uint8Array {
+  if (claim.maxQamOrder < 0 || claim.maxQamOrder > 255) {
+    throw new Error(`control frame: maxQamOrder ${claim.maxQamOrder} out of range`);
+  }
   const out = new Uint8Array(3);
-  out[0] = Math.round(claim.lowHz / BAND_CARD_BIN_HZ);
-  out[1] = Math.round(claim.highHz / BAND_CARD_BIN_HZ);
+  out[0] = toBin(claim.lowHz, 'lowHz');
+  out[1] = toBin(claim.highHz, 'highHz');
   out[2] = claim.maxQamOrder;
   return out;
 }
@@ -296,9 +310,13 @@ export function packFileComing(p: FileComingPayload): Uint8Array {
   );
   if (toneCountCode < 0) throw new Error(`control frame: toneCount ${p.toneCount} not in ${BAND_CARD_TONE_COUNTS}`);
 
+  if (p.settleSymbols < 0 || p.settleSymbols > 255) {
+    throw new Error(`control frame: settleSymbols ${p.settleSymbols} out of range`);
+  }
+
   const out = new Uint8Array(12);
-  out[0] = Math.round(p.pilotFreqHz / BAND_CARD_BIN_HZ);
-  out[1] = Math.round(p.toneStartHz / BAND_CARD_BIN_HZ);
+  out[0] = toBin(p.pilotFreqHz, 'pilotFreqHz');
+  out[1] = toBin(p.toneStartHz, 'toneStartHz');
   out[2] = toneCountCode;
   out[3] = p.settleSymbols;
   const view = new DataView(out.buffer);
