@@ -33,9 +33,9 @@ import {
   DEFAULT_LINK_PROFILE,
   qamMapToOrders,
   PROFILE_FRAME_REPEATS,
-  LINK_PROFILE_FLAG_BAND_HOP,
   type LinkProfile,
 } from '../protocol/linkProfile';
+import { encodeBandCard, BAND_CARD_REPEATS, BAND_CARD_WIRE_SIZE } from '../protocol/bandCard';
 import { dlog } from '../../lib/debug/dlog';
 
 
@@ -56,14 +56,16 @@ export class TxEngine {
   /** OFDM engine for OFDM/QPSK frame modulation (enabled via useOFDM flag) */
   private ofdmEngine: OFDMEngine | null = null;
   /**
-   * Fixed-band engine for the handshake preamble + profile frames (see
-   * OFDM_HANDSHAKE). Non-null only when bandHandshake is enabled.
+   * Fixed-band engine for the handshake segment (see OFDM_HANDSHAKE):
+   * chirp + preamble + band card ×3. Non-null only when bandHandshake is
+   * enabled.
    */
   private handshakeEngine: OFDMEngine | null = null;
   /**
-   * Band-handshake mode: chirp/preamble/profile go out on OFDM_HANDSHAKE,
-   * the v2 profile announces the target band with LINK_PROFILE_FLAG_BAND_HOP,
-   * a second preamble follows in the target band, then the data frames.
+   * Band-handshake mode: a self-contained announcement segment goes out on
+   * OFDM_HANDSHAKE (preamble + band card, see bandCard.ts), then the ENTIRE
+   * normal transmission — its own preamble included — follows in the target
+   * band, byte-identical to a flag-off send.
    */
   private bandHandshake = false;
   /** Whether to use OFDM/QPSK for frame payloads */
@@ -95,10 +97,11 @@ export class TxEngine {
     // Check for OFDM flag before merging into ModemConfig
     this.useOFDM = (cfg as any).useOFDM === true;
     this.emitLinkProfile = (cfg as any).emitLinkProfile === true;
-    // Band handshake implies a profile frame — it is the vehicle that
-    // announces the target band, so the flag forces emitLinkProfile on.
+    // Band handshake no longer forces a profile frame: the band card (see
+    // bandCard.ts) announces the target band, and the target-band stream is
+    // byte-identical to a flag-off send — which only carries a profile when
+    // the qamMap needs one.
     this.bandHandshake = (cfg as any).bandHandshake === true;
-    if (this.bandHandshake) this.emitLinkProfile = true;
     this.qamMap = (cfg as any).qamMap;
     this.qamScaleOverride = (cfg as any).qamScaleOverride;
     this.toneGains = (cfg as any).toneGains;
@@ -253,24 +256,73 @@ export class TxEngine {
     // OFDM engine switched to a QAM map.
     if (this.useOFDM && this.ofdmEngine) this.ofdmEngine.resetToneOrders();
 
-    // 1. Preamble: chirp (sync) + training symbols (channel est).
-    // Band handshake: the whole preamble (and the profile frames below) go
-    // out on the FIXED handshake band via handshakeEngine, so any receiver
-    // can decode them with zero knowledge of the target band.
-    const preambleEngine = this.bandHandshake ? this.handshakeEngine : this.ofdmEngine;
-    if (this.useOFDM && preambleEngine) {
+    // 0. Band handshake: a self-contained announcement on the FIXED handshake
+    // band — full preamble (chirp + settle + training) so any receiver can
+    // sync with zero knowledge of the target band, then the band card ×3
+    // (see bandCard.ts: pilot, tone start, tone count, settle — bin/table
+    // coded into 27 wire bytes). Everything AFTER this block is byte-identical
+    // to a flag-off transmission: the target band gets its own full preamble
+    // below, so the receiver re-syncs and retrains there exactly as if the
+    // user had configured both ends by hand. (The first cut reused the
+    // handshake-band boundary and an abbreviated settle+training hop preamble
+    // in the target band; the carried-over boundary and the per-band
+    // compressor still adapting under the shortened preamble cost fractions
+    // of a dB — enough to kill the LAST frame at zero-margin QAM.)
+    if (this.useOFDM && this.bandHandshake && this.handshakeEngine) {
+      const { chirp } = this.handshakeEngine.generateChirpBurst(OFDM_TUNING.chirpSymbols);
+      // FIXED settle count (not this.settleSymbols): the handshake segment is
+      // the part a zero-config receiver must predict, so every knob in it is
+      // a wire constant. The card then announces the TARGET band's settle.
+      const settle = this.handshakeEngine.generateSettleSymbols(OFDM_TUNING.trainingSettleSymbols);
+      const training = this.handshakeEngine.generateTrainingSymbols(OFDM_TUNING.trainingSymbols);
+      const combined = new Float32Array(chirp.length + settle.length + training.length);
+      combined.set(chirp, 0);
+      combined.set(settle, chirp.length);
+      combined.set(training, chirp.length + settle.length);
+      dlog('TX-OFDM', {
+        handshakePreambleMs: Math.round((combined.length / (this.cfg.sampleRate || 48000)) * 1000),
+      });
+      yield combined;
+
+      const card = encodeBandCard({
+        pilotFreqHz: this.cfg.pilotFreqHz,
+        toneStartHz: this.cfg.toneStartHz ?? OFDM_DEFAULTS.toneStartHz,
+        toneCount: this.cfg.toneCount,
+        settleSymbols: this.settleSymbols,
+      });
+      const cardAudio = this.handshakeEngine.modulateFrame(card);
+      dlog('TX-OFDM', {
+        bandCard: true,
+        pilot: this.cfg.pilotFreqHz,
+        toneStart: this.cfg.toneStartHz ?? OFDM_DEFAULTS.toneStartHz,
+        tones: this.cfg.toneCount,
+        settle: this.settleSymbols,
+      });
+      for (let r = 0; r < BAND_CARD_REPEATS; r++) yield cardAudio;
+
+      // Silence gap before the target-band transmission: the post-hop
+      // receiver must meet the target chirp the way a cold receiver does —
+      // quiet first, chirp second (see OFDM_HANDSHAKE.gapSymbols for the
+      // bench failure this prevents).
+      yield new Float32Array(OFDM_HANDSHAKE.gapSymbols * this.getSymbolLengthInSamples());
+    }
+
+    // 1. Preamble: chirp (sync) + training symbols (channel est) — always in
+    // the TARGET band. In handshake mode this is the receiver's cue to
+    // re-sync from scratch after retuning.
+    if (this.useOFDM && this.ofdmEngine) {
       // Settle symbols first, then the ones the RX actually trains on — see
       // OFDM_TUNING.trainingSettleSymbols. The RX discards exactly the same
       // count, so both sides must read it from there.
       // Chirp length is its own lever — see OFDM_TUNING.chirpSymbols. Tying it
       // to the sync-burst pool meant raising the settle period lengthened the
       // chirp, i.e. more of the thing the settle period exists to recover from.
-      const { chirp } = preambleEngine.generateChirpBurst(OFDM_TUNING.chirpSymbols);
+      const { chirp } = this.ofdmEngine.generateChirpBurst(OFDM_TUNING.chirpSymbols);
       // Settle symbols carry VARYING data and are discarded by the RX; only the
       // training symbols that follow are identical. See generateSettleSymbols
       // for why a stationary settle period breaks the channel estimate.
-      const settle = preambleEngine.generateSettleSymbols(this.settleSymbols);
-      const training = preambleEngine.generateTrainingSymbols(OFDM_TUNING.trainingSymbols);
+      const settle = this.ofdmEngine.generateSettleSymbols(this.settleSymbols);
+      const training = this.ofdmEngine.generateTrainingSymbols(OFDM_TUNING.trainingSymbols);
       const combined = new Float32Array(chirp.length + settle.length + training.length);
       combined.set(chirp, 0);
       combined.set(settle, chirp.length);
@@ -308,46 +360,12 @@ export class TxEngine {
       const profile: LinkProfile = this.qamMap
         ? { ...DEFAULT_LINK_PROFILE(this.cfg.toneCount), qamMap: this.qamMap }
         : DEFAULT_LINK_PROFILE(this.cfg.toneCount);
-      if (this.bandHandshake) {
-        // v2 band announcement: the profile is the only thing the receiver
-        // decodes before the hop, so it carries the full target band.
-        profile.pilotFreqHz = this.cfg.pilotFreqHz;
-        profile.toneStartHz = this.cfg.toneStartHz ?? OFDM_DEFAULTS.toneStartHz;
-        profile.flags |= LINK_PROFILE_FLAG_BAND_HOP;
-      }
       const profilePayload = packLinkProfile(profile);
-      const profileHeader = { type: FRAME_TYPE_PROFILE, seqNum: 0, totalFrames, crc: 0 };
-      // Handshake: profile frames ride the handshake band (8-tone QPSK) so
-      // an unconfigured receiver can decode them; otherwise the normal path.
-      const profileFrame = this.bandHandshake && this.handshakeEngine
-        ? this.handshakeEngine.modulateFrame(encodeFrame(profileHeader, profilePayload))
-        : modulate(profileHeader, profilePayload);
-      if (this.bandHandshake) {
-        dlog('TX-OFDM', { frame: '0x4', seq: 0, band: 'handshake' });
-      }
+      const profileFrame = modulate(
+        { type: FRAME_TYPE_PROFILE, seqNum: 0, totalFrames, crc: 0 },
+        profilePayload,
+      );
       for (let r = 0; r < PROFILE_FRAME_REPEATS; r++) yield profileFrame;
-
-      // Band hop: second preamble in the TARGET band — the receiver retunes
-      // after the profile and retrains here, because the channel estimate is
-      // per band and the handshake band's estimate says nothing about the
-      // target band's response. Same settle+training counts as the first
-      // preamble; both sides read them from OFDM_TUNING.
-      if (this.bandHandshake && this.ofdmEngine) {
-        // Same settle count as the first preamble (cfg-derived) — the RX
-        // counts the hop preamble with the same number, so both sides must
-        // read it from the same place.
-        const settle2 = this.ofdmEngine.generateSettleSymbols(this.settleSymbols);
-        const training2 = this.ofdmEngine.generateTrainingSymbols(OFDM_TUNING.trainingSymbols);
-        const hop = new Float32Array(settle2.length + training2.length);
-        hop.set(settle2, 0);
-        hop.set(training2, settle2.length);
-        dlog('TX-OFDM', {
-          bandHop: true,
-          settleSymbols: this.settleSymbols,
-          trainingSymbols: OFDM_TUNING.trainingSymbols,
-        });
-        yield hop;
-      }
 
       // Phase 3: NOW switch the OFDM engine to the announced qamMap — after
       // the profile itself (base-rate) but before header/data/tail, which
@@ -478,8 +496,21 @@ export class TxEngine {
         profileSamples += OFDM_TUNING.qamRefSymbols * symLen;
       }
     }
+    // Band handshake segment: fixed-band preamble + card ×BAND_CARD_REPEATS
+    // (see frameSegments step 0 — all wire constants, so exact, not estimated).
+    let handshakeSamples = 0;
+    if (this.useOFDM && this.bandHandshake) {
+      const cardBytesPerSymbol = Math.max(1, Math.floor(OFDM_HANDSHAKE.toneCount / 4));
+      const cardSymbols = Math.ceil(BAND_CARD_WIRE_SIZE / cardBytesPerSymbol);
+      handshakeSamples =
+        (OFDM_TUNING.chirpSymbols
+          + OFDM_TUNING.trainingSettleSymbols
+          + OFDM_TUNING.trainingSymbols
+          + BAND_CARD_REPEATS * cardSymbols
+          + OFDM_HANDSHAKE.gapSymbols) * symLen;
+    }
     const silence = OFDM_TUNING.tailSilenceSymbols * symLen;
-    return preambleSamples + frameSamples + profileSamples + silence;
+    return handshakeSamples + preambleSamples + frameSamples + profileSamples + silence;
   }
 
   /**

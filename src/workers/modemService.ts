@@ -3,6 +3,7 @@
  * drive it without a Worker. The worker file is a thin shim around this.
  */
 import { RxEngine } from '../modem/protocol/rxEngine';
+import { HandshakeReceiver } from '../modem/protocol/handshakeReceiver';
 import { TxEngine } from '../modem/protocol/txEngine';
 import { captureTransmit } from '../modem/protocol/txCapture';
 import { toneIQ } from '../modem/pilot';
@@ -20,12 +21,13 @@ export class ModemService {
     | (ModemConfig & {
         useOFDM?: boolean;
         emitLinkProfile?: boolean;
+        bandHandshake?: boolean;
         qamMap?: number[];
         toneGains?: number[];
         trainingSettleSymbols?: number;
       })
     | null = null;
-  private rx: RxEngine | null = null;
+  private rx: RxEngine | HandshakeReceiver | null = null;
   /**
    * Completion count (RxEngine.getCompletionCount()) already delivered to the
    * consumer. Gating on this identity — rather than a one-shot "fileSent"
@@ -54,6 +56,18 @@ export class ModemService {
     this.emit = emit;
   }
 
+  /**
+   * Build the receiver the current config asks for: a HandshakeReceiver
+   * (card listener + fresh target engine, see handshakeReceiver.ts) when the
+   * band handshake is on, a plain RxEngine otherwise.
+   */
+  private makeRx(): RxEngine | HandshakeReceiver {
+    const cfg = this.config as ConstructorParameters<typeof RxEngine>[0];
+    return this.config?.useOFDM && this.config?.bandHandshake
+      ? new HandshakeReceiver(cfg)
+      : new RxEngine(cfg);
+  }
+
   handle(cmd: ModemCommand): void {
     switch (cmd.type) {
       case 'configure': {
@@ -62,7 +76,7 @@ export class ModemService {
         this.ringLen = 0;
         // Listening restarts pick up the new config
         if (this.rx) {
-          this.rx = new RxEngine(this.config as ConstructorParameters<typeof RxEngine>[0]);
+          this.rx = this.makeRx();
           this.lastDeliveredCompletion = 0;
         }
         this.emit({ type: 'configured' });
@@ -70,7 +84,7 @@ export class ModemService {
       }
       case 'startRx': {
         if (!this.config) { this.emit({ type: 'error', error: 'startRx before configure' }); return; }
-        this.rx = new RxEngine(this.config as ConstructorParameters<typeof RxEngine>[0]);
+        this.rx = this.makeRx();
         this.lastDeliveredCompletion = 0;
         this.emit({ type: 'rxStarted' });
         break;

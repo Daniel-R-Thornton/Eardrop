@@ -36,7 +36,8 @@ export class SentinelScanner {
   private bitsCollected = 0;
 
   private readonly sentinel = 0xe79fe7;
-  private readonly collectBytes = FRAME_SIZE - 3; // 76 bytes after 3-byte sentinel
+  /** Bytes collected after the 3-byte sentinel (defaults to a full atomic frame). */
+  private readonly collectBytes: number;
 
   /** Hamming distance threshold for sentinel matching (allows bit errors) */
   private readonly sentinelHammingThreshold = 2;
@@ -49,6 +50,11 @@ export class SentinelScanner {
   private maxRegHistory = 64;
 
   onFrame: ((frameBytes: Uint8Array) => void) | null = null;
+
+  /** @param collectBytes bytes to collect after the sentinel — defaults to a full atomic frame */
+  constructor(collectBytes: number = FRAME_SIZE - 3) {
+    this.collectBytes = collectBytes;
+  }
 
   reset(): void {
     this.shiftReg = 0;
@@ -96,11 +102,11 @@ export class SentinelScanner {
 
       if (this.buf.length >= this.collectBytes) {
         this.collecting = false;
-        const fullFrame = new Uint8Array(FRAME_SIZE);
+        const fullFrame = new Uint8Array(3 + this.collectBytes);
         fullFrame[0] = 0xe7;
         fullFrame[1] = 0x9f;
         fullFrame[2] = 0xe7;
-        for (let i = 0; i < this.buf.length && i < FRAME_SIZE - 3; i++) {
+        for (let i = 0; i < this.buf.length && i < this.collectBytes; i++) {
           fullFrame[3 + i] = this.buf[i];
         }
         dlog('RX-SCAN', { frame: this.buf.length });

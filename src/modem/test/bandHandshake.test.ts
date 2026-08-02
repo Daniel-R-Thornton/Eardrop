@@ -1,15 +1,17 @@
 /**
- * bandHandshake.test.ts — fixed-handshake-band protocol.
+ * bandHandshake.test.ts — fixed-band handshake protocol (band-card design).
  *
- * Problem: the profile frame is OFDM on the very tones it describes, so a
- * receiver cannot learn the band from it — both sides had to be configured
- * by hand. With bandHandshake enabled, TX transmits its chirp + preamble +
- * profile frames on a FIXED, universally-known base config
- * (OFDM_HANDSHAKE), the v2 profile announces the real band (pilot, tone
- * start, count, qamMap) with the band-hop flag, a second settle+training
- * preamble follows in the target band, and the data frames ride there. A
- * receiver needs nothing but the flag: it listens on OFDM_HANDSHAKE and
- * follows the announcement.
+ * Problem: a receiver cannot learn the band from a transmission it can't
+ * tune to. With bandHandshake enabled, TX opens with a self-contained
+ * announcement on a FIXED, universally-known band (OFDM_HANDSHAKE): full
+ * preamble (chirp + settle + training) + the band card ×3 (bandCard.ts —
+ * pilot, tone start, tone count, settle, bin/table coded into 27 wire
+ * bytes). Then the ENTIRE normal transmission follows in the target band,
+ * byte-identical to a flag-off send — its own chirp, preamble and (when the
+ * qamMap needs one) in-band link profile. The receiver listens on
+ * OFDM_HANDSHAKE, decodes the card, and swaps in a factory-fresh engine for
+ * the announced band (HandshakeReceiver) — no boundary, PLL or channel
+ * state survives the hop.
  *
  * Flag OFF must stay byte-identical to today's waveform (covered by the
  * existing byte-identity tests; asserted structurally here).
@@ -17,6 +19,7 @@
 import { describe, expect, it } from 'vitest';
 import { TxEngine } from '../protocol/txEngine';
 import { RxEngine } from '../protocol/rxEngine';
+import { HandshakeReceiver } from '../protocol/handshakeReceiver';
 import { OFDM_HANDSHAKE, OFDM_TUNING, ofdmSamples } from '../types';
 
 const SAMPLE_RATE = 48000;
@@ -36,40 +39,100 @@ function makeTx(overrides: Record<string, unknown> = {}) {
   } as ConstructorParameters<typeof TxEngine>[0]);
 }
 
+const transmit = (tx: TxEngine, payload: Uint8Array) => tx.transmitFile('a.bin', payload);
+
 describe('band handshake: TX', () => {
+  const payload = new Uint8Array(64).map((_, i) => i);
+
   it(
-    'flag ON inserts a second settle+training preamble after the profile frames',
+    'flag ON opens with a full fixed-band preamble segment',
     () => {
-      const payload = new Uint8Array(64).map((_, i) => i);
-      const secondPreambleLen =
-        (OFDM_TUNING.trainingSettleSymbols + OFDM_TUNING.trainingSymbols) * SYM_LEN;
-
-      const segments = (tx: TxEngine) =>
-        Array.from(
-          (tx as unknown as { frameSegments(n: string, d: Uint8Array): Generator<Float32Array> })
-            .frameSegments('a.bin', payload),
-        );
-
-      const on = segments(makeTx({ bandHandshake: true }));
-      // Segment 0 is chirp+settle+training (handshake band); the second
-      // preamble is its own segment of exactly settle+training symbols.
-      expect(on.slice(1).some((seg) => seg.length === secondPreambleLen)).toBe(true);
-
-      const off = segments(makeTx());
-      expect(off.slice(1).some((seg) => seg.length === secondPreambleLen)).toBe(false);
+      const segments = Array.from(
+        (makeTx({ bandHandshake: true }) as unknown as {
+          frameSegments(n: string, d: Uint8Array): Generator<Float32Array>;
+        }).frameSegments('a.bin', payload),
+      );
+      const handshakePreambleLen =
+        (OFDM_TUNING.chirpSymbols
+          + OFDM_TUNING.trainingSettleSymbols
+          + OFDM_TUNING.trainingSymbols) * SYM_LEN;
+      expect(segments[0].length).toBe(handshakePreambleLen);
+      // Card ×3: three identical short segments right after the preamble.
+      expect(segments[1].length).toBe(segments[2].length);
+      expect(segments[2].length).toBe(segments[3].length);
+      expect(Array.from(segments[1])).toEqual(Array.from(segments[2]));
+      // Silence gap after the cards, before the target-band preamble — the
+      // post-hop engine must meet the target chirp the way a cold RX does.
+      expect(segments[4].length).toBe(OFDM_HANDSHAKE.gapSymbols * SYM_LEN);
+      expect(segments[4].every((s) => s === 0)).toBe(true);
     },
     TIMEOUT,
   );
 
   it(
-    'flag ON transmission is longer than flag OFF by at least the second preamble',
+    'listener discard lands the target engine inside the silence gap',
     () => {
-      const payload = new Uint8Array(64).map((_, i) => i);
-      const on = makeTx({ bandHandshake: true }).transmitFile('a.bin', payload);
-      const off = makeTx().transmitFile('a.bin', payload);
-      const secondPreambleLen =
-        (OFDM_TUNING.trainingSettleSymbols + OFDM_TUNING.trainingSymbols) * SYM_LEN;
-      expect(on.length - off.length).toBeGreaterThanOrEqual(secondPreambleLen);
+      const audio = transmit(makeTx({ bandHandshake: true }), payload);
+      const listener = new RxEngine({
+        useOFDM: true, sampleRate: SAMPLE_RATE, bandHandshake: true,
+        pilotFreqHz: 999, toneStartHz: 12345, toneCount: 16,
+      } as ConstructorParameters<typeof RxEngine>[0]);
+      let landing = -1;
+      listener.onBandCard = () => {
+        landing = 0; // resolved below once we know the current feed index
+      };
+      let i = 0;
+      for (; i < audio.length && landing < 0; i++) listener.feedSample(audio[i]);
+      expect(landing).toBe(0);
+      const discard = listener.handshakeSegmentRemaining();
+      expect(discard).not.toBeNull();
+      // The first sample the target engine would receive, and a couple of
+      // symbols after it, must be inside the TX's silence gap.
+      const start = i + discard!;
+      const probe = audio.slice(start, start + 2 * SYM_LEN);
+      expect(probe.length).toBe(2 * SYM_LEN);
+      expect(Math.max(...probe.map(Math.abs))).toBe(0);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    'flag ON transmission = handshake segment + the EXACT flag-off waveform',
+    () => {
+      const on = transmit(makeTx({ bandHandshake: true }), payload);
+      const off = transmit(makeTx(), payload);
+      expect(on.length).toBeGreaterThan(off.length);
+      const suffix = on.slice(on.length - off.length);
+      expect(Array.from(suffix)).toEqual(Array.from(off));
+    },
+    TIMEOUT,
+  );
+
+  it(
+    'handshake segment ignores the settle override (wire constant), card carries it',
+    () => {
+      // Different settle overrides must not change the handshake segment —
+      // a zero-config receiver has to predict its length from OFDM_TUNING.
+      const seg0 = (settle: number) =>
+        Array.from(
+          (makeTx({ bandHandshake: true, trainingSettleSymbols: settle }) as unknown as {
+            frameSegments(n: string, d: Uint8Array): Generator<Float32Array>;
+          }).frameSegments('a.bin', payload),
+        )[0].length;
+      expect(seg0(4)).toBe(seg0(24));
+    },
+    TIMEOUT,
+  );
+
+  it(
+    'estimateStreamSamples matches the streamed length with the flag on',
+    () => {
+      const est = makeTx({ bandHandshake: true }).estimateStreamSamples(payload.length);
+      let actual = 0;
+      for (const chunk of makeTx({ bandHandshake: true }).streamChunks('a.bin', payload, 4096)) {
+        actual += chunk.length;
+      }
+      expect(Math.abs(est - actual) / actual).toBeLessThan(0.05);
     },
     TIMEOUT,
   );
@@ -80,20 +143,19 @@ describe('band handshake: RX end-to-end (the oracle)', () => {
     const payload = new Uint8Array(payloadLen).map((_, i) => (i * 7 + 3) & 0xff);
     const tx = makeTx({ bandHandshake: true, ...txOverrides });
     // RX knows NOTHING about the target band — only the handshake flag.
-    // Its configured band fields are garbage on purpose.
-    const rx = new RxEngine({
+    // Its configured band fields are garbage on purpose, and it does NOT
+    // get the TX's settle override — the card carries that.
+    const rx = new HandshakeReceiver({
       useOFDM: true,
       sampleRate: SAMPLE_RATE,
-      bandHandshake: true,
       pilotFreqHz: 999,
       toneStartHz: 12345,
       toneCount: 16,
-    } as ConstructorParameters<typeof RxEngine>[0]);
+    } as ConstructorParameters<typeof HandshakeReceiver>[0]);
 
-    const audio = tx.transmitFile('h.bin', payload);
-    for (let i = 0; i < audio.length; i++) rx.feedSample(audio[i]);
-    const tail = new Float32Array(SYM_LEN * 8);
-    for (let i = 0; i < tail.length; i++) rx.feedSample(tail[i]);
+    const audio = transmit(tx, payload);
+    rx.feedChunk(audio);
+    rx.feedChunk(new Float32Array(SYM_LEN * 8));
     return { file: rx.getFile(), payload };
   };
 
@@ -111,6 +173,16 @@ describe('band handshake: RX end-to-end (the oracle)', () => {
     'decodes a 16-QAM transfer via handshake',
     () => {
       const { file, payload } = roundtrip({ qamMap: new Array(TARGET.toneCount).fill(1) });
+      expect(file).not.toBeNull();
+      expect(Array.from(file!.data.slice(0, payload.length))).toEqual(Array.from(payload));
+    },
+    TIMEOUT,
+  );
+
+  it(
+    'decodes when the TX uses a non-default settle count (card carries it)',
+    () => {
+      const { file, payload } = roundtrip({ trainingSettleSymbols: 8 });
       expect(file).not.toBeNull();
       expect(Array.from(file!.data.slice(0, payload.length))).toEqual(Array.from(payload));
     },

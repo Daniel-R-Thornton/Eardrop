@@ -109,13 +109,14 @@ export function buildModemConfig(
     config.qamMap = new Array(toneCount).fill(order);
   }
 
-  // Band handshake: preamble + profile on the fixed handshake band, v2
-  // profile announces this config's band, both sides hop (see OFDM_HANDSHAKE).
-  // TX reads the flag to emit the dual preamble; RX reads it to LISTEN on the
-  // handshake band instead of this config's band.
+  // Band handshake: an announcement segment (preamble + band card, see
+  // bandCard.ts) on the fixed handshake band, then the normal transmission in
+  // this config's band. TX reads the flag to emit the segment; RX reads it to
+  // LISTEN on the handshake band and retune from the card. No forced link
+  // profile — the target-band stream is byte-identical to a flag-off send,
+  // which only carries a profile when the qamMap needs one (order > 0 above).
   if (ui.useOFDM && ui.bandHandshake === true) {
     config.bandHandshake = true;
-    config.emitLinkProfile = true;
   }
 
   if (ui.useOFDM && typeof ui.qamScaleOverride === 'number' && Number.isFinite(ui.qamScaleOverride)) {
