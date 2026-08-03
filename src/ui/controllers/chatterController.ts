@@ -235,6 +235,16 @@ export class ChatterController {
         bytes: 0,
         note: info ? `grid ${info.linkDb.toFixed(1)} dB` : undefined,
       });
+      // Patch linkDb/grid into the store's member mirror the instant a probe
+      // is measured, rather than waiting for the next onStateChange snapshot
+      // — idle -> rollCall only fires from an explicit sendFile(), so in a
+      // quiet room onStateChange may not fire again for a long time, and the
+      // graph's primary distance/colour input would sit undefined the whole
+      // while. RoomProtocol.onProbeHeard (called just above) records the
+      // same heardGrid on its own _members entry, so the next onStateChange
+      // recomputes the identical linkDb/grid via toStoreMembers — the two
+      // mirrors never diverge, this just gets there sooner.
+      if (info) this.mergeMemberLinkInfo(ev.deviceId, info);
     });
     worker.on('controlMessage', (ev) => {
       this.room.onMessage({
@@ -362,6 +372,24 @@ export class ChatterController {
     setState({ chatterPackets: [...getState().chatterPackets, packet].slice(-CHATTER_PACKET_LOG_MAX) });
   }
 
+  /** Patch `linkDb`/`grid` into the store's `chatterMembers` mirror for one
+   *  peer, in place, without touching any other field or member — display
+   *  only, mirrors what `toStoreMembers` will recompute from the same
+   *  `heardGrid` the next time `onStateChange` fires. Inserts a minimal
+   *  entry (matching the shape `onStateChange` would produce) if the peer
+   *  isn't in the mirror yet — e.g. its very first probe. */
+  private mergeMemberLinkInfo(deviceId: number, info: { linkDb: number; grid: number[] }): void {
+    const members = getState().chatterMembers;
+    const idx = members.findIndex((m) => m.deviceId === deviceId);
+    const next = members.slice();
+    if (idx === -1) {
+      next.push({ deviceId, lastHeardMs: this.deps.now(), linkDb: info.linkDb, grid: info.grid });
+    } else {
+      next[idx] = { ...next[idx], linkDb: info.linkDb, grid: info.grid };
+    }
+    setState({ chatterMembers: next });
+  }
+
   private async doPlayAndMute(getAudio: () => Promise<{ samples: Float32Array; sampleRate: number }>): Promise<void> {
     const { samples, sampleRate } = await getAudio();
     this.worker.setRxMuted(true);
@@ -382,6 +410,10 @@ export class ChatterController {
    *  HandshakeReceiver); `info` carries nothing else this adapter needs
    *  (the receive timeout is RoomProtocol's own timer). */
   private armFileRx(info: FileComingPayload): void {
+    // bytes is the raw file payload size by design here (unlike control
+    // messages' bytes, which is the true encoded wire size) — fileBytes is
+    // what FILE_COMING actually advertises; the modulated wire size depends
+    // on settings not yet known to this adapter.
     this.recordPacket({ dir: 'rx', kind: 'file', bytes: info.fileBytes });
     if (this.rxArmed) return;
     this.rxArmed = true;
@@ -420,6 +452,11 @@ export class ChatterController {
     cfg.emitLinkProfile = true;
     this.worker.configure(cfg);
 
+    // bytes is the raw file payload size by design (unlike control messages'
+    // bytes, which is the true encoded wire size) — the actual modulated
+    // wire size isn't a simple formula here (depends on the negotiated
+    // per-tone bit-loading in cfg.qamMap above), so this reports the file
+    // size itself rather than approximating the wire size.
     await this.playAndMute(() => this.worker.encodeFile(pending.fileName, pending.data), {
       kind: 'file',
       peerId: 0,

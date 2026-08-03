@@ -370,4 +370,28 @@ describe('ChatterController', () => {
     expect(member!.linkDb).toBeCloseTo(0, 5); // flat grid -> already at its own peak
     expect(member!.grid).toEqual(flatGrid.map(() => 1));
   });
+
+  it('reflects linkDb/grid the instant a probe is heard, with no subsequent state transition', async () => {
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
+
+    await controller.joinRoom();
+    await clock.tick(
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200,
+    );
+    expect(getState().chatterState).toBe('idle');
+
+    // Device 9 probes us — a quiet room otherwise never fires another
+    // onStateChange (idle -> rollCall only happens via an explicit
+    // sendFile()), so without a same-tick store patch this would sit
+    // undefined indefinitely.
+    worker.emit('probeHeard', { deviceId: 9, grid: flatGrid });
+
+    const member = getState().chatterMembers.find((m) => m.deviceId === 9);
+    expect(member).toBeDefined();
+    expect(member!.linkDb).toBeCloseTo(0, 5);
+    expect(member!.grid).toEqual(flatGrid.map(() => 1));
+  });
 });
