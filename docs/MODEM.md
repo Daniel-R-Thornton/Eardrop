@@ -322,9 +322,12 @@ stalling the machine.
 
 A completed send or receive stays "occupied" for `durationMs + 5000 ms`
 (`TRANSFER_TAIL_MARGIN_MS`) before falling back to `idle`, covering the last
-frame's tail and scheduling jitter.
+frame's tail and scheduling jitter. A roll call that collects zero reports
+sets `lastError` and returns straight to `idle` without sending anything.
 
+---
 
+## Test Coverage
 
 | Test File | Path | Status |
 |-----------|------|--------|
