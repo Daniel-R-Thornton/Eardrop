@@ -43,6 +43,7 @@
 import {
   ControlType,
   packWelcome,
+  packReport,
   packFileComing,
   parseWelcome,
   parseReport,
@@ -179,10 +180,25 @@ export class RoomProtocol {
     // just refreshes the member table (simultaneous announce is a collision
     // both sides retry naturally at the next roll call). Dedupe by prober:
     // a repeat probe from the same device while its reply chain is still
-    // waiting out a slot must not start a second, redundant WELCOME chain.
+    // waiting out a slot must not start a second, redundant reply chain.
+    //
+    // WELCOME vs REPORT: the wire-level probe burst is identical for a join
+    // announcement and a roll-call announcement (see probeBurst.ts) — there
+    // is no purpose bit on the air, so a listener can only tell the two
+    // apart by whether it already knows this prober. A never-seen-before
+    // device is joining (reply WELCOME, onboarding it); an already-known
+    // member is running a roll call (reply REPORT — "roll-call ack" per the
+    // design spec's control-message table), since a member we've already
+    // welcomed needs a fresh channel measurement, not another welcome.
     if (this._state === 'idle' && !this.pendingReplyTo.has(deviceId)) {
       this.pendingReplyTo.add(deviceId);
-      this.scheduleReply(this.deps.now(), Array.from({ length: ROOM_TIMING.replySlots }, (_unused, i) => i), deviceId);
+      const alreadyKnown = existing !== undefined;
+      this.scheduleReply(
+        this.deps.now(),
+        Array.from({ length: ROOM_TIMING.replySlots }, (_unused, i) => i),
+        deviceId,
+        alreadyKnown,
+      );
     }
   }
 
@@ -349,7 +365,12 @@ export class RoomProtocol {
 
   // ---- reply-to-probe: slotted, carrier-sensed, re-rolling among later slots ----
 
-  private scheduleReply(baseTimeMs: number, candidateSlots: number[], proberId: number): void {
+  private scheduleReply(
+    baseTimeMs: number,
+    candidateSlots: number[],
+    proberId: number,
+    replyWithReport: boolean,
+  ): void {
     if (candidateSlots.length === 0) {
       this.pendingReplyTo.delete(proberId); // give up — no slot left to try
       return;
@@ -372,16 +393,25 @@ export class RoomProtocol {
         }
 
         if (busy) {
-          this.scheduleReply(baseTimeMs, laterSlots, proberId); // still pending — chain continues
+          this.scheduleReply(baseTimeMs, laterSlots, proberId, replyWithReport); // still pending — chain continues
           return;
         }
         const heardGrid = this._members.get(proberId)?.heardGrid ?? [];
-        await this.deps.sendMessage({
-          type: ControlType.Welcome,
-          senderId: this.deps.deviceId,
-          targetId: proberId,
-          payload: packWelcome({ claim: DEFAULT_CLAIM, grid: heardGrid }),
-        });
+        await this.deps.sendMessage(
+          replyWithReport
+            ? {
+                type: ControlType.Report,
+                senderId: this.deps.deviceId,
+                targetId: proberId,
+                payload: packReport(heardGrid),
+              }
+            : {
+                type: ControlType.Welcome,
+                senderId: this.deps.deviceId,
+                targetId: proberId,
+                payload: packWelcome({ claim: DEFAULT_CLAIM, grid: heardGrid }),
+              },
+        );
         this.pendingReplyTo.delete(proberId);
       } catch (err) {
         // isAirBusy/sendMessage rejected — we're already 'idle', so there's
