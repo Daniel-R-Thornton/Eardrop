@@ -61,6 +61,17 @@ function estimateDurationMs(fileBytes: number, symbolsPerSec: number): number {
  *  wedged encode/play must not make leaveRoom hang forever. */
 const LEAVE_PLAYBACK_TIMEOUT_MS = 2500;
 
+/** Cap on how long `joinRoom` waits for `startListening()` to settle before
+ *  declaring the join failed. An ungranted mic permission prompt (the user
+ *  never answers it, or the browser silently withholds the grant) leaves
+ *  `startListening()`'s returned promise pending forever — it doesn't
+ *  reject, it just never settles — so without this timeout `joinRoom` would
+ *  hang indefinitely with no `chatterError` ever set. ~13s: long enough
+ *  that a user answering a real permission dialog isn't cut off mid-click,
+ *  short enough that a hung join surfaces well before the user assumes the
+ *  app is simply broken. */
+const JOIN_MIC_TIMEOUT_MS = 13000;
+
 /** The subset of AudioPlayer's surface ChatterController needs — lets tests
  *  supply a fake without touching AudioContext. */
 export interface AudioPlayerLike {
@@ -271,6 +282,11 @@ export class ChatterController {
   async joinRoom(): Promise<void> {
     if (this.joining || getState().chatterOn) return;
     this.joining = true;
+    // Tracks whether `chatterStart` has already been sent to the worker this
+    // attempt — if a later step fails/hangs, the catch below must undo it
+    // with `chatterStop` rather than leaving the worker's chatter mode
+    // running under a store that thinks the join never happened.
+    let chatterStartSent = false;
     try {
       const deviceId = 1 + Math.floor(this.rng() * 255); // 1-255
       this.deviceId = deviceId;
@@ -289,11 +305,31 @@ export class ChatterController {
         bandHandshake: true,
       }));
       this.worker.chatterStart(deviceId);
-      await this.worker.startListening(s.micGain, s.selectedInputId, s.selectedInputLabel);
+      chatterStartSent = true;
+      await this.withTimeout(
+        this.worker.startListening(s.micGain, s.selectedInputId, s.selectedInputLabel),
+        JOIN_MIC_TIMEOUT_MS,
+        'timed out waiting for microphone permission',
+      );
       this.rxArmed = true;
 
       setState({ chatterOn: true, chatterDeviceId: deviceId, chatterError: null });
       this.room.start();
+    } catch (err) {
+      // Undo whatever partial setup this attempt performed — a failed/hung
+      // join must leave the store looking exactly like "never joined", not
+      // half-joined with the worker's chatter mode silently still running.
+      if (chatterStartSent) this.worker.chatterStop();
+      this.rxArmed = false;
+      this.deviceId = 0;
+      this.deps.deviceId = 0;
+      const reason = err instanceof Error ? err.message : String(err);
+      setState({
+        chatterOn: false,
+        chatterState: 'off',
+        chatterDeviceId: 0,
+        chatterError: `could not join: ${reason}`,
+      });
     } finally {
       this.joining = false;
     }
@@ -306,14 +342,22 @@ export class ChatterController {
     if (this.leaving || !getState().chatterOn) return;
     this.leaving = true;
     try {
-      this.room.stop(); // fires a best-effort BYE via a fire-and-forget deps.sendMessage
-      // Give that BYE's encode+play chain a real chance to run before tearing
-      // chatter mode down — chatterStop()/stopListening() below would
-      // otherwise race it out from under it structurally (every time, not just
-      // occasionally), since stop() doesn't await its own sendMessage call.
-      await Promise.race([this.lastPlayback, this.timeout(LEAVE_PLAYBACK_TIMEOUT_MS)]);
-      this.worker.chatterStop();
-      this.worker.stopListening();
+      let teardownErr: unknown;
+      try {
+        this.room.stop(); // fires a best-effort BYE via a fire-and-forget deps.sendMessage
+        // Give that BYE's encode+play chain a real chance to run before tearing
+        // chatter mode down — chatterStop()/stopListening() below would
+        // otherwise race it out from under it structurally (every time, not just
+        // occasionally), since stop() doesn't await its own sendMessage call.
+        await Promise.race([this.lastPlayback, this.timeout(LEAVE_PLAYBACK_TIMEOUT_MS)]);
+        this.worker.chatterStop();
+        this.worker.stopListening();
+      } catch (err) {
+        // Teardown failing partway through must not wedge the store in a
+        // half-joined state — fall through to the same not-joined reset the
+        // happy path takes, just with an error recorded for the UI.
+        teardownErr = err;
+      }
       this.rxArmed = false;
       this.pendingFile = null;
       setState({
@@ -321,7 +365,9 @@ export class ChatterController {
         chatterState: 'off',
         chatterDeviceId: 0,
         chatterMembers: [],
-        chatterError: null,
+        chatterError: teardownErr
+          ? `leave failed: ${teardownErr instanceof Error ? teardownErr.message : String(teardownErr)}`
+          : null,
       });
     } finally {
       this.leaving = false;
@@ -403,6 +449,24 @@ export class ChatterController {
 
   private timeout(delayMs: number): Promise<void> {
     return new Promise((resolve) => { this.schedule(resolve, delayMs); });
+  }
+
+  /** Races `p` against a `delayMs` timer; if the timer wins, rejects with
+   *  `message` instead of leaving the caller awaiting a promise that may
+   *  never settle (e.g. `startListening()` while a mic permission prompt
+   *  sits unanswered). Cancels the timer once either side settles, so a
+   *  normal resolve/reject doesn't leave a stray timer armed in the fake
+   *  clock (or a real one) for the rest of the run. */
+  private async withTimeout<T>(p: Promise<T>, delayMs: number, message: string): Promise<T> {
+    let cancel: (() => void) | undefined;
+    const timedOut = new Promise<never>((_resolve, reject) => {
+      cancel = this.schedule(() => reject(new Error(message)), delayMs);
+    });
+    try {
+      return await Promise.race([p, timedOut]);
+    } finally {
+      cancel?.();
+    }
   }
 
   /** Ensure the RX pipeline is running before an incoming transfer's band
