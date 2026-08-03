@@ -6,6 +6,7 @@
 import { useSyncExternalStore } from 'react';
 import { DEFAULT_CONFIG, OFDM_DEFAULTS, OFDM_TUNING } from '../modem/types';
 import type { Run } from '../modem/protocol/captureTypes';
+import type { RoomState } from '../modem/chatter/roomProtocol';
 
 // ─── State Shape ──────────────────────────────────────
 
@@ -227,6 +228,18 @@ export interface AppState {
    * (CONFIG_FIELDS), including the per-device calibration gains.
    */
   configPresets: Record<string, Partial<AppState>>;
+
+  // ─── Chatter room (see chatterController.ts / roomProtocol.ts) ───
+  /** True once the operator has joined the room (until leaveRoom). */
+  chatterOn: boolean;
+  /** Mirrors RoomProtocol.state; 'off' when not in a room at all. */
+  chatterState: RoomState | 'off';
+  /** This device's randomly-picked room id (1-255); 0 until joined. */
+  chatterDeviceId: number;
+  /** Room roster, refreshed on every RoomProtocol state change. */
+  chatterMembers: { deviceId: number; lastHeardMs: number; claimLowHz?: number; claimHighHz?: number }[];
+  /** Last RoomProtocol error, surfaced to the panel; null when clean. */
+  chatterError: string | null;
 }
 
 const defaultDecoder: DecoderInfo = {
@@ -307,6 +320,11 @@ const defaultState: AppState = {
   speedTestMode: 'hunt',
   bandHandshake: false,
   configPresets: {},
+  chatterOn: false,
+  chatterState: 'off',
+  chatterDeviceId: 0,
+  chatterMembers: [],
+  chatterError: null,
 };
 
 // ─── Store ────────────────────────────────────────────
