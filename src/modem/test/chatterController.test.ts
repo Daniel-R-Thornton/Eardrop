@@ -23,13 +23,19 @@ function makeClock() {
   const tick = async (ms: number) => {
     const end = t + ms;
     for (;;) {
+      // Drain microtasks BEFORE checking what's due — ChatterController's
+      // playAndMute chains encode -> play -> scheduled echo-tail unmute
+      // across several promise hops with NO synchronous schedule() call at
+      // the start (unlike roomProtocol.test.ts's deps, which call `timer()`
+      // directly inside start()/onProbeHeard). Without this pre-drain, a
+      // chain's first schedule() call can still be microtask-hops away when
+      // the due-check runs, so it's invisible this round and its timer ends
+      // up registered relative to `t` AFTER we've already jumped `t` to
+      // `end` at the bottom of the loop — permanently missing its window.
+      for (let i = 0; i < 10; i++) await Promise.resolve();
       const due = timers.filter((x) => !x.dead && x.at <= end).sort((a, b) => a.at - b.at)[0];
       if (!due) break;
       t = due.at; due.dead = true; due.fn();
-      // Drain a deeper microtask chain than roomProtocol.test.ts's harness
-      // needs — ChatterController's playAndMute chains encode -> play ->
-      // scheduled echo-tail unmute across several promise hops per firing.
-      for (let i = 0; i < 10; i++) await Promise.resolve();
     }
     t = end;
   };
@@ -197,13 +203,45 @@ describe('ChatterController', () => {
     const clock = makeClock();
     const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
 
-    await controller.joinRoom();
-    await controller.leaveRoom();
+    await controller.joinRoom(); // state 'listening' (not 'cold') — stop() below fires a BYE
+    const leavePromise = controller.leaveRoom();
+    await clock.tick(200); // let the BYE's own echo-tail timer settle leaveRoom's wait
+    await leavePromise;
 
     expect(worker.calls).toContain('chatterStop');
     expect(worker.calls).toContain('stopListening');
     expect(getState().chatterOn).toBe(false);
     expect(getState().chatterState).toBe('off');
     expect(getState().chatterDeviceId).toBe(0);
+  });
+
+  it('leaveRoom waits for the in-flight BYE playback before tearing chatter mode down', async () => {
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
+
+    await controller.joinRoom();
+    await clock.tick(
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200,
+    );
+    expect(getState().chatterState).toBe('idle');
+
+    const leavePromise = controller.leaveRoom();
+    await Promise.resolve(); // let stop()'s synchronous fire-and-forget sendMessage reach encodeControl
+
+    expect(worker.calls).toContain(`encodeControl:${ControlType.Bye}`);
+    // The BYE's encode+play is still in flight (its echo-tail timer hasn't
+    // fired yet) — chatterStop must NOT have run yet, structurally, not by luck.
+    expect(worker.calls).not.toContain('chatterStop');
+
+    await clock.tick(MUTE_TAIL_MS + 50); // let the BYE playback's echo-tail timer fire
+    await leavePromise;
+
+    expect(worker.calls).toContain('chatterStop');
+    const byeIdx = worker.calls.indexOf(`encodeControl:${ControlType.Bye}`);
+    const stopIdx = worker.calls.indexOf('chatterStop');
+    expect(byeIdx).toBeGreaterThanOrEqual(0);
+    expect(byeIdx).toBeLessThan(stopIdx);
   });
 });

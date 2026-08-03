@@ -40,11 +40,20 @@ const DURATION_FLOOR_MS = 2000;
 /** Worst-case per-symbol bit budget (floor settings: 4 tones, QPSK). */
 const FLOOR_BITS_PER_SYMBOL = 4 * 2;
 
+// TODO: this heuristic hasn't been checked against a real end-to-end
+// transfer's actual duration yet — only reasoned about as "conservative
+// enough". Verify on the bench once Task 7's panel makes a manual chatter
+// transfer possible, and tighten the fudge factor if it's wildly loose.
 function estimateDurationMs(fileBytes: number, symbolsPerSec: number): number {
   const bytesPerSec = (FLOOR_BITS_PER_SYMBOL * symbolsPerSec) / 8;
   if (bytesPerSec <= 0) return DURATION_FLOOR_MS;
   return Math.ceil((fileBytes / bytesPerSec) * 1000 * DURATION_FUDGE) + DURATION_FLOOR_MS;
 }
+
+/** Cap on how long `leaveRoom` waits for an in-flight own-playback (typically
+ *  `stop()`'s best-effort BYE) before tearing chatter mode down anyway — a
+ *  wedged encode/play must not make leaveRoom hang forever. */
+const LEAVE_PLAYBACK_TIMEOUT_MS = 2500;
 
 /** The subset of AudioPlayer's surface ChatterController needs — lets tests
  *  supply a fake without touching AudioContext. */
@@ -109,6 +118,10 @@ export class ChatterController {
   private deviceId = 0;
   private rxArmed = false;
   private pendingFile: { fileName: string; data: Uint8Array } | null = null;
+  /** The most recently started own-playback (probe/control/file), settled
+   *  (never rejected) — lets `leaveRoom` wait out `stop()`'s fire-and-forget
+   *  BYE before tearing chatter mode down out from under it. */
+  private lastPlayback: Promise<void> = Promise.resolve();
 
   constructor(private readonly worker: ModemWorkerHandle, options: ChatterControllerOptions = {}) {
     this.player = options.player ?? new AudioPlayer();
@@ -141,6 +154,10 @@ export class ChatterController {
     };
     this.room = new RoomProtocol(this.deps);
 
+    // Subscribed once, for the controller's whole lifetime — this class
+    // assumes one ChatterController per app session (never re-constructed
+    // per join/leave cycle), so there's no matching `off()`/teardown here;
+    // joinRoom/leaveRoom only start and stop the ROOM, not these listeners.
     worker.on('probeHeard', (ev) => this.room.onProbeHeard(ev.deviceId, ev.grid));
     worker.on('controlMessage', (ev) => {
       this.room.onMessage({
@@ -180,7 +197,12 @@ export class ChatterController {
 
   /** leave the room: stop the state machine, tear down the worker's chatter mode */
   async leaveRoom(): Promise<void> {
-    this.room.stop();
+    this.room.stop(); // fires a best-effort BYE via a fire-and-forget deps.sendMessage
+    // Give that BYE's encode+play chain a real chance to run before tearing
+    // chatter mode down — chatterStop()/stopListening() below would
+    // otherwise race it out from under it structurally (every time, not just
+    // occasionally), since stop() doesn't await its own sendMessage call.
+    await Promise.race([this.lastPlayback, this.timeout(LEAVE_PLAYBACK_TIMEOUT_MS)]);
     this.worker.chatterStop();
     this.worker.stopListening();
     this.rxArmed = false;
@@ -209,16 +231,28 @@ export class ChatterController {
 
   /** Mute RX for the duration of an own-playback (probe/control/file) plus a
    *  fixed echo tail, so the room's own speaker output is never demodulated
-   *  as if it were incoming. */
-  private async playAndMute(getAudio: () => Promise<{ samples: Float32Array; sampleRate: number }>): Promise<void> {
+   *  as if it were incoming. Tracks the attempt on `lastPlayback` (settled,
+   *  never rejected) so `leaveRoom` can wait one out; the returned promise
+   *  still rejects normally for callers (RoomProtocol's own catch blocks). */
+  private playAndMute(getAudio: () => Promise<{ samples: Float32Array; sampleRate: number }>): Promise<void> {
+    const attempt = this.doPlayAndMute(getAudio);
+    this.lastPlayback = attempt.catch(() => {});
+    return attempt;
+  }
+
+  private async doPlayAndMute(getAudio: () => Promise<{ samples: Float32Array; sampleRate: number }>): Promise<void> {
     const { samples, sampleRate } = await getAudio();
     this.worker.setRxMuted(true);
     try {
       await this.player.play(samples, sampleRate);
     } finally {
-      await new Promise<void>((resolve) => { this.schedule(resolve, MUTE_TAIL_MS); });
+      await this.timeout(MUTE_TAIL_MS);
       this.worker.setRxMuted(false);
     }
+  }
+
+  private timeout(delayMs: number): Promise<void> {
+    return new Promise((resolve) => { this.schedule(resolve, delayMs); });
   }
 
   /** Ensure the RX pipeline is running before an incoming transfer's band
