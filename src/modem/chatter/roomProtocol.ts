@@ -117,6 +117,10 @@ export class RoomProtocol {
   private pendingSendFile: PendingFile | null = null;
   private activeFileParams: PendingFile | null = null;
   private readonly collectedReports = new Map<number, PeerReport>();
+  /** Probers a WELCOME reply chain is already in flight for — dedupes a
+   *  second `onProbeHeard` for the same device while the first reply
+   *  attempt is still waiting out its slot(s). */
+  private readonly pendingReplyTo = new Set<number>();
 
   constructor(private readonly deps: RoomDeps) {}
 
@@ -153,6 +157,7 @@ export class RoomProtocol {
     this.pendingSendFile = null;
     this.activeFileParams = null;
     this.collectedReports.clear();
+    this.pendingReplyTo.clear();
     this.setState('cold');
   }
 
@@ -172,8 +177,11 @@ export class RoomProtocol {
 
     // Only 'idle' carries reply duty — a probe heard mid-join or mid-rollcall
     // just refreshes the member table (simultaneous announce is a collision
-    // both sides retry naturally at the next roll call).
-    if (this._state === 'idle') {
+    // both sides retry naturally at the next roll call). Dedupe by prober:
+    // a repeat probe from the same device while its reply chain is still
+    // waiting out a slot must not start a second, redundant WELCOME chain.
+    if (this._state === 'idle' && !this.pendingReplyTo.has(deviceId)) {
+      this.pendingReplyTo.add(deviceId);
       this.scheduleReply(this.deps.now(), Array.from({ length: ROOM_TIMING.replySlots }, (_unused, i) => i), deviceId);
     }
   }
@@ -238,16 +246,23 @@ export class RoomProtocol {
     this.setState('listening');
     this.timer(ROOM_TIMING.listenMs, async () => {
       if (this._state !== 'listening') return;
-      const busy = await this.deps.isAirBusy();
-      if (this._state !== 'listening') return;
+      try {
+        const busy = await this.deps.isAirBusy();
+        if (this._state !== 'listening') return;
 
-      this.listenElapsedMs += ROOM_TIMING.listenMs;
-      if (busy && this.listenElapsedMs < ROOM_TIMING.listenCapMs) {
-        this.beginListening(purpose);
-        return;
+        this.listenElapsedMs += ROOM_TIMING.listenMs;
+        if (busy && this.listenElapsedMs < ROOM_TIMING.listenCapMs) {
+          this.beginListening(purpose);
+          return;
+        }
+        if (purpose === 'join') await this.beginAnnounceJoin();
+        else await this.beginAnnounceRollCall();
+      } catch (err) {
+        // A rejected dep (playProbe/isAirBusy/sendMessage) must not stall the
+        // machine mid-chain: route to this purpose's existing deadline
+        // destination — cold for the pre-join chain, idle for a roll call.
+        this.handleDepsError(err, purpose === 'join' ? 'cold' : 'idle');
       }
-      if (purpose === 'join') await this.beginAnnounceJoin();
-      else await this.beginAnnounceRollCall();
     });
   }
 
@@ -298,58 +313,83 @@ export class RoomProtocol {
     const fileParams = this.activeFileParams;
     if (!fileParams) return; // stop() cleared it mid-flight
 
-    await this.deps.sendMessage({
-      type: ControlType.FileComing,
-      senderId: this.deps.deviceId,
-      targetId: 0,
-      payload: packFileComing({
-        pilotFreqHz: settings.pilotFreqHz,
-        toneStartHz: settings.toneStartHz,
-        toneCount: settings.toneCount,
-        settleSymbols: OFDM_TUNING.trainingSettleSymbols,
-        fileBytes: fileParams.fileBytes,
-        durationMs: fileParams.durationMs,
-      }),
-    });
-    if (this._state !== 'collecting') return; // stale guard (e.g. stop() mid-await)
-
-    this.timer(ROOM_TIMING.fileComingLeadMs, () => {
-      if (this._state !== 'collecting') return;
-      this.deps.startFileTx(settings);
-      this.setState('sending');
-      this.timer(fileParams.durationMs + TRANSFER_TAIL_MARGIN_MS, () => {
-        if (this._state !== 'sending') return;
-        this.activeFileParams = null;
-        this.finishToIdle();
+    try {
+      await this.deps.sendMessage({
+        type: ControlType.FileComing,
+        senderId: this.deps.deviceId,
+        targetId: 0,
+        payload: packFileComing({
+          pilotFreqHz: settings.pilotFreqHz,
+          toneStartHz: settings.toneStartHz,
+          toneCount: settings.toneCount,
+          settleSymbols: OFDM_TUNING.trainingSettleSymbols,
+          fileBytes: fileParams.fileBytes,
+          durationMs: fileParams.durationMs,
+        }),
       });
-    });
+      if (this._state !== 'collecting') return; // stale guard (e.g. stop() mid-await)
+
+      this.timer(ROOM_TIMING.fileComingLeadMs, () => {
+        if (this._state !== 'collecting') return;
+        this.deps.startFileTx(settings);
+        this.setState('sending');
+        this.timer(fileParams.durationMs + TRANSFER_TAIL_MARGIN_MS, () => {
+          if (this._state !== 'sending') return;
+          this.activeFileParams = null;
+          this.finishToIdle();
+        });
+      });
+    } catch (err) {
+      // sendMessage rejected (e.g. audio glitch mid-broadcast) — this is a
+      // roll call in progress, so the existing zero-report deadline
+      // destination (idle) is the right fallback, not a stuck 'collecting'.
+      this.handleDepsError(err, 'idle');
+    }
   }
 
   // ---- reply-to-probe: slotted, carrier-sensed, re-rolling among later slots ----
 
   private scheduleReply(baseTimeMs: number, candidateSlots: number[], proberId: number): void {
-    if (candidateSlots.length === 0) return; // give up — no slot left to try
+    if (candidateSlots.length === 0) {
+      this.pendingReplyTo.delete(proberId); // give up — no slot left to try
+      return;
+    }
     const idx = Math.floor(this.deps.rng() * candidateSlots.length);
     const slot = candidateSlots[idx];
     const laterSlots = candidateSlots.filter((s) => s > slot);
     const delay = Math.max(0, baseTimeMs + slot * ROOM_TIMING.replySlotMs - this.deps.now());
 
     this.timer(delay, async () => {
-      if (this._state !== 'idle') return;
-      const busy = await this.deps.isAirBusy();
-      if (this._state !== 'idle') return;
-
-      if (busy) {
-        this.scheduleReply(baseTimeMs, laterSlots, proberId);
+      if (this._state !== 'idle') {
+        this.pendingReplyTo.delete(proberId);
         return;
       }
-      const heardGrid = this._members.get(proberId)?.heardGrid ?? [];
-      await this.deps.sendMessage({
-        type: ControlType.Welcome,
-        senderId: this.deps.deviceId,
-        targetId: proberId,
-        payload: packWelcome({ claim: DEFAULT_CLAIM, grid: heardGrid }),
-      });
+      try {
+        const busy = await this.deps.isAirBusy();
+        if (this._state !== 'idle') {
+          this.pendingReplyTo.delete(proberId);
+          return;
+        }
+
+        if (busy) {
+          this.scheduleReply(baseTimeMs, laterSlots, proberId); // still pending — chain continues
+          return;
+        }
+        const heardGrid = this._members.get(proberId)?.heardGrid ?? [];
+        await this.deps.sendMessage({
+          type: ControlType.Welcome,
+          senderId: this.deps.deviceId,
+          targetId: proberId,
+          payload: packWelcome({ claim: DEFAULT_CLAIM, grid: heardGrid }),
+        });
+        this.pendingReplyTo.delete(proberId);
+      } catch (err) {
+        // isAirBusy/sendMessage rejected — we're already 'idle', so there's
+        // no state to unwind, just surface the error and stop dedupe-blocking
+        // this prober.
+        this.pendingReplyTo.delete(proberId);
+        this._lastError = err instanceof Error ? err.message : String(err);
+      }
     });
   }
 
@@ -361,6 +401,23 @@ export class RoomProtocol {
       const queued = this.pendingSendFile;
       this.pendingSendFile = null;
       this.beginRollCall(queued);
+    }
+  }
+
+  /** A rejected dep promise (playProbe/sendMessage/isAirBusy) must not stall
+   *  the machine mid-chain — route it through the same deadline destination
+   *  its state would have used on success, recording why for the UI. */
+  private handleDepsError(err: unknown, fallback: 'idle' | 'cold'): void {
+    this._lastError = err instanceof Error ? err.message : String(err);
+    this.collectedReports.clear();
+    if (fallback === 'cold') {
+      this.pendingSendFile = null;
+      this.activeFileParams = null;
+      this.pendingReplyTo.clear();
+      this.setState('cold');
+    } else {
+      this.activeFileParams = null;
+      this.finishToIdle();
     }
   }
 

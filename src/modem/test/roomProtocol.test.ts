@@ -3,7 +3,10 @@ import { RoomProtocol, ROOM_TIMING } from '../chatter/roomProtocol';
 import { ControlType, packReport, packWelcome, packFileComing } from '../protocol/controlFrame';
 
 /** Manual clock + timer wheel so every test is deterministic. */
-function makeHarness(deviceId: number, opts: { busy?: () => boolean } = {}) {
+function makeHarness(
+  deviceId: number,
+  opts: { busy?: () => boolean; playProbe?: () => Promise<void> } = {},
+) {
   let t = 0;
   const timers: { at: number; fn: () => void; dead: boolean }[] = [];
   const sent: any[] = [];
@@ -17,7 +20,7 @@ function makeHarness(deviceId: number, opts: { busy?: () => boolean } = {}) {
       timers.push(rec);
       return () => { rec.dead = true; };
     },
-    playProbe: async () => { calls.push('probe'); },
+    playProbe: opts.playProbe ?? (async () => { calls.push('probe'); }),
     sendMessage: async (m: any) => { sent.push(m); },
     isAirBusy: async () => opts.busy?.() ?? false,
     startFileTx: () => calls.push('fileTx'),
@@ -125,5 +128,44 @@ describe('room protocol', () => {
     expect(h.room.state).toBe('cold');
     await h.tick(60000); // nothing should fire/throw
     expect(h.room.state).toBe('cold');
+  });
+
+  it('a rejected playProbe during join is caught and routes to cold with lastError (no unhandled rejection)', async () => {
+    const h = makeHarness(1, { playProbe: async () => { throw new Error('audio glitch'); } });
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + 100);
+    expect(h.room.state).toBe('cold');
+    expect(h.room.lastError).toMatch(/audio glitch/);
+  });
+
+  it('a rejected playProbe during a roll call is caught and routes to idle with lastError', async () => {
+    // First playProbe (join's announce) succeeds so the room reaches idle;
+    // the second (the roll call's own announce) rejects, exercising the
+    // 'rollCall' -> idle branch of the same catch as the join test above.
+    let probeCalls = 0;
+    const h = makeHarness(1, {
+      playProbe: async () => {
+        probeCalls += 1;
+        if (probeCalls > 1) throw new Error('audio glitch');
+      },
+    });
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    expect(h.room.state).toBe('idle');
+
+    h.room.sendFile(1000, 30000);
+    await h.tick(ROOM_TIMING.listenMs + 100);
+    expect(h.room.state).toBe('idle');
+    expect(h.room.lastError).toMatch(/audio glitch/);
+  });
+
+  it('onProbeHeard twice for the same prober while idle only schedules one WELCOME chain', async () => {
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    h.room.onProbeHeard(9, flatGrid);
+    h.room.onProbeHeard(9, flatGrid); // duplicate, same prober, reply chain already pending
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 100);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
 });
