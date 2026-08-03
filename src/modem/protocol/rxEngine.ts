@@ -233,9 +233,22 @@ export class RxEngine {
    * garbage/false-lock frame must not permanently disarm it (see below).
    */
   private ofdmWindowsSinceDetect = 0;
-  /** Watchdog: reset to WAITING if no frame within this many windows (~15 s at any rate) */
+  /**
+   * Watchdog: reset to WAITING if no frame within this many windows.
+   *
+   * ~15 s for a file transfer, where frames are long and a spurious reset
+   * would abandon a live decode. The chatter control listener is the opposite
+   * case: a whole control message is about 3.5 s (preamble + at most a
+   * 48-byte payload), it is one persistent engine for the entire session, and
+   * anything that syncs it without completing makes it deaf until the
+   * watchdog fires. At 15 s that is most of a room exchange — hardware showed
+   * a listener burning 601 windows and missing the FILE_COMING that followed.
+   * 5 s is comfortably longer than any real message and short enough that a
+   * false sync costs one reply rather than the whole transfer.
+   */
   private get OFDM_WATCHDOG_WINDOWS() {
-    return Math.round(15000 / (OFDM_SYMBOL_MS + OFDM_CP_MS));
+    const ms = this.onControlMessage ? 5000 : 15000;
+    return Math.round(ms / (OFDM_SYMBOL_MS + OFDM_CP_MS));
   }
 
   // PLL
