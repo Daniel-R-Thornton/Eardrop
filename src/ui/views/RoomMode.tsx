@@ -146,6 +146,8 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
   // never reaches the expected state (see PENDING_TIMEOUT_MS doc above).
   const [pending, setPending] = useState<'join' | 'leave' | null>(null);
   const [localNotice, setLocalNotice] = useState<string | null>(null);
+  /** True while a file is being dragged over the mode — drives the drop overlay. */
+  const [dragging, setDragging] = useState(false);
   const wasOn = useRef(s.chatterOn);
   useEffect(() => {
     if (wasOn.current !== s.chatterOn) {
@@ -374,8 +376,53 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
   const joinLeaveLabel = pending === 'join' ? 'joining…' : pending === 'leave' ? 'leaving…' : s.chatterOn ? '⏏ LEAVE ROOM' : '☎ JOIN ROOM';
   const notice = s.chatterError ?? localNotice;
 
+  /** Broadcast a dropped/picked file. Goes out as the same `eardrop-file`
+   *  event the bench's TxPanel dispatches, so app.ts's existing routing —
+   *  which already sends to the room when chatterOn — stays the one place
+   *  that decides what a chosen file means. */
+  const offerFile = (f: File | undefined) => {
+    setDragging(false);
+    if (!f) return;
+    // Say why nothing happened. Silently swallowing the drop when the room
+    // isn't ready is indistinguishable from a broken drop target.
+    if (!s.chatterOn) {
+      setLocalNotice('Join the room before broadcasting a file.');
+      return;
+    }
+    if (s.chatterState !== 'idle') {
+      setLocalNotice(`Busy (${s.chatterState}) — wait until the room is idle, then drop again.`);
+      return;
+    }
+    setLocalNotice(null);
+    window.dispatchEvent(new CustomEvent('eardrop-file', { detail: { file: f } }));
+  };
+
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0 }}>
+    // Room mode replaces the whole bench, TxPanel's drop zone included — so
+    // the mode itself has to accept files, or the "drop a file" affordance is
+    // pointing at nothing. dragover must preventDefault or drop never fires.
+    <div
+      onDragOver={(e) => { e.preventDefault(); if (!dragging) setDragging(true); }}
+      onDragLeave={(e) => { if (e.currentTarget === e.target) setDragging(false); }}
+      onDrop={(e) => { e.preventDefault(); offerFile(e.dataTransfer.files?.[0]); }}
+      style={{ display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0, position: 'relative' }}
+    >
+      <input
+        id="roommode-file"
+        type="file"
+        style={{ display: 'none' }}
+        onChange={(e) => { offerFile(e.target.files?.[0]); e.target.value = ''; }}
+      />
+      {dragging && (
+        <div style={{
+          position: 'absolute', inset: 0, zIndex: 5, pointerEvents: 'none',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: 'rgba(0,0,0,0.55)', border: `2px dashed ${T.phosphor}`, borderRadius: 6,
+          fontFamily: T.mono, fontSize: 16, color: T.phosphor, letterSpacing: 1,
+        }}>
+          {s.chatterOn ? 'release to broadcast to the room' : 'join the room first to broadcast'}
+        </div>
+      )}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10, flex: '0 0 auto' }}>
         <span style={{ fontFamily: T.mono, fontSize: 15, letterSpacing: 1, color: T.panelInk }}>ROOM MODE — nodes &amp; packets</span>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -528,8 +575,14 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
                 </ul>
               )}
               {s.chatterOn && s.chatterState === 'idle' && (
-                <div style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk, opacity: 0.6, marginTop: 8 }}>
-                  drop a file anywhere to broadcast
+                <div
+                  onClick={() => document.getElementById('roommode-file')?.click()}
+                  style={{
+                    fontFamily: T.mono, fontSize: 11, color: T.panelInk, opacity: 0.6,
+                    marginTop: 8, cursor: 'pointer', textDecoration: 'underline dotted',
+                  }}
+                >
+                  drop a file anywhere to broadcast — or click to browse
                 </div>
               )}
             </div>
