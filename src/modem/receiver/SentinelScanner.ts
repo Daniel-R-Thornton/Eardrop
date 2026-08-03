@@ -36,7 +36,22 @@ export class SentinelScanner {
   private bitsCollected = 0;
 
   private readonly sentinel = 0xe79fe7;
-  private readonly collectBytes = FRAME_SIZE - 3; // 76 bytes after 3-byte sentinel
+  /** Bytes collected after the 3-byte sentinel (defaults to a full atomic frame).
+   *  Mutable so `continueCollecting` can retarget it for a second, contiguous
+   *  collection (see below) — otherwise fixed for the scanner's lifetime. */
+  private collectBytes: number;
+  /** `collectBytes`'s original (header) value — restored after each
+   *  `continueCollecting` run completes, so the NEXT sentinel hit collects a
+   *  header again rather than another payload-sized run. */
+  private readonly headerCollectBytes: number;
+  /**
+   * True while collecting the SECOND (extra) run requested via
+   * `continueCollecting` — e.g. a control message's payload wire bytes,
+   * collected right after its header with no new sentinel in between. Fires
+   * `onExtraFrame` (raw bytes, no synthesized sentinel prefix) instead of
+   * `onFrame` when that run completes.
+   */
+  private collectingExtra = false;
 
   /** Hamming distance threshold for sentinel matching (allows bit errors) */
   private readonly sentinelHammingThreshold = 2;
@@ -49,15 +64,42 @@ export class SentinelScanner {
   private maxRegHistory = 64;
 
   onFrame: ((frameBytes: Uint8Array) => void) | null = null;
+  /** Fires for a `continueCollecting` run — see `collectingExtra`. */
+  onExtraFrame: ((bytes: Uint8Array) => void) | null = null;
+
+  /** @param collectBytes bytes to collect after the sentinel — defaults to a full atomic frame */
+  constructor(collectBytes: number = FRAME_SIZE - 3) {
+    this.collectBytes = collectBytes;
+    this.headerCollectBytes = collectBytes;
+  }
 
   reset(): void {
     this.shiftReg = 0;
     this.bitCount = 0;
     this.collecting = false;
+    this.collectingExtra = false;
     this.byteAccum = 0;
     this.byteBits = 0;
     this.buf = [];
     this.bitsCollected = 0;
+    // A reset mid-payload-collection must not leave collectBytes stuck at
+    // the payload size — the next sentinel hit is always a header.
+    this.collectBytes = this.headerCollectBytes;
+  }
+
+  /**
+   * Call from within `onFrame` to keep collecting `byteCount` MORE bytes
+   * immediately (no new sentinel search) instead of returning to scanning —
+   * e.g. a control message's BCH header (`onFrame`) telling the scanner its
+   * payload length, so the payload wire bytes (`onExtraFrame`) are collected
+   * right after with no sentinel of their own. The completed run always
+   * starts from an empty buffer (the caller's `buf = []` right after
+   * `onFrame` returns), so `collectBytes` can simply be retargeted here.
+   */
+  continueCollecting(byteCount: number): void {
+    this.collectBytes = byteCount;
+    this.collecting = true;
+    this.collectingExtra = true;
   }
 
   feedByte(byte: number): void {
@@ -96,16 +138,24 @@ export class SentinelScanner {
 
       if (this.buf.length >= this.collectBytes) {
         this.collecting = false;
-        const fullFrame = new Uint8Array(FRAME_SIZE);
-        fullFrame[0] = 0xe7;
-        fullFrame[1] = 0x9f;
-        fullFrame[2] = 0xe7;
-        for (let i = 0; i < this.buf.length && i < FRAME_SIZE - 3; i++) {
-          fullFrame[3 + i] = this.buf[i];
-        }
-        dlog('RX-SCAN', { frame: this.buf.length });
-        if (this.onFrame) {
-          this.onFrame(fullFrame);
+        if (this.collectingExtra) {
+          this.collectingExtra = false;
+          dlog('RX-SCAN', { extraFrame: this.buf.length });
+          const extraBytes = new Uint8Array(this.buf.slice(0, this.collectBytes));
+          this.collectBytes = this.headerCollectBytes; // next sentinel hit collects a header again
+          if (this.onExtraFrame) this.onExtraFrame(extraBytes);
+        } else {
+          const fullFrame = new Uint8Array(3 + this.collectBytes);
+          fullFrame[0] = 0xe7;
+          fullFrame[1] = 0x9f;
+          fullFrame[2] = 0xe7;
+          for (let i = 0; i < this.buf.length && i < this.collectBytes; i++) {
+            fullFrame[3 + i] = this.buf[i];
+          }
+          dlog('RX-SCAN', { frame: this.buf.length });
+          if (this.onFrame) {
+            this.onFrame(fullFrame);
+          }
         }
         this.byteLog.push({ byte: 0x00, phase: 'FRAME', bitOffset: this.bitCount });
         if (this.byteLog.length > this.maxByteLog) this.byteLog.shift();

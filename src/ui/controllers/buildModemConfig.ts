@@ -34,11 +34,14 @@ export interface ModemUiConfig {
   /** OFDM: Hz above the pilot where the first data tone sits. Leave undefined
    *  for the default (OFDM_DEFAULTS.toneStartHz = 2000Hz, today's behavior). */
   toneStartHz?: number;
+  /** Band handshake: preamble+profile on the fixed OFDM_HANDSHAKE band; the
+   *  v2 profile announces this config's band and both sides hop. */
+  bandHandshake?: boolean;
 }
 
 export function buildModemConfig(
   ui: ModemUiConfig,
-): ModemConfig & { useOFDM: boolean; emitLinkProfile?: boolean; qamMap?: number[]; qamScaleOverride?: number; toneGains?: number[];
+): ModemConfig & { useOFDM: boolean; emitLinkProfile?: boolean; bandHandshake?: boolean; qamMap?: number[]; qamScaleOverride?: number; toneGains?: number[];
   trainingSettleSymbols?: number } {
   let pilot = ui.pilotFreqHz || DEFAULT_CONFIG.pilotFreqHz;
 
@@ -87,7 +90,7 @@ export function buildModemConfig(
   const bits = ui.dataQamBits ?? 2;
   const order = bits === 4 ? 1 : bits === 6 ? 2 : 0;
 
-  const config: ModemConfig & { useOFDM: boolean; emitLinkProfile?: boolean; qamMap?: number[]; qamScaleOverride?: number; toneGains?: number[];
+  const config: ModemConfig & { useOFDM: boolean; emitLinkProfile?: boolean; bandHandshake?: boolean; qamMap?: number[]; qamScaleOverride?: number; toneGains?: number[];
   trainingSettleSymbols?: number } = {
     ...DEFAULT_CONFIG,
     sampleRate: ui.useOFDM ? ui.hwSampleRate : DEFAULT_CONFIG.sampleRate,
@@ -104,6 +107,16 @@ export function buildModemConfig(
   if (ui.useOFDM && order > 0) {
     config.emitLinkProfile = true;
     config.qamMap = new Array(toneCount).fill(order);
+  }
+
+  // Band handshake: an announcement segment (preamble + band card, see
+  // bandCard.ts) on the fixed handshake band, then the normal transmission in
+  // this config's band. TX reads the flag to emit the segment; RX reads it to
+  // LISTEN on the handshake band and retune from the card. No forced link
+  // profile — the target-band stream is byte-identical to a flag-off send,
+  // which only carries a profile when the qamMap needs one (order > 0 above).
+  if (ui.useOFDM && ui.bandHandshake === true) {
+    config.bandHandshake = true;
   }
 
   if (ui.useOFDM && typeof ui.qamScaleOverride === 'number' && Number.isFinite(ui.qamScaleOverride)) {

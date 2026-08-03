@@ -24,6 +24,7 @@ Press Ctrl+Shift+D to open the debug panel.
 - Uses a single worker entrypoint, `modem.worker.ts`, backed by `ModemService`.
 - Exposes live telemetry, tone meters, spectrum views, constellation plots, and frame/debug logs in the UI.
 - Includes a self-test and channel-simulator path for loopback and impairment testing.
+- Includes a chatter room protocol (`src/modem/chatter/`): devices join by announcing a probe burst over the air, run a pre-send roll call to measure the live channel to every listener, then negotiate band/tone/QAM settings before handing off to the existing band-handshake file transfer.
 
 ## Current architecture
 

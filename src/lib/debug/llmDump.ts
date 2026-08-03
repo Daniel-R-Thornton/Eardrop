@@ -179,6 +179,12 @@ function compressOne(rec: DlogRecord): string | null {
 
   switch (rec.tag) {
     case 'TX-OFDM': {
+      // Band-handshake rows first — the card event also carries tones+pilot
+      // and would otherwise be swallowed by the C-row rule below.
+      if (has('bandCard')) {
+        return `HC ${n(asNum(f.pilot))} ${n(asNum(f.toneStart))} ${asNum(f.tones)} ${asNum(f.settle)}`;
+      }
+      if (has('handshakePreambleMs')) return `HP ${asNum(f.handshakePreambleMs)}`;
       if (has('tones') && has('pilot')) {
         // Two different callers use `tones`: the tone LIST, and a plain COUNT on
         // the enable line. Treating a count as a one-element list read as
@@ -206,6 +212,13 @@ function compressOne(rec: DlogRecord): string | null {
       if (has('toneCountChange')) return `!TCC ${asNum(f.from)}->${asNum(f.to)}`;
       if (has('badToneCount')) return `!TCB ${asNum(f.badToneCount)} ${asNum(f.using)}`;
       if (has('adaptingToneCount')) return `TCA ${asNum(f.newCount)}`;
+      // Band handshake (card mode) — listen, card decode, hop, bad card.
+      if (has('handshakeBand')) return `HL ${n(asNum(f.pilot))}`;
+      if (has('card')) {
+        return `HR ${n(asNum(f.pilot))} ${n(asNum(f.toneStart))} ${asNum(f.tones)} ${asNum(f.settle)}`;
+      }
+      if (has('cardHop')) return `HH ${n(asNum(f.pilot))} ${asNum(f.tones)} ${asNum(f.discard)}`;
+      if (has('cardInvalid')) return '!HC';
       return null;
     }
 

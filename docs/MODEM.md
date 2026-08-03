@@ -173,6 +173,160 @@ The 5 ms CP provides a 240-sample timing guard at 48 kHz. At 50 ppm clock drift 
 
 ---
 
+## Chatter room protocol
+
+Chatter turns Eardrop's one-way send into a small acoustic "room": any device
+joins by announcing itself over the air, every device keeps a table of who
+else is present, and any member can broadcast a file to all other members.
+It rides on top of the fixed-band handshake (band card + `HandshakeReceiver`)
+above — the file transfer itself is unchanged; chatter only negotiates WHO is
+present and WHAT settings to use before that handshake fires. Half duplex,
+strict turn-taking, no clock sync, no persistent identity, no heartbeats:
+membership is advisory and re-measured fresh at every send.
+
+### Probe burst
+
+`src/modem/protocol/probeBurst.ts` builds the one wire object every device
+uses both to join and to run a pre-send roll call. Timing is measured from
+the chirp's own start (the "anchor"), preceded by a 100 ms silent lead-in
+(buffer padding only, not part of the timed layout):
+
+```text
+[100 ms silence][down-chirp 150 ms][gap 50 ms][coarse sweep ~2.9 s][gap 50 ms][12 × 40 ms ID slots]
+```
+
+| Constant | Value |
+|----------|-------|
+| Anchor chirp | 4400 → 1200 Hz down-chirp, 150 ms |
+| `PROBE_LAYOUT.gapMs` | 50 ms (both gaps) |
+| `PROBE_LAYOUT.idSlotMs` | 40 ms per slot |
+| `PROBE_LAYOUT.idSlots` | 12 |
+| `CHATTER_SWEEP` | 1500–7800 Hz, 100 Hz steps, 45 ms/step (~2.9 s), amplitude 0.02 |
+| ID pulse tone | 2500 Hz, 25 ms raised-cosine burst, amplitude 0.15 |
+| `REPORT_GRID` | 1500–7800 Hz, 64 points, 100 Hz spacing — the fixed grid every sweep report is resampled onto |
+
+The chirp direction is deliberately reversed from the modem's own low→high
+sync chirp, so a probe listener correlating against it cannot false-trigger
+on ordinary data traffic.
+
+The 12 ID slots carry `V = (deviceId << 4) | crc4(deviceId)`, one bit per
+slot, **LSB-first** (slot 0 = the CRC's own LSB, slot 11 = the device ID's
+MSB) — deliberately not a MSB/first-split of the two fields, so decoding
+never depends on either field's own endpoint bit. Each slot is on/off keyed:
+tone present = 1, absent = 0, decided per-burst by a **largest-gap bimodal
+threshold** — the 12 slot magnitudes are sorted and split at whichever
+adjacent gap is largest, rather than compared to a fixed multiple of their
+median. That handles any on/off ratio from 1-in-12 to 11-in-12, where a
+fixed-threshold split breaks down once half or more of the bits are 1. CRC-4
+is poly `x^4+x+1`, MSB-first, non-reflected, over the 8 ID bits.
+
+### Control message frame
+
+`src/modem/protocol/controlFrame.ts` defines small room-control messages that
+ride the fixed `OFDM_HANDSHAKE` band (8 QPSK tones) — the same band and
+modulation path the band card already uses, distinguished by magic byte:
+
+```text
+SENTINEL (3 B) + BCH(63,30)×3 header (24 B) = 27 B  [CONTROL_HEADER_WIRE]
++ payload: raw bytes + CRC-16 trailer, chunked 3 B → BCH(63,30) 8 B per chunk
+```
+
+Header layout (9 raw bytes, BCH-chunked identically to the band card):
+
+| Byte | Field |
+|------|-------|
+| 0 | `CONTROL_MAGIC` = `0xC7` |
+| 1 | `ControlType` |
+| 2 | senderId (1–255) |
+| 3 | targetId (0 = broadcast) |
+| 4 | payloadLen (raw bytes, 0–48) |
+| 5 | CRC-8 over bytes 0–4 |
+| 6–8 | reserved (0) |
+
+`CONTROL_PAYLOAD_MAX` is 48 raw bytes. Message types:
+
+| Type | Value | Payload | Purpose |
+|------|-------|---------|---------|
+| `Welcome` | 1 | `BestRangeClaim` (3 B: lowBin, highBin, maxQamOrder) + quantized report grid (32 B) = 35 B | reply to a join probe |
+| `Report` | 2 | quantized report grid (32 B) | roll-call ack |
+| `FileComing` | 3 | pilotBin, startBin, toneCountCode, settleSymbols, fileBytes (u32 LE), durationMs (u32 LE) = 12 B | transfer announcement |
+| `Bye` | 4 | — (0 B) | best-effort leave; protocol never evicts members on it — aging is the UI's problem |
+
+The report grid is quantized to 4 bits/point: dB below the grid's own max, 2
+dB per code, clamped 0–15 (code 15 = ≤ -30 dB or silence), packed 2 points
+per byte (32 B for 64 points). `BestRangeClaim.lowHz`/`highHz` are binned on
+`BAND_CARD_BIN_HZ` (50 Hz), same convention as the band card. `FileComing`'s
+`pilotFreqHz`/`toneStartHz` are likewise 50 Hz bins, and `toneCount` is coded
+via `BAND_CARD_TONE_COUNTS` (4/8/16/32) — the same table the band card uses.
+
+### Settings intersection
+
+`src/modem/chatter/settingsPick.ts` turns the roll-call reports into one set
+of TX settings every responding peer can survive:
+
+1. Normalize each peer's report grid to its own max, then take the per-point
+   **minimum** across all peers — a point is only as good as its worst
+   listener.
+2. Slide a `toneCount * 50 Hz` window across 1500–7800 Hz in 100 Hz steps,
+   trying `toneCount` 32, 16, 8, 4 in that order (widest first). A window's
+   score is its weakest tone.
+3. Accept the first (widest) toneCount with any window scoring above -18 dB
+   relative to full scale; if nothing clears that bar at any width, fall back
+   to `FLOOR_SETTINGS`.
+4. `pilotFreqHz` is set 200 Hz below the window's first tone (clamped to a
+   200 Hz floor); `toneStartHz` is the **offset above the pilot** (first
+   tone = `pilotFreqHz + toneStartHz`) — the same convention
+   `ofdmToneFrequencies()` and `BandCard.toneStartHz` use elsewhere, not an
+   absolute frequency.
+5. `toneGains`: raw gain per tone is `1/mag`, then every raw gain is divided
+   by the largest one, so the weakest tone pins at gain 1 and stronger tones
+   are attenuated down from there (TX headroom is capped at unity — weak
+   tones can't be boosted).
+6. `qamMap`: each tone's margin relative to the window's own strongest tone
+   sets bit density — 6 bits/symbol at ≥ -6 dB, 4 at ≥ -12 dB, else 2.
+
+`FLOOR_SETTINGS` (used when no reports arrive, or no band clears the
+threshold): QPSK, 4 tones, `pilotFreqHz` 6700, `toneStartHz` 200 (tones at
+6900–7050 Hz — the same first-tone frequency as `OFDM_HANDSHAKE`).
+
+### State machine
+
+`src/modem/chatter/roomProtocol.ts` is the pure state machine (no
+AudioContext, no worker — every side effect goes through injected
+`RoomDeps`, which is what makes it unit-testable with a manual clock):
+
+```text
+cold --start()--> listening --(quiet)--> announcing --> joinWait --> idle
+idle --sendFile()--> listening --(quiet)--> rollCall --> collecting --> sending --> idle
+idle/joinWait --onMessage(FILE_COMING)--> receiving --> idle
+idle --onProbeHeard()--> (reply in a random slot) --> idle
+```
+
+`listening` is shared by both carrier-sense phases (join and roll-call).
+Every state reached via a timer carries its own deadline back to `idle` (or
+`cold`, for the pre-join chain) — `stop()` cancels every outstanding timer in
+one pass, and a rejected dependency promise (`playProbe`/`sendMessage`/
+`isAirBusy`) routes through the same deadline destination rather than
+stalling the machine.
+
+`ROOM_TIMING` (`src/modem/chatter/roomProtocol.ts`):
+
+| Constant | Value |
+|----------|-------|
+| `listenMs` | 1000 ms per carrier-sense poll |
+| `listenCapMs` | 10000 ms — cap before announcing/rolling-call anyway |
+| `replySlots` | 6 (shared by `joinWait` and `collecting`) |
+| `replySlotMs` | 1000 ms per slot |
+| `collectExtraMs` | 500 ms grace after the last reply slot |
+| `fileComingLeadMs` | 700 ms between sending `FILE_COMING` and starting the file TX |
+
+A completed send or receive stays "occupied" for `durationMs + 5000 ms`
+(`TRANSFER_TAIL_MARGIN_MS`) before falling back to `idle`, covering the last
+frame's tail and scheduling jitter. A roll call that collects zero reports
+sets `lastError` and returns straight to `idle` without sending anything.
+
+---
+
 ## Test Coverage
 
 | Test File | Path | Status |

@@ -39,6 +39,12 @@ console log if a specific symbol needs inspecting.
 | `SC` | `req` `use` | TX scale requested vs used after clamping |
 | `Y` | range `amp` `sPk` `sCoh` | chirp band, chirp peak, sync-symbol peak, sync COHERENT peak (what the scale is budgeted against) |
 | `Y2` | `tr` `st` `pre` | training symbols, settle symbols, preamble ms |
+| `HP` | ms | TX handshake-band preamble emitted (band handshake) |
+| `HC` | `p` `st` `t` `stl` | TX band card: announced pilot, tone start, tone count, settle symbols |
+| `HL` | `p` | RX listening on the fixed handshake band |
+| `HR` | `p` `st` `t` `stl` | RX decoded a band card (fields as `HC`) |
+| `HH` | `p` `t` `disc` | RX hopped: fresh engine for the announced band; `disc` = samples discarded so the new engine starts in the TX's post-segment silence gap (0 with no chirp anchor — suspect if the hop then fails) |
+| `!HC` | — | sentinel hit in card mode but the bytes were not a valid card |
 | `TF` | `t` `s` | frame transmitted: type, seq (compare with `F`/`X` on the RX side) |
 | `RC` | `p` `sps` `t` | RX config: pilot Hz, SAMPLES per OFDM symbol, tone count |
 | `PP` | Hz | RX PLL pilot frequency — must equal `C p` |

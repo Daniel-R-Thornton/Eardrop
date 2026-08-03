@@ -187,6 +187,35 @@ export const OFDM_DEFAULTS = {
 } as const;
 
 /**
+ * The FIXED handshake config — the only band knowledge a receiver needs when
+ * bandHandshake is enabled. TX transmits chirp + preamble + the band card
+ * here (see bandCard.ts); the card announces the real band and both sides
+ * hop, the receiver by swapping in a fresh engine (HandshakeReceiver).
+ *
+ * Values chosen from bench measurements, not aesthetics: 8 QPSK tones at
+ * 6900-7250 Hz decoded at MER 21-22 dB on the weakest hardware measured (a
+ * laptop DMIC + micro-speaker) — QPSK needs ~10 dB, so the handshake carries
+ * ~11 dB of margin. Few tones = maximum power per tone. CHANGING ANY VALUE
+ * BREAKS COMPATIBILITY with every deployed receiver — this is a wire
+ * constant, not a tuning knob.
+ *
+ * gapSymbols: silence between the handshake segment and the target-band
+ * transmission. The post-hop engine must meet the target chirp the way a
+ * cold receiver does — quiet first. Bench 2026-08-03: without the gap, the
+ * chirp correlator fired on the card symbols' 1850 Hz pilot (the template
+ * sweeps through 1850) at norm ~0.15, the CP probe then VALIDATED the false
+ * detect because cards are real OFDM with real cyclic prefixes, and the
+ * engine trained during the actual chirp — target tones measured ~1e-4 and
+ * the transfer was dead before it started.
+ */
+export const OFDM_HANDSHAKE = {
+  pilotFreqHz: 1850,
+  toneStartHz: 5050, // tones at 6900-7250 Hz
+  toneCount: 8,
+  gapSymbols: 8,
+} as const;
+
+/**
  * OFDM tuning levers — every knob that trades robustness for speed, in one
  * place.
  *

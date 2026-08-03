@@ -36,6 +36,7 @@ export type ModemCommand =
       config: ModemConfig & {
         useOFDM?: boolean;
         emitLinkProfile?: boolean;
+        bandHandshake?: boolean;
         qamMap?: number[];
         toneGains?: number[];
         trainingSettleSymbols?: number;
@@ -53,7 +54,14 @@ export type ModemCommand =
   // Round-trip barrier: the worker processes commands in order, so a 'flushed'
   // reply proves every previously-posted feedChunk has already been demodulated.
   | { type: 'flush'; id: number }
-  | { type: 'setVerboseLogging'; enabled: boolean };
+  | { type: 'setVerboseLogging'; enabled: boolean }
+  // ─── Chatter room (see chatterWorker.test.ts) ───
+  | { type: 'chatterStart'; deviceId: number }
+  | { type: 'chatterStop' }
+  | { type: 'encodeControl'; id: number; msg: { type: number; senderId: number; targetId: number; payload: ArrayBuffer } }
+  | { type: 'encodeProbe'; id: number; deviceId: number }
+  | { type: 'airCheck'; id: number }
+  | { type: 'setRxMuted'; muted: boolean };
 
 export type ModemEvent =
   | { type: 'ready' }
@@ -72,4 +80,8 @@ export type ModemEvent =
   | { type: 'flushed'; id: number; fileReady: boolean }
   /** Either a formatted console line or the structured event behind it. */
   | { type: 'dlog'; line?: string; rec?: { tag: string; fields: Record<string, unknown> } }
-  | { type: 'error'; id?: number; error: string };
+  | { type: 'error'; id?: number; error: string }
+  // ─── Chatter room (see chatterWorker.test.ts) ───
+  | { type: 'probeHeard'; deviceId: number; grid: number[] }
+  | { type: 'controlMessage'; msg: { type: number; senderId: number; targetId: number; payload: ArrayBuffer } }
+  | { type: 'airStatus'; id: number; busy: boolean; rms: number };

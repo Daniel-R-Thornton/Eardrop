@@ -21,6 +21,8 @@ import {
   FRAME_SIZE,
   PAYLOAD_DATA_SIZE,
   RAW_HEADER_SIZE,
+  BCH_HEADER_SIZE,
+  SENTINEL_SIZE,
   FRAME_TYPE_HEADER,
   FRAME_TYPE_PAYLOAD,
   FRAME_TYPE_TAIL,
@@ -33,10 +35,23 @@ import {
   PROFILE_FRAME_REPEATS,
   type LinkProfile,
 } from '../protocol/linkProfile';
+import {
+  decodeBandCard,
+  BAND_CARD_REPEATS,
+  BAND_CARD_WIRE_SIZE,
+  type BandCard,
+} from '../protocol/bandCard';
+import {
+  decodeControlHeader,
+  decodeControlPayload,
+  controlPayloadWireSize,
+  type ControlMessage,
+  type ControlType,
+} from '../protocol/controlFrame';
 import { SentinelScanner } from '../receiver/SentinelScanner';
 import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
 import type { QamOrder } from '../modulation/constellation';
-import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_SYMBOL_MS, OFDM_CP_MS, OFDM_TUNING } from '../types';
+import { ofdmSamples, ofdmToneFrequencies, OFDM_DEFAULTS, OFDM_HANDSHAKE, OFDM_SYMBOL_MS, OFDM_CP_MS, OFDM_TUNING } from '../types';
 import { generateChirp, chirpCorrelate, type ChirpConfig } from './chirp';
 import { dlog, dlogFmt } from '../../lib/debug/dlog';
 
@@ -153,6 +168,12 @@ export class RxEngine {
   private chirpDetected = false;
   /** Absolute sample count immediately after the detected chirp. */
   private chirpEndSample = -1;
+  /**
+   * Durable copy of where the last accepted chirp ENDED (samplesSeen units).
+   * chirpEndSample itself is consumed/reset at the CP handoff; this one
+   * survives so card mode can anchor the handshake-segment end on it.
+   */
+  private chirpAnchorSample = -1;
   /** Rolling buffer of recent samples (2 OFDM symbols) for boundary search */
   private ofdmAlignBuf: number[] = [];
   /** Samples still to discard so the window grid lands on a symbol boundary */
@@ -350,6 +371,19 @@ export class RxEngine {
    * scanner. Set alongside qamRefPending; counted down after it drains.
    */
   private qamWarmupPending = 0;
+  /**
+   * Band-handshake / card-listening mode (see OFDM_HANDSHAKE and
+   * bandCard.ts): listen on the fixed handshake band for a band card and
+   * report it via onBandCard. This engine never decodes data frames in this
+   * mode — the host swaps in a fresh engine for the announced band.
+   */
+  private bandHandshake = false;
+  /**
+   * Sync on the chirp ONLY — no energy fallback. Set by HandshakeReceiver on
+   * the post-hop engine, which starts mid-stream where leftover handshake
+   * audio would otherwise trip the energy detector (see the sync path).
+   */
+  private chirpOnlySync = false;
 
   // Per-tone I/Q calibration references (from Gray code calibration)
   /** Reference vectors for bit=0 (ref0I/Q) and bit=1 (ref1I/Q) per tone */
@@ -382,9 +416,26 @@ export class RxEngine {
   constructor(cfg: Partial<ModemConfig & { useOFDM?: boolean }> = {}) {
     this.cfg = { ...DEFAULT_CONFIG, ...cfg };
     this.useOFDM = (cfg as any).useOFDM === true;
+    this.bandHandshake = (cfg as any).bandHandshake === true;
+    this.chirpOnlySync = (cfg as any).chirpOnlySync === true;
+    if (this.bandHandshake) {
+      // Band handshake: LISTEN on the fixed handshake band regardless of the
+      // configured band — this engine's whole job is to decode a band card
+      // (see bandCard.ts) and hand it to onBandCard; the host then builds a
+      // FRESH engine for the announced band, which re-syncs on the target
+      // band's own full preamble. The configured band fields are TX-side
+      // knowledge only in this mode.
+      this.cfg.pilotFreqHz = OFDM_HANDSHAKE.pilotFreqHz;
+      this.cfg.toneStartHz = OFDM_HANDSHAKE.toneStartHz;
+      this.cfg.toneCount = OFDM_HANDSHAKE.toneCount;
+      dlog('RX-OFDM', { handshakeBand: true, pilot: this.cfg.pilotFreqHz });
+    }
     const settleOverride = (cfg as any).trainingSettleSymbols;
+    // Card-listening mode ignores the settle override: the handshake segment
+    // is built entirely from wire constants so a zero-config receiver can
+    // predict it (the card then carries the TARGET band's settle count).
     this.OFDM_SETTLE_SYMBOLS =
-      typeof settleOverride === 'number' && Number.isFinite(settleOverride)
+      !this.bandHandshake && typeof settleOverride === 'number' && Number.isFinite(settleOverride)
         ? Math.max(0, Math.round(settleOverride))
         : OFDM_TUNING.trainingSettleSymbols;
 
@@ -392,7 +443,8 @@ export class RxEngine {
     this.sps = 256;
 
     this.toneFreqs = getDataToneFreqs(this.cfg.pilotFreqHz, !!this.cfg.musical);
-    this.scanner = new SentinelScanner();
+    // Card mode collects the short card body instead of a full atomic frame.
+    this.scanner = new SentinelScanner(this.bandHandshake ? BCH_HEADER_SIZE : undefined);
 
     // Initialize OFDM demodulator (256 FFT + 16 CP = 272 samples/symbol)
     if (this.useOFDM) {
@@ -410,8 +462,117 @@ export class RxEngine {
 
     this.scanner.onFrame = (frame: Uint8Array) => {
       dlog('RX', { scanFrame: frame.length });
-      this.processFrame(frame);
+      if (this.bandHandshake) this.processCard(frame);
+      else this.processFrame(frame);
     };
+    // Card-listening mode only: fires when processCard recognized a control
+    // header (CONTROL_MAGIC) instead of a band card and told the scanner to
+    // keep collecting the payload wire bytes — see processCard/onControlMessage.
+    this.scanner.onExtraFrame = (payloadWire: Uint8Array) => {
+      const header = this.pendingControlHeader;
+      this.pendingControlHeader = null;
+      if (header) {
+        const payload = decodeControlPayload(payloadWire, header.payloadLen);
+        if (!payload) {
+          dlog('RX-OFDM', { controlPayloadInvalid: true }, { level: 'warn' });
+        } else {
+          this.onControlMessage?.({
+            type: header.type,
+            senderId: header.senderId,
+            targetId: header.targetId,
+            payload,
+          });
+        }
+      }
+      // Chatter mode's control-message listener is ONE persistent engine for
+      // the whole room session (see modemService.ts's chatterStart) — unlike
+      // the band-card listener, which is thrown away the moment it hops (see
+      // HandshakeReceiver), this engine must survive to decode the NEXT
+      // control message too. Left in RxState.FRAMES it never resyncs (chirp
+      // detection only runs from RxState.WAITING — see feedSample), so every
+      // message after the first would be silently dropped. Re-arm exactly
+      // like the OFDM file path's post-completion reset (processTail).
+      if (this.useOFDM && this.ofdmDemod) {
+        this.state = RxState.WAITING;
+        this.ofdmSyncFrames = 0;
+        this.ofdmNoiseEma = this.OFDM_EMA_SEED;
+        this.ofdmTrainingSymbols = 0;
+        this.ofdmSettleSymbols = 0;
+        this.ofdmDemod.discardMER();
+        this.ofdmDemod.resetTraining();
+        this.buf = [];
+        this.ofdmAlignBuf = [];
+      }
+    };
+  }
+
+  /**
+   * Fires once when a valid band card decodes (card-listening mode only).
+   * The host swaps in a fresh RxEngine for the announced band — see
+   * HandshakeReceiver.
+   */
+  onBandCard: ((card: BandCard) => void) | null = null;
+  /** The decoded card, if any (card-listening mode only). */
+  private bandCard: BandCard | null = null;
+  /**
+   * Fires for each decoded control message (chatter mode only — see
+   * modemService.ts's chatterStart). Unlike onBandCard this can fire
+   * repeatedly: a chatter listener stays on this same fixed-band engine for
+   * the whole session instead of hopping away after one card.
+   */
+  onControlMessage: ((msg: ControlMessage) => void) | null = null;
+  /** Header awaited while the scanner collects a control message's payload
+   *  bytes (see the scanner.onExtraFrame wiring above). */
+  private pendingControlHeader: { type: ControlType; senderId: number; targetId: number; payloadLen: number } | null = null;
+
+  /** Card-listening mode: every sentinel hit is a candidate band card OR
+   *  (chatter mode) a control message header. */
+  private processCard(frame: Uint8Array): void {
+    if (this.bandCard) return; // already hopped — later copies are redundant
+    const body = frame.slice(SENTINEL_SIZE);
+    const card = decodeBandCard(body);
+    if (card) {
+      this.bandCard = card;
+      dlog('RX-OFDM', {
+        card: true,
+        pilot: card.pilotFreqHz,
+        toneStart: card.toneStartHz,
+        tones: card.toneCount,
+        settle: card.settleSymbols,
+      }, { level: 'info' });
+      this.onBandCard?.(card);
+      return;
+    }
+    const header = decodeControlHeader(body);
+    if (header) {
+      this.pendingControlHeader = header;
+      this.scanner.continueCollecting(controlPayloadWireSize(header.payloadLen));
+      return;
+    }
+    dlog('RX-OFDM', { cardInvalid: true }, { level: 'warn' });
+  }
+
+  /**
+   * Card-listening mode: samples left until the handshake segment ends,
+   * anchored on the handshake chirp this engine synced on. The segment is
+   * built entirely from wire constants (fixed settle+training, card ×
+   * BAND_CARD_REPEATS), so the position is exact to within the chirp
+   * detector's few-sample tolerance — HandshakeReceiver discards exactly
+   * this many samples so the fresh target engine's first sample lands in
+   * the TX's silence gap and it never hears card audio at all (see
+   * OFDM_HANDSHAKE.gapSymbols for the false-sync this prevents).
+   * Null when there is no chirp anchor (energy-fallback sync).
+   */
+  handshakeSegmentRemaining(): number | null {
+    if (!this.bandHandshake || this.chirpAnchorSample < 0) return null;
+    const cardBytesPerSymbol = Math.max(1, Math.floor(OFDM_HANDSHAKE.toneCount / 4));
+    const cardSymbols = Math.ceil(BAND_CARD_WIRE_SIZE / cardBytesPerSymbol);
+    const segmentSymbols =
+      OFDM_TUNING.trainingSettleSymbols
+      + OFDM_TUNING.trainingSymbols
+      + BAND_CARD_REPEATS * cardSymbols;
+    const segmentEnd = this.chirpAnchorSample + segmentSymbols * this.sps;
+    return Math.max(0, segmentEnd - this.samplesSeen);
   }
 
   // ─── Public API ──────────────────────────────────────
@@ -574,6 +735,9 @@ export class RxEngine {
             const ofdmAlignBufLenAtHandoff = this.ofdmAlignBuf.length;
             this.chirpDetected = false;
             this.chirpEndSample = -1;
+            // Keep the chirp position as a durable anchor — card mode reads
+            // it to place the handshake-segment end (handshakeSegmentRemaining).
+            this.chirpAnchorSample = chirpEndSampleAtHandoff;
             // CP correlation reports offsets modulo one symbol. A peak near the
             // end (e.g. sps-1) is the equivalent one-sample-early boundary, not
             // a reason to discard almost a full training symbol. Keep that
@@ -636,7 +800,11 @@ export class RxEngine {
 
       // OFDM mode: detect energy at the tone frequencies (not just pilot).
       // The sync burst has all 4 tones at QPSK 0°, so total tone energy is high.
-      if (this.useOFDM && this.ofdmDemod && !this.chirpDetected) {
+      // chirpOnlySync disables this fallback: a post-handshake-hop engine is
+      // born INTO the tail of the handshake segment, and its leftover card
+      // symbols are exactly the kind of strong non-chirp energy the fallback
+      // would train on (then go deaf for the real target-band preamble).
+      if (this.useOFDM && this.ofdmDemod && !this.chirpDetected && !this.chirpOnlySync) {
         // Measure energy at the actual OFDM tone frequencies — this.toneFreqs
         // are the BPSK tones, which only partially overlap the OFDM bins and
         // made detection marginal (fired barely above threshold).
@@ -1664,9 +1832,9 @@ export class RxEngine {
           break;
         }
         if (profile.toneCount !== this.ofdmToneCount) {
-          dlog('RX-PROFILE', { 
-            tcMismatch: true, 
-            got: profile.toneCount, 
+          dlog('RX-PROFILE', {
+            tcMismatch: true,
+            got: profile.toneCount,
             want: this.ofdmToneCount,
             eccT: profile.eccT,
             qamMap: profile.qamMap.slice(0, 8).join(','),

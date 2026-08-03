@@ -13,7 +13,7 @@
  * peak-normalized to [-1, 1].
  */
 
-import { type ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG, ofdmSamples, OFDM_DEFAULTS, OFDM_TUNING } from '../types';
+import { type ModemConfig, TONE_OFFSETS, DEFAULT_CONFIG, ofdmSamples, OFDM_DEFAULTS, OFDM_TUNING, OFDM_HANDSHAKE } from '../types';
 import { generatePreamble, type PreambleConfig } from '../protocol/preamble';
 import {
   encodeFrame,
@@ -35,6 +35,7 @@ import {
   PROFILE_FRAME_REPEATS,
   type LinkProfile,
 } from '../protocol/linkProfile';
+import { encodeBandCard, BAND_CARD_REPEATS, BAND_CARD_WIRE_SIZE } from '../protocol/bandCard';
 import { dlog } from '../../lib/debug/dlog';
 
 
@@ -54,6 +55,19 @@ export class TxEngine {
   private modulator: BPSKModulator;
   /** OFDM engine for OFDM/QPSK frame modulation (enabled via useOFDM flag) */
   private ofdmEngine: OFDMEngine | null = null;
+  /**
+   * Fixed-band engine for the handshake segment (see OFDM_HANDSHAKE):
+   * chirp + preamble + band card ×3. Non-null only when bandHandshake is
+   * enabled.
+   */
+  private handshakeEngine: OFDMEngine | null = null;
+  /**
+   * Band-handshake mode: a self-contained announcement segment goes out on
+   * OFDM_HANDSHAKE (preamble + band card, see bandCard.ts), then the ENTIRE
+   * normal transmission — its own preamble included — follows in the target
+   * band, byte-identical to a flag-off send.
+   */
+  private bandHandshake = false;
   /** Whether to use OFDM/QPSK for frame payloads */
   private useOFDM = false;
   /**
@@ -83,6 +97,11 @@ export class TxEngine {
     // Check for OFDM flag before merging into ModemConfig
     this.useOFDM = (cfg as any).useOFDM === true;
     this.emitLinkProfile = (cfg as any).emitLinkProfile === true;
+    // Band handshake no longer forces a profile frame: the band card (see
+    // bandCard.ts) announces the target band, and the target-band stream is
+    // byte-identical to a flag-off send — which only carries a profile when
+    // the qamMap needs one.
+    this.bandHandshake = (cfg as any).bandHandshake === true;
     this.qamMap = (cfg as any).qamMap;
     this.qamScaleOverride = (cfg as any).qamScaleOverride;
     this.toneGains = (cfg as any).toneGains;
@@ -130,11 +149,54 @@ export class TxEngine {
         toneGains: this.toneGains,
         toneStartHz: this.cfg.toneStartHz,
       });
+
+      // Band handshake: a SECOND engine at the fixed handshake config, used
+      // for the chirp + first preamble + profile frames so any receiver can
+      // decode them without knowing the target band. No per-tone gains (a
+      // calibration for the target band would be wrong here) and no scale
+      // override — the handshake band's own safe scale applies.
+      if (this.bandHandshake) {
+        this.handshakeEngine = new OFDMEngine({
+          pilotFreqHz: OFDM_HANDSHAKE.pilotFreqHz,
+          sampleRate: this.cfg.sampleRate,
+          pilotAmplitude: OFDM_DEFAULTS.pilotAmplitude,
+          toneCount: OFDM_HANDSHAKE.toneCount,
+          toneStartHz: OFDM_HANDSHAKE.toneStartHz,
+        });
+      }
     }
   }
 
   reset(): void {
     this.modulator.reset();
+  }
+
+  /**
+   * Handshake-band preamble (chirp + settle + training) followed by `bytes`
+   * modulated as QPSK on the fixed handshake band — the same primitives
+   * (`handshakeEngine.generateChirpBurst`/`generateSettleSymbols`/
+   * `generateTrainingSymbols`/`modulateFrame`) the band-card announcement
+   * uses in `frameSegments`'s `bandHandshake` branch, but standalone: no
+   * repeats, no trailing silence gap (there is no target-band hop to protect
+   * after a bare control frame). Used by chatter-mode control-message TX
+   * (`encodeControl` in modemService.ts); the card path itself is untouched
+   * so its byte-identical output (see bandHandshake.test.ts) is unaffected.
+   */
+  buildHandshakeSegment(bytes: Uint8Array): Float32Array {
+    if (!this.handshakeEngine) {
+      throw new Error('buildHandshakeSegment requires useOFDM + bandHandshake config');
+    }
+    const { chirp } = this.handshakeEngine.generateChirpBurst(OFDM_TUNING.chirpSymbols);
+    const settle = this.handshakeEngine.generateSettleSymbols(OFDM_TUNING.trainingSettleSymbols);
+    const training = this.handshakeEngine.generateTrainingSymbols(OFDM_TUNING.trainingSymbols);
+    const body = this.handshakeEngine.modulateFrame(bytes);
+    const combined = new Float32Array(chirp.length + settle.length + training.length + body.length);
+    let off = 0;
+    combined.set(chirp, off); off += chirp.length;
+    combined.set(settle, off); off += settle.length;
+    combined.set(training, off); off += training.length;
+    combined.set(body, off);
+    return combined;
   }
 
   /** Check whether OFDM mode is active */
@@ -222,7 +284,60 @@ export class TxEngine {
     // OFDM engine switched to a QAM map.
     if (this.useOFDM && this.ofdmEngine) this.ofdmEngine.resetToneOrders();
 
-    // 1. Preamble: chirp (sync) + training symbols (channel est)
+    // 0. Band handshake: a self-contained announcement on the FIXED handshake
+    // band — full preamble (chirp + settle + training) so any receiver can
+    // sync with zero knowledge of the target band, then the band card ×3
+    // (see bandCard.ts: pilot, tone start, tone count, settle — bin/table
+    // coded into 27 wire bytes). Everything AFTER this block is byte-identical
+    // to a flag-off transmission: the target band gets its own full preamble
+    // below, so the receiver re-syncs and retrains there exactly as if the
+    // user had configured both ends by hand. (The first cut reused the
+    // handshake-band boundary and an abbreviated settle+training hop preamble
+    // in the target band; the carried-over boundary and the per-band
+    // compressor still adapting under the shortened preamble cost fractions
+    // of a dB — enough to kill the LAST frame at zero-margin QAM.)
+    if (this.useOFDM && this.bandHandshake && this.handshakeEngine) {
+      const { chirp } = this.handshakeEngine.generateChirpBurst(OFDM_TUNING.chirpSymbols);
+      // FIXED settle count (not this.settleSymbols): the handshake segment is
+      // the part a zero-config receiver must predict, so every knob in it is
+      // a wire constant. The card then announces the TARGET band's settle.
+      const settle = this.handshakeEngine.generateSettleSymbols(OFDM_TUNING.trainingSettleSymbols);
+      const training = this.handshakeEngine.generateTrainingSymbols(OFDM_TUNING.trainingSymbols);
+      const combined = new Float32Array(chirp.length + settle.length + training.length);
+      combined.set(chirp, 0);
+      combined.set(settle, chirp.length);
+      combined.set(training, chirp.length + settle.length);
+      dlog('TX-OFDM', {
+        handshakePreambleMs: Math.round((combined.length / (this.cfg.sampleRate || 48000)) * 1000),
+      });
+      yield combined;
+
+      const card = encodeBandCard({
+        pilotFreqHz: this.cfg.pilotFreqHz,
+        toneStartHz: this.cfg.toneStartHz ?? OFDM_DEFAULTS.toneStartHz,
+        toneCount: this.cfg.toneCount,
+        settleSymbols: this.settleSymbols,
+      });
+      const cardAudio = this.handshakeEngine.modulateFrame(card);
+      dlog('TX-OFDM', {
+        bandCard: true,
+        pilot: this.cfg.pilotFreqHz,
+        toneStart: this.cfg.toneStartHz ?? OFDM_DEFAULTS.toneStartHz,
+        tones: this.cfg.toneCount,
+        settle: this.settleSymbols,
+      });
+      for (let r = 0; r < BAND_CARD_REPEATS; r++) yield cardAudio;
+
+      // Silence gap before the target-band transmission: the post-hop
+      // receiver must meet the target chirp the way a cold receiver does —
+      // quiet first, chirp second (see OFDM_HANDSHAKE.gapSymbols for the
+      // bench failure this prevents).
+      yield new Float32Array(OFDM_HANDSHAKE.gapSymbols * this.getSymbolLengthInSamples());
+    }
+
+    // 1. Preamble: chirp (sync) + training symbols (channel est) — always in
+    // the TARGET band. In handshake mode this is the receiver's cue to
+    // re-sync from scratch after retuning.
     if (this.useOFDM && this.ofdmEngine) {
       // Settle symbols first, then the ones the RX actually trains on — see
       // OFDM_TUNING.trainingSettleSymbols. The RX discards exactly the same
@@ -409,8 +524,21 @@ export class TxEngine {
         profileSamples += OFDM_TUNING.qamRefSymbols * symLen;
       }
     }
+    // Band handshake segment: fixed-band preamble + card ×BAND_CARD_REPEATS
+    // (see frameSegments step 0 — all wire constants, so exact, not estimated).
+    let handshakeSamples = 0;
+    if (this.useOFDM && this.bandHandshake) {
+      const cardBytesPerSymbol = Math.max(1, Math.floor(OFDM_HANDSHAKE.toneCount / 4));
+      const cardSymbols = Math.ceil(BAND_CARD_WIRE_SIZE / cardBytesPerSymbol);
+      handshakeSamples =
+        (OFDM_TUNING.chirpSymbols
+          + OFDM_TUNING.trainingSettleSymbols
+          + OFDM_TUNING.trainingSymbols
+          + BAND_CARD_REPEATS * cardSymbols
+          + OFDM_HANDSHAKE.gapSymbols) * symLen;
+    }
     const silence = OFDM_TUNING.tailSilenceSymbols * symLen;
-    return preambleSamples + frameSamples + profileSamples + silence;
+    return handshakeSamples + preambleSamples + frameSamples + profileSamples + silence;
   }
 
   /**

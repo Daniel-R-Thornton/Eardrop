@@ -13,8 +13,10 @@ import { PipelineView } from './views/PipelineView';
 import { FrameTimeline } from './views/FrameTimeline';
 import { RxPipeline } from './views/RxPipeline';
 import { PresentationMode } from './views/PresentationMode';
+import { RoomMode } from './views/RoomMode';
 import { SettingsPanel } from './views/SettingsPanel';
 import { TxPanel } from './views/TxPanel';
+import { ChatterPanel } from './views/ChatterPanel';
 import { Panel } from './components/instrument/Panel';
 import { LED } from './components/instrument/LED';
 import { FrequencySweep } from './views/FrequencySweep';
@@ -32,6 +34,7 @@ export function BenchApp() {
   const ph = usePipelinePlayhead(s.demoRun, s.demoSpeed);
   const [enlargeFocused, setEnlargeFocused] = useState(false);
   const [presenting, setPresenting] = useState(false);
+  const [inRoom, setInRoom] = useState(false);
   const [showFrequencySweep, setShowFrequencySweep] = useState(false);
   const [showChannelSweep, setShowChannelSweep] = useState(false);
   const [copiedLlm, setCopiedLlm] = useState(false);
@@ -96,10 +99,20 @@ export function BenchApp() {
     <div
       style={{
         minHeight: '100vh',
+        // Room mode is capped to exactly the viewport (no page-level scroll)
+        // so the node graph can fill genuinely available space and the
+        // packet/roster panels handle their own internal scrolling instead
+        // of the whole page growing taller. Every other mode keeps the
+        // original "grow with content" page scroll unchanged.
+        height: inRoom ? '100vh' : undefined,
+        overflow: inRoom ? 'hidden' : undefined,
+        display: 'flex',
+        flexDirection: 'column',
         background: '#c9c3b3',
         padding: 16,
         fontFamily: T.mono,
         color: T.panelInk,
+        boxSizing: 'border-box',
       }}
     >
       {/* header */}
@@ -138,7 +151,7 @@ export function BenchApp() {
             {copiedRaw ? '✓ copied' : '⧉ raw log'}
           </button>
           <button
-            onClick={() => setPresenting((p) => !p)}
+            onClick={() => { setPresenting((p) => !p); setInRoom(false); }}
             style={{
               fontFamily: T.mono, fontSize: 12, padding: '5px 12px', borderRadius: T.radius, cursor: 'pointer',
               border: `1px solid ${presenting ? T.phosphor : T.panelEdge}`,
@@ -148,13 +161,29 @@ export function BenchApp() {
           >
             {presenting ? '◱ bench' : '▶ presentation'}
           </button>
+          <button
+            onClick={() => { setInRoom((r) => !r); setPresenting(false); }}
+            style={{
+              fontFamily: T.mono, fontSize: 12, padding: '5px 12px', borderRadius: T.radius, cursor: 'pointer',
+              border: `1px solid ${inRoom ? T.phosphor : T.panelEdge}`,
+              background: inRoom ? T.phosphorDim : 'rgba(0,0,0,0.04)',
+              color: inRoom ? T.phosphor : T.panelInk,
+            }}
+          >
+            {inRoom ? '◱ bench' : '◎ room mode'}
+          </button>
           <LED on={s.isPlaying || s.isListening} label={s.isPlaying ? 'TX' : s.isListening ? 'RX' : 'IDLE'} />
         </div>
       </div>
 
       {presenting && <PresentationMode onExit={() => setPresenting(false)} />}
+      {!presenting && inRoom && (
+        <div style={{ flex: '1 1 auto', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+          <RoomMode onExit={() => setInRoom(false)} />
+        </div>
+      )}
 
-      {!presenting && (
+      {!presenting && !inRoom && (
       <>
       {/* transport */}
       <div style={{ marginBottom: 12 }}>
@@ -183,10 +212,11 @@ export function BenchApp() {
         </Panel>
       </div>
 
-      {/* tx + settings */}
-      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gap: 12, alignItems: 'start', marginBottom: 12 }}>
+      {/* tx + settings + chatter room */}
+      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr 260px', gap: 12, alignItems: 'start', marginBottom: 12 }}>
         <TxPanel />
         <SettingsPanel />
+        <ChatterPanel />
       </div>
 
       {/* rx decode pipeline */}

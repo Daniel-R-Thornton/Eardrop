@@ -3,6 +3,7 @@
  * drive it without a Worker. The worker file is a thin shim around this.
  */
 import { RxEngine } from '../modem/protocol/rxEngine';
+import { HandshakeReceiver } from '../modem/protocol/handshakeReceiver';
 import { TxEngine } from '../modem/protocol/txEngine';
 import { captureTransmit } from '../modem/protocol/txCapture';
 import { toneIQ } from '../modem/pilot';
@@ -10,9 +11,161 @@ import { DEFAULT_CONFIG, ofdmToneFrequencies, type ModemConfig } from '../modem/
 import { compressBest, decompressScheme } from '../modem/compression';
 import { dlog } from '../lib/debug/dlog';
 import type { ModemCommand, ModemEvent, ModemTelemetry } from './modemSchema';
+import { chirpCorrelate } from '../modem/protocol/chirp';
+import {
+  probeChirpTemplate,
+  probeBurstSamplesAfterChirp,
+  decodeProbeId,
+  measureProbeSweep,
+  buildProbeBurst,
+} from '../modem/protocol/probeBurst';
+import { encodeControlMessage, type ControlMessage, type ControlType } from '../modem/protocol/controlFrame';
 
 const RING_SECONDS = 10;
 const SPECTRUM_BINS = 64;
+
+/** RMS (root-mean-square) of a sample buffer. */
+export function rmsOf(samples: ArrayLike<number>): number {
+  let sumSq = 0;
+  for (let i = 0; i < samples.length; i++) sumSq += samples[i] * samples[i];
+  return samples.length ? Math.sqrt(sumSq / samples.length) : 0;
+}
+
+/**
+ * Air-check noise floor: a slow EMA of QUIET-period RMS, used to tell an
+ * ordinary busy channel apart from silence for chatter-mode carrier sense
+ * (see modemService.ts's 'airCheck' command). Seeded unconditionally on the
+ * first chunk it ever sees; after that, a chunk only teaches it anything
+ * when the chunk itself reads as quiet (< 3x the current floor) — a loud
+ * chunk (someone transmitting) must never drag the floor up to match it,
+ * or the gate could never trip busy again.
+ */
+export class AirNoiseTracker {
+  private floor = 0;
+  private seeded = false;
+
+  constructor(private readonly alpha = 0.05) {}
+
+  update(chunkRms: number): void {
+    if (!this.seeded) {
+      this.floor = chunkRms;
+      this.seeded = true;
+      return;
+    }
+    if (chunkRms < 3 * this.floor) {
+      this.floor = this.floor * (1 - this.alpha) + chunkRms * this.alpha;
+    }
+  }
+
+  isBusy(rms: number): boolean {
+    return rms > 3 * this.floor;
+  }
+
+  get noiseFloor(): number {
+    return this.floor;
+  }
+}
+
+/**
+ * ProbeDetector — passive listener for chatter-room probe bursts (see
+ * probeBurst.ts): a down-chirp anchor (reverse direction from the modem's
+ * own up-chirp sync burst, specifically so ordinary data traffic can never
+ * false-trigger this), followed by a coarse channel sweep and a 12-bit
+ * pulse-keyed device ID.
+ *
+ * Runs a normalized cross-correlation of a rolling 0.5 s buffer against the
+ * down-chirp template every `scanHop` (4096) samples. At full rate that's
+ * O(ring ~24k x template 7200) ~= 170M multiplies per hop — too much for a
+ * cadence this runs at for the chatter session's entire life — so, exactly
+ * like RxEngine's own chirp detector (rxEngine.ts, the `chirpCorrelate`
+ * call under `feedSample`), both sides are 4:1 decimated (stride-sampled,
+ * not filtered) before correlating: ~10M multiplies per hop, with the peak
+ * index scaled back up by the same factor to index the full-rate ring.
+ * Once a candidate clears the threshold, buffers the rest of the burst
+ * (`probeBurstSamplesAfterChirp` more samples from the chirp start) and
+ * decodes it; a CRC failure (`decodeProbeId` returning null) is treated as a
+ * false trigger and silently discarded, matching the module's design intent
+ * ("no false triggers to worry about — the CRC catches them").
+ */
+export class ProbeDetector {
+  private readonly template: Float32Array;
+  /** Template decimated by `DECIMATION` — built once, correlated every hop. */
+  private readonly templateDec: Float32Array;
+  private readonly ringCap: number;
+  private readonly scanHop = 4096;
+  /** Stride for the scan-time correlation — see the class doc. */
+  private static readonly DECIMATION = 4;
+
+  private ring: number[] = [];
+  private samplesSinceScan = 0;
+
+  /** Non-null while buffering the rest of a burst after a chirp candidate. */
+  private pending: { buf: number[]; need: number } | null = null;
+
+  constructor(
+    private readonly ownDeviceId: number,
+    private readonly sampleRate: number,
+    private readonly onProbe: (deviceId: number, grid: number[]) => void,
+  ) {
+    this.template = probeChirpTemplate(sampleRate);
+    this.ringCap = Math.round(sampleRate * 0.5);
+    const ds = ProbeDetector.DECIMATION;
+    const decLen = Math.ceil(this.template.length / ds);
+    const templateDec = new Float32Array(decLen);
+    for (let i = 0; i < decLen; i++) templateDec[i] = this.template[i * ds];
+    this.templateDec = templateDec;
+  }
+
+  feedChunk(chunk: Float32Array): void {
+    for (let i = 0; i < chunk.length; i++) this.feedSample(chunk[i]);
+  }
+
+  private feedSample(sample: number): void {
+    if (this.pending) {
+      this.pending.buf.push(sample);
+      if (this.pending.buf.length >= this.pending.need) this.finishCapture();
+      return;
+    }
+
+    this.ring.push(sample);
+    this.samplesSinceScan++;
+    if (this.samplesSinceScan < this.scanHop) return;
+    this.samplesSinceScan = 0;
+
+    if (this.ring.length >= this.template.length) {
+      const ds = ProbeDetector.DECIMATION;
+      const ringDec = new Float32Array(Math.ceil(this.ring.length / ds));
+      for (let i = 0; i < ringDec.length; i++) ringDec[i] = this.ring[i * ds];
+      const { peakValue, peakIndex } = chirpCorrelate(ringDec, this.templateDec);
+      const rms = rmsOf(ringDec);
+      const norm = rms > 0 ? peakValue / (this.templateDec.length * rms) : 0;
+      if (norm > 0.25 && peakIndex >= 0) {
+        const anchor = peakIndex * ds; // back to a full-rate ring index
+        const need = probeBurstSamplesAfterChirp(this.sampleRate);
+        this.pending = { buf: this.ring.slice(anchor), need };
+        this.ring = [];
+        if (this.pending.buf.length >= need) {
+          this.finishCapture();
+          return;
+        }
+      }
+    }
+
+    if (this.ring.length > this.ringCap) {
+      this.ring = this.ring.slice(this.ring.length - this.ringCap);
+    }
+  }
+
+  private finishCapture(): void {
+    const samples = new Float32Array(this.pending!.buf);
+    this.pending = null;
+    const deviceId = decodeProbeId(samples, 0, this.sampleRate);
+    if (deviceId === null || deviceId === this.ownDeviceId) return; // CRC fail or our own probe
+    const grid = measureProbeSweep(samples, 0, this.sampleRate);
+    if (!grid) return;
+    this.onProbe(deviceId, grid);
+  }
+}
 
 export class ModemService {
   private emit: (ev: ModemEvent, transfer?: Transferable[]) => void;
@@ -20,12 +173,13 @@ export class ModemService {
     | (ModemConfig & {
         useOFDM?: boolean;
         emitLinkProfile?: boolean;
+        bandHandshake?: boolean;
         qamMap?: number[];
         toneGains?: number[];
         trainingSettleSymbols?: number;
       })
     | null = null;
-  private rx: RxEngine | null = null;
+  private rx: RxEngine | HandshakeReceiver | null = null;
   /**
    * Completion count (RxEngine.getCompletionCount()) already delivered to the
    * consumer. Gating on this identity — rather than a one-shot "fileSent"
@@ -50,8 +204,30 @@ export class ModemService {
   private ring: Float32Array = new Float32Array(0);
   private ringLen = 0; // valid samples (<= ring.length)
 
+  // ─── Chatter room (see chatterWorker.test.ts) ───
+  /** Fixed-band control-message listener, live only between chatterStart/Stop. */
+  private chatterRx: RxEngine | null = null;
+  /** Probe-burst listener, fed the same samples as chatterRx. */
+  private probeDetector: ProbeDetector | null = null;
+  /** Air-check carrier-sense noise floor — tracked continuously (see feedChunk). */
+  private airNoise = new AirNoiseTracker();
+  /** While true, feedChunk skips ALL demodulation (own-playback echo guard). */
+  private rxMuted = false;
+
   constructor(emit: (ev: ModemEvent, transfer?: Transferable[]) => void) {
     this.emit = emit;
+  }
+
+  /**
+   * Build the receiver the current config asks for: a HandshakeReceiver
+   * (card listener + fresh target engine, see handshakeReceiver.ts) when the
+   * band handshake is on, a plain RxEngine otherwise.
+   */
+  private makeRx(): RxEngine | HandshakeReceiver {
+    const cfg = this.config as ConstructorParameters<typeof RxEngine>[0];
+    return this.config?.useOFDM && this.config?.bandHandshake
+      ? new HandshakeReceiver(cfg)
+      : new RxEngine(cfg);
   }
 
   handle(cmd: ModemCommand): void {
@@ -62,7 +238,7 @@ export class ModemService {
         this.ringLen = 0;
         // Listening restarts pick up the new config
         if (this.rx) {
-          this.rx = new RxEngine(this.config as ConstructorParameters<typeof RxEngine>[0]);
+          this.rx = this.makeRx();
           this.lastDeliveredCompletion = 0;
         }
         this.emit({ type: 'configured' });
@@ -70,7 +246,7 @@ export class ModemService {
       }
       case 'startRx': {
         if (!this.config) { this.emit({ type: 'error', error: 'startRx before configure' }); return; }
-        this.rx = new RxEngine(this.config as ConstructorParameters<typeof RxEngine>[0]);
+        this.rx = this.makeRx();
         this.lastDeliveredCompletion = 0;
         this.emit({ type: 'rxStarted' });
         break;
@@ -83,6 +259,11 @@ export class ModemService {
       case 'feedChunk': {
         const chunk = new Float32Array(cmd.samples);
         this.pushRing(chunk);
+        // Air-check noise floor tracks every chunk regardless of mute state —
+        // it characterizes the CHANNEL, and muting exists only to stop our
+        // own playback from being demodulated as if it were incoming.
+        this.airNoise.update(rmsOf(chunk));
+        if (this.rxMuted) break;
         // Guard against RxEngine exceptions that would silently kill
         // the worker. Log and continue — the caller's watchdog will
         // notice the gap if processing taps out.
@@ -91,6 +272,12 @@ export class ModemService {
         } catch (err) {
           console.error('[MODEM] RxEngine.feedChunk exception:', (err as Error).message, 'len:', chunk.length);
         }
+        try {
+          this.chatterRx?.feedChunk(chunk);
+        } catch (err) {
+          console.error('[MODEM] chatter RxEngine.feedChunk exception:', (err as Error).message, 'len:', chunk.length);
+        }
+        this.probeDetector?.feedChunk(chunk);
         break;
       }
       case 'encodeFile': {
@@ -164,6 +351,73 @@ export class ModemService {
       }
       case 'setVerboseLogging': {
         RxEngine.verboseRxLogging = cmd.enabled;
+        break;
+      }
+      case 'chatterStart': {
+        if (!this.config) { this.emit({ type: 'error', error: 'chatterStart before configure' }); return; }
+        const cfg = { ...this.config, bandHandshake: true } as ConstructorParameters<typeof RxEngine>[0];
+        const engine = new RxEngine(cfg);
+        engine.onControlMessage = (msg: ControlMessage) => {
+          const owned = msg.payload.slice();
+          this.emit(
+            {
+              type: 'controlMessage',
+              msg: { type: msg.type, senderId: msg.senderId, targetId: msg.targetId, payload: owned.buffer as ArrayBuffer },
+            },
+            [owned.buffer as ArrayBuffer],
+          );
+        };
+        this.chatterRx = engine;
+        this.probeDetector = new ProbeDetector(cmd.deviceId, this.config.sampleRate, (deviceId, grid) => {
+          this.emit({ type: 'probeHeard', deviceId, grid });
+        });
+        break;
+      }
+      case 'chatterStop': {
+        this.chatterRx = null;
+        this.probeDetector = null;
+        break;
+      }
+      case 'encodeControl': {
+        if (!this.config) { this.emit({ type: 'error', id: cmd.id, error: 'encodeControl before configure' }); return; }
+        try {
+          const msg: ControlMessage = {
+            type: cmd.msg.type as ControlType,
+            senderId: cmd.msg.senderId,
+            targetId: cmd.msg.targetId,
+            payload: new Uint8Array(cmd.msg.payload),
+          };
+          const wire = encodeControlMessage(msg);
+          const tx = new TxEngine({ ...this.config, bandHandshake: true } as ConstructorParameters<typeof TxEngine>[0]);
+          const samples = tx.buildHandshakeSegment(wire);
+          this.emit(
+            { type: 'encoded', id: cmd.id, samples: samples.buffer as ArrayBuffer, sampleRate: this.config.sampleRate },
+            [samples.buffer as ArrayBuffer],
+          );
+        } catch (err) {
+          this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
+        }
+        break;
+      }
+      case 'encodeProbe': {
+        if (!this.config) { this.emit({ type: 'error', id: cmd.id, error: 'encodeProbe before configure' }); return; }
+        const samples = buildProbeBurst(cmd.deviceId, this.config.sampleRate);
+        this.emit(
+          { type: 'encoded', id: cmd.id, samples: samples.buffer as ArrayBuffer, sampleRate: this.config.sampleRate },
+          [samples.buffer as ArrayBuffer],
+        );
+        break;
+      }
+      case 'airCheck': {
+        const sr = this.config?.sampleRate ?? DEFAULT_CONFIG.sampleRate;
+        const want = Math.min(Math.floor(sr * 0.25), this.ringLen);
+        const tail = this.ring.subarray(this.ringLen - want, this.ringLen);
+        const rms = rmsOf(tail);
+        this.emit({ type: 'airStatus', id: cmd.id, busy: this.airNoise.isBusy(rms), rms });
+        break;
+      }
+      case 'setRxMuted': {
+        this.rxMuted = cmd.muted;
         break;
       }
     }

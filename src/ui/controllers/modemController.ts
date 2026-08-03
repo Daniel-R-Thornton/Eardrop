@@ -7,6 +7,7 @@ import { AudioRecorder } from '../../audio/recorder';
 import type { ModemCommand, ModemEvent } from '../../workers/modemSchema';
 import type { buildModemConfig } from './buildModemConfig';
 import type { Run } from '../../modem/protocol/captureTypes';
+import type { ControlMessage } from '../../modem/protocol/controlFrame';
 
 type Handler<T extends ModemEvent['type']> = (ev: Extract<ModemEvent, { type: T }>) => void;
 
@@ -32,6 +33,11 @@ export class ModemController {
       }
       this.handlers.get(ev.type)?.forEach((fn) => fn(ev));
     };
+  }
+
+  /** Hardware sample rate — same AudioContext rate every config/build path assumes. */
+  get sampleRate(): number {
+    return this.audioCtx.sampleRate;
   }
 
   on<T extends ModemEvent['type']>(type: T, fn: Handler<T>): () => void {
@@ -212,5 +218,64 @@ export class ModemController {
     // Transfer the entire buffer as one chunk; the worker handles chunking internally.
     const owned = new Float32Array(samples);
     this.worker.postMessage({ type: 'feedChunk', samples: owned.buffer }, [owned.buffer]);
+  }
+
+  // ─── Chatter room passthroughs (thin — see ChatterController/RoomProtocol
+  // for anything that looks like a decision) ───
+
+  /** Arm the worker's fixed-band chatter RX (probe detector + control-message listener). */
+  chatterStart(deviceId: number): void {
+    this.post({ type: 'chatterStart', deviceId });
+  }
+
+  /** Tear down the worker's chatter RX. */
+  chatterStop(): void {
+    this.post({ type: 'chatterStop' });
+  }
+
+  /** Encode a join/roll-call probe burst for the given device id. */
+  encodeProbe(deviceId: number): Promise<{ samples: Float32Array; sampleRate: number }> {
+    return new Promise((resolve, reject) => {
+      const id = this.nextId++;
+      this.pending.set(id, (ev) => {
+        if (ev.type === 'encoded') resolve({ samples: new Float32Array(ev.samples), sampleRate: ev.sampleRate });
+        else reject(new Error((ev as { error?: string }).error ?? 'encodeProbe failed'));
+      });
+      this.post({ type: 'encodeProbe', id, deviceId });
+    });
+  }
+
+  /** Encode a fixed-band control message (WELCOME/CLAIM/FILE_COMING/etc). */
+  encodeControl(msg: ControlMessage): Promise<{ samples: Float32Array; sampleRate: number }> {
+    return new Promise((resolve, reject) => {
+      const id = this.nextId++;
+      this.pending.set(id, (ev) => {
+        if (ev.type === 'encoded') resolve({ samples: new Float32Array(ev.samples), sampleRate: ev.sampleRate });
+        else reject(new Error((ev as { error?: string }).error ?? 'encodeControl failed'));
+      });
+      const payload = new Uint8Array(msg.payload);
+      this.post({
+        type: 'encodeControl',
+        id,
+        msg: { type: msg.type, senderId: msg.senderId, targetId: msg.targetId, payload: payload.buffer },
+      }, [payload.buffer]);
+    });
+  }
+
+  /** Is the acoustic channel currently busy (carrier sense)? */
+  airCheck(): Promise<{ busy: boolean; rms: number }> {
+    return new Promise((resolve) => {
+      const id = this.nextId++;
+      this.pending.set(id, (ev) => {
+        if (ev.type === 'airStatus') resolve({ busy: ev.busy, rms: ev.rms });
+        else resolve({ busy: false, rms: 0 });
+      });
+      this.post({ type: 'airCheck', id });
+    });
+  }
+
+  /** Mute/unmute the worker's RX path (own-playback echo suppression). */
+  setRxMuted(muted: boolean): void {
+    this.post({ type: 'setRxMuted', muted });
   }
 }

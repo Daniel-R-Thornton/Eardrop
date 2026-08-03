@@ -139,11 +139,13 @@ describe('Phase 4: link-profile frame (TxEngine → RxEngine)', () => {
     // Valid profile announcing non-default eccT/cpId — proves storage, not
     // just "matches default" (P4 doesn't interpret it, just stores it).
     const sentProfile = {
-      ver: 1,
+      ver: 2,
       flags: 0,
       eccT: 2,
       cpId: 1,
       toneCount: TONE_COUNT,
+      pilotFreqHz: 0,
+      toneStartHz: 0,
       qamMap: new Array(TONE_COUNT).fill(0),
     };
     const goodPayload = packLinkProfile(sentProfile);
