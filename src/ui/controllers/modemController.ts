@@ -57,6 +57,15 @@ export class ModemController {
 
   async startListening(micGain: number, deviceId?: string, deviceLabel?: string): Promise<void> {
     this.post({ type: 'startRx' });
+    // Tear down any previous recorder first. This used to overwrite the field
+    // and leak the old one: its mic stream stayed open and its worklet kept
+    // pushing chunks into the worker. A retried join (each failed attempt
+    // calls through here again) therefore stacked up live microphones, all
+    // feeding the same decoder.
+    if (this.recorder) {
+      try { await this.recorder.stop(); } catch { /* already stopped */ }
+      this.recorder = null;
+    }
     this.recorder = new AudioRecorder(this.audioCtx, micGain);
     await this.recorder.start(
       this.audioCtx.sampleRate,

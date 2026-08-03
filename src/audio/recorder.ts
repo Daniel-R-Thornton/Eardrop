@@ -231,7 +231,27 @@ export class AudioRecorder {
       },
     };
 
-    this.stream = await navigator.mediaDevices.getUserMedia(constraints);
+    // `deviceId: {exact}` is a hard requirement: if the stored id no longer
+    // matches a live device, getUserMedia REJECTS rather than falling back.
+    // That happens routinely — Chrome's deviceId is a salted hash and the salt
+    // rotates across restarts, profile changes and permission changes — and it
+    // is exactly the state a `label=(unresolved)` start is in, because the
+    // label lookup that would have repaired the id already failed. Honour an
+    // explicit choice when it is still valid, but degrade to the browser's
+    // default rather than refusing to open a microphone at all.
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (err) {
+      const name = (err as Error)?.name;
+      if (!deviceId || (name !== 'OverconstrainedError' && name !== 'NotFoundError')) throw err;
+      dlog('REC-ERR', {
+        staleDeviceId: deviceId.slice(0, 8),
+        error: name,
+        retryingWith: 'browserDefault',
+      }, { level: 'warn' });
+      const { deviceId: _dropped, ...rest } = constraints.audio as MediaTrackConstraints;
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: rest });
+    }
     console.log(this.stream);
     const track = this.stream.getAudioTracks()[0];
     console.log('Mic settings:', track.getSettings());
