@@ -9,7 +9,7 @@ import { captureTransmit } from '../modem/protocol/txCapture';
 import { toneIQ } from '../modem/pilot';
 import { DEFAULT_CONFIG, ofdmToneFrequencies, type ModemConfig } from '../modem/types';
 import { compressBest, decompressScheme } from '../modem/compression';
-import { dlog } from '../lib/debug/dlog';
+import { dlog, dlogSetFocus } from '../lib/debug/dlog';
 import type { ModemCommand, ModemEvent, ModemTelemetry } from './modemSchema';
 import { chirpCorrelate } from '../modem/protocol/chirp';
 import {
@@ -367,6 +367,10 @@ export class ModemService {
       }
       case 'setVerboseLogging': {
         RxEngine.verboseRxLogging = cmd.enabled;
+        break;
+      }
+      case 'setLogFocus': {
+        dlogSetFocus(cmd.tags);
         break;
       }
       case 'chatterStart': {

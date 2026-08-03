@@ -32,7 +32,7 @@ import { coordinateDescent, type DescentAxis } from './lib/coordinateDescent';
 import { scoreTrial } from './lib/speedTestScore';
 import { detectToneEnergy } from '../lib/scan/index';
 import { resample } from '../lib/math/index';
-import { dlog, dlogDump, dlogInject, dlogInjectRecord, dlogReset, dlogSetMode, DLOG_RING_MAX, dlogRingLength } from '../lib/debug/dlog';
+import { dlog, dlogDump, dlogInject, dlogInjectRecord, dlogReset, dlogSetFocus, dlogSetMode, DLOG_RING_MAX, dlogRingLength } from '../lib/debug/dlog';
 import { ModemController } from './controllers/modemController';
 import { buildModemConfig } from './controllers/buildModemConfig';
 import { ChatterController } from './controllers/chatterController';
@@ -161,6 +161,23 @@ window.addEventListener('eardrop-chatter-join', (() => {
 
 window.addEventListener('eardrop-chatter-leave', (() => {
   void chatter.leaveRoom();
+}) as EventListener);
+
+/**
+ * Tags worth seeing while the room is on screen: what the room decided, what
+ * control traffic was demodulated, and the audio devices behind both. The
+ * modem's per-symbol OFDM/sync/frame logging is excluded — it is the bulk of
+ * the output and it buries these.
+ */
+const ROOM_LOG_TAGS = ['ROOM', 'CHATTER-RX', 'REC', 'REC-ERR', 'PLAY', 'APP'];
+
+// Room mode narrows debug output to the room's own story. Applied on BOTH
+// sides: the worker does most of the logging, the main thread the rest.
+window.addEventListener('eardrop-room-focus', ((e: CustomEvent) => {
+  const { focused } = e.detail as { focused: boolean };
+  const tags = focused ? ROOM_LOG_TAGS : null;
+  dlogSetFocus(tags);
+  modem.setLogFocus(tags);
 }) as EventListener);
 
 let speedTestActive = false;

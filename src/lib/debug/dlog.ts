@@ -154,6 +154,22 @@ export function dlogFmt(value: unknown): string {
   return String(value);
 }
 
+/**
+ * Allow-list. When non-null ONLY these tags emit, whatever else is enabled.
+ *
+ * Room mode needs this: the modem logs a burst of OFDM/sync/frame detail for
+ * every symbol it touches, which buries the handful of room-protocol lines
+ * that explain what the room is actually doing. A deny-list would have to
+ * enumerate — and keep enumerating — every noisy tag in the modem, so the
+ * focus is expressed as "just these" instead.
+ */
+let focusTags: Set<string> | null = null;
+
+/** Restrict output to `tags`, or pass null to go back to everything. */
+export function dlogSetFocus(tags: string[] | null): void {
+  focusTags = tags && tags.length > 0 ? new Set(tags) : null;
+}
+
 export function dlogSetTagEnabled(tag: string, enabled: boolean): void {
   if (enabled) {
     disabledTags.delete(tag);
@@ -232,6 +248,7 @@ export function dlog(
   opts: DlogOptions = {},
 ): string | null {
   if (disabledTags.has(tag)) return null;
+  if (focusTags && !focusTags.has(tag)) return null;
 
   if (opts.every && opts.every > 1) {
     const count = (rateCounters.get(tag) ?? 0) + 1;

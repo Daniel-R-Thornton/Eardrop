@@ -148,6 +148,16 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
   const [localNotice, setLocalNotice] = useState<string | null>(null);
   /** True while a file is being dragged over the mode — drives the drop overlay. */
   const [dragging, setDragging] = useState(false);
+
+  // Quiet the modem's per-symbol logging for as long as this mode is on
+  // screen, so the room's own lines are readable in the console. Restored on
+  // exit — this narrows the view, it does not permanently change logging.
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('eardrop-room-focus', { detail: { focused: true } }));
+    return () => {
+      window.dispatchEvent(new CustomEvent('eardrop-room-focus', { detail: { focused: false } }));
+    };
+  }, []);
   const wasOn = useRef(s.chatterOn);
   useEffect(() => {
     if (wasOn.current !== s.chatterOn) {

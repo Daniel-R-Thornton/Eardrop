@@ -55,6 +55,11 @@ export type ModemCommand =
   // reply proves every previously-posted feedChunk has already been demodulated.
   | { type: 'flush'; id: number }
   | { type: 'setVerboseLogging'; enabled: boolean }
+  /** Restrict worker debug output to these tags; null restores everything.
+   *  Most modem logging happens in here, so quieting the console for a focused
+   *  view has to reach the worker — the main thread cannot filter what it
+   *  never sees as individual events. */
+  | { type: 'setLogFocus'; tags: string[] | null }
   // ─── Chatter room (see chatterWorker.test.ts) ───
   | { type: 'chatterStart'; deviceId: number }
   | { type: 'chatterStop' }

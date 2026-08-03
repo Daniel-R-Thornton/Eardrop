@@ -287,4 +287,9 @@ export class ModemController {
   setRxMuted(muted: boolean): void {
     this.post({ type: 'setRxMuted', muted });
   }
+
+  /** Restrict the worker's debug output to `tags` (null restores everything). */
+  setLogFocus(tags: string[] | null): void {
+    this.post({ type: 'setLogFocus', tags });
+  }
 }
