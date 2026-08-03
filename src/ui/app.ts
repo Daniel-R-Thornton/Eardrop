@@ -169,7 +169,15 @@ window.addEventListener('eardrop-chatter-leave', (() => {
  * modem's per-symbol OFDM/sync/frame logging is excluded — it is the bulk of
  * the output and it buries these.
  */
-const ROOM_LOG_TAGS = ['ROOM', 'CHATTER-RX', 'REC', 'REC-ERR', 'PLAY', 'APP'];
+const ROOM_LOG_TAGS = [
+  'ROOM', 'CHATTER-RX', 'REC', 'REC-ERR', 'PLAY', 'APP',
+  // The decode ladder for a control message, needed to tell "heard nothing"
+  // from "heard it and could not read it": OFDM-SYNC = the chirp was found,
+  // RX-OFDM cardInvalid = a sentinel arrived but its header would not decode.
+  // These are noisy during a file transfer but near-silent while a room idles,
+  // which is exactly when we need them.
+  'OFDM-SYNC', 'RX-OFDM',
+];
 
 // Room mode narrows debug output to the room's own story. Applied on BOTH
 // sides: the worker does most of the logging, the main thread the rest.

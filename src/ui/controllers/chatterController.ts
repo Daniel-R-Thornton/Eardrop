@@ -31,7 +31,12 @@ import type { ModemEvent } from '../../workers/modemSchema';
 import { AudioPlayer } from '../../audio/player';
 import { buildModemConfig } from './buildModemConfig';
 import { getState, setState, CHATTER_PACKET_LOG_MAX, type ChatterPacket } from '../Store';
-import { OFDM_DEFAULTS } from '../../modem/types';
+import { OFDM_DEFAULTS, OFDM_HANDSHAKE } from '../../modem/types';
+import { reportGridFreqs } from '../../modem/protocol/probeBurst';
+import { dlog } from '../../lib/debug/dlog';
+
+/** OFDM tone spacing — the handshake band's tones sit on this grid. */
+const OFDM_TONE_SPACING_HZ = OFDM_DEFAULTS.toneSpacingHz;
 
 /** Echo tail after our own playback ends, before RX un-mutes (room echo settle). */
 const MUTE_TAIL_MS = 150;
@@ -125,6 +130,28 @@ function computeLinkInfo(rawGrid: number[]): { linkDb: number; grid: number[] } 
   const grid = rawGrid.map((m) => m / peak);
   const linkDb = grid.reduce((sum, m) => sum + (m > 0 ? 20 * Math.log10(m) : GRID_FLOOR_DB), 0) / grid.length;
   return { linkDb, grid };
+}
+
+/**
+ * Level of the fixed handshake band in a measured probe grid, in dB relative
+ * to that grid's strongest point.
+ *
+ * Every control message rides OFDM_HANDSHAKE's tones. A probe burst sweeps
+ * straight through that range and its ID pulses sit far below it, so probes
+ * can decode perfectly on hardware whose response has already collapsed where
+ * the control frames live — which looks like "they can hear each other but
+ * cannot talk". This turns that into a number in the log instead of a guess.
+ */
+function handshakeBandDb(grid: number[]): number | null {
+  const freqs = reportGridFreqs();
+  const lo = OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz;
+  const hi = lo + OFDM_HANDSHAKE.toneCount * OFDM_TONE_SPACING_HZ;
+  const peak = Math.max(...grid);
+  if (!(peak > 0)) return null;
+  const inBand = grid.filter((_m, i) => freqs[i] >= lo - 100 && freqs[i] <= hi + 100);
+  if (inBand.length === 0) return null;
+  const mean = inBand.reduce((sum, m) => sum + m, 0) / inBand.length;
+  return mean > 0 ? 20 * Math.log10(mean / peak) : GRID_FLOOR_DB;
 }
 
 /** Actual over-the-air bytes for a control message with `payloadLen` raw
@@ -239,6 +266,18 @@ export class ChatterController {
     worker.on('probeHeard', (ev) => {
       this.room.onProbeHeard(ev.deviceId, ev.grid);
       const info = computeLinkInfo(ev.grid);
+      // The probe just measured this peer's whole passband — report what it
+      // found where the control messages actually live. A healthy probe with
+      // a collapsed handshake band is the signature of "we can see each other
+      // but never exchange a control frame".
+      const hsDb = handshakeBandDb(ev.grid);
+      dlog('ROOM', {
+        probeFrom: ev.deviceId,
+        meanDb: info ? info.linkDb.toFixed(1) : 'n/a',
+        handshakeBandDb: hsDb === null ? 'n/a' : hsDb.toFixed(1),
+        band: `${OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz}-${
+          OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz + OFDM_HANDSHAKE.toneCount * OFDM_TONE_SPACING_HZ}Hz`,
+      }, { level: 'warn' });
       this.recordPacket({
         dir: 'rx',
         kind: 'probe',
