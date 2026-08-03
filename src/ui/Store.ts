@@ -237,10 +237,44 @@ export interface AppState {
   /** This device's randomly-picked room id (1-255); 0 until joined. */
   chatterDeviceId: number;
   /** Room roster, refreshed on every RoomProtocol state change. */
-  chatterMembers: { deviceId: number; lastHeardMs: number; claimLowHz?: number; claimHighHz?: number }[];
+  chatterMembers: {
+    deviceId: number;
+    lastHeardMs: number;
+    claimLowHz?: number;
+    claimHighHz?: number;
+    /** Mean of the member's heardGrid in dB relative to that grid's own peak.
+     *  Higher (closer to 0) = stronger link. Undefined until a probe from
+     *  them has been measured. */
+    linkDb?: number;
+    /** The 64-point REPORT_GRID response we measured from that member's
+     *  probe, linear mags, normalized so max = 1. Undefined until measured. */
+    grid?: number[];
+  }[];
   /** Last RoomProtocol error, surfaced to the panel; null when clean. */
   chatterError: string | null;
+  /** Bounded ring of observed control-plane events, newest last, for the room-mode packet log. */
+  chatterPackets: ChatterPacket[];
+  /** performance.now() of this device's last own transmission (for the "talking" pulse); null until the first one. */
+  chatterLastTx: number | null;
 }
+
+/** One observed control-plane event. Newest LAST. Capped at CHATTER_PACKET_LOG_MAX. */
+export interface ChatterPacket {
+  /** Monotonic counter, unique per session — React key. */
+  seq: number;
+  /** performance.now() at observation. */
+  tMs: number;
+  dir: 'tx' | 'rx';
+  kind: 'probe' | 'welcome' | 'report' | 'fileComing' | 'bye' | 'file';
+  /** Sender for rx, target for tx. 0 = broadcast, undefined = unknown. */
+  peerId?: number;
+  /** Wire bytes on the air for this event (probe = burst samples ÷ sampleRate → use 0). */
+  bytes: number;
+  /** Optional one-line detail, e.g. "32 tones @ 6900 Hz" or "grid −4.2 dB". */
+  note?: string;
+}
+
+export const CHATTER_PACKET_LOG_MAX = 200;
 
 const defaultDecoder: DecoderInfo = {
   inFrame: false,
@@ -325,6 +359,8 @@ const defaultState: AppState = {
   chatterDeviceId: 0,
   chatterMembers: [],
   chatterError: null,
+  chatterPackets: [],
+  chatterLastTx: null,
 };
 
 // ─── Store ────────────────────────────────────────────

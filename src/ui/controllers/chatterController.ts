@@ -20,11 +20,17 @@ import {
   type Member,
 } from '../../modem/chatter/roomProtocol';
 import { type PickedSettings } from '../../modem/chatter/settingsPick';
-import type { ControlMessage, FileComingPayload } from '../../modem/protocol/controlFrame';
+import {
+  ControlType,
+  CONTROL_HEADER_WIRE,
+  controlPayloadWireSize,
+  type ControlMessage,
+  type FileComingPayload,
+} from '../../modem/protocol/controlFrame';
 import type { ModemEvent } from '../../workers/modemSchema';
 import { AudioPlayer } from '../../audio/player';
 import { buildModemConfig } from './buildModemConfig';
-import { getState, setState } from '../Store';
+import { getState, setState, CHATTER_PACKET_LOG_MAX, type ChatterPacket } from '../Store';
 import { OFDM_DEFAULTS } from '../../modem/types';
 
 /** Echo tail after our own playback ends, before RX un-mutes (room echo settle). */
@@ -94,18 +100,61 @@ export interface ChatterControllerOptions {
   schedule?: (fn: () => void, delayMs: number) => () => void;
 }
 
+/** dB floor for a zero-magnitude grid point — avoids -Infinity feeding the mean. */
+const GRID_FLOOR_DB = -60;
+
+/** Mean of `rawGrid` in dB relative to its own peak (≤ 0), plus the grid
+ *  itself normalized so max = 1. Guards zero-length/all-zero grids by
+ *  returning undefined rather than NaN/-Infinity. Display-only — never feeds
+ *  a protocol decision. */
+function computeLinkInfo(rawGrid: number[]): { linkDb: number; grid: number[] } | undefined {
+  if (rawGrid.length === 0) return undefined;
+  const peak = Math.max(...rawGrid);
+  if (!(peak > 0)) return undefined;
+  const grid = rawGrid.map((m) => m / peak);
+  const linkDb = grid.reduce((sum, m) => sum + (m > 0 ? 20 * Math.log10(m) : GRID_FLOOR_DB), 0) / grid.length;
+  return { linkDb, grid };
+}
+
+/** Actual over-the-air bytes for a control message with `payloadLen` raw
+ *  payload bytes: the fixed BCH-coded header plus the BCH-coded payload —
+ *  same wire shape controlFrame.ts uses to encode/decode it. */
+function controlWireBytes(payloadLen: number): number {
+  return CONTROL_HEADER_WIRE + controlPayloadWireSize(payloadLen);
+}
+
+/** Maps a decoded ControlType to the packet log's `kind` — display labels
+ *  only, mirrors controlFrame.ts's ControlType without adding new meaning. */
+function controlKindFromType(type: ControlType): ChatterPacket['kind'] {
+  switch (type) {
+    case ControlType.Welcome: return 'welcome';
+    case ControlType.FileComing: return 'fileComing';
+    case ControlType.Bye: return 'bye';
+    case ControlType.Report:
+    default:
+      return 'report';
+  }
+}
+
 function toStoreMembers(members: Member[]): {
   deviceId: number;
   lastHeardMs: number;
   claimLowHz?: number;
   claimHighHz?: number;
+  linkDb?: number;
+  grid?: number[];
 }[] {
-  return members.map((m) => ({
-    deviceId: m.deviceId,
-    lastHeardMs: m.lastHeardMs,
-    claimLowHz: m.claim?.lowHz,
-    claimHighHz: m.claim?.highHz,
-  }));
+  return members.map((m) => {
+    const info = m.heardGrid ? computeLinkInfo(m.heardGrid) : undefined;
+    return {
+      deviceId: m.deviceId,
+      lastHeardMs: m.lastHeardMs,
+      claimLowHz: m.claim?.lowHz,
+      claimHighHz: m.claim?.highHz,
+      linkDb: info?.linkDb,
+      grid: info?.grid,
+    };
+  });
 }
 
 export class ChatterController {
@@ -130,6 +179,8 @@ export class ChatterController {
    *  (never rejected) — lets `leaveRoom` wait out `stop()`'s fire-and-forget
    *  BYE before tearing chatter mode down out from under it. */
   private lastPlayback: Promise<void> = Promise.resolve();
+  /** Monotonic counter for ChatterPacket.seq (React key) — session-scoped, never reset. */
+  private packetSeq = 0;
 
   constructor(private readonly worker: ModemWorkerHandle, options: ChatterControllerOptions = {}) {
     this.player = options.player ?? new AudioPlayer();
@@ -147,8 +198,16 @@ export class ChatterController {
       now,
       rng: this.rng,
       schedule: this.schedule,
-      playProbe: () => this.playAndMute(() => this.worker.encodeProbe(this.deviceId)),
-      sendMessage: (msg: ControlMessage) => this.playAndMute(() => this.worker.encodeControl(msg)),
+      playProbe: () => this.playAndMute(() => this.worker.encodeProbe(this.deviceId), {
+        kind: 'probe',
+        peerId: 0,
+        bytes: 0,
+      }),
+      sendMessage: (msg: ControlMessage) => this.playAndMute(() => this.worker.encodeControl(msg), {
+        kind: controlKindFromType(msg.type),
+        peerId: msg.targetId,
+        bytes: controlWireBytes(msg.payload.byteLength),
+      }),
       isAirBusy: async () => (await this.worker.airCheck()).busy,
       startFileTx: (settings: PickedSettings) => { void this.transmitFile(settings); },
       armFileRx: (info: FileComingPayload) => this.armFileRx(info),
@@ -166,7 +225,17 @@ export class ChatterController {
     // assumes one ChatterController per app session (never re-constructed
     // per join/leave cycle), so there's no matching `off()`/teardown here;
     // joinRoom/leaveRoom only start and stop the ROOM, not these listeners.
-    worker.on('probeHeard', (ev) => this.room.onProbeHeard(ev.deviceId, ev.grid));
+    worker.on('probeHeard', (ev) => {
+      this.room.onProbeHeard(ev.deviceId, ev.grid);
+      const info = computeLinkInfo(ev.grid);
+      this.recordPacket({
+        dir: 'rx',
+        kind: 'probe',
+        peerId: ev.deviceId,
+        bytes: 0,
+        note: info ? `grid ${info.linkDb.toFixed(1)} dB` : undefined,
+      });
+    });
     worker.on('controlMessage', (ev) => {
       this.room.onMessage({
         type: ev.msg.type,
@@ -174,6 +243,12 @@ export class ChatterController {
         targetId: ev.msg.targetId,
         payload: new Uint8Array(ev.msg.payload),
       } as ControlMessage);
+      this.recordPacket({
+        dir: 'rx',
+        kind: controlKindFromType(ev.msg.type),
+        peerId: ev.msg.senderId,
+        bytes: controlWireBytes(ev.msg.payload.byteLength),
+      });
     });
   }
 
@@ -260,11 +335,31 @@ export class ChatterController {
    *  fixed echo tail, so the room's own speaker output is never demodulated
    *  as if it were incoming. Tracks the attempt on `lastPlayback` (settled,
    *  never rejected) so `leaveRoom` can wait one out; the returned promise
-   *  still rejects normally for callers (RoomProtocol's own catch blocks). */
-  private playAndMute(getAudio: () => Promise<{ samples: Float32Array; sampleRate: number }>): Promise<void> {
+   *  still rejects normally for callers (RoomProtocol's own catch blocks).
+   *
+   *  Also the SINGLE place a tx ChatterPacket is recorded — every own
+   *  playback (probe, control message, file) routes through here, so this is
+   *  the one spot that logs the event and stamps `chatterLastTx`, rather than
+   *  scattering recording across each RoomDeps call site. Recorded before
+   *  `getAudio()` runs, per the "observed" semantics (tx = immediately before
+   *  playback starts) — all packet metadata (kind/peerId/bytes) is known
+   *  upfront, without needing the encoded audio. */
+  private playAndMute(
+    getAudio: () => Promise<{ samples: Float32Array; sampleRate: number }>,
+    packet: Omit<ChatterPacket, 'seq' | 'tMs' | 'dir'>,
+  ): Promise<void> {
+    this.recordPacket({ dir: 'tx', ...packet });
+    setState({ chatterLastTx: this.deps.now() });
     const attempt = this.doPlayAndMute(getAudio);
     this.lastPlayback = attempt.catch(() => {});
     return attempt;
+  }
+
+  /** Push one ChatterPacket onto the bounded ring (display-only — never
+   *  read by any protocol decision). */
+  private recordPacket(p: Omit<ChatterPacket, 'seq' | 'tMs'>): void {
+    const packet: ChatterPacket = { seq: this.packetSeq++, tMs: this.deps.now(), ...p };
+    setState({ chatterPackets: [...getState().chatterPackets, packet].slice(-CHATTER_PACKET_LOG_MAX) });
   }
 
   private async doPlayAndMute(getAudio: () => Promise<{ samples: Float32Array; sampleRate: number }>): Promise<void> {
@@ -287,7 +382,7 @@ export class ChatterController {
    *  HandshakeReceiver); `info` carries nothing else this adapter needs
    *  (the receive timeout is RoomProtocol's own timer). */
   private armFileRx(info: FileComingPayload): void {
-    void info;
+    this.recordPacket({ dir: 'rx', kind: 'file', bytes: info.fileBytes });
     if (this.rxArmed) return;
     this.rxArmed = true;
     const s = getState();
@@ -325,6 +420,11 @@ export class ChatterController {
     cfg.emitLinkProfile = true;
     this.worker.configure(cfg);
 
-    await this.playAndMute(() => this.worker.encodeFile(pending.fileName, pending.data));
+    await this.playAndMute(() => this.worker.encodeFile(pending.fileName, pending.data), {
+      kind: 'file',
+      peerId: 0,
+      bytes: pending.data.byteLength,
+      note: pending.fileName,
+    });
   }
 }

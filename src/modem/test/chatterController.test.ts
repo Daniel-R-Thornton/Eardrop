@@ -8,8 +8,8 @@
 import { describe, expect, it, beforeEach } from 'vitest';
 import { ChatterController, type ModemWorkerHandle, type AudioPlayerLike } from '../../ui/controllers/chatterController';
 import { ROOM_TIMING } from '../chatter/roomProtocol';
-import { ControlType } from '../protocol/controlFrame';
-import { getState, setState } from '../../ui/Store';
+import { ControlType, CONTROL_HEADER_WIRE, controlPayloadWireSize } from '../protocol/controlFrame';
+import { getState, setState, CHATTER_PACKET_LOG_MAX } from '../../ui/Store';
 
 /** Manual clock + timer wheel, mirroring roomProtocol.test.ts's harness. */
 function makeClock() {
@@ -112,6 +112,8 @@ describe('ChatterController', () => {
       chatterDeviceId: 0,
       chatterMembers: [],
       chatterError: null,
+      chatterPackets: [],
+      chatterLastTx: null,
     });
   });
 
@@ -261,5 +263,111 @@ describe('ChatterController', () => {
     const stopIdx = worker.calls.indexOf('chatterStop');
     expect(byeIdx).toBeGreaterThanOrEqual(0);
     expect(byeIdx).toBeLessThan(stopIdx);
+  });
+
+  it('records a tx packet + chatterLastTx for the join probe', async () => {
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
+
+    await controller.joinRoom();
+    await clock.tick(ROOM_TIMING.listenMs + MUTE_TAIL_MS + 50);
+
+    const probePackets = getState().chatterPackets.filter((p) => p.kind === 'probe' && p.dir === 'tx');
+    expect(probePackets).toHaveLength(1);
+    expect(probePackets[0]).toMatchObject({ dir: 'tx', kind: 'probe', bytes: 0 });
+    expect(getState().chatterLastTx).not.toBeNull();
+  });
+
+  it('records an rx packet for a heard probe, with a link-quality note', async () => {
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
+
+    await controller.joinRoom();
+    await clock.tick(
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200,
+    );
+
+    worker.emit('probeHeard', { deviceId: 9, grid: flatGrid });
+
+    const rxProbe = getState().chatterPackets.find((p) => p.kind === 'probe' && p.dir === 'rx');
+    expect(rxProbe).toBeDefined();
+    expect(rxProbe).toMatchObject({ dir: 'rx', kind: 'probe', peerId: 9, bytes: 0 });
+    // flatGrid is uniform, so it's already at its own peak everywhere -> 0 dB.
+    expect(rxProbe!.note).toMatch(/0(\.0)? ?dB/);
+  });
+
+  it('records an rx packet for a decoded control message, keyed by ControlType', async () => {
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
+
+    await controller.joinRoom();
+    await clock.tick(ROOM_TIMING.listenMs + MUTE_TAIL_MS + 50); // reach 'joinWait'
+
+    worker.emit('controlMessage', {
+      msg: { type: ControlType.Welcome, senderId: 9, targetId: 1, payload: new Uint8Array([1, 2, 3]) },
+    });
+
+    const rxWelcome = getState().chatterPackets.find((p) => p.kind === 'welcome' && p.dir === 'rx');
+    expect(rxWelcome).toBeDefined();
+    expect(rxWelcome).toMatchObject({
+      dir: 'rx',
+      kind: 'welcome',
+      peerId: 9,
+      bytes: CONTROL_HEADER_WIRE + controlPayloadWireSize(3),
+    });
+  });
+
+  it('caps the packet log at CHATTER_PACKET_LOG_MAX, keeping the newest', async () => {
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
+
+    await controller.joinRoom();
+    await clock.tick(
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200,
+    );
+
+    for (let i = 0; i < CHATTER_PACKET_LOG_MAX + 20; i++) {
+      worker.emit('probeHeard', { deviceId: 9, grid: flatGrid });
+    }
+
+    const packets = getState().chatterPackets;
+    expect(packets.length).toBe(CHATTER_PACKET_LOG_MAX);
+    expect(packets[packets.length - 1].seq).toBeGreaterThan(packets[0].seq);
+  });
+
+  it('enriches a member with linkDb/grid once a probe from them has been measured', async () => {
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
+
+    await controller.joinRoom();
+    await clock.tick(
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200,
+    );
+    expect(getState().chatterState).toBe('idle');
+
+    // Device 9 probes us — this device measures & records device 9's grid.
+    worker.emit('probeHeard', { deviceId: 9, grid: flatGrid });
+    await clock.tick(ROOM_TIMING.replySlotMs + MUTE_TAIL_MS + 100);
+    expect(getState().chatterState).toBe('idle');
+
+    // Drive a roll call so RoomProtocol's next onStateChange snapshot carries
+    // device 9 (with its heardGrid) into the store.
+    await controller.broadcastFile('a.txt', new Uint8Array([1, 2, 3]));
+    await clock.tick(ROOM_TIMING.listenMs + MUTE_TAIL_MS + 50); // reach 'rollCall'
+
+    const member = getState().chatterMembers.find((m) => m.deviceId === 9);
+    expect(member).toBeDefined();
+    expect(member!.linkDb).toBeCloseTo(0, 5); // flat grid -> already at its own peak
+    expect(member!.grid).toEqual(flatGrid.map(() => 1));
   });
 });
