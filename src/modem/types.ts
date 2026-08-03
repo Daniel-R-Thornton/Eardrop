@@ -230,8 +230,14 @@ export const OFDM_DEFAULTS = {
  * the transfer was dead before it started.
  */
 export const OFDM_HANDSHAKE = {
-  pilotFreqHz: 6800,
-  toneStartHz: 100, // offset above the pilot — tones at 6900-7250 Hz
+  // 6300 rather than something snugger: ofdmToneFrequencies clamps the offset
+  // to MIN_TONE_START_HZ (600) so tones can never land on the pilot, and a
+  // smaller number here is silently raised to 600 — which shifts the TONES up
+  // instead of moving the pilot closer, the opposite of the intent. 6300 + 600
+  // lands the tones back on the bench-measured 6900-7250 with the factor at
+  // 1.15. It is also the pilot the main band settled on for the same reason.
+  pilotFreqHz: 6300,
+  toneStartHz: 600, // offset above the pilot — tones at 6900-7250 Hz
   toneCount: 8,
   gapSymbols: 8,
 } as const;

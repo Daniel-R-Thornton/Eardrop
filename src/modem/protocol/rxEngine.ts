@@ -681,7 +681,14 @@ export class RxEngine {
           this.ofdmDemod!.resetTraining();
         } else {
           // Score too low — reset and retry on fresh data.
-          dlog('OFDM-SYNC', { chirpMiss: true, norm: normScore, peak: peakValue });
+          //
+          // Own tag, not OFDM-SYNC: this fires on every correlator pass that
+          // does not find a chirp, which in an idle room is continuous —
+          // hundreds of lines between anything worth reading. Splitting it out
+          // lets a focused view keep the OFDM-SYNC rows that matter (chirp
+          // found, handoff, reject) without the miss stream. The LLM dump
+          // still counts these under `chirpMiss` for its SUPPRESSED tally.
+          dlog('OFDM-MISS', { chirpMiss: true, norm: normScore, peak: peakValue });
           this.chirpRan = false;
           this.chirpTick = 0;
           // Drop old data, giving new samples a chance (was chirpBuf.slice(-len)).

@@ -545,7 +545,9 @@ export function compressRecords(recs: DlogRecord[]): string {
       suppressed.set(rec.tag, (suppressed.get(rec.tag) ?? 0) + 1);
       continue;
     }
-    if (rec.tag === 'OFDM-SYNC' && rec.fields.chirpMiss === true) {
+    // OFDM-MISS is the current tag; OFDM-SYNC is accepted so dumps captured
+    // before the split still tally correctly.
+    if ((rec.tag === 'OFDM-MISS' || rec.tag === 'OFDM-SYNC') && rec.fields.chirpMiss === true) {
       suppressed.set('chirpMiss', (suppressed.get('chirpMiss') ?? 0) + 1);
       continue;
     }
