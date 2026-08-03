@@ -99,10 +99,20 @@ export function BenchApp() {
     <div
       style={{
         minHeight: '100vh',
+        // Room mode is capped to exactly the viewport (no page-level scroll)
+        // so the node graph can fill genuinely available space and the
+        // packet/roster panels handle their own internal scrolling instead
+        // of the whole page growing taller. Every other mode keeps the
+        // original "grow with content" page scroll unchanged.
+        height: inRoom ? '100vh' : undefined,
+        overflow: inRoom ? 'hidden' : undefined,
+        display: 'flex',
+        flexDirection: 'column',
         background: '#c9c3b3',
         padding: 16,
         fontFamily: T.mono,
         color: T.panelInk,
+        boxSizing: 'border-box',
       }}
     >
       {/* header */}
@@ -167,7 +177,11 @@ export function BenchApp() {
       </div>
 
       {presenting && <PresentationMode onExit={() => setPresenting(false)} />}
-      {!presenting && inRoom && <RoomMode onExit={() => setInRoom(false)} />}
+      {!presenting && inRoom && (
+        <div style={{ flex: '1 1 auto', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+          <RoomMode onExit={() => setInRoom(false)} />
+        </div>
+      )}
 
       {!presenting && !inRoom && (
       <>

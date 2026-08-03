@@ -1,32 +1,26 @@
 /**
  * RoomModePacketStream.tsx — the live packet list for RoomMode.tsx, split
  * out to keep the parent file under the codebase's ~450-line guideline.
- * Newest-first scroller, capped visually (fixed height + overflow) so it
- * stays readable even with the full 200-entry ring buffer behind it.
+ * Newest-first scroller; fills whatever height its parent gives it
+ * (`height: 100%` + `overflowY: auto`) so it gets real vertical room in the
+ * room-mode layout instead of a small fixed box, while staying readable at
+ * the full 200-entry ring buffer.
  */
 import type { ChatterPacket } from '../Store';
-import { T } from '../theme/labaccent/tokens';
+import { T, TONE_TRACE } from '../theme/labaccent/tokens';
+import { hex, formatAgoShort } from './roomModeFormat';
 
+// All colours here come from the shared token vocabulary (T / TONE_TRACE) —
+// no ad hoc hex values — so packet kinds stay visually consistent with the
+// rest of the lab-accent theme.
 const KIND_COLOR: Record<ChatterPacket['kind'], string> = {
   probe: T.cyan,
   welcome: T.phosphor,
   report: T.amber,
-  fileComing: '#ff7ad0',
+  fileComing: TONE_TRACE[3],
   bye: T.led,
-  file: '#b3ff3c',
+  file: TONE_TRACE[4],
 };
-
-function hex(id: number): string {
-  return id.toString(16).padStart(2, '0');
-}
-
-function formatAgoShort(ms: number): string {
-  const sec = Math.max(0, ms / 1000);
-  if (sec < 1) return 'now';
-  if (sec < 60) return `${sec.toFixed(0)}s`;
-  const min = sec / 60;
-  return `${min.toFixed(0)}m`;
-}
 
 export function PacketStream({ packets, now }: { packets: ChatterPacket[]; now: number }) {
   if (packets.length === 0) {
@@ -38,7 +32,7 @@ export function PacketStream({ packets, now }: { packets: ChatterPacket[]; now: 
   }
   const rows = [...packets].reverse();
   return (
-    <div style={{ maxHeight: 460, overflowY: 'auto', fontFamily: T.mono, fontSize: 11 }}>
+    <div style={{ height: '100%', overflowY: 'auto', fontFamily: T.mono, fontSize: 11 }}>
       {rows.map((p) => (
         <div
           key={p.seq}
