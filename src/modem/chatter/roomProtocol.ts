@@ -190,6 +190,13 @@ export class RoomProtocol {
     // member is running a roll call (reply REPORT — "roll-call ack" per the
     // design spec's control-message table), since a member we've already
     // welcomed needs a fresh channel measurement, not another welcome.
+    // Consequence: a device rejoining with the same deviceId while peers
+    // still hold it in _members (page refresh, reconnect, a second start())
+    // gets a REPORT while sitting in joinWait, not a WELCOME — see
+    // handleReport, which treats that as a member refresh rather than
+    // dropping it. The real fix is a purpose bit on the probe burst so
+    // WELCOME vs REPORT is signaled explicitly instead of inferred from
+    // membership.
     if (this._state === 'idle' && !this.pendingReplyTo.has(deviceId)) {
       this.pendingReplyTo.add(deviceId);
       const alreadyKnown = existing !== undefined;
@@ -237,10 +244,29 @@ export class RoomProtocol {
   }
 
   private handleReport(msg: ControlMessage): void {
-    if (this._state !== 'collecting') return;
     if (msg.targetId !== this.deps.deviceId) return;
     const grid = parseReport(msg.payload);
     if (!grid) return;
+
+    // A REPORT is also a member refresh, independent of roll-call state: a
+    // device rejoining with the same deviceId (page refresh, reconnect, a
+    // second start()) while peers still hold it in _members receives REPORT
+    // (not WELCOME, see onProbeHeard) even while it sits in joinWait. Drop
+    // that silently and the rejoiner finishes joining knowing nothing about
+    // this peer — so always upsert the sender here, mirroring what
+    // handleWelcome refreshes.
+    const existing = this._members.get(msg.senderId);
+    this._members.set(msg.senderId, {
+      ...existing,
+      deviceId: msg.senderId,
+      lastHeardMs: this.deps.now(),
+      theirViewOfUs: grid,
+    });
+
+    // Roll-call accumulation (feeds pickSettings) only happens while actively
+    // collecting — a REPORT arriving outside that window is member-refresh
+    // only, never counted toward the roll call.
+    if (this._state !== 'collecting') return;
     this.collectedReports.set(msg.senderId, { deviceId: msg.senderId, grid });
   }
 

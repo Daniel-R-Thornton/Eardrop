@@ -159,6 +159,26 @@ describe('room protocol', () => {
     expect(h.room.lastError).toMatch(/audio glitch/);
   });
 
+  it('a REPORT received while in joinWait refreshes the member but is not counted toward roll call', async () => {
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + 50);
+    expect(h.room.state).toBe('joinWait'); // rejoin gap: still pre-idle when the REPORT arrives
+
+    h.room.onMessage({ type: ControlType.Report, senderId: 5, targetId: 2, payload: packReport(flatGrid) });
+
+    const member = h.room.members.get(5);
+    expect(member).toBeDefined();
+    expect(member?.lastHeardMs).toBe(ROOM_TIMING.listenMs + 50);
+    expect(member?.theirViewOfUs).toEqual(flatGrid);
+    // Must be a member refresh only — never fed to the roll-call collection
+    // that pickSettings later reads from.
+    expect((h.room as any).collectedReports.size).toBe(0);
+
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 100);
+    expect(h.room.state).toBe('idle');
+  });
+
   it('onProbeHeard twice for the same prober while idle only schedules one WELCOME chain', async () => {
     const h = makeHarness(2);
     h.room.start();
