@@ -5,7 +5,7 @@
  * dispatch/Store event bus (see TxPanel.tsx/SettingsPanel.tsx) — it never
  * imports ChatterController directly.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useStore } from '../Store';
 import { T } from '../theme/labaccent/tokens';
 import { Panel } from '../components/instrument/Panel';
@@ -17,6 +17,14 @@ const dispatch = (type: string) => window.dispatchEvent(new CustomEvent(type));
 /** Members past this age are still listed but shown as aged-out — display-only;
  *  RoomProtocol owns its own membership timeout separately. */
 const AGE_OUT_MS = 5 * 60 * 1000;
+
+/** Safety ceiling on the Join/Leave button's disabled window — the button
+ *  re-enables as soon as `chatterOn` actually flips (the normal path), but a
+ *  join/leave that throws before touching the store must not leave it stuck
+ *  disabled forever. `ChatterController.joinRoom`/`leaveRoom` themselves are
+ *  idempotency-guarded (see chatterController.ts), so this is a UX debounce
+ *  against rapid double-clicks, not the sole re-entry guard. */
+const PENDING_TIMEOUT_MS = 15000;
 
 function formatAgo(ms: number): string {
   const sec = Math.max(0, Math.round(ms / 1000));
@@ -39,6 +47,25 @@ export function ChatterPanel() {
     return () => clearInterval(t);
   }, []);
 
+  // Join/Leave dispatches a fire-and-forget custom event — there's no promise
+  // to await here, so track "a click is in flight" locally and disable the
+  // button until the store reflects the outcome (chatterOn flips) or the
+  // safety timeout elapses. Without this, a second click mid-join re-enters
+  // ChatterController.joinRoom() while chatterOn is still false.
+  const [pending, setPending] = useState(false);
+  const wasOn = useRef(s.chatterOn);
+  useEffect(() => {
+    if (wasOn.current !== s.chatterOn) {
+      wasOn.current = s.chatterOn;
+      setPending(false);
+    }
+  }, [s.chatterOn]);
+  useEffect(() => {
+    if (!pending) return;
+    const t = setTimeout(() => setPending(false), PENDING_TIMEOUT_MS);
+    return () => clearTimeout(t);
+  }, [pending]);
+
   const now = performance.now();
   const title = s.chatterOn ? `CHATTER — ${s.chatterState.toUpperCase()}` : 'CHATTER';
 
@@ -47,9 +74,13 @@ export function ChatterPanel() {
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
         <Button
           primary={!s.chatterOn}
-          onClick={() => dispatch(s.chatterOn ? 'eardrop-chatter-leave' : 'eardrop-chatter-join')}
+          disabled={pending}
+          onClick={() => {
+            setPending(true);
+            dispatch(s.chatterOn ? 'eardrop-chatter-leave' : 'eardrop-chatter-join');
+          }}
         >
-          {s.chatterOn ? '⏏ LEAVE ROOM' : '☎ JOIN ROOM'}
+          {pending ? '…' : s.chatterOn ? '⏏ LEAVE ROOM' : '☎ JOIN ROOM'}
         </Button>
         <LED on={s.chatterOn} label={s.chatterOn ? s.chatterState.toUpperCase() : 'OFF'} />
         {s.chatterOn && (

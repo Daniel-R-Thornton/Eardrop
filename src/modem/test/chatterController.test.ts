@@ -143,6 +143,24 @@ describe('ChatterController', () => {
     expect(getState().chatterState).toBe('idle');
   });
 
+  it('a second joinRoom call while the first is still in flight is a no-op', async () => {
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const rng = () => 0;
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng });
+
+    // Neither call is awaited before the second fires — reproduces a second
+    // button click landing mid-await, before `chatterOn` has flipped true.
+    const p1 = controller.joinRoom();
+    const p2 = controller.joinRoom();
+    await Promise.all([p1, p2]);
+
+    expect(worker.calls.filter((c) => c.startsWith('chatterStart')).length).toBe(1);
+    expect(worker.calls.filter((c) => c === 'startListening').length).toBe(1);
+    expect(getState().chatterOn).toBe(true);
+  });
+
   it('routes a worker probeHeard event into the protocol and replies WELCOME', async () => {
     const worker = makeFakeWorker();
     const player = makeFakePlayer();

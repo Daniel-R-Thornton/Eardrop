@@ -118,6 +118,14 @@ export class ChatterController {
   private deviceId = 0;
   private rxArmed = false;
   private pendingFile: { fileName: string; data: Uint8Array } | null = null;
+  /** Re-entry guard: `chatterOn` in the Store only flips true at the END of
+   *  `joinRoom`'s async chain, so a second click/call arriving mid-await sees
+   *  `chatterOn === false` and would otherwise re-enter — re-rolling the
+   *  device id mid-join and making `ModemController.startListening` spin up a
+   *  SECOND `AudioRecorder` (leaking the first one's open mic stream) on top
+   *  of the in-flight one. Mirrors the shape for `leaveRoom`. */
+  private joining = false;
+  private leaving = false;
   /** The most recently started own-playback (probe/control/file), settled
    *  (never rejected) — lets `leaveRoom` wait out `stop()`'s fire-and-forget
    *  BYE before tearing chatter mode down out from under it. */
@@ -169,51 +177,70 @@ export class ChatterController {
     });
   }
 
-  /** join the room: pick a random device id, tell the worker, start the state machine */
+  /** join the room: pick a random device id, tell the worker, start the state machine.
+   *  No-op while a join is already in flight or the room is already joined —
+   *  `chatterOn` only flips true at the very end of this method, so without
+   *  this guard a second call arriving mid-await would re-roll the device id
+   *  and hand `ModemController.startListening` a second `AudioRecorder` on
+   *  top of the first (leaked mic stream). */
   async joinRoom(): Promise<void> {
-    const deviceId = 1 + Math.floor(this.rng() * 255); // 1-255
-    this.deviceId = deviceId;
-    this.deps.deviceId = deviceId;
+    if (this.joining || getState().chatterOn) return;
+    this.joining = true;
+    try {
+      const deviceId = 1 + Math.floor(this.rng() * 255); // 1-255
+      this.deviceId = deviceId;
+      this.deps.deviceId = deviceId;
 
-    const s = getState();
-    this.worker.configure(buildModemConfig({
-      useOFDM: true,
-      pilotFreqHz: OFDM_DEFAULTS.pilotFreqHz,
-      toneStartHz: OFDM_DEFAULTS.toneStartHz,
-      toneCount: OFDM_DEFAULTS.toneCount,
-      symbolsPerSec: s.symbolsPerSec,
-      musicalMode: false,
-      diversityMode: false,
-      hwSampleRate: this.worker.sampleRate,
-      bandHandshake: true,
-    }));
-    this.worker.chatterStart(deviceId);
-    await this.worker.startListening(s.micGain, s.selectedInputId, s.selectedInputLabel);
-    this.rxArmed = true;
+      const s = getState();
+      this.worker.configure(buildModemConfig({
+        useOFDM: true,
+        pilotFreqHz: OFDM_DEFAULTS.pilotFreqHz,
+        toneStartHz: OFDM_DEFAULTS.toneStartHz,
+        toneCount: OFDM_DEFAULTS.toneCount,
+        symbolsPerSec: s.symbolsPerSec,
+        musicalMode: false,
+        diversityMode: false,
+        hwSampleRate: this.worker.sampleRate,
+        bandHandshake: true,
+      }));
+      this.worker.chatterStart(deviceId);
+      await this.worker.startListening(s.micGain, s.selectedInputId, s.selectedInputLabel);
+      this.rxArmed = true;
 
-    setState({ chatterOn: true, chatterDeviceId: deviceId, chatterError: null });
-    this.room.start();
+      setState({ chatterOn: true, chatterDeviceId: deviceId, chatterError: null });
+      this.room.start();
+    } finally {
+      this.joining = false;
+    }
   }
 
-  /** leave the room: stop the state machine, tear down the worker's chatter mode */
+  /** leave the room: stop the state machine, tear down the worker's chatter mode.
+   *  No-op while a leave is already in flight or the room isn't joined — same
+   *  re-entry hazard as `joinRoom` (`chatterOn` only flips false at the end). */
   async leaveRoom(): Promise<void> {
-    this.room.stop(); // fires a best-effort BYE via a fire-and-forget deps.sendMessage
-    // Give that BYE's encode+play chain a real chance to run before tearing
-    // chatter mode down — chatterStop()/stopListening() below would
-    // otherwise race it out from under it structurally (every time, not just
-    // occasionally), since stop() doesn't await its own sendMessage call.
-    await Promise.race([this.lastPlayback, this.timeout(LEAVE_PLAYBACK_TIMEOUT_MS)]);
-    this.worker.chatterStop();
-    this.worker.stopListening();
-    this.rxArmed = false;
-    this.pendingFile = null;
-    setState({
-      chatterOn: false,
-      chatterState: 'off',
-      chatterDeviceId: 0,
-      chatterMembers: [],
-      chatterError: null,
-    });
+    if (this.leaving || !getState().chatterOn) return;
+    this.leaving = true;
+    try {
+      this.room.stop(); // fires a best-effort BYE via a fire-and-forget deps.sendMessage
+      // Give that BYE's encode+play chain a real chance to run before tearing
+      // chatter mode down — chatterStop()/stopListening() below would
+      // otherwise race it out from under it structurally (every time, not just
+      // occasionally), since stop() doesn't await its own sendMessage call.
+      await Promise.race([this.lastPlayback, this.timeout(LEAVE_PLAYBACK_TIMEOUT_MS)]);
+      this.worker.chatterStop();
+      this.worker.stopListening();
+      this.rxArmed = false;
+      this.pendingFile = null;
+      setState({
+        chatterOn: false,
+        chatterState: 'off',
+        chatterDeviceId: 0,
+        chatterMembers: [],
+        chatterError: null,
+      });
+    } finally {
+      this.leaving = false;
+    }
   }
 
   /** Broadcast a file to the room (chatter path for the existing drop zone). */
