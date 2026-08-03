@@ -40,6 +40,12 @@ export function rmsOf(samples: ArrayLike<number>): number {
  * chunk (someone transmitting) must never drag the floor up to match it,
  * or the gate could never trip busy again.
  */
+/** How much slower the noise floor rises than it falls. Slow enough that a
+ *  real transmission doesn't drag the floor up behind it (which would make
+ *  the air read clear mid-burst), fast enough to escape a bad seed within a
+ *  couple of seconds of audio. */
+const RISE_RATIO = 0.1;
+
 export class AirNoiseTracker {
   private floor = 0;
   private seeded = false;
@@ -52,9 +58,16 @@ export class AirNoiseTracker {
       this.seeded = true;
       return;
     }
-    if (chunkRms < 3 * this.floor) {
-      this.floor = this.floor * (1 - this.alpha) + chunkRms * this.alpha;
-    }
+    // Asymmetric, and — critically — never frozen. Updating only while quiet
+    // (the original rule) latches permanently if the seed lands too low: the
+    // very first chunk after a mic starts is often near-silence, every later
+    // chunk then reads above 3x that floor, so the floor can never rise and
+    // the air is reported busy forever. A join then burns its full
+    // carrier-sense cap before every single announce. Tracking down fast and
+    // up slowly keeps a genuine transmission from inflating the floor while
+    // still guaranteeing recovery from a bad seed.
+    const alpha = chunkRms < this.floor ? this.alpha : this.alpha * RISE_RATIO;
+    this.floor = this.floor * (1 - alpha) + chunkRms * alpha;
   }
 
   isBusy(rms: number): boolean {

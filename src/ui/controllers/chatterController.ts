@@ -440,7 +440,12 @@ export class ChatterController {
     const { samples, sampleRate } = await getAudio();
     this.worker.setRxMuted(true);
     try {
-      await this.player.play(samples, sampleRate);
+      // Route to the SELECTED speaker, not the system default. Chatter is an
+      // over-the-air protocol: playing out of whatever the OS picked (a
+      // headset, typically) means the room never hears the burst — and the
+      // operator hears every probe in their ears instead. Read at play time
+      // so a device change mid-session takes effect on the next burst.
+      await this.player.play(samples, sampleRate, getState().selectedOutputId);
     } finally {
       await this.timeout(MUTE_TAIL_MS);
       this.worker.setRxMuted(false);

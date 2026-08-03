@@ -100,6 +100,29 @@ describe('AirNoiseTracker', () => {
     // Floor should still be near the quiet level, not the loud one.
     expect(tracker.noiseFloor).toBeLessThan(rmsOf(loud) / 3);
   });
+
+  it('recovers from a too-quiet seed instead of reporting busy forever', () => {
+    // The first chunk after a mic starts is often near-silence, which seeds
+    // the floor far below the real room. Every later chunk then sits above
+    // 3x that seed. If the floor can only move while the air reads clear, it
+    // never moves again and the air is busy forever — a join burns its whole
+    // carrier-sense cap before every announce, which is exactly what was seen
+    // on hardware.
+    const tracker = new AirNoiseTracker();
+    tracker.update(rmsOf(new Float32Array(2048).map(() => 1e-6))) // near-silent seed
+    ;
+    const room = new Float32Array(2048).map((_, i) => 0.01 * Math.sin((2 * Math.PI * 300 * i) / SR));
+    expect(tracker.isBusy(rmsOf(room))).toBe(true); // busy at first, correctly
+
+    // Steady room tone is the new normal — a few seconds of it must lift the
+    // floor enough that the room alone no longer counts as a transmission.
+    for (let n = 0; n < 400; n++) tracker.update(rmsOf(room));
+    expect(tracker.isBusy(rmsOf(room))).toBe(false);
+
+    // ...while a genuinely loud burst over that room still reads busy.
+    const burst = new Float32Array(2048).map((_, i) => 0.3 * Math.sin((2 * Math.PI * 1000 * i) / SR));
+    expect(tracker.isBusy(rmsOf(burst))).toBe(true);
+  });
 });
 
 describe('control frames on the handshake band', () => {

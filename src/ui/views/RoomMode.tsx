@@ -25,6 +25,26 @@ const dispatch = (type: string) => window.dispatchEvent(new CustomEvent(type));
  *  display-only; RoomProtocol owns its own membership timeout separately. */
 const AGE_OUT_MS = 5 * 60 * 1000;
 
+/**
+ * Plain-English account of each protocol phase, with the rough duration where
+ * one is bounded. Every phase here involves either silence or a burst that
+ * takes seconds, so a bare state word ("LISTENING") reads as a hang — the
+ * operator cannot tell a working join from a stuck one without knowing what
+ * the radio is actually doing and roughly how long it takes.
+ */
+const PHASE_TEXT: Record<string, string> = {
+  off: 'not joined',
+  cold: 'not joined',
+  listening: 'waiting for a clear moment on the air before announcing',
+  announcing: 'announcing — playing the probe burst (~4 s of audio)',
+  joinWait: 'announced; waiting for anyone already here to reply (~6 s)',
+  idle: 'in the room — listening for probes and transfers',
+  rollCall: 'roll call — playing the probe burst so peers can measure us (~4 s)',
+  collecting: 'collecting channel reports from peers (~6 s)',
+  sending: 'transmitting the file',
+  receiving: 'receiving a file',
+};
+
 /** Safety ceiling on the Join/Leave button's disabled window — mirrors
  *  ChatterPanel's guard against double-clicking mid-join/leave. If the store
  *  never reaches the expected chatterOn state within this window, that's the
@@ -381,6 +401,24 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
           </button>
           <button onClick={onExit} style={btn(false)}>← back to bench</button>
         </div>
+      </div>
+
+      {/* What the radio is doing right now, and on which devices. Chatter is
+       *  half duplex over real speakers and mics: if it plays out of the wrong
+       *  output the room never hears it, so the devices in use belong on
+       *  screen next to the phase rather than buried in the bench settings. */}
+      <div style={{
+        display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12,
+        marginBottom: 10, flex: '0 0 auto', fontFamily: T.mono, fontSize: 11,
+      }}>
+        <span style={{ color: s.chatterOn ? T.phosphor : T.panelInk, opacity: s.chatterOn ? 1 : 0.7 }}>
+          {pending === 'join'
+            ? 'starting microphone and joining…'
+            : PHASE_TEXT[s.chatterOn ? s.chatterState : 'off'] ?? s.chatterState}
+        </span>
+        <span style={{ color: T.panelInk, opacity: 0.7 }}>
+          mic {s.selectedInputLabel || 'default'} · out {s.selectedOutputId ? 'selected' : 'system default'}
+        </span>
       </div>
 
       {notice && (
