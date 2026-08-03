@@ -414,14 +414,17 @@ export class ChatterController {
   }
 
   /** Broadcast a file to the room (chatter path for the existing drop zone). */
-  async broadcastFile(fileName: string, data: Uint8Array): Promise<void> {
+  /** `targetId` 0 (the default) sends to the whole room; anything else
+   *  addresses one member — the air carries it to everyone either way, but
+   *  only the addressee arms its receiver. */
+  async broadcastFile(fileName: string, data: Uint8Array, targetId = 0): Promise<void> {
     if (this.room.state !== 'idle') {
-      setState({ chatterError: `cannot broadcast: room is ${this.room.state}, not idle` });
+      setState({ chatterError: `cannot send: room is ${this.room.state}, not idle` });
       return;
     }
     this.pendingFile = { fileName, data };
     const durationMs = estimateDurationMs(data.byteLength, getState().symbolsPerSec);
-    this.room.sendFile(data.byteLength, durationMs);
+    this.room.sendFile(data.byteLength, durationMs, targetId);
   }
 
   // ---- RoomDeps adapters ----

@@ -115,6 +115,15 @@ const TRANSFER_TAIL_MARGIN_MS = 5000;
 interface PendingFile {
   fileBytes: number;
   durationMs: number;
+  /**
+   * Who the transfer is for: 0 broadcasts to the room, any other id addresses
+   * one member. The air carries it either way — acoustic transmission has no
+   * notion of a private channel — so this only decides who ACTS on it. An
+   * addressed send also negotiates against that member alone rather than the
+   * worst peer in the room, which is the real benefit: one slow device no
+   * longer drags down a transfer that was never meant for it.
+   */
+  targetId: number;
 }
 
 export class RoomProtocol {
@@ -172,12 +181,13 @@ export class RoomProtocol {
   }
 
   /** user dropped a file; size+duration go into FILE_COMING */
-  sendFile(fileBytes: number, durationMs: number): void {
+  /** `targetId` 0 broadcasts to the room; anything else addresses one member. */
+  sendFile(fileBytes: number, durationMs: number, targetId = 0): void {
     if (this._state !== 'idle') {
-      this.pendingSendFile = { fileBytes, durationMs };
+      this.pendingSendFile = { fileBytes, durationMs, targetId };
       return;
     }
-    this.beginRollCall({ fileBytes, durationMs });
+    this.beginRollCall({ fileBytes, durationMs, targetId });
   }
 
   /** worker heard a probe: id + measured grid */
@@ -306,6 +316,17 @@ export class RoomProtocol {
 
   private handleFileComing(msg: ControlMessage): void {
     if (this._state !== 'idle' && this._state !== 'joinWait') return;
+    // Addressed transfers: everyone in earshot demodulates this announcement,
+    // but only the addressee acts on it. Without the check every device would
+    // arm its receiver and sit in 'receiving' for the whole transfer, deaf to
+    // the room and unable to answer anything, for a file it will never
+    // assemble. 0 is the broadcast address.
+    if (msg.targetId !== 0 && msg.targetId !== this.deps.deviceId) {
+      dlog('ROOM', {
+        fileComingForOther: true, from: msg.senderId, to: msg.targetId, us: this.deps.deviceId,
+      }, { level: 'info' });
+      return;
+    }
     const parsed = parseFileComing(msg.payload);
     if (!parsed) return;
     this.deps.armFileRx(parsed);
@@ -379,16 +400,24 @@ export class RoomProtocol {
   }
 
   private finishRollCall(): void {
-    const reports = Array.from(this.collectedReports.values());
+    const target = this.activeFileParams?.targetId ?? 0;
+    // An addressed transfer negotiates against its addressee alone. Including
+    // everyone else's reports would pick settings for the worst device in the
+    // room, throttling a transfer that device is not even receiving.
+    const all = Array.from(this.collectedReports.values());
+    const reports = target === 0 ? all : all.filter((r) => r.deviceId === target);
     dlog('ROOM', {
       rollCallDone: true,
+      target: target === 0 ? 'broadcast' : target,
       reports: reports.length,
       from: reports.map((r) => r.deviceId).join(',') || 'none',
       knownMembers: Array.from(this._members.keys()).join(',') || 'none',
       us: this.deps.deviceId,
     }, { level: 'warn' });
     if (reports.length === 0) {
-      this._lastError = 'roll call: no reports received — nobody home';
+      this._lastError = target === 0
+        ? 'roll call: no reports received — nobody home'
+        : `roll call: no reply from ${target.toString(16).padStart(2, '0')} — not reachable`;
       this.activeFileParams = null;
       this.finishToIdle();
       return;
@@ -404,7 +433,7 @@ export class RoomProtocol {
       await this.deps.sendMessage({
         type: ControlType.FileComing,
         senderId: this.deps.deviceId,
-        targetId: 0,
+        targetId: fileParams.targetId,
         payload: packFileComing({
           pilotFreqHz: settings.pilotFreqHz,
           toneStartHz: settings.toneStartHz,

@@ -148,6 +148,13 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
   const [localNotice, setLocalNotice] = useState<string | null>(null);
   /** True while a file is being dragged over the mode — drives the drop overlay. */
   const [dragging, setDragging] = useState(false);
+  /**
+   * Who the next chosen file is addressed to: 0 for the whole room. Set by a
+   * node's "send file to" button just before the picker opens, and cleared
+   * once the file is handed off, so a later drag-and-drop is a broadcast again
+   * rather than silently inheriting the last node clicked.
+   */
+  const [sendTargetId, setSendTargetId] = useState(0);
 
   // Quiet the modem's per-symbol logging for as long as this mode is on
   // screen, so the room's own lines are readable in the console. Restored on
@@ -386,11 +393,13 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
   const joinLeaveLabel = pending === 'join' ? 'joining…' : pending === 'leave' ? 'leaving…' : s.chatterOn ? '⏏ LEAVE ROOM' : '☎ JOIN ROOM';
   const notice = s.chatterError ?? localNotice;
 
-  /** Broadcast a dropped/picked file. Goes out as the same `eardrop-file`
-   *  event the bench's TxPanel dispatches, so app.ts's existing routing —
-   *  which already sends to the room when chatterOn — stays the one place
-   *  that decides what a chosen file means. */
-  const offerFile = (f: File | undefined) => {
+  /** Send a dropped/picked file. Goes out as the same `eardrop-file` event
+   *  the bench's TxPanel dispatches, so app.ts's existing routing — which
+   *  already sends to the room when chatterOn — stays the one place that
+   *  decides what a chosen file means. `targetId` is passed explicitly rather
+   *  than read from state: a drop is always a broadcast, and a cancelled
+   *  file picker must not leave a stale address behind for the next one. */
+  const offerFile = (f: File | undefined, targetId: number) => {
     setDragging(false);
     if (!f) return;
     // Say why nothing happened. Silently swallowing the drop when the room
@@ -404,7 +413,8 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
       return;
     }
     setLocalNotice(null);
-    window.dispatchEvent(new CustomEvent('eardrop-file', { detail: { file: f } }));
+    window.dispatchEvent(new CustomEvent('eardrop-file', { detail: { file: f, targetId } }));
+    setSendTargetId(0); // next file is a broadcast unless a node is chosen again
   };
 
   return (
@@ -414,14 +424,14 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
     <div
       onDragOver={(e) => { e.preventDefault(); if (!dragging) setDragging(true); }}
       onDragLeave={(e) => { if (e.currentTarget === e.target) setDragging(false); }}
-      onDrop={(e) => { e.preventDefault(); offerFile(e.dataTransfer.files?.[0]); }}
+      onDrop={(e) => { e.preventDefault(); offerFile(e.dataTransfer.files?.[0], 0); }}
       style={{ display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0, position: 'relative' }}
     >
       <input
         id="roommode-file"
         type="file"
         style={{ display: 'none' }}
-        onChange={(e) => { offerFile(e.target.files?.[0]); e.target.value = ''; }}
+        onChange={(e) => { offerFile(e.target.files?.[0], sendTargetId); e.target.value = ''; }}
       />
       {dragging && (
         <div style={{
@@ -580,6 +590,18 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
                       {` · ${formatAgo(ageMs)}`}
                       {m.linkDb !== undefined && <span style={{ opacity: 0.7 }}>{` · ${m.linkDb.toFixed(0)}dB`}</span>}
                       {agedOut && <span style={{ opacity: 0.7 }}> · aged out</span>}
+                      {selectedId === m.deviceId && s.chatterState === 'idle' && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation(); // don't toggle the selection off
+                            setSendTargetId(m.deviceId);
+                            document.getElementById('roommode-file')?.click();
+                          }}
+                          style={{ ...btn(false), marginLeft: 8, padding: '1px 6px', fontSize: 10 }}
+                        >
+                          send file to {hex(m.deviceId)}
+                        </button>
+                      )}
                     </li>
                   ))}
                 </ul>

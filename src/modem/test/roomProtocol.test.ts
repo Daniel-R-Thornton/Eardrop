@@ -129,6 +129,51 @@ describe('room protocol', () => {
     expect(h.room.lastError).toMatch(/no.*report|nobody/i);
   });
 
+  it('ignores a FILE_COMING addressed to someone else', async () => {
+    // Everyone in earshot demodulates the announcement; only the addressee
+    // acts. Without this a bystander arms its receiver and sits in
+    // 'receiving' for the whole transfer, deaf to the room, for a file it
+    // will never assemble.
+    const h = makeHarness(3);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.onMessage({
+      type: ControlType.FileComing, senderId: 8, targetId: 9, // not us (3)
+      payload: packFileComing({ pilotFreqHz: 6300, toneStartHz: 600, toneCount: 32, settleSymbols: 16, fileBytes: 100, durationMs: 2000 }),
+    });
+    expect(h.calls).not.toContain('fileRx');
+    expect(h.room.state).toBe('idle');
+  });
+
+  it('an addressed roll call negotiates against the addressee alone', async () => {
+    // A report from a device that is not the recipient must not drag the
+    // settings down — it is not receiving this transfer.
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.sendFile(1000, 30000, 5); // addressed to 5
+    await h.tick(ROOM_TIMING.listenMs + 100);
+    // Only a bystander answers.
+    h.room.onMessage({ type: ControlType.Report, senderId: 7, targetId: 1, payload: packReport(flatGrid) });
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200);
+    expect(h.calls).not.toContain('fileTx');
+    expect(h.room.lastError).toMatch(/not reachable/);
+  });
+
+  it('an addressed FILE_COMING carries the target id', async () => {
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.sendFile(1000, 30000, 5);
+    await h.tick(ROOM_TIMING.listenMs + 100);
+    h.room.onMessage({ type: ControlType.Report, senderId: 5, targetId: 1, payload: packReport(flatGrid) });
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200);
+    const fc = h.sent.find((m) => m.type === ControlType.FileComing);
+    expect(fc).toBeDefined();
+    expect(fc.targetId).toBe(5);
+    expect(h.calls).toContain('fileTx');
+  });
+
   it('FILE_COMING while idle arms RX and times back out to idle', async () => {
     const h = makeHarness(3);
     h.room.start();

@@ -247,9 +247,12 @@ subscribe(() => {
 // File selection — while in a chatter room, a dropped file broadcasts to the
 // room instead of feeding the point-to-point send flow (selectedFile/eardrop-send).
 window.addEventListener('eardrop-file', ((e: CustomEvent) => {
-  const { file } = e.detail as { file: File };
+  // `targetId` addresses one member; absent or 0 means the whole room.
+  const { file, targetId } = e.detail as { file: File; targetId?: number };
   if (getState().chatterOn) {
-    void file.arrayBuffer().then((buf) => chatter.broadcastFile(file.name, new Uint8Array(buf)));
+    void file.arrayBuffer().then(
+      (buf) => chatter.broadcastFile(file.name, new Uint8Array(buf), targetId ?? 0),
+    );
     return;
   }
   selectedFile = file;
