@@ -18,7 +18,17 @@ describe('settingsPick', () => {
     const lowOnly = { deviceId: 2, grid: gridWhere((hz) => (hz < 4000 ? 1 : 0.001)) };
     const s = pickSettings([strong, lowOnly]);
     expect(s.floor).toBe(false);
-    expect(s.toneStartHz + s.toneCount * 50).toBeLessThanOrEqual(4000 + 100);
+    // toneStartHz is an OFFSET above the pilot (not absolute) — same
+    // semantics as ofdmToneFrequencies()/BandCard — so the first tone's
+    // absolute frequency is pilotFreqHz + toneStartHz.
+    expect(s.pilotFreqHz + s.toneStartHz + s.toneCount * 50).toBeLessThanOrEqual(4000 + 100);
+  });
+
+  it('toneStartHz is an offset (>= 50) and both frequencies are band-card-expressible (multiples of 50)', () => {
+    const s = pickSettings([{ deviceId: 1, grid: gridWhere(() => 1) }]);
+    expect(s.toneStartHz).toBeGreaterThanOrEqual(50);
+    expect(s.pilotFreqHz % 50).toBe(0);
+    expect(s.toneStartHz % 50).toBe(0);
   });
 
   it('disjoint peers → floor settings', () => {
