@@ -90,7 +90,15 @@ export interface RoomDeps {
 export const ROOM_TIMING = {
   listenMs: 1000, listenCapMs: 10000,
   replySlots: 6, replySlotMs: 1000, // JOIN_WAIT and COLLECT both
-  collectExtraMs: 500,
+  // Grace after the last reply slot opens. A peer that draws the final slot
+  // only STARTS transmitting at replySlots*replySlotMs; its control message is
+  // then roughly a second of audio (handshake-band preamble + payload), on top
+  // of worker encode latency and the offset between our window opening and its
+  // slot clock starting (it can only begin timing once it has buffered and
+  // decoded our whole ~4 s probe). At 500 ms the last slot's reply routinely
+  // landed after the window shut and the roll call reported "nobody home"
+  // while a peer was audibly answering.
+  collectExtraMs: 2500,
   fileComingLeadMs: 700,
 } as const;
 
@@ -241,6 +249,18 @@ export class RoomProtocol {
       claim: parsed.claim,
       theirViewOfUs: parsed.grid,
     });
+
+    // A WELCOME arriving during a roll call counts as a report. Which reply a
+    // peer sends is inferred from whether it already knows us (see
+    // onProbeHeard), and that inference is one-sided: if our WELCOME to them
+    // was lost when they joined, they still consider us a stranger and answer
+    // our roll call with a WELCOME rather than a REPORT. Ignoring it fails the
+    // roll call with "nobody home" while a peer is audibly replying — observed
+    // on hardware. The payload carries the same measured grid a REPORT does,
+    // so there is no reason to discard it.
+    if (this._state === 'collecting') {
+      this.collectedReports.set(msg.senderId, { deviceId: msg.senderId, grid: parsed.grid });
+    }
   }
 
   private handleReport(msg: ControlMessage): void {

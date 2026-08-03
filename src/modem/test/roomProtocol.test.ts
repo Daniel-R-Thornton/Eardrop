@@ -95,6 +95,29 @@ describe('room protocol', () => {
     expect(h.room.state).toBe('sending');
   });
 
+  it('roll call counts a WELCOME reply as a report', async () => {
+    // A peer whose member table lost us answers a roll call with WELCOME
+    // instead of REPORT (the reply type is inferred from whether it knows the
+    // prober). Its payload carries the same measured grid, so the roll call
+    // must accept it — otherwise a peer that is audibly replying reads as
+    // "nobody home", which is what happened on hardware.
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    h.room.sendFile(1000, 30000);
+    await h.tick(ROOM_TIMING.listenMs + 100); // carrier-sense + probe
+    h.room.onMessage({
+      type: ControlType.Welcome,
+      senderId: 5,
+      targetId: 1,
+      payload: packWelcome({ claim: { lowHz: 1500, highHz: 7800, maxQamOrder: 6 }, grid: flatGrid }),
+    });
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200);
+    expect(h.room.lastError).toBeNull();
+    expect(h.sent.some((m) => m.type === ControlType.FileComing)).toBe(true);
+    expect(h.calls).toContain('fileTx');
+  });
+
   it('roll call with zero reports aborts to idle with lastError', async () => {
     const h = makeHarness(1);
     h.room.start();
