@@ -3,7 +3,26 @@
  * enough to contain detection + alignment slack + training.
  */
 import { expect, test } from 'vitest';
-import { OFDM_TUNING } from '../types';
+import { OFDM_TUNING, OFDM_DEFAULTS, OFDM_HANDSHAKE } from '../types';
+
+test('handshake pilot sits directly below its tones', () => {
+  // Drift correction extrapolates the pilot's measured phase to each tone by
+  // toneFreq/pilotFreq. A pure timing offset extrapolates exactly, but any
+  // ERROR in that measurement — noise, a fractional-sample estimate, residual
+  // drift — is multiplied by the same factor. This band shipped with pilot
+  // 1850 under tones at 6900-7250, a factor of ~3.9, so roughly 12 degrees of
+  // pilot uncertainty was enough to cross QPSK's 45 degree decision boundary
+  // at the top tone. Loopback is noise-free and decoded fine; over the air
+  // two devices never demodulated a single control frame in either direction.
+  // Keep the factor near 1 or that returns, silently and only on hardware.
+  const firstTone = OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz;
+  const topTone = firstTone + (OFDM_HANDSHAKE.toneCount - 1) * OFDM_DEFAULTS.toneSpacingHz;
+  expect(topTone / OFDM_HANDSHAKE.pilotFreqHz).toBeLessThan(1.2);
+
+  // The pilot must also stay clear of the chirp template's centre, or the
+  // correlator can fire on the pilot itself (see OFDM_HANDSHAKE's comment).
+  expect(Math.abs(OFDM_HANDSHAKE.pilotFreqHz - OFDM_TUNING.chirpCenterHz)).toBeGreaterThan(500);
+});
 
 test('sync burst covers detection + alignment slack + settle + training', () => {
   // See OFDM_TUNING's INVARIANT. The settle term is easy to forget and its

@@ -199,6 +199,27 @@ export const OFDM_DEFAULTS = {
  * BREAKS COMPATIBILITY with every deployed receiver — this is a wire
  * constant, not a tuning knob.
  *
+ * The PILOT sits directly below the tones, and must stay there. Drift
+ * correction extrapolates the pilot's measured phase by toneFreq/pilotFreq
+ * (see rxEngine), so the further the pilot is from the band, the more a small
+ * timing error is amplified — the same trap documented on OFDM_TUNING's
+ * chirpCenterHz, which is why the main band moved its pilot up to 6300.
+ *
+ * A pure timing offset extrapolates exactly; what the ratio multiplies is any
+ * ERROR in the pilot phase measurement — noise, a fractional-sample estimate,
+ * residual drift. This band shipped with the pilot left at 1850 while its
+ * tones sat at 6900-7250, a factor of ~3.9, so roughly 12 degrees of pilot
+ * uncertainty was enough to cross QPSK's 45 degree decision boundary at the
+ * top tone. Loopback is noise-free and decoded perfectly; over the air
+ * nothing ever did — two devices in a room detected each other's chirps
+ * (norm 0.6, handoff score 0.75, training collected) and then failed to
+ * demodulate a single control frame in either direction, with no sentinel
+ * ever found. Pilot 6800 puts the factor at ~1.07.
+ *
+ * Moving it also clears an overlap with chirpCenterHz, which is 1850 — the
+ * old pilot sat exactly on the chirp template's centre, the false-trigger
+ * mechanism described below.
+ *
  * gapSymbols: silence between the handshake segment and the target-band
  * transmission. The post-hop engine must meet the target chirp the way a
  * cold receiver does — quiet first. Bench 2026-08-03: without the gap, the
@@ -209,8 +230,8 @@ export const OFDM_DEFAULTS = {
  * the transfer was dead before it started.
  */
 export const OFDM_HANDSHAKE = {
-  pilotFreqHz: 1850,
-  toneStartHz: 5050, // tones at 6900-7250 Hz
+  pilotFreqHz: 6800,
+  toneStartHz: 100, // offset above the pilot — tones at 6900-7250 Hz
   toneCount: 8,
   gapSymbols: 8,
 } as const;
