@@ -15,6 +15,7 @@ import { RxPipeline } from './views/RxPipeline';
 import { PresentationMode } from './views/PresentationMode';
 import { SettingsPanel } from './views/SettingsPanel';
 import { TxPanel } from './views/TxPanel';
+import { ChatterPanel } from './views/ChatterPanel';
 import { Panel } from './components/instrument/Panel';
 import { LED } from './components/instrument/LED';
 import { FrequencySweep } from './views/FrequencySweep';
@@ -183,10 +184,11 @@ export function BenchApp() {
         </Panel>
       </div>
 
-      {/* tx + settings */}
-      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gap: 12, alignItems: 'start', marginBottom: 12 }}>
+      {/* tx + settings + chatter room */}
+      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr 260px', gap: 12, alignItems: 'start', marginBottom: 12 }}>
         <TxPanel />
         <SettingsPanel />
+        <ChatterPanel />
       </div>
 
       {/* rx decode pipeline */}

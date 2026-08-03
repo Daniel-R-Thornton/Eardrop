@@ -35,6 +35,7 @@ import { resample } from '../lib/math/index';
 import { dlog, dlogDump, dlogInject, dlogInjectRecord, dlogReset, dlogSetMode, DLOG_RING_MAX, dlogRingLength } from '../lib/debug/dlog';
 import { ModemController } from './controllers/modemController';
 import { buildModemConfig } from './controllers/buildModemConfig';
+import { ChatterController } from './controllers/chatterController';
 /**
  * Resolve the persisted mic selection to an id that exists right now, and keep
  * the store in step.
@@ -143,6 +144,25 @@ const player = new AudioPlayer(audioCtx);
 
 const modem = new ModemController(audioCtx);
 
+// ─── Chatter room ─────────────────────────────────────
+// ModemController satisfies ChatterController's ModemWorkerHandle structurally
+// (on/configure/startListening/stopListening/encodeFile plus the six chatter
+// passthroughs + sampleRate added alongside this wiring). Reuses the same
+// AudioPlayer as every other TX path rather than spinning up a second
+// AudioContext.
+const chatter = new ChatterController(modem, { player });
+// ChatterPanel (mounted inside BenchApp's own grid, see BenchApp.tsx) talks to
+// this controller purely through the Store + the custom-event bus below —
+// same wiring every other view/app.ts pair uses.
+
+window.addEventListener('eardrop-chatter-join', (() => {
+  void chatter.joinRoom();
+}) as EventListener);
+
+window.addEventListener('eardrop-chatter-leave', (() => {
+  void chatter.leaveRoom();
+}) as EventListener);
+
 let speedTestActive = false;
 let speedTestExpectedFile: string | null = null;
 
@@ -199,9 +219,15 @@ subscribe(() => {
 
 // ─── Custom Events from React ─────────────────────────
 
-// File selection
+// File selection — while in a chatter room, a dropped file broadcasts to the
+// room instead of feeding the point-to-point send flow (selectedFile/eardrop-send).
 window.addEventListener('eardrop-file', ((e: CustomEvent) => {
-  selectedFile = e.detail.file;
+  const { file } = e.detail as { file: File };
+  if (getState().chatterOn) {
+    void file.arrayBuffer().then((buf) => chatter.broadcastFile(file.name, new Uint8Array(buf)));
+    return;
+  }
+  selectedFile = file;
 }) as EventListener);
 
 // Demo — the full experience: capture the pipeline stages for the visual AND
