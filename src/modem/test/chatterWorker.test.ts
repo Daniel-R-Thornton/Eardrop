@@ -14,6 +14,7 @@ import { generateChirp } from '../protocol/chirp';
 import { TxEngine } from '../protocol/txEngine';
 import { RxEngine } from '../protocol/rxEngine';
 import { ControlType, type ControlMessage, encodeControlMessage } from '../protocol/controlFrame';
+import { SentinelScanner } from '../receiver/SentinelScanner';
 
 const SR = 48000;
 const TIMEOUT = 60000;
@@ -175,5 +176,43 @@ describe('control frames on the handshake band', () => {
 
     expect(cardSeen).toBe(false);
     expect(msgSeen).toBe(true);
+  });
+});
+
+describe('SentinelScanner: reset mid-collection', () => {
+  const SENTINEL_BYTES = [0xe7, 0x9f, 0xe7];
+
+  it('reset() during a continueCollecting run restores the header size for the NEXT sentinel', () => {
+    const HEADER_BYTES = 5;
+    const scanner = new SentinelScanner(HEADER_BYTES);
+    const frames: Uint8Array[] = [];
+
+    // First header: fires onFrame, which asks for 3 MORE (payload) bytes —
+    // simulating a control message's header telling the scanner its
+    // payload length — then reset() lands mid-way through that payload run
+    // (e.g. a config change or chatterStop tearing the engine down).
+    let continued = false;
+    scanner.onFrame = (f) => {
+      frames.push(f);
+      if (!continued) {
+        continued = true;
+        scanner.continueCollecting(3);
+      }
+    };
+    for (const b of SENTINEL_BYTES) scanner.feedByte(b);
+    for (let i = 0; i < HEADER_BYTES; i++) scanner.feedByte(0xaa);
+    expect(frames).toHaveLength(1); // header fired, now mid-payload-collection
+
+    scanner.reset(); // <- must restore collectBytes to the header size
+
+    // A fresh sentinel + header-sized run must collect at HEADER_BYTES, not
+    // the stale 3-byte payload size from the interrupted run.
+    scanner.onFrame = (f) => frames.push(f);
+    for (const b of SENTINEL_BYTES) scanner.feedByte(b);
+    for (let i = 0; i < HEADER_BYTES; i++) scanner.feedByte(0xbb);
+
+    expect(frames).toHaveLength(2);
+    expect(frames[1]).toHaveLength(3 + HEADER_BYTES); // sentinel + full header, not a short 3-byte frame
+    expect(Array.from(frames[1].slice(3))).toEqual(new Array(HEADER_BYTES).fill(0xbb));
   });
 });

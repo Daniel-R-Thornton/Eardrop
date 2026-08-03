@@ -74,8 +74,13 @@ export class AirNoiseTracker {
  * pulse-keyed device ID.
  *
  * Runs a normalized cross-correlation of a rolling 0.5 s buffer against the
- * down-chirp template every `scanHop` (4096) samples — O(0.5s@48k x 7200)
- * ~= 30M multiplies per hop, acceptable at a ~85 ms cadence in a worker.
+ * down-chirp template every `scanHop` (4096) samples. At full rate that's
+ * O(ring ~24k x template 7200) ~= 170M multiplies per hop — too much for a
+ * cadence this runs at for the chatter session's entire life — so, exactly
+ * like RxEngine's own chirp detector (rxEngine.ts, the `chirpCorrelate`
+ * call under `feedSample`), both sides are 4:1 decimated (stride-sampled,
+ * not filtered) before correlating: ~10M multiplies per hop, with the peak
+ * index scaled back up by the same factor to index the full-rate ring.
  * Once a candidate clears the threshold, buffers the rest of the burst
  * (`probeBurstSamplesAfterChirp` more samples from the chirp start) and
  * decodes it; a CRC failure (`decodeProbeId` returning null) is treated as a
@@ -84,8 +89,12 @@ export class AirNoiseTracker {
  */
 export class ProbeDetector {
   private readonly template: Float32Array;
+  /** Template decimated by `DECIMATION` — built once, correlated every hop. */
+  private readonly templateDec: Float32Array;
   private readonly ringCap: number;
   private readonly scanHop = 4096;
+  /** Stride for the scan-time correlation — see the class doc. */
+  private static readonly DECIMATION = 4;
 
   private ring: number[] = [];
   private samplesSinceScan = 0;
@@ -100,6 +109,11 @@ export class ProbeDetector {
   ) {
     this.template = probeChirpTemplate(sampleRate);
     this.ringCap = Math.round(sampleRate * 0.5);
+    const ds = ProbeDetector.DECIMATION;
+    const decLen = Math.ceil(this.template.length / ds);
+    const templateDec = new Float32Array(decLen);
+    for (let i = 0; i < decLen; i++) templateDec[i] = this.template[i * ds];
+    this.templateDec = templateDec;
   }
 
   feedChunk(chunk: Float32Array): void {
@@ -119,12 +133,16 @@ export class ProbeDetector {
     this.samplesSinceScan = 0;
 
     if (this.ring.length >= this.template.length) {
-      const { peakValue, peakIndex } = chirpCorrelate(this.ring, this.template);
-      const rms = rmsOf(this.ring);
-      const norm = rms > 0 ? peakValue / (this.template.length * rms) : 0;
+      const ds = ProbeDetector.DECIMATION;
+      const ringDec = new Float32Array(Math.ceil(this.ring.length / ds));
+      for (let i = 0; i < ringDec.length; i++) ringDec[i] = this.ring[i * ds];
+      const { peakValue, peakIndex } = chirpCorrelate(ringDec, this.templateDec);
+      const rms = rmsOf(ringDec);
+      const norm = rms > 0 ? peakValue / (this.templateDec.length * rms) : 0;
       if (norm > 0.25 && peakIndex >= 0) {
+        const anchor = peakIndex * ds; // back to a full-rate ring index
         const need = probeBurstSamplesAfterChirp(this.sampleRate);
-        this.pending = { buf: this.ring.slice(peakIndex), need };
+        this.pending = { buf: this.ring.slice(anchor), need };
         this.ring = [];
         if (this.pending.buf.length >= need) {
           this.finishCapture();

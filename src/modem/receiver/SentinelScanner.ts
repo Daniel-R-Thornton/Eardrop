@@ -82,6 +82,9 @@ export class SentinelScanner {
     this.byteBits = 0;
     this.buf = [];
     this.bitsCollected = 0;
+    // A reset mid-payload-collection must not leave collectBytes stuck at
+    // the payload size — the next sentinel hit is always a header.
+    this.collectBytes = this.headerCollectBytes;
   }
 
   /**
