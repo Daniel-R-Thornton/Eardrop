@@ -141,7 +141,7 @@ describe('ChatterController', () => {
     // muted true for the probe, then false again after the echo tail
     expect(worker.muteLog).toEqual([true, false]);
 
-    await clock.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 100);
+    await clock.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 100);
     expect(getState().chatterState).toBe('idle');
   });
 
@@ -171,7 +171,7 @@ describe('ChatterController', () => {
 
     await controller.joinRoom();
     await clock.tick(
-      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200,
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
     );
     expect(getState().chatterState).toBe('idle');
 
@@ -197,7 +197,7 @@ describe('ChatterController', () => {
     });
     // Malformed WELCOME payload (empty) is simply ignored by parseWelcome —
     // this only proves the event reaches RoomProtocol.onMessage without throwing.
-    await clock.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 100);
+    await clock.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 100);
     expect(getState().chatterState).toBe('idle');
   });
 
@@ -243,7 +243,7 @@ describe('ChatterController', () => {
 
     await controller.joinRoom();
     await clock.tick(
-      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200,
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
     );
     expect(getState().chatterState).toBe('idle');
 
@@ -288,7 +288,7 @@ describe('ChatterController', () => {
 
     await controller.joinRoom();
     await clock.tick(
-      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200,
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
     );
 
     worker.emit('probeHeard', { deviceId: 9, grid: flatGrid });
@@ -331,7 +331,7 @@ describe('ChatterController', () => {
 
     await controller.joinRoom();
     await clock.tick(
-      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200,
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
     );
 
     for (let i = 0; i < CHATTER_PACKET_LOG_MAX + 20; i++) {
@@ -351,7 +351,7 @@ describe('ChatterController', () => {
 
     await controller.joinRoom();
     await clock.tick(
-      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200,
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
     );
     expect(getState().chatterState).toBe('idle');
 
@@ -379,7 +379,7 @@ describe('ChatterController', () => {
 
     await controller.joinRoom();
     await clock.tick(
-      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200,
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
     );
     expect(getState().chatterState).toBe('idle');
 

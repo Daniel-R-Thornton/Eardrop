@@ -50,7 +50,7 @@ describe('room protocol', () => {
     expect(h.room.state).toBe('listening');
     await h.tick(ROOM_TIMING.listenMs + 50);
     expect(h.calls).toContain('probe');
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 100);
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 100);
     expect(h.room.state).toBe('idle');
     expect(h.room.members.size).toBe(0);
   });
@@ -58,7 +58,7 @@ describe('room protocol', () => {
   it('member replies WELCOME when it hears a probe', async () => {
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
     h.room.onProbeHeard(9, flatGrid);
     await h.tick(ROOM_TIMING.replySlotMs + 100); // slot 0 fires
     const welcome = h.sent.find((m) => m.type === ControlType.Welcome);
@@ -72,7 +72,7 @@ describe('room protocol', () => {
     const h = makeHarness(2, { busy: () => busy });
     h.room.start();
     // air busy: listening extends, then cap forces announce
-    await h.tick(ROOM_TIMING.listenCapMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 500);
+    await h.tick(ROOM_TIMING.listenCapMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 500);
     expect(h.room.state).toBe('idle');
     h.room.onProbeHeard(9, flatGrid);
     await h.tick(ROOM_TIMING.replySlotMs + 50); // slot 0 blocked
@@ -85,7 +85,7 @@ describe('room protocol', () => {
   it('roll call with one report → FILE_COMING + startFileTx', async () => {
     const h = makeHarness(1);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
     h.room.sendFile(1000, 30000);
     await h.tick(ROOM_TIMING.listenMs + 100); // carrier-sense + probe
     h.room.onMessage({ type: ControlType.Report, senderId: 5, targetId: 1, payload: packReport(flatGrid) });
@@ -103,7 +103,7 @@ describe('room protocol', () => {
     // "nobody home", which is what happened on hardware.
     const h = makeHarness(1);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
     h.room.sendFile(1000, 30000);
     await h.tick(ROOM_TIMING.listenMs + 100); // carrier-sense + probe
     h.room.onMessage({
@@ -121,7 +121,7 @@ describe('room protocol', () => {
   it('roll call with zero reports aborts to idle with lastError', async () => {
     const h = makeHarness(1);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
     h.room.sendFile(1000, 30000);
     await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 500);
     expect(h.calls).not.toContain('fileTx');
@@ -132,7 +132,7 @@ describe('room protocol', () => {
   it('FILE_COMING while idle arms RX and times back out to idle', async () => {
     const h = makeHarness(3);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
     h.room.onMessage({
       type: ControlType.FileComing, senderId: 8, targetId: 0,
       payload: packFileComing({ pilotFreqHz: 6300, toneStartHz: 600, toneCount: 32, settleSymbols: 16, fileBytes: 100, durationMs: 2000 }),
@@ -173,7 +173,7 @@ describe('room protocol', () => {
       },
     });
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
     expect(h.room.state).toBe('idle');
 
     h.room.sendFile(1000, 30000);
@@ -198,17 +198,17 @@ describe('room protocol', () => {
     // that pickSettings later reads from.
     expect((h.room as any).collectedReports.size).toBe(0);
 
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 100);
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 100);
     expect(h.room.state).toBe('idle');
   });
 
   it('onProbeHeard twice for the same prober while idle only schedules one WELCOME chain', async () => {
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
     h.room.onProbeHeard(9, flatGrid);
     h.room.onProbeHeard(9, flatGrid); // duplicate, same prober, reply chain already pending
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 100);
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 100);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
 });

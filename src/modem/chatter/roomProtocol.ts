@@ -348,7 +348,11 @@ export class RoomProtocol {
     if (this._state !== 'announcing') return; // stale guard (e.g. stop() mid-await)
 
     this.setState('joinWait');
-    this.timer(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs, () => {
+    // Same grace the collect window gets, and for the same reason: a peer that
+    // draws the final reply slot only STARTS transmitting at the end of the
+    // slot window, and a WELCOME is around three seconds of audio. Without it
+    // the joiner declares an empty room while a welcome is still in the air.
+    this.timer(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs, () => {
       if (this._state !== 'joinWait') return;
       this.finishToIdle();
     });

@@ -173,14 +173,14 @@ describe('chatter loopback: join, roll call, negotiated transfer', () => {
 
       // --- 1. A joins an empty room -> idle, no members. ---
       aRoom.start();
-      await clock.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+      await clock.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
       expect(aRoom.state).toBe('idle');
       expect(aRoom.members.size).toBe(0);
 
       // --- 2. B joins -> A hears B's probe and WELCOMEs; both idle with
       //     mutual member entries. ---
       bRoom.start();
-      await clock.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+      await clock.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
       expect(aRoom.state).toBe('idle');
       expect(bRoom.state).toBe('idle');
       expect(aRoom.members.get(B_ID)).toBeDefined();
