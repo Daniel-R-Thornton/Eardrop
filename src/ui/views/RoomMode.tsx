@@ -12,7 +12,7 @@
  * graph is a genuine hero at any viewport width and the mode fills the
  * screen instead of stranding a small canvas in a sea of empty panel.
  */
-import { useEffect, useRef, useState, type CSSProperties, type RefObject } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type RefObject } from 'react';
 import { useStore } from '../Store';
 import { T } from '../theme/labaccent/tokens';
 import { Screen } from '../components/instrument/Screen';
@@ -77,18 +77,35 @@ function nodeXY(w: number, h: number, angle: number, radius: number) {
   return { x: cx + Math.cos(angle) * R * radius, y: cy + Math.sin(angle) * R * radius };
 }
 
-/** Tracks an element's content-box size via ResizeObserver so a canvas can be
- *  sized to fill its container instead of a hardcoded pixel box. */
+/**
+ * Tracks an element's content-box size so a canvas can be sized to fill its
+ * container instead of a hardcoded pixel box.
+ *
+ * The first measurement is taken synchronously in a layout effect rather than
+ * waiting for ResizeObserver's initial callback. RO delivers its callbacks as
+ * part of the rendering steps, so a window that is occluded or throttled can
+ * defer them indefinitely — the canvas then never gets a non-zero size and
+ * simply never appears. Measuring up front makes the first paint independent
+ * of that; the observer only handles later resizes.
+ */
 function useMeasuredSize<T extends HTMLElement>(): [RefObject<T | null>, { w: number; h: number }] {
   const ref = useRef<T | null>(null);
   const [size, setSize] = useState({ w: 0, h: 0 });
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
+    // Re-setting an identical size would re-render, and any render that can
+    // nudge layout turns the observer into a feedback loop — so bail on no-ops.
+    const apply = (rawW: number, rawH: number) => {
+      const w = Math.max(0, Math.floor(rawW));
+      const h = Math.max(0, Math.floor(rawH));
+      setSize((prev) => (prev.w === w && prev.h === h ? prev : { w, h }));
+    };
+    const rect = el.getBoundingClientRect();
+    apply(rect.width, rect.height);
     const ro = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (!entry) return;
-      setSize({ w: Math.max(0, Math.floor(entry.contentRect.width)), h: Math.max(0, Math.floor(entry.contentRect.height)) });
+      const box = entries[0]?.contentRect;
+      if (box) apply(box.width, box.height);
     });
     ro.observe(el);
     return () => ro.disconnect();
@@ -382,10 +399,19 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
                 {members.length} node{members.length === 1 ? '' : 's'} detected
               </span>
             </div>
-            <div ref={graphBoxRef} style={{ position: 'relative', flex: '1 1 auto', minHeight: 220 }}>
+            {/* basis 0, not auto: the box's height must come from the flex
+             *  line alone, never from what it contains. */}
+            <div ref={graphBoxRef} style={{ position: 'relative', flex: '1 1 0', minHeight: 220 }}>
               {graphSize.w > 0 && graphSize.h > 0 && (
                 <>
-                  <Screen width={graphSize.w} height={graphSize.h} draw={drawGraph} grid={false} />
+                  {/* Absolutely positioned so the canvas contributes NOTHING to
+                   *  this box's content size. In normal flow it fed its own
+                   *  measured height back into the box's `flex: 1 1 auto`
+                   *  basis, so every measurement grew the box and re-triggered
+                   *  the observer — the panel visibly pulsed. */}
+                  <div style={{ position: 'absolute', inset: 0 }}>
+                    <Screen width={graphSize.w} height={graphSize.h} draw={drawGraph} grid={false} />
+                  </div>
                   {/* invisible hit-targets over each node, so the canvas graph stays hover/select-able */}
                   <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
                     {nodes.map((n) => {
@@ -414,9 +440,12 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
             <div style={{ ...title, flex: '0 0 auto' }}>
               SPECTRUM {focusMember ? `— node ${hex(focusMember.deviceId)}` : ''}
             </div>
-            <div ref={spectrumBoxRef} style={{ position: 'relative', flex: '1 1 auto', minHeight: 60 }}>
+            <div ref={spectrumBoxRef} style={{ position: 'relative', flex: '1 1 0', minHeight: 60 }}>
               {spectrumSize.w > 0 && spectrumSize.h > 0 && (
-                <Screen width={spectrumSize.w} height={spectrumSize.h} draw={drawSpectrum} grid={false} />
+                // Out of flow for the same reason as the graph canvas above.
+                <div style={{ position: 'absolute', inset: 0 }}>
+                  <Screen width={spectrumSize.w} height={spectrumSize.h} draw={drawSpectrum} grid={false} />
+                </div>
               )}
             </div>
           </div>
