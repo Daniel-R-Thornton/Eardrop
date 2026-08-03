@@ -162,6 +162,12 @@ export class TxEngine {
           pilotAmplitude: OFDM_DEFAULTS.pilotAmplitude,
           toneCount: OFDM_HANDSHAKE.toneCount,
           toneStartHz: OFDM_HANDSHAKE.toneStartHz,
+          // Pre-emphasis for the handshake band ONLY — never the target band's
+          // calibration, which would be measured for different frequencies
+          // entirely. Supplied per transmission by the caller from what the
+          // recipient reported hearing of us (see handshakeGains.ts);
+          // undefined keeps the original flat behaviour.
+          toneGains: (this.cfg as { handshakeToneGains?: number[] }).handshakeToneGains,
         });
       }
     }

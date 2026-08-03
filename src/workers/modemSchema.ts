@@ -63,7 +63,10 @@ export type ModemCommand =
   // ─── Chatter room (see chatterWorker.test.ts) ───
   | { type: 'chatterStart'; deviceId: number }
   | { type: 'chatterStop' }
-  | { type: 'encodeControl'; id: number; msg: { type: number; senderId: number; targetId: number; payload: ArrayBuffer } }
+  /** `toneGains`: per-tone pre-emphasis for the handshake band, derived from
+   *  what the RECIPIENT reported hearing of us. Omitted for a broadcast or
+   *  before any measurement exists, which keeps the band flat. */
+  | { type: 'encodeControl'; id: number; msg: { type: number; senderId: number; targetId: number; payload: ArrayBuffer }; toneGains?: number[] }
   | { type: 'encodeProbe'; id: number; deviceId: number }
   | { type: 'airCheck'; id: number }
   | { type: 'setRxMuted'; muted: boolean };

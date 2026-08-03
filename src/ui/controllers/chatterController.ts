@@ -34,6 +34,7 @@ import { getState, setState, CHATTER_PACKET_LOG_MAX, type ChatterPacket } from '
 import { OFDM_DEFAULTS, OFDM_HANDSHAKE } from '../../modem/types';
 import { reportGridFreqs } from '../../modem/protocol/probeBurst';
 import { dlog } from '../../lib/debug/dlog';
+import { handshakeToneGains } from '../../modem/chatter/handshakeGains';
 
 /** OFDM tone spacing — the handshake band's tones sit on this grid. */
 const OFDM_TONE_SPACING_HZ = OFDM_DEFAULTS.toneSpacingHz;
@@ -104,7 +105,7 @@ export interface ModemWorkerHandle {
   chatterStart(deviceId: number): void;
   chatterStop(): void;
   encodeProbe(deviceId: number): Promise<{ samples: Float32Array; sampleRate: number }>;
-  encodeControl(msg: ControlMessage): Promise<{ samples: Float32Array; sampleRate: number }>;
+  encodeControl(msg: ControlMessage, toneGains?: number[]): Promise<{ samples: Float32Array; sampleRate: number }>;
   airCheck(): Promise<{ busy: boolean; rms: number }>;
   setRxMuted(muted: boolean): void;
 }
@@ -241,11 +242,17 @@ export class ChatterController {
         peerId: 0,
         bytes: 0,
       }),
-      sendMessage: (msg: ControlMessage) => this.playAndMute(() => this.worker.encodeControl(msg), {
+      sendMessage: (msg: ControlMessage) => this.playAndMute(
+        // Pre-emphasise the handshake band using what THIS recipient reported
+        // hearing of our probe. A broadcast (targetId 0) has no single right
+        // curve, so it stays flat.
+        () => this.worker.encodeControl(msg, this.handshakeGainsFor(msg.targetId)),
+        {
         kind: controlKindFromType(msg.type),
-        peerId: msg.targetId,
-        bytes: controlWireBytes(msg.payload.byteLength),
-      }),
+          peerId: msg.targetId,
+          bytes: controlWireBytes(msg.payload.byteLength),
+        },
+      ),
       isAirBusy: async () => (await this.worker.airCheck()).busy,
       startFileTx: (settings: PickedSettings) => { void this.transmitFile(settings); },
       armFileRx: (info: FileComingPayload) => this.armFileRx(info),
@@ -425,6 +432,22 @@ export class ChatterController {
     this.pendingFile = { fileName, data };
     const durationMs = estimateDurationMs(data.byteLength, getState().symbolsPerSec);
     this.room.sendFile(data.byteLength, durationMs, targetId);
+  }
+
+  /**
+   * Handshake-band pre-emphasis for a control message aimed at `targetId`.
+   *
+   * Uses `theirViewOfUs` — the curve THAT peer measured from OUR probe — not
+   * what we measured of theirs. Those are different channels (their mic and
+   * our speaker versus the reverse), and using the wrong one would emphasise
+   * the wrong tones, which is how a link that works one way fails the other.
+   *
+   * Undefined for a broadcast: one waveform reaches everyone, so there is no
+   * single correct curve, and the flat behaviour is the honest default.
+   */
+  private handshakeGainsFor(targetId: number): number[] | undefined {
+    if (!targetId) return undefined;
+    return handshakeToneGains(this.room.members.get(targetId)?.theirViewOfUs);
   }
 
   // ---- RoomDeps adapters ----

@@ -255,7 +255,10 @@ export class ModemController {
   }
 
   /** Encode a fixed-band control message (WELCOME/CLAIM/FILE_COMING/etc). */
-  encodeControl(msg: ControlMessage): Promise<{ samples: Float32Array; sampleRate: number }> {
+  encodeControl(
+    msg: ControlMessage,
+    toneGains?: number[],
+  ): Promise<{ samples: Float32Array; sampleRate: number }> {
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       this.pending.set(id, (ev) => {
@@ -267,6 +270,7 @@ export class ModemController {
         type: 'encodeControl',
         id,
         msg: { type: msg.type, senderId: msg.senderId, targetId: msg.targetId, payload: payload.buffer },
+        toneGains,
       }, [payload.buffer]);
     });
   }

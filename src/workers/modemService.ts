@@ -420,7 +420,11 @@ export class ModemService {
             payload: new Uint8Array(cmd.msg.payload),
           };
           const wire = encodeControlMessage(msg);
-          const tx = new TxEngine({ ...this.config, bandHandshake: true } as ConstructorParameters<typeof TxEngine>[0]);
+          const tx = new TxEngine({
+            ...this.config,
+            bandHandshake: true,
+            handshakeToneGains: cmd.toneGains,
+          } as ConstructorParameters<typeof TxEngine>[0]);
           const samples = tx.buildHandshakeSegment(wire);
           this.emit(
             { type: 'encoded', id: cmd.id, samples: samples.buffer as ArrayBuffer, sampleRate: this.config.sampleRate },
