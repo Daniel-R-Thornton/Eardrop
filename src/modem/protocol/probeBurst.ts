@@ -104,6 +104,17 @@ function sweepPlan(sampleRate: number): SweepPlan {
   return buildSweep({ ...CHATTER_SWEEP, sampleRate });
 }
 
+/** Sample count of the sweep audio, without synthesizing it. Mirrors the
+ *  step count `buildSweep` computes internally before its per-sample cos()
+ *  loop — needed by every length/offset calculation (`probeBurstSamplesAfterChirp`,
+ *  `idSlotsStart`, called on every decode) that only wants a length, not the
+ *  ~139k-sample waveform itself. */
+function sweepSampleCount(sampleRate: number): number {
+  const { startHz, endHz, stepHz, stepMs } = CHATTER_SWEEP;
+  const steps = Math.floor((endHz - startHz) / stepHz) + 1;
+  return steps * ms(sampleRate, stepMs);
+}
+
 /** Slot k carries bit k of the 12-bit word V = (deviceId << 4) | crc4(deviceId),
  *  LSB-first — so slot 0 is the CRC's own least-significant bit and slot 11
  *  is the device ID's most-significant bit. Sent LSB-first (rather than the
@@ -167,7 +178,7 @@ export function buildProbeBurst(deviceId: number, sampleRate: number): Float32Ar
 export function probeBurstSamplesAfterChirp(sampleRate: number): number {
   const chirpSamples = ms(sampleRate, PROBE_LAYOUT.chirpMs);
   const gapSamples = ms(sampleRate, PROBE_LAYOUT.gapMs);
-  const sweepSamples = sweepPlan(sampleRate).audio.length;
+  const sweepSamples = sweepSampleCount(sampleRate);
   const idSamples = PROBE_LAYOUT.idSlots * ms(sampleRate, PROBE_LAYOUT.idSlotMs);
   return chirpSamples + gapSamples + sweepSamples + gapSamples + idSamples;
 }
@@ -176,13 +187,17 @@ export function probeBurstSamplesAfterChirp(sampleRate: number): number {
 function idSlotsStart(sampleRate: number): number {
   const chirpSamples = ms(sampleRate, PROBE_LAYOUT.chirpMs);
   const gapSamples = ms(sampleRate, PROBE_LAYOUT.gapMs);
-  const sweepSamples = sweepPlan(sampleRate).audio.length;
+  const sweepSamples = sweepSampleCount(sampleRate);
   return chirpSamples + gapSamples + sweepSamples + gapSamples;
 }
 
 /** anchor = sample index where the chirp STARTS in `samples`.
  *  Returns null on CRC failure. */
 export function decodeProbeId(samples: Float32Array, anchor: number, sampleRate: number): number | null {
+  // chirpCorrelate returns peakIndex -1 when its template is longer than the
+  // signal — never a real anchor. Guard here rather than let it silently
+  // slice into whatever precedes `samples[0]`.
+  if (anchor < 0) return null;
   const slotSamples = ms(sampleRate, PROBE_LAYOUT.idSlotMs);
   const start = anchor + idSlotsStart(sampleRate);
 
@@ -223,6 +238,7 @@ export function decodeProbeId(samples: Float32Array, anchor: number, sampleRate:
 
 /** Measure the burst's sweep, sampled onto REPORT_GRID (linear mags). */
 export function measureProbeSweep(samples: Float32Array, anchor: number, sampleRate: number): number[] | null {
+  if (anchor < 0) return null;
   const chirpSamples = ms(sampleRate, PROBE_LAYOUT.chirpMs);
   const gapSamples = ms(sampleRate, PROBE_LAYOUT.gapMs);
   const plan = sweepPlan(sampleRate);
