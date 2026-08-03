@@ -170,6 +170,52 @@ describe('control frames on the handshake band', () => {
     TIMEOUT,
   );
 
+  it(
+    'a listener stuck mid-frame stays deaf until it is re-armed',
+    () => {
+      // The persistent chatter listener only re-armed after a SUCCESSFUL
+      // decode. Anything that syncs it without completing — a truncated
+      // message, or interference such as a probe burst whose sweep crosses
+      // the handshake band — leaves it out of WAITING, where chirp detection
+      // never runs, permanently. On hardware this showed as a room that heard
+      // probes (a separate detector) but never decoded one control frame on
+      // either device.
+      const msg: ControlMessage = {
+        type: ControlType.Bye, senderId: 9, targetId: 4, payload: new Uint8Array([7, 7]),
+      };
+      const tx = new TxEngine({
+        useOFDM: true, sampleRate: SR, bandHandshake: true,
+        pilotFreqHz: 6300, toneStartHz: 600, toneCount: 32,
+      } as ConstructorParameters<typeof TxEngine>[0]);
+      const audio = tx.buildHandshakeSegment(encodeControlMessage(msg));
+
+      const rx = new RxEngine({
+        useOFDM: true, sampleRate: SR, bandHandshake: true,
+        pilotFreqHz: 999, toneStartHz: 12345, toneCount: 16,
+      } as ConstructorParameters<typeof RxEngine>[0]);
+      let received: ControlMessage | null = null;
+      rx.onControlMessage = (m) => { received = m; };
+
+      // Sync it, then cut the audio off mid-frame.
+      rx.feedChunk(audio.slice(0, Math.floor(audio.length * 0.7)));
+      expect(received).toBeNull();
+
+      // A complete message now arrives — and is silently dropped.
+      rx.feedChunk(audio);
+      rx.feedChunk(new Float32Array(4096));
+      const decodedWhileStuck = received !== null;
+
+      rx.rearmForNextControlMessage();
+      rx.feedChunk(audio);
+      rx.feedChunk(new Float32Array(4096));
+
+      expect(decodedWhileStuck).toBe(false); // the deafness this fix targets
+      expect(received).not.toBeNull();       // ...and recovery from it
+      expect(received!.senderId).toBe(9);
+    },
+    TIMEOUT,
+  );
+
   it('encodeControl audio does not falsely decode as a band card', () => {
     // decodeBandCard must reject a control header's magic byte, exercised
     // implicitly above by getting a controlMessage and no onBandCard call.

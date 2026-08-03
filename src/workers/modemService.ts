@@ -395,6 +395,12 @@ export class ModemService {
         };
         this.chatterRx = engine;
         this.probeDetector = new ProbeDetector(cmd.deviceId, this.config.sampleRate, (deviceId, grid) => {
+          // A probe burst just went through — whatever the control listener
+          // thinks it is part-way through demodulating, it is not a control
+          // message. Re-arm it, or a false sync on the burst's sweep (which
+          // crosses the handshake band) leaves it stuck out of WAITING and
+          // deaf to every reply that follows.
+          this.chatterRx?.rearmForNextControlMessage();
           this.emit({ type: 'probeHeard', deviceId, grid });
         });
         break;
@@ -443,7 +449,14 @@ export class ModemService {
         break;
       }
       case 'setRxMuted': {
+        const unmuting = this.rxMuted && !cmd.muted;
         this.rxMuted = cmd.muted;
+        // Coming back from our own transmission: the room is still ringing
+        // with it, and the listener may have latched onto the tail that got
+        // through before the mute or just after it. Re-arm so the reply
+        // window starts from a clean WAITING state — this is the moment a
+        // roll call is about to listen for every peer's answer.
+        if (unmuting) this.chatterRx?.rearmForNextControlMessage();
         break;
       }
     }

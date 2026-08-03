@@ -492,18 +492,35 @@ export class RxEngine {
       // detection only runs from RxState.WAITING — see feedSample), so every
       // message after the first would be silently dropped. Re-arm exactly
       // like the OFDM file path's post-completion reset (processTail).
-      if (this.useOFDM && this.ofdmDemod) {
-        this.state = RxState.WAITING;
-        this.ofdmSyncFrames = 0;
-        this.ofdmNoiseEma = this.OFDM_EMA_SEED;
-        this.ofdmTrainingSymbols = 0;
-        this.ofdmSettleSymbols = 0;
-        this.ofdmDemod.discardMER();
-        this.ofdmDemod.resetTraining();
-        this.buf = [];
-        this.ofdmAlignBuf = [];
-      }
+      this.rearmForNextControlMessage();
     };
+  }
+
+  /**
+   * Return the persistent chatter listener to WAITING so it can sync on the
+   * next control message.
+   *
+   * Called after a successful decode, and — importantly — by the host when it
+   * knows the engine has been listening to something that was never a control
+   * message. Chirp detection only runs from WAITING, so an engine that syncs
+   * on a non-message and then waits for training that never arrives is deaf
+   * from that moment on, permanently. A probe burst does exactly that: its
+   * sweep crosses the handshake band's pilot and tones, and one is transmitted
+   * on every join and every roll call. Observed on hardware as a room where
+   * probes were heard (a separate detector) but not one control frame ever
+   * decoded, on either device.
+   */
+  rearmForNextControlMessage(): void {
+    if (!this.useOFDM || !this.ofdmDemod) return;
+    this.state = RxState.WAITING;
+    this.ofdmSyncFrames = 0;
+    this.ofdmNoiseEma = this.OFDM_EMA_SEED;
+    this.ofdmTrainingSymbols = 0;
+    this.ofdmSettleSymbols = 0;
+    this.ofdmDemod.discardMER();
+    this.ofdmDemod.resetTraining();
+    this.buf = [];
+    this.ofdmAlignBuf = [];
   }
 
   /**
