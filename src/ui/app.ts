@@ -170,7 +170,7 @@ window.addEventListener('eardrop-chatter-leave', (() => {
  * the output and it buries these.
  */
 const ROOM_LOG_TAGS = [
-  'ROOM', 'CHATTER-RX', 'REC', 'REC-ERR', 'PLAY', 'APP',
+  'ROOM', 'CHATTER-RX', 'REC', 'REC-CAP', 'REC-ERR', 'PLAY', 'APP',
   // The decode ladder for a control message, needed to tell "heard nothing"
   // from "heard it and could not read it": OFDM-SYNC = the chirp was found,
   // RX-OFDM cardInvalid = a sentinel arrived but its header would not decode.

@@ -252,12 +252,24 @@ export class AudioRecorder {
       const { deviceId: _dropped, ...rest } = constraints.audio as MediaTrackConstraints;
       this.stream = await navigator.mediaDevices.getUserMedia({ audio: rest });
     }
-    console.log(this.stream);
+    // What the browser ACTUALLY granted, not what we asked for. These were
+    // console.log calls, which meant they never reached the dump — and on a
+    // phone the console is not reachable at all, which is precisely where
+    // they matter: mobile stacks routinely ignore the three processing
+    // constraints below and apply AGC/NS/AEC anyway. Any of them coming back
+    // true explains a link whose preamble decodes (chirp correlation is
+    // normalised, so gain-invariant) while every payload fails (OFDM needs
+    // amplitude and phase to hold still across the frame).
     const track = this.stream.getAudioTracks()[0];
-    console.log('Mic settings:', track.getSettings());
-    console.log('Mic constraints:', track.getConstraints());
-    console.log('AudioContext rate:', this.ctx.sampleRate);
-    // globalThis.window.['myStream'] = this.stream;
+    const applied = track.getSettings();
+    dlog('REC-CAP', {
+      agc: applied.autoGainControl ?? 'unset',
+      ns: applied.noiseSuppression ?? 'unset',
+      aec: applied.echoCancellation ?? 'unset',
+      rate: applied.sampleRate ?? 'unset',
+      ch: applied.channelCount ?? 'unset',
+      ctxRate: this.ctx.sampleRate,
+    }, { level: 'warn' });
     this.source = this.ctx.createMediaStreamSource(this.stream);
     this.onChunk = onChunk ?? null;
 

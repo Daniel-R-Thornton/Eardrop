@@ -5,6 +5,7 @@
  */
 import { useCallback, useEffect, useState } from 'react';
 import { dlogDump, dlogRecords, DLOG_RING_MAX } from '../lib/debug/dlog';
+import { LogShare } from './views/LogShare';
 import { compressRecords } from '../lib/debug/llmDump';
 import { useStore, setState } from './Store';
 import { Toggle } from './components/instrument/Toggle';
@@ -37,6 +38,7 @@ export function BenchApp() {
   const [inRoom, setInRoom] = useState(false);
   const [showFrequencySweep, setShowFrequencySweep] = useState(false);
   const [showChannelSweep, setShowChannelSweep] = useState(false);
+  const [showLog, setShowLog] = useState(false);
   const [copiedLlm, setCopiedLlm] = useState(false);
   const [copiedRaw, setCopiedRaw] = useState(false);
 
@@ -151,6 +153,17 @@ export function BenchApp() {
             {copiedRaw ? '✓ copied' : '⧉ raw log'}
           </button>
           <button
+            onClick={() => setShowLog(true)}
+            title="Read, share or download the session log — the only way to see it on a phone"
+            style={{
+              fontFamily: T.mono, fontSize: 12, padding: '5px 12px', borderRadius: T.radius,
+              cursor: 'pointer', border: `1px solid ${T.panelEdge}`,
+              background: 'rgba(0,0,0,0.04)', color: T.panelInk,
+            }}
+          >
+            ▤ log
+          </button>
+          <button
             onClick={() => { setPresenting((p) => !p); setInRoom(false); }}
             style={{
               fontFamily: T.mono, fontSize: 12, padding: '5px 12px', borderRadius: T.radius, cursor: 'pointer',
@@ -226,6 +239,7 @@ export function BenchApp() {
       </>
       )}
 
+      {showLog && <LogShare onClose={() => setShowLog(false)} />}
       {showFrequencySweep && <FrequencySweep />}
       {showChannelSweep && <ChannelSweep onClose={() => setShowChannelSweep(false)} />}
     </div>

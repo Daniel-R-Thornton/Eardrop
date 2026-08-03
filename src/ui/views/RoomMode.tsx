@@ -18,6 +18,7 @@ import { T } from '../theme/labaccent/tokens';
 import { Screen } from '../components/instrument/Screen';
 import { PacketStream } from './RoomModePacketStream';
 import { hex, formatAgo } from './roomModeFormat';
+import { LogShare } from './LogShare';
 
 const dispatch = (type: string) => window.dispatchEvent(new CustomEvent(type));
 
@@ -155,6 +156,9 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
    * rather than silently inheriting the last node clicked.
    */
   const [sendTargetId, setSendTargetId] = useState(0);
+  /** Session-log viewer — room mode is full-screen, and on a phone this is the
+   *  only way to read what the radio actually did. */
+  const [showLog, setShowLog] = useState(false);
 
   // Quiet the modem's per-symbol logging for as long as this mode is on
   // screen, so the room's own lines are readable in the console. Restored on
@@ -443,6 +447,7 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
           {s.chatterOn ? 'release to broadcast to the room' : 'join the room first to broadcast'}
         </div>
       )}
+      {showLog && <LogShare onClose={() => setShowLog(false)} />}
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10, flex: '0 0 auto' }}>
         <span style={{ fontFamily: T.mono, fontSize: 15, letterSpacing: 1, color: T.panelInk }}>ROOM MODE — nodes &amp; packets</span>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -466,6 +471,7 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
           >
             {joinLeaveLabel}
           </button>
+          <button onClick={() => setShowLog(true)} style={btn(false)}>▤ log</button>
           <button onClick={onExit} style={btn(false)}>← back to bench</button>
         </div>
       </div>
