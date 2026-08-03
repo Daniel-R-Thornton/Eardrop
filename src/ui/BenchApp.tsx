@@ -13,6 +13,7 @@ import { PipelineView } from './views/PipelineView';
 import { FrameTimeline } from './views/FrameTimeline';
 import { RxPipeline } from './views/RxPipeline';
 import { PresentationMode } from './views/PresentationMode';
+import { RoomMode } from './views/RoomMode';
 import { SettingsPanel } from './views/SettingsPanel';
 import { TxPanel } from './views/TxPanel';
 import { ChatterPanel } from './views/ChatterPanel';
@@ -33,6 +34,7 @@ export function BenchApp() {
   const ph = usePipelinePlayhead(s.demoRun, s.demoSpeed);
   const [enlargeFocused, setEnlargeFocused] = useState(false);
   const [presenting, setPresenting] = useState(false);
+  const [inRoom, setInRoom] = useState(false);
   const [showFrequencySweep, setShowFrequencySweep] = useState(false);
   const [showChannelSweep, setShowChannelSweep] = useState(false);
   const [copiedLlm, setCopiedLlm] = useState(false);
@@ -139,7 +141,7 @@ export function BenchApp() {
             {copiedRaw ? '✓ copied' : '⧉ raw log'}
           </button>
           <button
-            onClick={() => setPresenting((p) => !p)}
+            onClick={() => { setPresenting((p) => !p); setInRoom(false); }}
             style={{
               fontFamily: T.mono, fontSize: 12, padding: '5px 12px', borderRadius: T.radius, cursor: 'pointer',
               border: `1px solid ${presenting ? T.phosphor : T.panelEdge}`,
@@ -149,13 +151,25 @@ export function BenchApp() {
           >
             {presenting ? '◱ bench' : '▶ presentation'}
           </button>
+          <button
+            onClick={() => { setInRoom((r) => !r); setPresenting(false); }}
+            style={{
+              fontFamily: T.mono, fontSize: 12, padding: '5px 12px', borderRadius: T.radius, cursor: 'pointer',
+              border: `1px solid ${inRoom ? T.phosphor : T.panelEdge}`,
+              background: inRoom ? T.phosphorDim : 'rgba(0,0,0,0.04)',
+              color: inRoom ? T.phosphor : T.panelInk,
+            }}
+          >
+            {inRoom ? '◱ bench' : '◎ room mode'}
+          </button>
           <LED on={s.isPlaying || s.isListening} label={s.isPlaying ? 'TX' : s.isListening ? 'RX' : 'IDLE'} />
         </div>
       </div>
 
       {presenting && <PresentationMode onExit={() => setPresenting(false)} />}
+      {!presenting && inRoom && <RoomMode onExit={() => setInRoom(false)} />}
 
-      {!presenting && (
+      {!presenting && !inRoom && (
       <>
       {/* transport */}
       <div style={{ marginBottom: 12 }}>
