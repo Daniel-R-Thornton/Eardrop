@@ -471,18 +471,38 @@ export class RxEngine {
     this.scanner.onExtraFrame = (payloadWire: Uint8Array) => {
       const header = this.pendingControlHeader;
       this.pendingControlHeader = null;
-      if (!header) return;
-      const payload = decodeControlPayload(payloadWire, header.payloadLen);
-      if (!payload) {
-        dlog('RX-OFDM', { controlPayloadInvalid: true }, { level: 'warn' });
-        return;
+      if (header) {
+        const payload = decodeControlPayload(payloadWire, header.payloadLen);
+        if (!payload) {
+          dlog('RX-OFDM', { controlPayloadInvalid: true }, { level: 'warn' });
+        } else {
+          this.onControlMessage?.({
+            type: header.type,
+            senderId: header.senderId,
+            targetId: header.targetId,
+            payload,
+          });
+        }
       }
-      this.onControlMessage?.({
-        type: header.type,
-        senderId: header.senderId,
-        targetId: header.targetId,
-        payload,
-      });
+      // Chatter mode's control-message listener is ONE persistent engine for
+      // the whole room session (see modemService.ts's chatterStart) — unlike
+      // the band-card listener, which is thrown away the moment it hops (see
+      // HandshakeReceiver), this engine must survive to decode the NEXT
+      // control message too. Left in RxState.FRAMES it never resyncs (chirp
+      // detection only runs from RxState.WAITING — see feedSample), so every
+      // message after the first would be silently dropped. Re-arm exactly
+      // like the OFDM file path's post-completion reset (processTail).
+      if (this.useOFDM && this.ofdmDemod) {
+        this.state = RxState.WAITING;
+        this.ofdmSyncFrames = 0;
+        this.ofdmNoiseEma = this.OFDM_EMA_SEED;
+        this.ofdmTrainingSymbols = 0;
+        this.ofdmSettleSymbols = 0;
+        this.ofdmDemod.discardMER();
+        this.ofdmDemod.resetTraining();
+        this.buf = [];
+        this.ofdmAlignBuf = [];
+      }
     };
   }
 
