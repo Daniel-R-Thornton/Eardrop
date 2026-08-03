@@ -54,6 +54,7 @@ import {
 } from '../protocol/controlFrame';
 import { pickSettings, type PeerReport, type PickedSettings } from './settingsPick';
 import { OFDM_TUNING } from '../types';
+import { dlog } from '../../lib/debug/dlog';
 
 export type RoomState =
   | 'cold' | 'listening' | 'announcing' | 'joinWait'
@@ -238,7 +239,15 @@ export class RoomProtocol {
   // ---- WELCOME / REPORT / FILE_COMING handlers ----
 
   private handleWelcome(msg: ControlMessage): void {
-    if (msg.targetId !== this.deps.deviceId) return;
+    if (msg.targetId !== this.deps.deviceId) {
+      // Not silent: a reply addressed to the wrong id looks identical to no
+      // reply at all, and the two have completely different causes (a
+      // mis-decoded probe ID vs nothing being heard).
+      dlog('ROOM', {
+        droppedWelcome: true, from: msg.senderId, to: msg.targetId, us: this.deps.deviceId,
+      }, { level: 'warn' });
+      return;
+    }
     const parsed = parseWelcome(msg.payload);
     if (!parsed) return;
     const existing = this._members.get(msg.senderId);
@@ -264,7 +273,12 @@ export class RoomProtocol {
   }
 
   private handleReport(msg: ControlMessage): void {
-    if (msg.targetId !== this.deps.deviceId) return;
+    if (msg.targetId !== this.deps.deviceId) {
+      dlog('ROOM', {
+        droppedReport: true, from: msg.senderId, to: msg.targetId, us: this.deps.deviceId,
+      }, { level: 'warn' });
+      return;
+    }
     const grid = parseReport(msg.payload);
     if (!grid) return;
 
@@ -362,6 +376,13 @@ export class RoomProtocol {
 
   private finishRollCall(): void {
     const reports = Array.from(this.collectedReports.values());
+    dlog('ROOM', {
+      rollCallDone: true,
+      reports: reports.length,
+      from: reports.map((r) => r.deviceId).join(',') || 'none',
+      knownMembers: Array.from(this._members.keys()).join(',') || 'none',
+      us: this.deps.deviceId,
+    }, { level: 'warn' });
     if (reports.length === 0) {
       this._lastError = 'roll call: no reports received — nobody home';
       this.activeFileParams = null;

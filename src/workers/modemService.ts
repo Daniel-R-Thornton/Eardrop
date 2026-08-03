@@ -19,7 +19,7 @@ import {
   measureProbeSweep,
   buildProbeBurst,
 } from '../modem/protocol/probeBurst';
-import { encodeControlMessage, type ControlMessage, type ControlType } from '../modem/protocol/controlFrame';
+import { encodeControlMessage, ControlType, type ControlMessage } from '../modem/protocol/controlFrame';
 
 const RING_SECONDS = 10;
 const SPECTRUM_BINS = 64;
@@ -272,11 +272,14 @@ export class ModemService {
       case 'feedChunk': {
         const chunk = new Float32Array(cmd.samples);
         this.pushRing(chunk);
-        // Air-check noise floor tracks every chunk regardless of mute state —
-        // it characterizes the CHANNEL, and muting exists only to stop our
-        // own playback from being demodulated as if it were incoming.
-        this.airNoise.update(rmsOf(chunk));
+        // Skip the noise floor while muted. Muted means WE are playing, and
+        // our own burst leaking back through the mic is not the channel's
+        // noise: feeding it in drags the floor up toward our own transmit
+        // level, after which a peer's genuinely loud reply no longer reads as
+        // busy. (This was harmless while the floor could only fall, but the
+        // floor now rises too, so self-noise would be absorbed into it.)
         if (this.rxMuted) break;
+        this.airNoise.update(rmsOf(chunk));
         // Guard against RxEngine exceptions that would silently kill
         // the worker. Log and continue — the caller's watchdog will
         // notice the gap if processing taps out.
@@ -371,6 +374,12 @@ export class ModemService {
         const cfg = { ...this.config, bandHandshake: true } as ConstructorParameters<typeof RxEngine>[0];
         const engine = new RxEngine(cfg);
         engine.onControlMessage = (msg: ControlMessage) => {
+          dlog('CHATTER-RX', {
+            decoded: ControlType[msg.type] ?? msg.type,
+            from: msg.senderId,
+            to: msg.targetId,
+            bytes: msg.payload.length,
+          }, { level: 'warn' });
           const owned = msg.payload.slice();
           this.emit(
             {
