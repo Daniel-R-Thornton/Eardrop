@@ -41,6 +41,13 @@ import {
   BAND_CARD_WIRE_SIZE,
   type BandCard,
 } from '../protocol/bandCard';
+import {
+  decodeControlHeader,
+  decodeControlPayload,
+  controlPayloadWireSize,
+  type ControlMessage,
+  type ControlType,
+} from '../protocol/controlFrame';
 import { SentinelScanner } from '../receiver/SentinelScanner';
 import { OFDMQPSKDemodulator } from '../demodulation/OFDMQPSKDemodulator';
 import type { QamOrder } from '../modulation/constellation';
@@ -458,6 +465,25 @@ export class RxEngine {
       if (this.bandHandshake) this.processCard(frame);
       else this.processFrame(frame);
     };
+    // Card-listening mode only: fires when processCard recognized a control
+    // header (CONTROL_MAGIC) instead of a band card and told the scanner to
+    // keep collecting the payload wire bytes — see processCard/onControlMessage.
+    this.scanner.onExtraFrame = (payloadWire: Uint8Array) => {
+      const header = this.pendingControlHeader;
+      this.pendingControlHeader = null;
+      if (!header) return;
+      const payload = decodeControlPayload(payloadWire, header.payloadLen);
+      if (!payload) {
+        dlog('RX-OFDM', { controlPayloadInvalid: true }, { level: 'warn' });
+        return;
+      }
+      this.onControlMessage?.({
+        type: header.type,
+        senderId: header.senderId,
+        targetId: header.targetId,
+        payload,
+      });
+    };
   }
 
   /**
@@ -468,24 +494,42 @@ export class RxEngine {
   onBandCard: ((card: BandCard) => void) | null = null;
   /** The decoded card, if any (card-listening mode only). */
   private bandCard: BandCard | null = null;
+  /**
+   * Fires for each decoded control message (chatter mode only — see
+   * modemService.ts's chatterStart). Unlike onBandCard this can fire
+   * repeatedly: a chatter listener stays on this same fixed-band engine for
+   * the whole session instead of hopping away after one card.
+   */
+  onControlMessage: ((msg: ControlMessage) => void) | null = null;
+  /** Header awaited while the scanner collects a control message's payload
+   *  bytes (see the scanner.onExtraFrame wiring above). */
+  private pendingControlHeader: { type: ControlType; senderId: number; targetId: number; payloadLen: number } | null = null;
 
-  /** Card-listening mode: every sentinel hit is a candidate band card. */
+  /** Card-listening mode: every sentinel hit is a candidate band card OR
+   *  (chatter mode) a control message header. */
   private processCard(frame: Uint8Array): void {
     if (this.bandCard) return; // already hopped — later copies are redundant
-    const card = decodeBandCard(frame.slice(SENTINEL_SIZE));
-    if (!card) {
-      dlog('RX-OFDM', { cardInvalid: true }, { level: 'warn' });
+    const body = frame.slice(SENTINEL_SIZE);
+    const card = decodeBandCard(body);
+    if (card) {
+      this.bandCard = card;
+      dlog('RX-OFDM', {
+        card: true,
+        pilot: card.pilotFreqHz,
+        toneStart: card.toneStartHz,
+        tones: card.toneCount,
+        settle: card.settleSymbols,
+      }, { level: 'info' });
+      this.onBandCard?.(card);
       return;
     }
-    this.bandCard = card;
-    dlog('RX-OFDM', {
-      card: true,
-      pilot: card.pilotFreqHz,
-      toneStart: card.toneStartHz,
-      tones: card.toneCount,
-      settle: card.settleSymbols,
-    }, { level: 'info' });
-    this.onBandCard?.(card);
+    const header = decodeControlHeader(body);
+    if (header) {
+      this.pendingControlHeader = header;
+      this.scanner.continueCollecting(controlPayloadWireSize(header.payloadLen));
+      return;
+    }
+    dlog('RX-OFDM', { cardInvalid: true }, { level: 'warn' });
   }
 
   /**

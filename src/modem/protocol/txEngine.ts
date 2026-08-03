@@ -171,6 +171,34 @@ export class TxEngine {
     this.modulator.reset();
   }
 
+  /**
+   * Handshake-band preamble (chirp + settle + training) followed by `bytes`
+   * modulated as QPSK on the fixed handshake band — the same primitives
+   * (`handshakeEngine.generateChirpBurst`/`generateSettleSymbols`/
+   * `generateTrainingSymbols`/`modulateFrame`) the band-card announcement
+   * uses in `frameSegments`'s `bandHandshake` branch, but standalone: no
+   * repeats, no trailing silence gap (there is no target-band hop to protect
+   * after a bare control frame). Used by chatter-mode control-message TX
+   * (`encodeControl` in modemService.ts); the card path itself is untouched
+   * so its byte-identical output (see bandHandshake.test.ts) is unaffected.
+   */
+  buildHandshakeSegment(bytes: Uint8Array): Float32Array {
+    if (!this.handshakeEngine) {
+      throw new Error('buildHandshakeSegment requires useOFDM + bandHandshake config');
+    }
+    const { chirp } = this.handshakeEngine.generateChirpBurst(OFDM_TUNING.chirpSymbols);
+    const settle = this.handshakeEngine.generateSettleSymbols(OFDM_TUNING.trainingSettleSymbols);
+    const training = this.handshakeEngine.generateTrainingSymbols(OFDM_TUNING.trainingSymbols);
+    const body = this.handshakeEngine.modulateFrame(bytes);
+    const combined = new Float32Array(chirp.length + settle.length + training.length + body.length);
+    let off = 0;
+    combined.set(chirp, off); off += chirp.length;
+    combined.set(settle, off); off += settle.length;
+    combined.set(training, off); off += training.length;
+    combined.set(body, off);
+    return combined;
+  }
+
   /** Check whether OFDM mode is active */
   isOFDM(): boolean {
     return this.useOFDM;
