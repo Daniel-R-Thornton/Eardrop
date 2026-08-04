@@ -17,7 +17,11 @@
  * format doc rather than repeated on every line.
  */
 
-import type { DlogRecord } from './dlog';
+import { dlogFmt, type DlogRecord } from './dlog';
+
+/** Cap on a fallback row for an unmapped tag — keeps one stray record from
+ *  swamping a dump that is meant to be skim-readable. */
+const UNMAPPED_LINE_MAX = 100;
 
 /** Format version — bump when field order or codes change. */
 export const LLM_DUMP_VERSION = 'v2';
@@ -427,6 +431,11 @@ function compressOne(rec: DlogRecord): string | null {
     case 'PLAYER':
       return has('clipClamped') ? `!CLIP ${asNum(f.clipClamped)} ${n(asNum(f.peak))}` : null;
 
+    // A control message that decoded end to end — the success case the whole
+    // ladder builds toward, and the one that says who is actually reachable.
+    case 'CHATTER-RX':
+      return `CRX ${asString(f.decoded)} from=${asNum(f.from)} to=${asNum(f.to)} ${asNum(f.bytes)}B`;
+
     // What the operator did, and when. Without it a dump shows the radio
     // reacting to nothing, and a protocol that never started is
     // indistinguishable from one that started and failed.
@@ -593,7 +602,18 @@ export function compressRecords(recs: DlogRecord[]): string {
     }
     const row = compressOne(rec);
     if (row === null) {
+      // Still render it. An unmapped tag used to be counted and its contents
+      // thrown away, which has now hidden decisive evidence three separate
+      // times during one investigation — capture settings, room decisions,
+      // and a control payload failure — each time costing a debugging round
+      // trip on hardware that is not on this desk. A tag with no case is a
+      // gap in this file, not permission to discard the data, so fall back to
+      // a generic rendering and keep the count for visibility.
       unmapped.set(rec.tag, (unmapped.get(rec.tag) ?? 0) + 1);
+      const pairs = Object.entries(rec.fields)
+        .map(([k, v]) => `${k}=${dlogFmt(v)}`)
+        .join(' ');
+      rows.push(`?${rec.tag} ${pairs}`.slice(0, UNMAPPED_LINE_MAX));
       continue;
     }
     if (row === DROP) {

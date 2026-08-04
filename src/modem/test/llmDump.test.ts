@@ -213,7 +213,11 @@ describe('compression', () => {
     expect(out).toContain('HW 48000');
     expect(out).toContain('TF 0x4 0');
     expect(out).toMatch(/UNMAPPED SOMETHING-NEW=2/);
-    expect(out).toContain('rows=2');
+    // The unmapped records are now RENDERED as well as counted, so they are
+    // rows in their own right — the count alone proved not to be enough to
+    // debug with, having hidden decisive evidence three times over.
+    expect(out).toMatch(/\?SOMETHING-NEW a=1/);
+    expect(out).toContain('rows=4');
   });
 
   it('emits a version and format pointer so a reader can decode it', () => {
@@ -257,6 +261,24 @@ describe('chatter diagnostics survive compression', () => {
     const out = compressRecords([rec('RX-OFDM', { controlPayloadInvalid: true })]);
     expect(out).toMatch(/!CPAY/);
     expect(out).not.toMatch(/UNMAPPED/);
+  });
+
+  it('renders a decoded control message', () => {
+    const out = compressRecords([
+      rec('CHATTER-RX', { decoded: 'Welcome', from: 183, to: 98, bytes: 35 }),
+    ]);
+    expect(out).toMatch(/CRX Welcome from=183 to=98 35B/);
+    expect(out).not.toMatch(/UNMAPPED/);
+  });
+
+  it('still renders a tag it has no rule for, instead of discarding it', () => {
+    // A missing case is a gap in the format, not permission to throw the data
+    // away — silently counting unmapped records hid decisive evidence three
+    // times in one investigation, each costing a round trip on hardware that
+    // is not on this desk.
+    const out = compressRecords([rec('TOTALLY-NEW', { why: 'because', n: 42 })]);
+    expect(out).toMatch(/\?TOTALLY-NEW why=because n=42/);
+    expect(out).toMatch(/UNMAPPED .*TOTALLY-NEW=1/); // still flagged as a gap
   });
 
   it('renders operator actions', () => {
