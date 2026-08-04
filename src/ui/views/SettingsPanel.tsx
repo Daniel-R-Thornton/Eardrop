@@ -5,7 +5,7 @@ import { useCallback, useEffect, useState } from 'react';
 import {
   useStore, setState, saveConfigPreset, loadConfigPreset, deleteConfigPreset,
 } from '../Store';
-import { enumerateDevices, type DeviceInfo } from '../../audio';
+import { enumerateDevices, DEVICES_CHANGED_EVENT, type DeviceInfo } from '../../audio';
 import { Panel } from '../components/instrument/Panel';
 import { Toggle } from '../components/instrument/Toggle';
 import { Slider } from '../components/instrument/Slider';
@@ -42,7 +42,13 @@ export function SettingsPanel() {
     refreshDevices();
     const md = navigator.mediaDevices;
     md?.addEventListener?.('devicechange', refreshDevices);
-    return () => md?.removeEventListener?.('devicechange', refreshDevices);
+    // Also refresh the moment capture starts: that is when permission exists
+    // and the browser stops withholding names and the rest of the list.
+    window.addEventListener(DEVICES_CHANGED_EVENT, refreshDevices);
+    return () => {
+      md?.removeEventListener?.('devicechange', refreshDevices);
+      window.removeEventListener(DEVICES_CHANGED_EVENT, refreshDevices);
+    };
   }, [refreshDevices]);
   useEffect(() => {
     if (s.isListening) refreshDevices();

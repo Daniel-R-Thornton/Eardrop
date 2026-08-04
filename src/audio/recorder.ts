@@ -4,6 +4,7 @@
  */
 
 import { dlog } from '../lib/debug/dlog';
+import { DEVICES_CHANGED_EVENT } from './devices';
 
 export type ChunkCallback = (chunk: Float32Array) => void;
 
@@ -260,6 +261,13 @@ export class AudioRecorder {
     // true explains a link whose preamble decodes (chirp correlation is
     // normalised, so gain-invariant) while every payload fails (OFDM needs
     // amplitude and phase to hold still across the frame).
+    // Permission now exists, so device names and the full list are available
+    // for the first time. Tell the UI to re-enumerate — otherwise it keeps
+    // showing the placeholder entries the browser returned before the grant.
+    try {
+      globalThis.dispatchEvent?.(new CustomEvent(DEVICES_CHANGED_EVENT));
+    } catch { /* non-DOM host (tests/worker) — nothing to notify */ }
+
     const track = this.stream.getAudioTracks()[0];
     const applied = track.getSettings();
     dlog('REC-CAP', {

@@ -10,6 +10,14 @@ export interface DeviceInfo {
 
 export type DeviceList = { inputs: DeviceInfo[]; outputs: DeviceInfo[] };
 
+/**
+ * Fired once capture actually starts, i.e. the moment microphone permission
+ * exists and the browser will finally hand over real device names and the
+ * full list. Nothing re-enumerated after that before, so the placeholder
+ * names from the first (pre-permission) enumeration stuck for the session.
+ */
+export const DEVICES_CHANGED_EVENT = 'eardrop-devices-changed';
+
 /** Enumerate all audio input/output devices */
 export async function enumerateDevices(): Promise<DeviceList> {
   // Request mic permission first so labels populate
@@ -19,17 +27,24 @@ export async function enumerateDevices(): Promise<DeviceList> {
   const inputs: DeviceInfo[] = [];
   const outputs: DeviceInfo[] = [];
 
+  // An empty label means the page has no microphone permission YET — browsers
+  // withhold names until it is granted, and expose only a single placeholder
+  // per kind while withholding them. "Mic 1" therefore reads as "this device
+  // has one microphone", which on a phone is simply wrong and sends you
+  // looking for a hardware problem that isn't there. Say what is actually
+  // going on instead. (The list is re-enumerated once capture starts — see
+  // DEVICES_CHANGED_EVENT.)
   for (const dev of all) {
     if (dev.kind === 'audioinput') {
       inputs.push({
         id: dev.deviceId,
-        label: dev.label || `Mic ${inputs.length + 1}`,
+        label: dev.label || 'Microphone (allow mic access to see names)',
         groupId: dev.groupId,
       });
     } else if (dev.kind === 'audiooutput') {
       outputs.push({
         id: dev.deviceId,
-        label: dev.label || `Speaker ${outputs.length + 1}`,
+        label: dev.label || 'Speaker (allow mic access to see names)',
         groupId: dev.groupId,
       });
     }
