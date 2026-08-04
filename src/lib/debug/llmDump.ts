@@ -219,6 +219,11 @@ function compressOne(rec: DlogRecord): string | null {
       }
       if (has('cardHop')) return `HH ${n(asNum(f.pilot))} ${asNum(f.tones)} ${asNum(f.discard)}`;
       if (has('cardInvalid')) return '!HC';
+      // The most informative failure on the whole ladder, and it was being
+      // dropped: the header decoded (sentinel found, BCH and CRC-8 good) and
+      // only the payload failed its own BCH/CRC. That is a link carrying the
+      // waveform correctly and losing bits, not one that cannot hear.
+      if (has('controlPayloadInvalid')) return '!CPAY';
       return null;
     }
 

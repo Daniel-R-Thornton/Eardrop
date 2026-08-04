@@ -249,6 +249,16 @@ describe('chatter diagnostics survive compression', () => {
     expect(out).not.toMatch(/UNMAPPED/);
   });
 
+  it('renders a control payload that failed after a good header', () => {
+    // Was UNMAPPED, which hid the single most informative outcome: header
+    // decoded, payload did not. Header-good/payload-bad is a link that is
+    // carrying the waveform and losing bits — a completely different problem
+    // from one that never syncs.
+    const out = compressRecords([rec('RX-OFDM', { controlPayloadInvalid: true })]);
+    expect(out).toMatch(/!CPAY/);
+    expect(out).not.toMatch(/UNMAPPED/);
+  });
+
   it('renders operator actions', () => {
     const out = compressRecords([
       rec('UI', { action: 'joinRoom' }),
