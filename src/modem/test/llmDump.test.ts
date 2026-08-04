@@ -233,3 +233,19 @@ describe('compression', () => {
     expect(out.length).toBeLessThan(rawSize / 5);
   });
 });
+
+describe('chatter diagnostics survive compression', () => {
+  it('renders capture settings and room decisions instead of dropping them', () => {
+    // Both tags were UNMAPPED in a real two-device dump, so the exact values
+    // the mobile investigation needed were counted and thrown away.
+    const out = compressRecords([
+      rec('REC-CAP', { agc: true, ns: false, aec: false, rate: 48000, ch: 1, ctxRate: 48000 }),
+      rec('ROOM', { rollCallDone: true, target: 'broadcast', reports: 0, from: 'none', knownMembers: '183', us: 123 }),
+      rec('ROOM', { probeFrom: 183, meanDb: '-10.1', handshakeBandDb: '-24.8', band: '6900-7250Hz' }),
+    ]);
+    expect(out).toMatch(/CAP agc=true ns=false aec=false rate=48000 ch=1/);
+    expect(out).toMatch(/RCALL n=0 from=none known=183/);
+    expect(out).toMatch(/PRB 183 mean=-10\.1 hs=-24\.8/);
+    expect(out).not.toMatch(/UNMAPPED/);
+  });
+});

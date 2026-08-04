@@ -422,6 +422,29 @@ function compressOne(rec: DlogRecord): string | null {
     case 'PLAYER':
       return has('clipClamped') ? `!CLIP ${asNum(f.clipClamped)} ${n(asNum(f.peak))}` : null;
 
+    // What the browser ACTUALLY granted for capture. The whole reason this
+    // exists is mobile: those stacks routinely apply AGC/noise suppression
+    // despite being asked not to, and either one explains a link whose
+    // preamble decodes while every payload dies.
+    case 'REC-CAP':
+      return `CAP agc=${asString(f.agc)} ns=${asString(f.ns)} aec=${asString(f.aec)}`
+        + ` rate=${asString(f.rate)} ch=${asString(f.ch)}`;
+
+    // Room protocol decisions — without these a dump shows the radio's view
+    // and none of the reasoning on top of it.
+    case 'ROOM': {
+      if (has('rollCallDone')) {
+        return `RCALL n=${asNum(f.reports)} from=${asString(f.from)} known=${asString(f.knownMembers)}`;
+      }
+      if (has('probeFrom')) {
+        return `PRB ${asNum(f.probeFrom)} mean=${asString(f.meanDb)} hs=${asString(f.handshakeBandDb)}`;
+      }
+      if (has('droppedWelcome')) return `!DW from=${asNum(f.from)} to=${asNum(f.to)} us=${asNum(f.us)}`;
+      if (has('droppedReport')) return `!DR from=${asNum(f.from)} to=${asNum(f.to)} us=${asNum(f.us)}`;
+      if (has('fileComingForOther')) return `FC-OTHER to=${asNum(f.to)} us=${asNum(f.us)}`;
+      return DROP;
+    }
+
     case 'REC': {
       if (has('label')) return `MIC ${asString(f.label)}`;
       if (has('deviceFallback')) return `!MIC-DEFAULT`;
