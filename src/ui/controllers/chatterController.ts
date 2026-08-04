@@ -549,9 +549,40 @@ export class ChatterController {
     // what FILE_COMING actually advertises; the modulated wire size depends
     // on settings not yet known to this adapter.
     this.recordPacket({ dir: 'rx', kind: 'file', bytes: info.fileBytes });
-    if (this.rxArmed) return;
-    this.rxArmed = true;
+
+    // RECONFIGURE, don't just start listening.
+    //
+    // The sender transmits with bandHandshake on: a band card on the fixed
+    // handshake band announcing the negotiated band, then the file itself
+    // there. The worker only builds a HandshakeReceiver — the thing that can
+    // read that card and hop — when its config says bandHandshake, and the
+    // receiver's config came from the bench UI, where that is an unrelated
+    // user toggle that defaults off. So a receiver could arm, sit on whatever
+    // band the bench happened to be set to, and never hear the file at all
+    // while its control plane worked perfectly. Observed exactly that: a PC
+    // decoded FILE_COMING and then nothing.
+    //
+    // The announced band seeds the config so a missed card is survivable;
+    // per-tone bit-loading still arrives in the transmission's own link
+    // profile, as on the normal handshake path.
+    //
+    // Not guarded by rxArmed either: every transfer negotiates its own
+    // settings, so a second one must re-arm rather than inherit the first's.
     const s = getState();
+    this.worker.configure(buildModemConfig({
+      useOFDM: true,
+      bandHandshake: true,
+      pilotFreqHz: info.pilotFreqHz,
+      toneStartHz: info.toneStartHz,
+      toneCount: info.toneCount,
+      trainingSettleSymbols: info.settleSymbols,
+      symbolsPerSec: s.symbolsPerSec,
+      musicalMode: false,
+      diversityMode: false,
+      hwSampleRate: this.worker.sampleRate,
+      qamScaleOverride: s.qamScaleOverride,
+    }));
+    this.rxArmed = true;
     this.worker.startListening(s.micGain, s.selectedInputId, s.selectedInputLabel).catch((err) => {
       this.rxArmed = false;
       setState({ chatterError: err instanceof Error ? err.message : String(err) });

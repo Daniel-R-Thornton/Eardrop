@@ -8,7 +8,7 @@
 import { describe, expect, it, beforeEach } from 'vitest';
 import { ChatterController, type ModemWorkerHandle, type AudioPlayerLike } from '../../ui/controllers/chatterController';
 import { ROOM_TIMING } from '../chatter/roomProtocol';
-import { ControlType, CONTROL_HEADER_WIRE, controlPayloadWireSize } from '../protocol/controlFrame';
+import { ControlType, packFileComing, CONTROL_HEADER_WIRE, controlPayloadWireSize } from '../protocol/controlFrame';
 import { getState, setState, CHATTER_PACKET_LOG_MAX } from '../../ui/Store';
 
 /** Manual clock + timer wheel, mirroring roomProtocol.test.ts's harness. */
@@ -46,13 +46,15 @@ function makeClock() {
  *  immediately, and lets the test fire probeHeard/controlMessage events. */
 function makeFakeWorker() {
   const calls: string[] = [];
+  const configs: any[] = [];
   const muteLog: boolean[] = [];
   const handlers = new Map<string, Set<(ev: any) => void>>();
   let airBusy = false;
 
-  const worker: ModemWorkerHandle & { emit: (type: string, ev: any) => void; calls: string[]; muteLog: boolean[]; setAirBusy: (b: boolean) => void } = {
+  const worker: ModemWorkerHandle & { emit: (type: string, ev: any) => void; calls: string[]; configs: any[]; muteLog: boolean[]; setAirBusy: (b: boolean) => void } = {
     sampleRate: 48000,
     calls,
+    configs,
     muteLog,
     on: (type: any, fn: any) => {
       if (!handlers.has(type)) handlers.set(type, new Set());
@@ -62,7 +64,7 @@ function makeFakeWorker() {
     emit: (type: string, ev: any) => {
       handlers.get(type)?.forEach((fn) => fn(ev));
     },
-    configure: () => { calls.push('configure'); },
+    configure: (cfg: any) => { calls.push('configure'); configs.push(cfg); },
     startListening: async () => { calls.push('startListening'); },
     stopListening: () => { calls.push('stopListening'); },
     encodeFile: async (fileName: string) => {
@@ -393,5 +395,48 @@ describe('ChatterController', () => {
     expect(member).toBeDefined();
     expect(member!.linkDb).toBeCloseTo(0, 5);
     expect(member!.grid).toEqual(flatGrid.map(() => 1));
+  });
+
+  it('arms the receiver in band-handshake mode on FILE_COMING', async () => {
+    // The sender transmits a band card and then the file on the negotiated
+    // band. Only a bandHandshake-configured receiver builds the
+    // HandshakeReceiver that can read that card and hop, and the receiver's
+    // config otherwise comes from an unrelated bench toggle that defaults
+    // off — so without this it decodes FILE_COMING and then hears nothing.
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, {
+      player, schedule: clock.schedule, now: clock.now, rng: () => 0,
+    });
+    await controller.joinRoom();
+    // FILE_COMING is only acted on from idle/joinWait, so finish the join.
+    await clock.tick(
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS
+      + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
+    );
+    const before = worker.configs.length;
+
+    worker.emit('controlMessage', {
+      msg: {
+        type: ControlType.FileComing,
+        senderId: 143,
+        targetId: 0,
+        payload: packFileComing({
+          pilotFreqHz: 6300, toneStartHz: 600, toneCount: 32,
+          settleSymbols: 16, fileBytes: 1047, durationMs: 30000,
+        }).buffer,
+      },
+    });
+    await clock.tick(50);
+
+    const cfg = worker.configs[worker.configs.length - 1];
+    expect(worker.configs.length).toBeGreaterThan(before);
+    expect(cfg.bandHandshake).toBe(true);
+    expect(cfg.useOFDM).toBe(true);
+    // Seeded with the announced band so a missed card is survivable.
+    expect(cfg.pilotFreqHz).toBe(6300);
+    expect(cfg.toneCount).toBe(32);
+    expect(worker.calls).toContain('startListening');
   });
 });
