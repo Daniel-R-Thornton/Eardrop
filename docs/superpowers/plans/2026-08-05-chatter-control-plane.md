@@ -1810,17 +1810,146 @@ Report to the operator:
 
 Correct for a phone regardless of the out-of-memory cause. **Not** evidence that the memory error is fixed.
 
+The level maths is the risky part and it does not need an `AudioContext` — only a destination `Float32Array`. Extract it as a pure function so it is directly testable, and leave `play` holding the Web Audio plumbing.
+
 **Files:**
-- Modify: `src/audio/player.ts:53-104` (`play`)
-- Test: `src/modem/test/` — no existing player test; this task adds none, because `play` needs a real `AudioContext`. It is covered by the existing suite continuing to pass plus a manual bench send (Step 4).
+- Modify: `src/audio/player.ts:53-104` (`play`), plus a new exported `shapeForPlayback`
+- Test: create `src/modem/test/playerShaping.test.ts`
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: no API change. `AudioPlayer.play`'s signature and observable behaviour (volume, auto-normalise, clip counting, resolve-on-ended) are identical.
+- Produces:
+  - `shapeForPlayback(samples: Float32Array, out: Float32Array, volume: number, clean: boolean): { peak: number; scale: number; clips: number }` — exported from `src/audio/player.ts`. Writes shaped samples into `out` and returns what the caller needs for logging.
+  - `AudioPlayer.play`'s signature and observable behaviour (volume, auto-normalise, clip counting, resolve-on-ended) are unchanged.
 
-- [ ] **Step 1: Rewrite play to fill the AudioBuffer directly**
+- [ ] **Step 1: Write the failing test**
 
-In `src/audio/player.ts`, replace the body of the returned promise (`:53-104`). The peak scan, the `scale` formula, the clip counting, and every `dlog` call must produce the same numbers as before — the only change is where the samples land.
+Create `src/modem/test/playerShaping.test.ts`:
+
+```typescript
+import { describe, expect, it } from 'vitest';
+import { shapeForPlayback } from '../../audio/player';
+
+describe('shapeForPlayback', () => {
+  it('normalises so the loudest sample lands at 0.95 after volume', () => {
+    // The whole point of the auto-norm: peak * volume * scale === 0.95, so a
+    // transmission uses the full output range without clipping.
+    const samples = new Float32Array([0.5, -0.25, 0.1]);
+    const out = new Float32Array(3);
+    const { peak, scale, clips } = shapeForPlayback(samples, out, 2.0, false);
+
+    expect(peak).toBeCloseTo(0.5, 6);
+    expect(0.5 * 2.0 * scale).toBeCloseTo(0.95, 6);
+    expect(out[0]).toBeCloseTo(0.95, 6);
+    expect(out[1]).toBeCloseTo(-0.475, 6);
+    expect(clips).toBe(0);
+  });
+
+  it('passes samples through untouched when clean', () => {
+    // The musical/clean path must not be pre-amplified at all.
+    const samples = new Float32Array([0.5, -0.25]);
+    const out = new Float32Array(2);
+    shapeForPlayback(samples, out, 6.0, true);
+    expect(Array.from(out)).toEqual([0.5, -0.25]);
+  });
+
+  it('caps the scale at 5x so a near-silent buffer is not blown up', () => {
+    const samples = new Float32Array([0.001]);
+    const out = new Float32Array(1);
+    const { scale } = shapeForPlayback(samples, out, 1.0, false);
+    expect(scale).toBe(5.0);
+  });
+
+  it('clamps and counts samples that still exceed unity', () => {
+    // The 5x cap means a quiet buffer can still overshoot. Clamping distorts
+    // the offending samples; it must never rescale the buffer, because a level
+    // step breaks the receiver's amplitude reference.
+    const samples = new Float32Array([0.5, -0.5, 0.01]);
+    const out = new Float32Array(3);
+    const { clips } = shapeForPlayback(samples, out, 100.0, false);
+    expect(out[0]).toBe(1.0);
+    expect(out[1]).toBe(-1.0);
+    expect(clips).toBe(2);
+  });
+
+  it('survives an all-zero buffer without dividing by zero', () => {
+    const samples = new Float32Array([0, 0, 0]);
+    const out = new Float32Array(3);
+    const { peak, scale, clips } = shapeForPlayback(samples, out, 2.0, false);
+    expect(peak).toBe(0);
+    expect(scale).toBe(1.0);
+    expect(clips).toBe(0);
+    expect(Array.from(out)).toEqual([0, 0, 0]);
+  });
+});
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `npx vitest run src/modem/test/playerShaping.test.ts`
+
+Expected: FAIL — `shapeForPlayback` is not exported from `src/audio/player.ts`.
+
+- [ ] **Step 3: Extract the shaping function**
+
+Add to `src/audio/player.ts`, above the class:
+
+```typescript
+/**
+ * Apply playback volume and the auto-normalise/clamp policy, writing into
+ * `out` rather than returning a new array — the caller already has a
+ * destination (an AudioBuffer's channel data), and allocating a scratch copy
+ * here meant three copies of every waveform were live at once.
+ *
+ * Extracted from `play` so the level maths is testable without an
+ * AudioContext. Getting it wrong is not a cosmetic bug: the receiver trains
+ * its amplitude reference on the preamble and applies it to the data, so a
+ * scaling error corrupts every channel estimate downstream.
+ */
+export function shapeForPlayback(
+  samples: Float32Array,
+  out: Float32Array,
+  volume: number,
+  clean: boolean,
+): { peak: number; scale: number; clips: number } {
+  if (clean) {
+    out.set(samples);
+    return { peak: 0, scale: 1.0, clips: 0 };
+  }
+
+  let peak = 0;
+  for (const element of samples) {
+    const abs = Math.abs(element);
+    if (abs > peak) peak = abs;
+  }
+  // Scale so that peak * volume * scale = 0.95 (no clipping). Capped at 5x so
+  // a near-silent buffer is not amplified into noise.
+  const targetPeak = 0.95;
+  const scale = peak > 0 ? Math.min(targetPeak / (peak * volume), 5.0) : 1.0;
+
+  // Clamp, never rescale, the samples that still overshoot: the cap above
+  // means overshoot is possible, and clamping distorts a handful of samples
+  // while a rescale would step the whole buffer's level.
+  let clips = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const sample = samples[i] * volume * scale;
+    if (sample > 1.0) {
+      out[i] = 1.0;
+      clips++;
+    } else if (sample < -1.0) {
+      out[i] = -1.0;
+      clips++;
+    } else {
+      out[i] = sample;
+    }
+  }
+  return { peak, scale, clips };
+}
+```
+
+- [ ] **Step 4: Rewrite play to fill the AudioBuffer directly**
+
+In `src/audio/player.ts`, replace the body of the returned promise (`:53-104`). The `dlog` calls must fire on the same conditions and report the same numbers as before — the only changes are where the samples land and who computes them.
 
 ```typescript
     return new Promise((resolve) => {
@@ -1832,41 +1961,13 @@ In `src/audio/player.ts`, replace the body of the returned promise (`:53-104`). 
       // store). The buffer has to be allocated either way; the scratch does
       // not.
       const buffer = ctx.createBuffer(1, samples.length, sampleRate);
-      const out = buffer.getChannelData(0);
+      const { peak, scale, clips } = shapeForPlayback(samples, buffer.getChannelData(0), this.volume, clean);
 
-      if (clean) {
-        out.set(samples);
-      } else {
-        // Find peak to auto-normalize
-        let peak = 0;
-        for (const element of samples) {
-          const abs = Math.abs(element);
-          if (abs > peak) peak = abs;
-        }
-        // Scale so that peak * volume * scale = 0.95 (no clipping)
-        const targetPeak = 0.95;
-        const scale = peak > 0 ? Math.min(targetPeak / (peak * this.volume), 5.0) : 1.0;
-
-        if (scale < 1.0) {
-          dlog('PLAY', { autoNorm: scale, peak, vol: this.volume }, { level: 'debug' });
-        }
-
-        let clips = 0;
-        for (let i = 0; i < samples.length; i++) {
-          const sample = samples[i] * this.volume * scale;
-          if (sample > 1.0) {
-            out[i] = 1.0;
-            clips++;
-          } else if (sample < -1.0) {
-            out[i] = -1.0;
-            clips++;
-          } else {
-            out[i] = sample;
-          }
-        }
-        if (clips > 0) {
-          dlog('PLAY', { clipped: clips }, { level: 'warn' });
-        }
+      if (!clean && scale < 1.0) {
+        dlog('PLAY', { autoNorm: scale, peak, vol: this.volume }, { level: 'debug' });
+      }
+      if (clips > 0) {
+        dlog('PLAY', { clipped: clips }, { level: 'warn' });
       }
 
       const source = ctx.createBufferSource();
@@ -1883,27 +1984,37 @@ In `src/audio/player.ts`, replace the body of the returned promise (`:53-104`). 
     });
 ```
 
-- [ ] **Step 2: Run the full suite and lint**
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `npx vitest run src/modem/test/playerShaping.test.ts`
+
+Expected: PASS, 5 tests.
+
+- [ ] **Step 6: Run the full suite and lint**
 
 Run: `npm run test && npm run lint`
 
 Expected: PASS except the 3 known BPSK failures.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/audio/player.ts
+git add src/audio/player.ts src/modem/test/playerShaping.test.ts
 git commit -m "perf(audio): fill the AudioBuffer directly instead of a scratch copy
 
 play() built a scratch Float32Array, filled it, then set() it into the
 AudioBuffer — three copies of every waveform live at once. The buffer has
-to exist either way; the scratch does not. Levels, clip counting, and
-logging are unchanged."
+to exist either way; the scratch does not.
+
+The level maths moves to an exported shapeForPlayback so it can be tested
+without an AudioContext. Getting it wrong is not cosmetic: the receiver
+trains its amplitude reference on the preamble and applies it to the data,
+so a scaling error corrupts every channel estimate."
 ```
 
-- [ ] **Step 4: Verify on real audio before moving on**
+- [ ] **Step 8: Verify on real audio before moving on**
 
-Automated tests do not cover `play` — it needs a real `AudioContext`. Run `npm run dev` and send a file over the bench path between two browser tabs. Confirm the receiver assembles it and the `PLAY` log line reports the same peak and clip counts it did before the change. A level change here would be a real regression: the receiver's amplitude reference is trained on the preamble, so a scaling error breaks every channel estimate.
+The extracted function is unit-tested but the Web Audio plumbing around it is not. Run `npm run dev` and send a file over the bench path between two browser tabs. Confirm the receiver assembles it and the `PLAY` log line reports the same peak and clip counts it did before the change.
 
 ---
 
