@@ -478,6 +478,17 @@ function compressOne(rec: DlogRecord): string | null {
       return DROP;
     }
 
+    // Capture failed over to another device. First-class, because a silent
+    // downgrade to a laptop's built-in mic looks exactly like the channel
+    // getting worse — and cost a whole test round reading as a regression.
+    case 'REC-ERR': {
+      if (has('staleDeviceId')) {
+        return `!MIC-STALE ${asString(f.staleDeviceId)} ${asString(f.error)} -> ${asString(f.retryingWith)}`;
+      }
+      if (has('workletAddModuleFailed')) return `!WORKLET ${asString(f.error)}`;
+      return DROP;
+    }
+
     case 'REC': {
       if (has('label')) return `MIC ${asString(f.label)}`;
       if (has('deviceFallback')) return `!MIC-DEFAULT`;

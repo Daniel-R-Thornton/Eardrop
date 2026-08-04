@@ -6,11 +6,15 @@ const freqs = reportGridFreqs();
 const gridWhere = (fn: (hz: number) => number) => freqs.map(fn);
 
 describe('settingsPick', () => {
-  it('one strong flat peer → widest band, dense QAM', () => {
+  it('one strong flat peer → widest band, still QPSK', () => {
     const s = pickSettings([{ deviceId: 1, grid: gridWhere(() => 1) }]);
     expect(s.floor).toBe(false);
     expect(s.toneCount).toBe(32);
-    expect(s.qamMap.every((q) => q === 6)).toBe(true);
+    // A perfectly flat grid must NOT buy dense QAM. The grid is peak-relative,
+    // so it measures flatness, not signal-to-noise — and this exact input (a
+    // room measuring -0.7 dB across the band) previously earned 64-QAM, after
+    // which a receiver locked on at 0.985 and decoded nothing at all.
+    expect(s.qamMap.every((q) => q === 2)).toBe(true);
   });
 
   it('a deaf-above-4kHz peer forces the band low for everyone', () => {

@@ -6,6 +6,7 @@ export { AudioRecorder } from './recorder';
 export {
   enumerateDevices,
   DEVICES_CHANGED_EVENT,
+  MIC_FALLBACK_EVENT,
   populateSelect,
   resolveInputDevice,
   labelForInputDevice,

@@ -18,6 +18,14 @@ export type DeviceList = { inputs: DeviceInfo[]; outputs: DeviceInfo[] };
  */
 export const DEVICES_CHANGED_EVENT = 'eardrop-devices-changed';
 
+/**
+ * Fired when the requested capture device was refused and the browser default
+ * was used instead. Worth surfacing rather than only logging: the swap is
+ * silent, and an external mic quietly replaced by a laptop's built-in one
+ * presents as the acoustic link degrading.
+ */
+export const MIC_FALLBACK_EVENT = 'eardrop-mic-fallback';
+
 /** Enumerate all audio input/output devices */
 export async function enumerateDevices(): Promise<DeviceList> {
   // Request mic permission first so labels populate

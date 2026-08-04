@@ -4,7 +4,7 @@
  */
 
 import { dlog } from '../lib/debug/dlog';
-import { DEVICES_CHANGED_EVENT } from './devices';
+import { DEVICES_CHANGED_EVENT, MIC_FALLBACK_EVENT } from './devices';
 
 export type ChunkCallback = (chunk: Float32Array) => void;
 
@@ -250,6 +250,15 @@ export class AudioRecorder {
         error: name,
         retryingWith: 'browserDefault',
       }, { level: 'warn' });
+      // Tell the UI, not just the log. Falling back keeps the session alive,
+      // but a silent switch from a good external mic to a laptop's built-in
+      // one is indistinguishable from the room getting worse — it reads as a
+      // regression in the radio and sends you debugging the wrong layer.
+      try {
+        globalThis.dispatchEvent?.(new CustomEvent(MIC_FALLBACK_EVENT, {
+          detail: { requestedLabel: deviceLabel ?? '', reason: name },
+        }));
+      } catch { /* non-DOM host (tests/worker) */ }
       const { deviceId: _dropped, ...rest } = constraints.audio as MediaTrackConstraints;
       this.stream = await navigator.mediaDevices.getUserMedia({ audio: rest });
     }

@@ -60,6 +60,11 @@ export type ModemCommand =
    *  view has to reach the worker — the main thread cannot filter what it
    *  never sees as individual events. */
   | { type: 'setLogFocus'; tags: string[] | null }
+  /** Pause the chatter SCANNERS (probe correlator + control listener) without
+   *  tearing chatter mode down. During a transfer they are guaranteed to be
+   *  hearing file audio rather than room traffic, and the probe correlator is
+   *  the most expensive thing in the worker. */
+  | { type: 'chatterScanPaused'; paused: boolean }
   // ─── Chatter room (see chatterWorker.test.ts) ───
   | { type: 'chatterStart'; deviceId: number }
   | { type: 'chatterStop' }

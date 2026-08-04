@@ -35,9 +35,10 @@
  *      1/mag; dividing every raw gain by the largest one pins the WEAKEST
  *      tone (which needs the least reduction) at 1 and scales every
  *      stronger tone down from there.
- *   6. qamMap: each tone's margin, in dB relative to the selected window's
- *      own strongest tone, sets bit density — dense QAM only where the
- *      worst peer clearly has margin to spare.
+ *   6. qamMap: QPSK on every tone. The grid this negotiates from is
+ *      peak-relative, which measures FLATNESS, not signal-to-noise — and
+ *      only the latter can justify denser QAM. See the note at the qamMap
+ *      assignment for the hardware failure that established this.
  */
 import { REPORT_GRID } from '../protocol/probeBurst';
 import { BAND_CARD_TONE_COUNTS } from '../protocol/bandCard';
@@ -182,12 +183,27 @@ export function pickSettings(reports: PeerReport[]): PickedSettings {
     const maxRawGain = Math.max(...rawGains);
     const toneGains = rawGains.map((g) => g / maxRawGain);
 
-    const qamMap = mags.map((m) => {
-      const relativeDb = 20 * Math.log10(m / windowMax);
-      if (relativeDb >= -6) return 6;
-      if (relativeDb >= -12) return 4;
-      return 2;
-    });
+    // QPSK everywhere, deliberately, until something measures absolute SNR.
+    //
+    // This used to read bit density off each tone's level RELATIVE to the
+    // window's strongest tone: >= -6 dB got 6 bits, >= -12 got 4. That is a
+    // flatness measure, and flatness says nothing about signal-to-noise. A
+    // channel can be ruler-flat and still sit 15 dB above the noise, and 64-QAM
+    // wants around 26 dB of MER.
+    //
+    // Hardware showed exactly that failure. A room measured -0.7 dB across the
+    // handshake band — beautifully flat — so nearly every tone was assigned 6
+    // bits. The receiver then hopped to the right band, locked on with a
+    // handoff score of 0.985, heard the transmission at full strength, and
+    // decoded not one frame: not the data, not even the link profile.
+    // Perfect sync, undecodable constellation.
+    //
+    // The probe grid we negotiate from is peak-relative by construction (see
+    // step 1), so it CANNOT justify anything denser. QPSK is also what the
+    // bench path actually succeeds with over the air. Restore per-tone
+    // loading when a real MER measurement exists to drive it — the map stays
+    // per-tone so that change is local to this function.
+    const qamMap = mags.map(() => 2);
 
     return { pilotFreqHz, toneStartHz, toneCount, qamMap, toneGains, floor: false };
   }

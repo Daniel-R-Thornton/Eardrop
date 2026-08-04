@@ -73,6 +73,7 @@ function makeFakeWorker() {
     },
     chatterStart: (deviceId: number) => { calls.push(`chatterStart:${deviceId}`); },
     chatterStop: () => { calls.push('chatterStop'); },
+    chatterScanPaused: (paused: boolean) => { calls.push(`chatterScanPaused:${paused}`); },
     encodeProbe: async () => {
       calls.push('encodeProbe');
       return { samples: new Float32Array(4), sampleRate: 48000 };

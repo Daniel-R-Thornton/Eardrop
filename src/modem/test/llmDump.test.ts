@@ -281,6 +281,16 @@ describe('chatter diagnostics survive compression', () => {
     expect(out).toMatch(/UNMAPPED .*TOTALLY-NEW=1/); // still flagged as a gap
   });
 
+  it('renders a capture-device fallback as a first-class event', () => {
+    // A silent downgrade to a laptop's built-in mic reads as the channel
+    // degrading — it cost a whole test round being mistaken for a regression.
+    const out = compressRecords([
+      rec('REC-ERR', { staleDeviceId: 'db5b4b0f', error: 'OverconstrainedError', retryingWith: 'browserDefault' }),
+    ]);
+    expect(out).toMatch(/!MIC-STALE db5b4b0f OverconstrainedError -> browserDefault/);
+    expect(out).not.toMatch(/UNMAPPED/);
+  });
+
   it('renders operator actions', () => {
     const out = compressRecords([
       rec('UI', { action: 'joinRoom' }),

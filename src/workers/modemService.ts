@@ -226,6 +226,7 @@ export class ModemService {
   private airNoise = new AirNoiseTracker();
   /** While true, feedChunk skips ALL demodulation (own-playback echo guard). */
   private rxMuted = false;
+  private chatterScanPaused = false;
 
   constructor(emit: (ev: ModemEvent, transfer?: Transferable[]) => void) {
     this.emit = emit;
@@ -289,11 +290,14 @@ export class ModemService {
           console.error('[MODEM] RxEngine.feedChunk exception:', (err as Error).message, 'len:', chunk.length);
         }
         try {
-          this.chatterRx?.feedChunk(chunk);
+          // Skipped during a transfer: the room's own file audio is not
+          // control traffic, and demodulating it here only produces false
+          // syncs while competing for CPU with the decode that matters.
+          if (!this.chatterScanPaused) this.chatterRx?.feedChunk(chunk);
         } catch (err) {
           console.error('[MODEM] chatter RxEngine.feedChunk exception:', (err as Error).message, 'len:', chunk.length);
         }
-        this.probeDetector?.feedChunk(chunk);
+        if (!this.chatterScanPaused) this.probeDetector?.feedChunk(chunk);
         break;
       }
       case 'encodeFile': {
@@ -371,6 +375,13 @@ export class ModemService {
       }
       case 'setLogFocus': {
         dlogSetFocus(cmd.tags);
+        break;
+      }
+      case 'chatterScanPaused': {
+        this.chatterScanPaused = cmd.paused;
+        // Coming back, the listener must not resume mid-frame on whatever it
+        // was part-way through when it stopped being fed.
+        if (!cmd.paused) this.chatterRx?.rearmForNextControlMessage();
         break;
       }
       case 'chatterStart': {

@@ -21,7 +21,7 @@ import { type AudioRecorder } from '../audio/recorder';
 import { runAutoCalibration } from './controllers/calibration';
 import { Visualizer } from '../modem/debug/visualizer';
 import { DEFAULT_CONFIG, OFDM_TUNING, ofdmSamples } from '../modem/types';
-import { enumerateDevices, resolveInputDevice } from '../audio/devices';
+import { enumerateDevices, resolveInputDevice, MIC_FALLBACK_EVENT } from '../audio/devices';
 import { TxEngine } from '../modem/protocol/txEngine';
 import { encodeFrame, PAYLOAD_DATA_SIZE } from '../modem/protocol/atomicFrame';
 import { tryParsePreamble, verifyPayload } from '../protocol';
@@ -154,6 +154,19 @@ const chatter = new ChatterController(modem, { player });
 // ChatterPanel (mounted inside BenchApp's own grid, see BenchApp.tsx) talks to
 // this controller purely through the Store + the custom-event bus below —
 // same wiring every other view/app.ts pair uses.
+
+// A refused capture device is a downgrade the operator must be told about:
+// an external mic silently replaced by a laptop's built-in one presents as
+// the acoustic link degrading, and reads as a regression in the radio.
+window.addEventListener(MIC_FALLBACK_EVENT, ((e: CustomEvent) => {
+  const { requestedLabel, reason } = e.detail as { requestedLabel: string; reason: string };
+  const msg = `Microphone "${requestedLabel || 'selected device'}" unavailable (${reason}) —`
+    + ' using the system default. Re-pick it in Settings for full quality.';
+  setState({
+    sendStatus: { type: 'error', msg: `MIC ${msg}` },
+    ...(getState().chatterOn ? { chatterError: msg } : {}),
+  });
+}) as EventListener);
 
 window.addEventListener('eardrop-chatter-join', (() => {
   dlog('UI', { action: 'joinRoom' }, { level: 'warn' });

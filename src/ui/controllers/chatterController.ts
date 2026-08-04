@@ -106,6 +106,7 @@ export interface ModemWorkerHandle {
   chatterStop(): void;
   encodeProbe(deviceId: number): Promise<{ samples: Float32Array; sampleRate: number }>;
   encodeControl(msg: ControlMessage, toneGains?: number[]): Promise<{ samples: Float32Array; sampleRate: number }>;
+  chatterScanPaused(paused: boolean): void;
   airCheck(): Promise<{ busy: boolean; rms: number }>;
   setRxMuted(muted: boolean): void;
 }
@@ -257,6 +258,11 @@ export class ChatterController {
       startFileTx: (settings: PickedSettings) => { void this.transmitFile(settings); },
       armFileRx: (info: FileComingPayload) => this.armFileRx(info),
       onStateChange: (state: RoomState, members: Member[]) => {
+        // While a file is in the air the room's scanners have nothing useful
+        // to hear: the probe correlator and the control listener would only
+        // chew CPU false-syncing on file audio, and on a phone that CPU is
+        // competing with the demodulation that actually matters.
+        this.worker.chatterScanPaused(state === 'sending' || state === 'receiving');
         setState({
           chatterState: state,
           chatterMembers: toStoreMembers(members),
@@ -614,7 +620,14 @@ export class ChatterController {
     // tailored per tone to the worst peer's measured margin (settingsPick.ts),
     // not a single global QAM order.
     cfg.qamMap = settings.qamMap.slice();
-    cfg.emitLinkProfile = true;
+    // No link profile. It exists to tell the receiver a per-tone bit loading
+    // it could not otherwise know, and settingsPick now negotiates uniform
+    // QPSK — which is also what buildModemConfig defaults the RECEIVER to
+    // (`dataQamBits ?? 2`), so both ends already agree without being told.
+    // Emitting it anyway added a full atomic frame of airtime and one more
+    // thing that has to decode before any data can; a receiver that missed
+    // it was left guessing. Restore this alongside real per-tone loading.
+    cfg.emitLinkProfile = false;
     this.worker.configure(cfg);
 
     // bytes is the raw file payload size by design (unlike control messages'

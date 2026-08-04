@@ -292,6 +292,11 @@ export class ModemController {
     this.post({ type: 'setRxMuted', muted });
   }
 
+  /** Pause/resume the chatter scanners (probe correlator + control listener). */
+  chatterScanPaused(paused: boolean): void {
+    this.post({ type: 'chatterScanPaused', paused });
+  }
+
   /** Restrict the worker's debug output to `tags` (null restores everything). */
   setLogFocus(tags: string[] | null): void {
     this.post({ type: 'setLogFocus', tags });
