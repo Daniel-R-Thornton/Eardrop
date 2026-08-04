@@ -378,7 +378,7 @@ Task 1 put the bit on the wire but nothing sets or reads it. `RoomProtocol` call
 - Produces:
   - `RoomDeps.playProbe(purpose: ProbePurpose): Promise<void>`
   - `ModemWorkerHandle.encodeProbe(deviceId: number, purpose: ProbePurpose): Promise<{ samples: Float32Array; sampleRate: number }>`
-  - `RoomProtocol.onProbeHeard(deviceId: number, grid: number[], purpose?: ProbePurpose)` — the third parameter is accepted and stored but not yet acted on; Task 3 uses it.
+  - `RoomProtocol.onProbeHeard(deviceId: number, grid: number[], purpose?: ProbePurpose)` — defaults to `PROBE_PURPOSE.joining`. The purpose selects the reply type as of this task; Task 3 changes *when* the reply is eligible to be sent, not which type it is.
   - `probeHeard` worker event shape: `{ type: 'probeHeard'; deviceId: number; grid: number[]; purpose: ProbePurpose }`
 
 - [ ] **Step 1: Write the failing test**
@@ -422,11 +422,51 @@ Add to that file's imports:
 import { PROBE_PURPOSE, type ProbePurpose } from '../protocol/probeBurst';
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+Also add these two to `src/modem/test/roomProtocol.test.ts`, inside `describe('room protocol')` — they cover the reply type coming off the wire instead of from the membership inference. Add `import { PROBE_PURPOSE } from '../protocol/probeBurst';` to that file.
 
-Run: `npx vitest run src/modem/test/chatterController.test.ts -t "announces a join as joining"`
+```typescript
+  it('answers a roll-call probe with a REPORT even from a device it has never seen', async () => {
+    // The reply type now comes from the purpose bit, not from whether we
+    // already know the prober. A never-seen device running a roll call needs
+    // a channel measurement, not a welcome.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    expect(h.room.state).toBe('idle');
 
-Expected: FAIL — `expect(worker.probePurposes).toEqual([0])` receives `[undefined]`, because `playProbe` still calls `encodeProbe` with one argument.
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.rollCall);
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
+    const report = h.sent.find((m) => m.type === ControlType.Report);
+    expect(report).toBeDefined();
+    expect(report.targetId).toBe(9);
+  });
+
+  it('answers a joining probe with a WELCOME even from a device it already knows', async () => {
+    // The mirror case: a device rejoining with the same id (page refresh)
+    // is already in _members, and used to receive a REPORT while sitting in
+    // joinWait — so it finished joining knowing nothing about this peer.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.rollCall);
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    expect(h.room.members.get(9)).toBeDefined();
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining); // 9 refreshed and rejoined
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+  });
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `npx vitest run src/modem/test/chatterController.test.ts -t "announces a join as joining"` and `npx vitest run src/modem/test/roomProtocol.test.ts -t "even from a device"`
+
+Expected: FAIL. The `chatterController` case receives `[undefined]` because `playProbe` still calls `encodeProbe` with one argument. The `roomProtocol` roll-call case gets a WELCOME instead of a REPORT, because the reply type still comes from the membership inference.
 
 - [ ] **Step 3: Add purpose to the worker schema**
 
@@ -531,26 +571,44 @@ In `beginAnnounceRollCall` (`:393`):
     await this.deps.playProbe(PROBE_PURPOSE.rollCall);
 ```
 
-Widen `onProbeHeard` to accept the purpose, storing it without acting on it yet (Task 3 uses it). Add a field beside `pendingReplyTo`:
+Widen `onProbeHeard` to accept the purpose and use it for the reply type straight away, retiring the membership inference. This is the whole point of the bit — storing it unread would be dead code, and the inference is what produced the two bugs.
+
+Replace the signature and the long inference comment block (`roomProtocol.ts:203`, and the comment at `:207-227`):
 
 ```typescript
-  /** What each prober last announced — read by the reply path to decide
-   *  WELCOME vs REPORT. Task-3 note: this replaces the membership inference. */
-  private readonly lastProbePurpose = new Map<number, ProbePurpose>();
-```
-
-and at the top of `onProbeHeard`:
-
-```typescript
+  /** worker heard a probe: id + measured grid + what it announced */
   onProbeHeard(deviceId: number, grid: number[], purpose: ProbePurpose = PROBE_PURPOSE.joining): void {
-    this.lastProbePurpose.set(deviceId, purpose);
+    const existing = this._members.get(deviceId);
+    this._members.set(deviceId, { ...existing, deviceId, lastHeardMs: this.deps.now(), heardGrid: grid });
+
+    // Only 'idle' carries reply duty — a probe heard mid-join or mid-rollcall
+    // just refreshes the member table. (Task 3 replaces this gate with a
+    // queue; the reply TYPE is what changes here.) Dedupe by prober: a repeat
+    // probe from the same device while its reply chain is still waiting out a
+    // slot must not start a second, redundant reply chain.
+    //
+    // WELCOME vs REPORT now comes off the wire (see PROBE_PURPOSE), not from
+    // whether we already know this prober. That inference was one-sided in
+    // both directions: a device rejoining with the same id (page refresh,
+    // reconnect, a second start()) is a stranger to itself but a known member
+    // to us, so it received a REPORT when it needed a WELCOME; and a peer
+    // whose WELCOME we lost still thinks we are a stranger, so it answered our
+    // roll call with a WELCOME. handleWelcome and handleReport keep their
+    // tolerance for the "wrong" reply type regardless, so a peer running an
+    // older build degrades rather than breaks.
+    if (this._state === 'idle' && !this.pendingReplyTo.has(deviceId)) {
+      this.pendingReplyTo.add(deviceId);
+      this.scheduleReply(
+        this.deps.now(),
+        Array.from({ length: ROOM_TIMING.replySlots }, (_unused, i) => i),
+        deviceId,
+        purpose === PROBE_PURPOSE.rollCall,
+      );
+    }
+  }
 ```
 
-Clear it in `stop()` alongside `pendingReplyTo.clear()`:
-
-```typescript
-    this.lastProbePurpose.clear();
-```
+`scheduleReply`'s fourth parameter is already `replyWithReport: boolean` (`:481`) and its body already branches on it (`:510-522`) — so no change is needed there. The local `alreadyKnown` variable disappears with the inference.
 
 - [ ] **Step 7: Forward purpose through ChatterController**
 
@@ -700,39 +758,20 @@ import { PROBE_PURPOSE } from '../protocol/probeBurst';
     expect(b.sent.find((m) => m.type === ControlType.Welcome)?.targetId).toBe(1);
   });
 
-  it('answers a roll-call probe with a REPORT even from a device it has never seen', async () => {
-    // The reply type now comes from the purpose bit, not from whether we
-    // already know the prober. A never-seen device running a roll call needs
-    // a channel measurement, not a welcome.
+  it('replies with the type the newest probe asked for', async () => {
+    // A queued reply's purpose is overwritten by a fresh probe, because the
+    // newest announcement is the true one: a device that ran a roll call and
+    // then refreshed and rejoined needs a WELCOME, not the REPORT its earlier
+    // probe queued.
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
-    expect(h.room.state).toBe('idle');
+    await h.tick(ROOM_TIMING.listenMs - 10); // 'listening' — transmitter held
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.rollCall);
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
-
-    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
-    const report = h.sent.find((m) => m.type === ControlType.Report);
-    expect(report).toBeDefined();
-    expect(report.targetId).toBe(9);
-  });
-
-  it('answers a joining probe with a WELCOME even from a device it already knows', async () => {
-    // The mirror case: a device rejoining with the same id (page refresh)
-    // is already in _members, and used to receive a REPORT while sitting in
-    // joinWait — so it finished joining knowing nothing about this peer.
-    const h = makeHarness(2);
-    h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
-
-    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.rollCall);
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
     await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
-    expect(h.room.members.get(9)).toBeDefined();
 
-    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining); // 9 refreshed and rejoined
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
-
+    expect(h.sent.filter((m) => m.type === ControlType.Report)).toHaveLength(0);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
 
@@ -763,11 +802,11 @@ import { PROBE_PURPOSE } from '../protocol/probeBurst';
 
 Run: `npx vitest run src/modem/test/roomProtocol.test.ts`
 
-Expected: FAIL on the new tests — "replies to a probe heard while in joinWait" finds no WELCOME (`welcome` is `undefined`), and "answers a roll-call probe with a REPORT even from a device it has never seen" gets a WELCOME instead of a REPORT.
+Expected: FAIL on the new tests — "replies to a probe heard while in joinWait" finds no WELCOME (`welcome` is `undefined`), and "holds a probe heard mid-announce" sends nothing at all because the probe was dropped rather than queued.
 
 - [ ] **Step 3: Replace the dedupe set with a reply queue**
 
-In `src/modem/chatter/roomProtocol.ts`, replace the `pendingReplyTo` field (`:148-151`) and the `lastProbePurpose` field Task 2 added with:
+In `src/modem/chatter/roomProtocol.ts`, replace the `pendingReplyTo` field (`:148-151`) with:
 
 ```typescript
   /**
@@ -807,7 +846,7 @@ interface PendingReply {
 
 - [ ] **Step 4: Rewrite onProbeHeard**
 
-Replace `onProbeHeard` (`roomProtocol.ts:202-238`) entirely. The long comment block at `:207-227` documented the inference this removes — replace it with the reason the inference is gone.
+Replace the body of `onProbeHeard` — Task 2 already replaced the membership inference with the purpose bit, so what changes here is the `this._state === 'idle'` gate and the `pendingReplyTo` dedupe, both of which the queue subsumes. Keep Task 2's comment about the reply type coming off the wire.
 
 ```typescript
   /** worker heard a probe: id + measured grid + what it announced */
@@ -815,13 +854,10 @@ Replace `onProbeHeard` (`roomProtocol.ts:202-238`) entirely. The long comment bl
     const existing = this._members.get(deviceId);
     this._members.set(deviceId, { ...existing, deviceId, lastHeardMs: this.deps.now(), heardGrid: grid });
 
-    // Reply type comes off the wire now (see PROBE_PURPOSE), not from whether
-    // we already know this prober. The old inference was one-sided in both
-    // directions: a device rejoining with the same id is a stranger to itself
-    // but a known member to us, and a peer whose WELCOME we lost still thinks
-    // we are a stranger. handleWelcome and handleReport keep their tolerance
-    // for the "wrong" reply type anyway, so a peer on an older build degrades
-    // instead of breaking.
+    // Reply type comes off the wire (see PROBE_PURPOSE), not from whether we
+    // already know this prober — see the note kept from the previous change.
+    // A fresh probe overwrites a queued entry's purpose: the newest
+    // announcement is the true one.
     const queued = this.replyQueue.get(deviceId);
     if (queued) queued.purpose = purpose;
     else this.replyQueue.set(deviceId, { proberId: deviceId, purpose, attempts: 0, scheduled: false });
@@ -958,8 +994,6 @@ In `handleDepsError`'s `cold` branch (`:552-556`), replace `this.pendingReplyTo.
 ```typescript
       this.replyQueue.clear();
 ```
-
-Also remove the now-unused `lastProbePurpose` field and its `stop()` clear that Task 2 added — the queue entry carries the purpose.
 
 - [ ] **Step 9: Update the state-chart comment**
 
