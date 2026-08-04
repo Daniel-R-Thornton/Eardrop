@@ -90,16 +90,25 @@ export interface RoomDeps {
 
 export const ROOM_TIMING = {
   listenMs: 1000, listenCapMs: 10000,
-  replySlots: 6, replySlotMs: 1000, // JOIN_WAIT and COLLECT both
-  // Grace after the last reply slot opens. A peer that draws the final slot
-  // only STARTS transmitting at replySlots*replySlotMs; its control message is
-  // then roughly a second of audio (handshake-band preamble + payload), on top
-  // of worker encode latency and the offset between our window opening and its
-  // slot clock starting (it can only begin timing once it has buffered and
-  // decoded our whole ~4 s probe). At 500 ms the last slot's reply routinely
-  // landed after the window shut and the roll call reported "nobody home"
-  // while a peer was audibly answering.
-  collectExtraMs: 2500,
+  // JOIN_WAIT and COLLECT both.
+  //
+  // 300 ms, not the 1 s this shipped with. Slots exist so two peers do not
+  // start talking at the same instant, but listen-before-talk is what
+  // actually prevents the collision — the slot only has to be long enough
+  // that a peer who started in the previous one is visible to the next
+  // device's carrier sense. That check averages the last 250 ms of audio, so
+  // 300 ms clears it with margin. A full second bought nothing and cost up to
+  // five seconds of the join, which is most of the time a two-device room
+  // spends waiting.
+  replySlots: 6, replySlotMs: 300,
+  // Grace after the last reply slot opens.
+  //
+  // Must exceed one whole control message, because a peer that draws the
+  // final slot only STARTS transmitting then and a WELCOME is roughly 3.15 s
+  // of audio. Anything less and the window shuts mid-reply: the roll call
+  // reports an empty room while a peer is still audibly answering, and the
+  // answer lands just after everyone stopped listening for it.
+  collectExtraMs: 4000,
   fileComingLeadMs: 700,
 } as const;
 
