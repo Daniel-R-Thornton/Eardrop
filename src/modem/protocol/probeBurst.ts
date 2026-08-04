@@ -50,7 +50,23 @@ export const CHATTER_SWEEP = {
   endHz: 7800,
   stepHz: 100,
   stepMs: 45,
-  amplitude: 0.02,
+  /**
+   * Matched to the ID pulses, NOT inherited from SWEEP_DEFAULTS' 0.02.
+   *
+   * That default is sized for the calibration tool, where the point is to
+   * probe at the same operating level a 32-40 tone grid uses per tone. A
+   * probe burst is a different animal: one tone at a time, sharing a burst
+   * with a 0.5 chirp, and the player normalises the WHOLE burst by its peak.
+   * At 0.02 the sweep therefore landed near -28 dBFS while the chirp sat at
+   * full scale — and the sweep is 2.9 of the burst's 3.7 seconds, so almost
+   * everything a listener hears, and everything the channel measurement
+   * rides on, was the quietest part of the transmission by a factor of 25.
+   *
+   * 0.15 is ~17 dB louder and still well under the 0.25 where a sustained
+   * single tone was measured compressing by 14 dB, which would flatten the
+   * very response this is here to measure.
+   */
+  amplitude: 0.15,
 } as const; // ~2.9 s, coarse by design (band pick, not notch hunting)
 
 /** The frequency grid a decoded sweep is reported on — fixed, so reports from
