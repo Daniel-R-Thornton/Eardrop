@@ -422,6 +422,18 @@ function compressOne(rec: DlogRecord): string | null {
     case 'PLAYER':
       return has('clipClamped') ? `!CLIP ${asNum(f.clipClamped)} ${n(asNum(f.peak))}` : null;
 
+    // What the operator did, and when. Without it a dump shows the radio
+    // reacting to nothing, and a protocol that never started is
+    // indistinguishable from one that started and failed.
+    case 'UI': {
+      if (has('pressed')) return `>${asString(f.pressed)}${has('target') ? ` ${asNum(f.target)}` : ''}`;
+      if (has('action')) return `>${asString(f.action)}`;
+      if (has('fileChosen')) return `>file ${asString(f.fileChosen)} ${asNum(f.bytes)}B to=${asString(f.to)}`;
+      if (has('fileEvent')) return `>route ${asString(f.route)} ${asNum(f.bytes)}B to=${asString(f.to)}`;
+      if (has('fileRejected')) return `!>file ${asString(f.fileRejected)}`;
+      return DROP;
+    }
+
     // What the browser ACTUALLY granted for capture. The whole reason this
     // exists is mobile: those stacks routinely apply AGC/noise suppression
     // despite being asked not to, and either one explains a link whose

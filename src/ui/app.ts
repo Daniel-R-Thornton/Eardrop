@@ -156,10 +156,12 @@ const chatter = new ChatterController(modem, { player });
 // same wiring every other view/app.ts pair uses.
 
 window.addEventListener('eardrop-chatter-join', (() => {
+  dlog('UI', { action: 'joinRoom' }, { level: 'warn' });
   void chatter.joinRoom();
 }) as EventListener);
 
 window.addEventListener('eardrop-chatter-leave', (() => {
+  dlog('UI', { action: 'leaveRoom' }, { level: 'warn' });
   void chatter.leaveRoom();
 }) as EventListener);
 
@@ -170,7 +172,7 @@ window.addEventListener('eardrop-chatter-leave', (() => {
  * the output and it buries these.
  */
 const ROOM_LOG_TAGS = [
-  'ROOM', 'CHATTER-RX', 'REC', 'REC-CAP', 'REC-ERR', 'PLAY', 'APP',
+  'ROOM', 'CHATTER-RX', 'REC', 'REC-CAP', 'REC-ERR', 'PLAY', 'APP', 'UI',
   // The decode ladder for a control message, needed to tell "heard nothing"
   // from "heard it and could not read it": OFDM-SYNC = the chirp was found,
   // RX-OFDM cardInvalid = a sentinel arrived but its header would not decode.
@@ -249,6 +251,11 @@ subscribe(() => {
 window.addEventListener('eardrop-file', ((e: CustomEvent) => {
   // `targetId` addresses one member; absent or 0 means the whole room.
   const { file, targetId } = e.detail as { file: File; targetId?: number };
+  dlog('UI', {
+    fileEvent: file.name, bytes: file.size,
+    route: getState().chatterOn ? 'room' : 'bench',
+    to: targetId || 'broadcast',
+  }, { level: 'warn' });
   if (getState().chatterOn) {
     void file.arrayBuffer().then(
       (buf) => chatter.broadcastFile(file.name, new Uint8Array(buf), targetId ?? 0),

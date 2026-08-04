@@ -248,4 +248,18 @@ describe('chatter diagnostics survive compression', () => {
     expect(out).toMatch(/PRB 183 mean=-10\.1 hs=-24\.8/);
     expect(out).not.toMatch(/UNMAPPED/);
   });
+
+  it('renders operator actions', () => {
+    const out = compressRecords([
+      rec('UI', { action: 'joinRoom' }),
+      rec('UI', { pressed: 'sendTo', target: 183 }),
+      rec('UI', { fileChosen: 'a.bin', bytes: 256, to: 183 }),
+      rec('UI', { fileRejected: 'busy', state: 'collecting', name: 'a.bin' }),
+    ]);
+    expect(out).toMatch(/>joinRoom/);
+    expect(out).toMatch(/>sendTo 183/);
+    expect(out).toMatch(/>file a\.bin 256B to=183/);
+    expect(out).toMatch(/!>file busy/);
+    expect(out).not.toMatch(/UNMAPPED/);
+  });
 });

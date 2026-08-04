@@ -19,6 +19,7 @@ import { Screen } from '../components/instrument/Screen';
 import { PacketStream } from './RoomModePacketStream';
 import { hex, formatAgo } from './roomModeFormat';
 import { LogShare } from './LogShare';
+import { dlog } from '../../lib/debug/dlog';
 
 const dispatch = (type: string) => window.dispatchEvent(new CustomEvent(type));
 
@@ -409,14 +410,19 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
     // Say why nothing happened. Silently swallowing the drop when the room
     // isn't ready is indistinguishable from a broken drop target.
     if (!s.chatterOn) {
+      dlog('UI', { fileRejected: 'notJoined', name: f.name }, { level: 'warn' });
       setLocalNotice('Join the room before broadcasting a file.');
       return;
     }
     if (s.chatterState !== 'idle') {
+      dlog('UI', { fileRejected: 'busy', state: s.chatterState, name: f.name }, { level: 'warn' });
       setLocalNotice(`Busy (${s.chatterState}) — wait until the room is idle, then drop again.`);
       return;
     }
     setLocalNotice(null);
+    dlog('UI', {
+      fileChosen: f.name, bytes: f.size, to: targetId || 'broadcast',
+    }, { level: 'warn' });
     window.dispatchEvent(new CustomEvent('eardrop-file', { detail: { file: f, targetId } }));
     setSendTargetId(0); // next file is a broadcast unless a node is chosen again
   };
@@ -464,6 +470,10 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
             style={btn(pending !== null ? true : !s.chatterOn, pending !== null ? 'amber' : 'phosphor')}
             disabled={pending !== null}
             onClick={() => {
+              // User actions belong in the log: without them a dump shows the
+              // radio reacting to nothing, and there is no way to tell a
+              // protocol that never started from one that started and failed.
+              dlog('UI', { pressed: s.chatterOn ? 'leave' : 'join' }, { level: 'warn' });
               setPending(s.chatterOn ? 'leave' : 'join');
               setLocalNotice(null);
               dispatch(s.chatterOn ? 'eardrop-chatter-leave' : 'eardrop-chatter-join');
@@ -600,6 +610,7 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
                         <button
                           onClick={(e) => {
                             e.stopPropagation(); // don't toggle the selection off
+                            dlog('UI', { pressed: 'sendTo', target: m.deviceId }, { level: 'warn' });
                             setSendTargetId(m.deviceId);
                             document.getElementById('roommode-file')?.click();
                           }}
