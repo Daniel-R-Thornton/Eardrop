@@ -248,7 +248,7 @@ describe('chatter diagnostics survive compression', () => {
       rec('ROOM', { probeFrom: 183, meanDb: '-10.1', handshakeBandDb: '-24.8', band: '6900-7250Hz' }),
     ]);
     expect(out).toMatch(/CAP agc=true ns=false aec=false rate=48000 ch=1/);
-    expect(out).toMatch(/RCALL n=0 from=none known=183/);
+    expect(out).toMatch(/RCALL us=123 n=0 from=none known=183/);
     expect(out).toMatch(/PRB 183 mean=-10\.1 hs=-24\.8/);
     expect(out).not.toMatch(/UNMAPPED/);
   });

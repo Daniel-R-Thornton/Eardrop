@@ -460,7 +460,14 @@ function compressOne(rec: DlogRecord): string | null {
     // and none of the reasoning on top of it.
     case 'ROOM': {
       if (has('rollCallDone')) {
-        return `RCALL n=${asNum(f.reports)} from=${asString(f.from)} known=${asString(f.knownMembers)}`;
+        // `us` matters as much as the rest: a peer addresses its reply to the
+        // id it decoded from our probe's pulse trailer, and that trailer is
+        // guarded by only a 4-bit CRC. If it mis-decodes, every reply is
+        // addressed to a device that isn't here and gets dropped — which
+        // looks exactly like nobody answering. Without our own id printed
+        // there is nothing to compare the drops against.
+        return `RCALL us=${asNum(f.us)} n=${asNum(f.reports)} from=${asString(f.from)}`
+          + ` known=${asString(f.knownMembers)}`;
       }
       if (has('probeFrom')) {
         return `PRB ${asNum(f.probeFrom)} mean=${asString(f.meanDb)} hs=${asString(f.handshakeBandDb)}`;
