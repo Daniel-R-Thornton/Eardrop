@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildProbeBurst, decodeProbeId, measureProbeSweep,
   probeChirpTemplate, crc4, reportGridFreqs, REPORT_GRID,
+  PROBE_LAYOUT, PROBE_PURPOSE,
 } from '../protocol/probeBurst';
 import { chirpCorrelate } from '../protocol/chirp';
 
@@ -12,26 +13,88 @@ function findAnchor(burst: Float32Array): number {
 }
 
 describe('probe burst', () => {
-  it('round-trips the device ID', () => {
-    const burst = buildProbeBurst(0xa7, SR);
-    expect(decodeProbeId(burst, findAnchor(burst), SR)).toBe(0xa7);
+  it('round-trips the device ID and a joining purpose', () => {
+    const burst = buildProbeBurst(0xa7, SR, PROBE_PURPOSE.joining);
+    expect(decodeProbeId(burst, findAnchor(burst), SR)).toEqual({
+      deviceId: 0xa7,
+      purpose: PROBE_PURPOSE.joining,
+    });
+  });
+
+  it('round-trips a roll-call purpose', () => {
+    const burst = buildProbeBurst(0xa7, SR, PROBE_PURPOSE.rollCall);
+    expect(decodeProbeId(burst, findAnchor(burst), SR)).toEqual({
+      deviceId: 0xa7,
+      purpose: PROBE_PURPOSE.rollCall,
+    });
+  });
+
+  it('defaults to a joining purpose', () => {
+    const burst = buildProbeBurst(12, SR);
+    expect(decodeProbeId(burst, findAnchor(burst), SR)?.purpose).toBe(PROBE_PURPOSE.joining);
+  });
+
+  it('round-trips the id/purpose extremes', () => {
+    // The pulse threshold is a largest-gap split over the slot magnitudes, so
+    // it has to hold for every on/off ratio the 13-bit word can produce.
+    // These ids cover the extremes: all-zero and all-one id bits, and the
+    // single-bit-set and single-bit-clear cases either side of them.
+    //
+    // Anchor is computed, not correlated: findAnchor runs an O(burst x
+    // template) correlation — roughly 1.3 billion multiplies for a ~3.7 s
+    // burst — which is fine once but not once per case. The chirp starts after
+    // the fixed 100 ms lead-in (LEAD_IN_MS in probeBurst.ts), and the
+    // correlation path is already covered by the round-trip tests above.
+    const ANCHOR = Math.round(0.1 * SR);
+    for (const purpose of [PROBE_PURPOSE.joining, PROBE_PURPOSE.rollCall] as const) {
+      for (const id of [1, 2, 0x55, 0xaa, 0x7f, 0x80, 0xfe, 0xff]) {
+        const burst = buildProbeBurst(id, SR, purpose);
+        expect(decodeProbeId(burst, ANCHOR, SR)).toEqual({ deviceId: id, purpose });
+      }
+    }
   });
 
   it('decodes the ID under additive noise', () => {
-    const burst = buildProbeBurst(42, SR);
+    const burst = buildProbeBurst(42, SR, PROBE_PURPOSE.rollCall);
     let seed = 1;
     const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
     const noisy = burst.map((s) => s + (rnd() - 0.5) * 0.05);
-    expect(decodeProbeId(noisy, findAnchor(noisy), SR)).toBe(42);
+    expect(decodeProbeId(noisy, findAnchor(noisy), SR)).toEqual({
+      deviceId: 42,
+      purpose: PROBE_PURPOSE.rollCall,
+    });
   });
 
   it('rejects a corrupted ID trailer via CRC', () => {
     const burst = buildProbeBurst(42, SR);
     const anchor = findAnchor(burst);
     // Zero out one ID slot → bit flips → CRC mismatch.
-    const layoutEnd = burst.length;
-    const slot0Start = layoutEnd - 12 * Math.round(0.04 * SR);
-    for (let i = slot0Start; i < slot0Start + Math.round(0.04 * SR); i++) burst[i] = 0;
+    // Slot 0 (the CRC's own LSB) happens to already be silent for id 42's
+    // default-purpose word — the purpose-bit shift changed which CRC value
+    // this id produces, and zeroing an already-off slot is a no-op. Slot 1
+    // carries a pulse for this id/purpose, so corrupt that one instead.
+    const slotSamples = Math.round(PROBE_LAYOUT.idSlotMs / 1000 * SR);
+    const slotsStart = burst.length - PROBE_LAYOUT.idSlots * slotSamples;
+    const slot1Start = slotsStart + slotSamples;
+    for (let i = slot1Start; i < slot1Start + slotSamples; i++) burst[i] = 0;
+    expect(decodeProbeId(burst, anchor, SR)).toBeNull();
+  });
+
+  it('a flipped purpose bit fails CRC rather than sending the wrong reply type', () => {
+    // The purpose bit decides WELCOME vs REPORT. A silent flip would make a
+    // joining device receive a REPORT and never learn the room is occupied,
+    // so the CRC must cover it.
+    const burst = buildProbeBurst(42, SR, PROBE_PURPOSE.joining);
+    const anchor = findAnchor(burst);
+    const slotSamples = Math.round(PROBE_LAYOUT.idSlotMs / 1000 * SR);
+    const slotsStart = burst.length - PROBE_LAYOUT.idSlots * slotSamples;
+    // Slot 4 is the purpose bit: the word is (deviceId << 1) | purpose,
+    // shifted left 4 for the CRC, so purpose lands at packed bit 4.
+    const flipStart = slotsStart + 4 * slotSamples;
+    const ref = buildProbeBurst(42, SR, PROBE_PURPOSE.rollCall);
+    for (let i = 0; i < slotSamples; i++) {
+      burst[flipStart + i] = ref[flipStart + i];
+    }
     expect(decodeProbeId(burst, anchor, SR)).toBeNull();
   });
 

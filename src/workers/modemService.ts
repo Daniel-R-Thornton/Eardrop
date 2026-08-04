@@ -83,8 +83,8 @@ export class AirNoiseTracker {
  * ProbeDetector — passive listener for chatter-room probe bursts (see
  * probeBurst.ts): a down-chirp anchor (reverse direction from the modem's
  * own up-chirp sync burst, specifically so ordinary data traffic can never
- * false-trigger this), followed by a coarse channel sweep and a 12-bit
- * pulse-keyed device ID.
+ * false-trigger this), followed by a coarse channel sweep and a 13-bit
+ * pulse-keyed device ID and purpose.
  *
  * Runs a normalized cross-correlation of a rolling 0.5 s buffer against the
  * down-chirp template every `scanHop` (4096) samples. At full rate that's
@@ -172,11 +172,11 @@ export class ProbeDetector {
   private finishCapture(): void {
     const samples = new Float32Array(this.pending!.buf);
     this.pending = null;
-    const deviceId = decodeProbeId(samples, 0, this.sampleRate);
-    if (deviceId === null || deviceId === this.ownDeviceId) return; // CRC fail or our own probe
+    const decoded = decodeProbeId(samples, 0, this.sampleRate);
+    if (decoded === null || decoded.deviceId === this.ownDeviceId) return; // CRC fail or our own probe
     const grid = measureProbeSweep(samples, 0, this.sampleRate);
     if (!grid) return;
-    this.onProbe(deviceId, grid);
+    this.onProbe(decoded.deviceId, grid);
   }
 }
 
