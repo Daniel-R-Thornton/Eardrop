@@ -68,15 +68,28 @@ describe('probe burst', () => {
   it('rejects a corrupted ID trailer via CRC', () => {
     const burst = buildProbeBurst(42, SR);
     const anchor = findAnchor(burst);
-    // Zero out one ID slot → bit flips → CRC mismatch.
-    // Slot 0 (the CRC's own LSB) happens to already be silent for id 42's
-    // default-purpose word — the purpose-bit shift changed which CRC value
-    // this id produces, and zeroing an already-off slot is a no-op. Slot 1
-    // carries a pulse for this id/purpose, so corrupt that one instead.
+    // Zero out one ID slot → bit flips → CRC mismatch. Pick the
+    // highest-magnitude slot programmatically, rather than hardcoding an
+    // index, and assert it is actually a pulse before corrupting it — a
+    // hardcoded slot index is exactly how this test silently became a
+    // no-op the first time the packing changed: slot 0 (the CRC's own
+    // LSB) happened to already be silent for id 42's default-purpose word,
+    // so zeroing it did nothing and the test passed for the wrong reason.
+    // Asserting the precondition means a future repacking fails loudly
+    // instead of quietly passing again.
     const slotSamples = Math.round(PROBE_LAYOUT.idSlotMs / 1000 * SR);
     const slotsStart = burst.length - PROBE_LAYOUT.idSlots * slotSamples;
-    const slot1Start = slotsStart + slotSamples;
-    for (let i = slot1Start; i < slot1Start + slotSamples; i++) burst[i] = 0;
+    let loudestSlot = 0;
+    let loudestMag = -1;
+    for (let k = 0; k < PROBE_LAYOUT.idSlots; k++) {
+      const s = slotsStart + k * slotSamples;
+      let mag = 0;
+      for (let i = s; i < s + slotSamples; i++) mag = Math.max(mag, Math.abs(burst[i]));
+      if (mag > loudestMag) { loudestMag = mag; loudestSlot = k; }
+    }
+    expect(loudestMag).toBeGreaterThan(0); // precondition: a pulse slot exists to corrupt
+    const targetStart = slotsStart + loudestSlot * slotSamples;
+    for (let i = targetStart; i < targetStart + slotSamples; i++) burst[i] = 0;
     expect(decodeProbeId(burst, anchor, SR)).toBeNull();
   });
 

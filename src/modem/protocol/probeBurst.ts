@@ -254,13 +254,14 @@ export function decodeProbeId(
     mags.push(Math.hypot(i, q));
   }
 
-  // Self-referencing threshold: split the 12 slot magnitudes into "pulse
+  // Self-referencing threshold: split the 13 slot magnitudes into "pulse
   // present" / "pulse absent" clusters by the largest gap in sorted order.
   // A single fixed multiple of the literal median breaks down whenever half
-  // or more of the 12 bits are 1 (the median then falls IN the "on" cluster,
+  // or more of the 13 bits are 1 (the median then falls IN the "on" cluster,
   // so no on-slot can ever be 4x itself) — which is a common case, not an
-  // edge case, for an 8-bit ID + 4-bit CRC. The largest-gap split has no such
-  // failure mode: it works for any on/off ratio from 1-in-12 to 11-in-12.
+  // edge case, for an 8-bit ID + 1 purpose bit + 4-bit CRC. The largest-gap
+  // split has no such failure mode: it works for any on/off ratio from
+  // 1-in-13 to 12-in-13.
   const sorted = mags.slice().sort((a, b) => a - b);
   let gapIdx = 0;
   let gapSize = -Infinity;
