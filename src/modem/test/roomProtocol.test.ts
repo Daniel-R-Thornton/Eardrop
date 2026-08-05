@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { RoomProtocol, ROOM_TIMING } from '../chatter/roomProtocol';
+import { RoomProtocol, ROOM_TIMING, ROOM_STALL_MS } from '../chatter/roomProtocol';
 import {
   ControlType, packReport, packWelcome, packFileComing,
   packText, packAck, parseText, parseAck, TEXT_MAX_BYTES,
@@ -1009,5 +1009,64 @@ describe('room protocol', () => {
     await h.tick(2000 + 5000 + ROOM_TIMING.replySlotMs + 300);
     expect(h.room.state).toBe('idle');
     expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(1);
+  });
+
+  // ---- stall guards: a dep promise that never settles ----
+  //
+  // Every state reached via a TIMER carries its own deadline back to idle, but
+  // a state entered immediately BEFORE an await carries none: 'rollCall' is
+  // entered and then `playProbe` is awaited, so a playback promise that never
+  // settles (a suspended AudioContext never fires `ended`, a worker reply that
+  // never arrives) leaves the machine in 'rollCall' for the rest of the
+  // session. That is not merely a stuck badge — every REPORT that arrives is
+  // then dropped, because roll-call accumulation requires 'collecting'.
+
+  it('a playProbe that never settles does not wedge the roll call', async () => {
+    const h = makeHarness(1, { playProbe: () => new Promise<void>(() => {}) });
+    (h.room as any).setState('idle');
+
+    h.room.sendFile(64, 1000);
+    await h.tick(ROOM_TIMING.listenMs + 100);
+    expect(h.room.state).toBe('rollCall'); // awaiting a probe that never ends
+
+    await h.tick(ROOM_STALL_MS + 100);
+    expect(h.room.state).toBe('idle');
+    expect(h.room.lastError).toMatch(/never completed/);
+  });
+
+  it('a REPORT arriving while the prober is still in rollCall is not silently dropped', async () => {
+    const h = makeHarness(1, { playProbe: () => new Promise<void>(() => {}) });
+    (h.room as any).setState('idle');
+    h.room.sendFile(64, 1000);
+    await h.tick(ROOM_TIMING.listenMs + 100);
+    expect(h.room.state).toBe('rollCall');
+
+    h.room.onMessage({ type: ControlType.Report, senderId: 7, targetId: 1, payload: packReport(flatGrid) });
+    // The member refresh still happens; only the roll-call accumulation is
+    // state-gated, and the reason must be visible rather than silent.
+    expect(h.room.members.get(7)).toBeDefined();
+    expect((h.room as any).collectedReports.size).toBe(0);
+  });
+
+  it('a join announce that never settles falls back to cold', async () => {
+    const h = makeHarness(1, { playProbe: () => new Promise<void>(() => {}) });
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + 100);
+    expect(h.room.state).toBe('announcing');
+
+    await h.tick(ROOM_STALL_MS + 100);
+    expect(h.room.state).toBe('cold');
+    expect(h.room.lastError).toMatch(/never completed/);
+  });
+
+  it('an isAirBusy that never settles does not wedge carrier sense', async () => {
+    const h = makeHarness(1, { isAirBusy: () => new Promise<boolean>(() => {}) });
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + 100);
+    expect(h.room.state).toBe('listening');
+
+    await h.tick(ROOM_STALL_MS + 100);
+    expect(h.room.state).toBe('cold');
+    expect(h.room.lastError).toMatch(/never completed/);
   });
 });

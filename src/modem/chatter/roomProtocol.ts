@@ -177,6 +177,33 @@ export const ROOM_TIMING = {
   ackWindowMs: REPLY_SLOTS * REPLY_SLOT_MS + ACK_AIR_MS,
 } as const;
 
+/**
+ * How long a state entered immediately before an `await` may sit there before
+ * the machine gives up on the dep and routes to its fallback.
+ *
+ * The class doc promises that every state carries a deadline back to idle (or
+ * cold) so nothing can get stuck. That was only true of states reached via a
+ * TIMER. A state entered and THEN awaited on — 'rollCall' awaiting playProbe,
+ * 'announcing' awaiting playProbe, 'listening' awaiting isAirBusy, 'collecting'
+ * awaiting the FILE_COMING send — had no deadline at all, so a dep promise that
+ * never settles wedged the room for the rest of the session. Nothing rejects in
+ * that case, so `handleDepsError` never runs either.
+ *
+ * The ways that happens are ordinary, not exotic: `AudioPlayer.play` resolves
+ * on the buffer source's `ended` event, which a suspended AudioContext (a
+ * backgrounded tab, a locked phone) may never fire, and every worker request
+ * (encodeProbe/encodeControl/airCheck) is a bare promise with no timeout, so a
+ * dropped reply hangs its caller forever.
+ *
+ * Wedging in 'rollCall' is worse than a stuck badge: roll-call accumulation
+ * requires 'collecting' (see handleReport), so every REPORT the room sends back
+ * is discarded on arrival while the prober looks like it is still working.
+ *
+ * 20 s is far longer than any real dep: the longest is a probe burst at ~3.9 s
+ * of audio plus its encode. Anything past that is a fault, not slowness.
+ */
+export const ROOM_STALL_MS = 20000;
+
 /** A device's real self-knowledge (measured passband/QAM ceiling) arrives in
  *  a later iteration; v1 claims this fixed, sensible default for every WELCOME. */
 const DEFAULT_CLAIM: BestRangeClaim = { lowHz: 1500, highHz: 7800, maxQamOrder: 6 };
@@ -274,6 +301,9 @@ export class RoomProtocol {
   private _lastError: string | null = null;
 
   private readonly pendingTimers = new Set<() => void>();
+  /** Bumped on every transition — see guardStall for why a stall guard needs
+   *  more than the state name to know it is still the one that armed it. */
+  private transitionSeq = 0;
   private listenElapsedMs = 0;
   private pendingSendFile: PendingFile | null = null;
   private activeFileParams: PendingFile | null = null;
@@ -590,8 +620,23 @@ export class RoomProtocol {
     // Roll-call accumulation (feeds pickSettings) only happens while actively
     // collecting — a REPORT arriving outside that window is member-refresh
     // only, never counted toward the roll call.
-    if (this._state !== 'collecting') return;
+    //
+    // Logged rather than dropped in silence: "the peer never answered" and
+    // "the peer answered while we were in the wrong state" produce the same
+    // `no reports received — nobody home`, and they have completely different
+    // causes. A REPORT landing in 'rollCall' means our own probe playback had
+    // not resolved yet (see ROOM_STALL_MS); one landing in 'idle' means it
+    // arrived after the collect window shut.
+    if (this._state !== 'collecting') {
+      dlog('ROOM', {
+        reportOutsideCollect: true, from: msg.senderId, state: this._state, us: this.deps.deviceId,
+      }, { level: 'warn' });
+      return;
+    }
     this.collectedReports.set(msg.senderId, { deviceId: msg.senderId, grid });
+    dlog('ROOM', {
+      reportCollected: true, from: msg.senderId, total: this.collectedReports.size, us: this.deps.deviceId,
+    }, { level: 'warn' });
   }
 
   private handleFileComing(msg: ControlMessage): void {
@@ -699,6 +744,7 @@ export class RoomProtocol {
 
   private beginListening(purpose: 'join' | 'rollCall'): void {
     this.setState('listening');
+    this.guardStall('listening', purpose === 'join' ? 'cold' : 'idle', 'air check');
     this.timer(ROOM_TIMING.listenMs, async () => {
       if (this._state !== 'listening') return;
       try {
@@ -723,6 +769,7 @@ export class RoomProtocol {
 
   private async beginAnnounceJoin(): Promise<void> {
     this.setState('announcing');
+    this.guardStall('announcing', 'cold', 'probe playback (join)');
     await this.deps.playProbe(PROBE_PURPOSE.joining);
     if (this._state !== 'announcing') return; // stale guard (e.g. stop() mid-await)
 
@@ -739,6 +786,7 @@ export class RoomProtocol {
 
   private async beginAnnounceRollCall(): Promise<void> {
     this.setState('rollCall');
+    this.guardStall('rollCall', 'idle', 'probe playback (roll call)');
     await this.deps.playProbe(PROBE_PURPOSE.rollCall);
     if (this._state !== 'rollCall') return;
 
@@ -787,6 +835,11 @@ export class RoomProtocol {
     const fileParams = this.activeFileParams;
     if (!fileParams) return; // stop() cleared it mid-flight
 
+    // The collect window's own deadline has already fired by the time this
+    // runs (finishRollCall is what called us), so from here to the
+    // fileComingLeadMs timer 'collecting' is deadline-free and the two awaits
+    // below are the room's last unguarded ones.
+    this.guardStall('collecting', 'idle', 'FILE_COMING send');
     try {
       // Carrier-sense before the announcement — the same deps.isAirBusy()
       // idiom every reply uses (see outbox.ts). This was the only transmit
@@ -1105,8 +1158,27 @@ export class RoomProtocol {
     }
   }
 
+  /**
+   * Guard the state we are about to await in: if we are still in it, and no
+   * transition has happened since, `ROOM_STALL_MS` from now, the dep never
+   * settled — treat it exactly like a rejected one.
+   *
+   * Gated on `transitionSeq` as well as on the state itself because a state can
+   * legitimately be re-entered (beginListening recurses while the air is busy),
+   * and an older entry's guard must not fire against a newer one's await.
+   */
+  private guardStall(state: RoomState, fallback: 'idle' | 'cold', what: string): void {
+    const seq = this.transitionSeq;
+    this.timer(ROOM_STALL_MS, () => {
+      if (this._state !== state || this.transitionSeq !== seq) return;
+      dlog('ROOM', { stalled: what, state, us: this.deps.deviceId }, { level: 'warn' });
+      this.handleDepsError(new Error(`room: ${what} never completed after ${ROOM_STALL_MS} ms`), fallback);
+    });
+  }
+
   private setState(next: RoomState): void {
     this._state = next;
+    this.transitionSeq++;
     this.deps.onStateChange?.(next, Array.from(this._members.values()));
     // Entering an eligible state is the moment a held reply can go out. Every
     // transition routes through here, so this is the single re-arm point —
