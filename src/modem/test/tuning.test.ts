@@ -21,7 +21,11 @@ test('handshake pilot sits directly below its tones', () => {
 
   // The pilot must also stay clear of the chirp template's centre, or the
   // correlator can fire on the pilot itself (see OFDM_HANDSHAKE's comment).
-  expect(Math.abs(OFDM_HANDSHAKE.pilotFreqHz - OFDM_TUNING.chirpCenterHz)).toBeGreaterThan(500);
+  // The handshake band's own correlator reads OFDM_HANDSHAKE.chirpCenterHz,
+  // not the global OFDM_TUNING value (see rxEngine's bandHandshake block) —
+  // that pairing is the one actually live for this band, so it's the one
+  // this assertion must guard.
+  expect(Math.abs(OFDM_HANDSHAKE.pilotFreqHz - OFDM_HANDSHAKE.chirpCenterHz)).toBeGreaterThan(500);
 });
 
 test('sync burst covers detection + alignment slack + settle + training', () => {

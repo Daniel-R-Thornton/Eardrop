@@ -240,6 +240,34 @@ export const OFDM_HANDSHAKE = {
   toneStartHz: 600, // offset above the pilot — tones at 6900-7250 Hz
   toneCount: 8,
   gapSymbols: 8,
+  /**
+   * Sync-chirp centre for THIS band only, decoupled from
+   * OFDM_TUNING.chirpCenterHz.
+   *
+   * The chirp is the loudest thing in a transmission and the transmit chain
+   * compresses per band, so a chirp sitting next to the tones it precedes
+   * compresses them and then releases across the frame — measured as the
+   * received pilot going 0.367 during training to 2.67 during data, a 17 dB
+   * swing, with no frame decoding (see OFDM_TUNING.chirpCenterHz). The global
+   * value is parked at 1850 Hz for exactly that reason, well below any data
+   * band today (tones at 6900-7250, see pilotFreqHz/toneStartHz above). A
+   * planned change would move this band's tones DOWN to 2600-2950 Hz, at
+   * which point 1850 would stop being "well below" and become "adjacent" —
+   * this field exists so that move doesn't also drag the chirp into the band
+   * it precedes.
+   *
+   * 4400 Hz: the probe burst's own down-chirp already sweeps through here and
+   * is decoded reliably on this hardware. Today it clears the handshake tones
+   * (6900-7250) by ~2.4 kHz; against the tone move described above it would
+   * clear by ~1.35 kHz — comfortably more than the 500 Hz separation that
+   * failed either way.
+   *
+   * The chirp only provides coarse timing, so its frequency is unconstrained
+   * by anything else. TX and RX must agree: both derive it from
+   * `bandHandshake` mode rather than passing it around, so there is no
+   * configuration in which one side reads this and the other does not.
+   */
+  chirpCenterHz: 4400,
 } as const;
 
 /**
@@ -282,9 +310,16 @@ export const OFDM_TUNING = {
    *
    * So the chirp keeps its own low band, well away from any usable data
    * frequency. It only provides coarse timing (see rxEngine's chirpCorrelate),
-   * so its frequency is unconstrained by anything else. TX and RX must agree —
-   * both read this value, and a mismatch makes the correlation template the
-   * wrong shape and nothing syncs.
+   * so its frequency is unconstrained by anything else.
+   *
+   * This value governs the TARGET band only. The fixed handshake band has its
+   * own chirp centre, OFDM_HANDSHAKE.chirpCenterHz, for the same reason this
+   * one exists — see that field's comment. TX and RX must agree on whichever
+   * of the two applies, and both derive that choice the same way (from
+   * `bandHandshake` mode) rather than having it passed around, so there is no
+   * configuration in which one side reads one value and the other reads the
+   * other. A mismatch would make the correlation template the wrong shape and
+   * nothing would sync.
    */
   chirpCenterHz: 1850,
   /**

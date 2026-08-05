@@ -20,6 +20,7 @@ import { describe, expect, it } from 'vitest';
 import { TxEngine } from '../protocol/txEngine';
 import { RxEngine } from '../protocol/rxEngine';
 import { HandshakeReceiver } from '../protocol/handshakeReceiver';
+import { OFDMEngine } from '../protocol/ofdmEngine';
 import { OFDM_HANDSHAKE, OFDM_TUNING, ofdmSamples } from '../types';
 
 const SAMPLE_RATE = 48000;
@@ -133,6 +134,34 @@ describe('band handshake: TX', () => {
         actual += chunk.length;
       }
       expect(Math.abs(est - actual) / actual).toBeLessThan(0.05);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    'puts the handshake segment chirp on the handshake band\'s own centre, not the target band\'s',
+    () => {
+      // The chirp is the loudest thing in a transmission and the chain
+      // compresses per band, so it must not sit next to the tones it precedes
+      // (types.ts documents a 17 dB received-level swing and zero decoded
+      // frames from exactly that). The handshake band therefore carries its
+      // own chirp centre, and the target band keeps OFDM_TUNING's.
+      expect(OFDM_HANDSHAKE.chirpCenterHz).not.toBe(OFDM_TUNING.chirpCenterHz);
+
+      const handshake = new OFDMEngine({
+        sampleRate: SAMPLE_RATE,
+        toneCount: OFDM_HANDSHAKE.toneCount,
+        pilotFreqHz: OFDM_HANDSHAKE.pilotFreqHz,
+        toneStartHz: OFDM_HANDSHAKE.toneStartHz,
+        chirpCenterHz: OFDM_HANDSHAKE.chirpCenterHz,
+      });
+      const target = new OFDMEngine({ sampleRate: SAMPLE_RATE, toneCount: 32 });
+
+      const hsCfg = handshake.generateChirpBurst(OFDM_TUNING.chirpSymbols).chirpCfg;
+      const tgtCfg = target.generateChirpBurst(OFDM_TUNING.chirpSymbols).chirpCfg;
+
+      expect((hsCfg.fStart + hsCfg.fEnd) / 2).toBeCloseTo(OFDM_HANDSHAKE.chirpCenterHz, 6);
+      expect((tgtCfg.fStart + tgtCfg.fEnd) / 2).toBeCloseTo(OFDM_TUNING.chirpCenterHz, 6);
     },
     TIMEOUT,
   );

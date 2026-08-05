@@ -30,8 +30,11 @@ export class OFDMEngine {
   private pilotFreqHz: number;
   private sampleRate: number;
   private symSamples: number;
-  /** Chirp span (Hz) around pilot; sweep goes pilot±span/2 */
+  /** Chirp span (Hz); sweep goes chirpCenterHz±span/2 — NOT the pilot, see below */
   private chirpSpanHz: number;
+  /** Chirp centre (Hz) — see OFDM_TUNING.chirpCenterHz and, for the handshake
+   *  band's own value, OFDM_HANDSHAKE.chirpCenterHz. */
+  private chirpCenterHz: number;
 
   // Per-tone bit-loading (Phase 3). Default: every tone QPSK, which keeps
   // modulateFrame() on the untouched legacy 4-tone/nibble-lane path (see
@@ -47,6 +50,7 @@ export class OFDMEngine {
     pilotFreqHz?: number;
     pilotAmplitude?: number;
     chirpSpanHz?: number;
+    chirpCenterHz?: number;
     qamScaleOverride?: number;
     toneStartHz?: number;
     /** Per-tone pre-emphasis (linear); see OFDMQPSKModulatorConfig.toneGains. */
@@ -64,6 +68,7 @@ export class OFDMEngine {
     this.pilotFreqHz = pilotFreqHz;
     this.sampleRate = cfg.sampleRate;
     this.chirpSpanHz = cfg.chirpSpanHz ?? 200;
+    this.chirpCenterHz = cfg.chirpCenterHz ?? OFDM_TUNING.chirpCenterHz;
     const { symSamples } = ofdmSamples(cfg.sampleRate);
     this.symSamples = symSamples;
 
@@ -160,9 +165,12 @@ export class OFDMEngine {
     const amplitude = Math.min(OFDM_TUNING.chirpAmplitude, matchedAmplitude);
 
     const chirpCfg: ChirpConfig = {
-      // Centred on OFDM_TUNING.chirpCenterHz, NOT the pilot — see that field.
-      fStart: OFDM_TUNING.chirpCenterHz - halfSpan,
-      fEnd: OFDM_TUNING.chirpCenterHz + halfSpan,
+      // Centred on this engine's chirpCenterHz, NOT the pilot — see
+      // OFDM_TUNING.chirpCenterHz. Per-engine because a future tone move on
+      // the handshake band would put it low enough that the global centre
+      // becomes adjacent to its tones — see OFDM_HANDSHAKE.chirpCenterHz.
+      fStart: this.chirpCenterHz - halfSpan,
+      fEnd: this.chirpCenterHz + halfSpan,
       durationSec,
       sampleRate: this.sampleRate,
       amplitude,

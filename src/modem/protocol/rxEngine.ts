@@ -149,8 +149,12 @@ export class RxEngine {
   private chirpBufData: Float32Array = new Float32Array(0);
   private chirpBufHead = 0;
   private chirpBufCount = 0;
-  /** Chirp detection: span Hz around pilot */
+  /** Chirp detection: span Hz — sweep goes chirpCenterHz±span/2, NOT the pilot, see below */
   private chirpSpanHz = 200;
+  /** Chirp detection: centre Hz. Set from OFDM_HANDSHAKE in card-listening
+   *  mode (see the constructor) — derived from the mode, not passed in, so it
+   *  can never disagree with what TxEngine chose the same way. */
+  private chirpCenterHz = OFDM_TUNING.chirpCenterHz;
   /** Chirp correlation throttle — run once per sps samples (not every sample) */
   private chirpRan = false;
   private chirpTick = 0;
@@ -441,7 +445,8 @@ export class RxEngine {
       this.cfg.pilotFreqHz = OFDM_HANDSHAKE.pilotFreqHz;
       this.cfg.toneStartHz = OFDM_HANDSHAKE.toneStartHz;
       this.cfg.toneCount = OFDM_HANDSHAKE.toneCount;
-      dlog('RX-OFDM', { handshakeBand: true, pilot: this.cfg.pilotFreqHz });
+      this.chirpCenterHz = OFDM_HANDSHAKE.chirpCenterHz;
+      dlog('RX-OFDM', { handshakeBand: true, pilot: this.cfg.pilotFreqHz, chirp: this.chirpCenterHz });
     }
     const settleOverride = (cfg as any).trainingSettleSymbols;
     // Card-listening mode ignores the settle override: the handshake segment
@@ -1553,11 +1558,11 @@ export class RxEngine {
     const chirpDurationSec = (OFDM_TUNING.chirpSymbols * symSamples) / this.cfg.sampleRate;
     const halfSpan = this.chirpSpanHz / 2;
     const chirpCfg: ChirpConfig = {
-      // MUST match OFDMEngine.generateChirpBurst: centred on
-      // OFDM_TUNING.chirpCenterHz, not on the pilot. Deriving it from the pilot
-      // here would make the template the wrong shape the moment the pilot moves.
-      fStart: OFDM_TUNING.chirpCenterHz - halfSpan,
-      fEnd: OFDM_TUNING.chirpCenterHz + halfSpan,
+      // MUST match OFDMEngine.generateChirpBurst: centred on this engine's
+      // chirpCenterHz, not on the pilot. Deriving it from the pilot here would
+      // make the template the wrong shape the moment the pilot moves.
+      fStart: this.chirpCenterHz - halfSpan,
+      fEnd: this.chirpCenterHz + halfSpan,
       durationSec: chirpDurationSec,
       sampleRate: this.cfg.sampleRate,
     };
