@@ -30,6 +30,8 @@
  *
  *   idle/joinWait --onMessage(FILE_COMING)--> receiving --durationMs+5000--> idle
  *
+ *   idle/joinWait --onProbeHeard--> (queued reply, slotted + carrier-sensed)
+ *
  * Every state reached via a timer carries its OWN deadline back to idle (or
  * cold, for the pre-join chain) so nothing can get stuck; `stop()` cancels
  * every outstanding timer via a single `pendingTimers` set. Timer callbacks
@@ -39,6 +41,12 @@
  *
  * `listening` is shared by both carrier-sense phases (join and roll-call) —
  * carrier sense is carrier sense regardless of what comes after it.
+ *
+ * Replies to probes are QUEUED, not state-gated: `onProbeHeard` records what
+ * is owed and `drainReplyQueue` sends it whenever the local transmitter is
+ * free (`canTransmitReply`). Gating the send on a single state meant two
+ * devices joining at once were both in `joinWait` when the other's probe
+ * arrived and neither ever replied.
  */
 import {
   ControlType,
@@ -138,6 +146,18 @@ interface PendingFile {
   targetId: number;
 }
 
+interface PendingReply {
+  proberId: number;
+  /** What the prober announced — decides WELCOME vs REPORT. Overwritten by a
+   *  fresh probe, because the newest announcement is the true one: a device
+   *  that ran a roll call and then refreshed and rejoined needs a WELCOME. */
+  purpose: ProbePurpose;
+  /** Sends attempted for this reply. Task-4 retry budget. */
+  attempts: number;
+  /** A slot chain is already in flight for this entry. */
+  scheduled: boolean;
+}
+
 export class RoomProtocol {
   private _state: RoomState = 'cold';
   private readonly _members = new Map<number, Member>();
@@ -148,10 +168,23 @@ export class RoomProtocol {
   private pendingSendFile: PendingFile | null = null;
   private activeFileParams: PendingFile | null = null;
   private readonly collectedReports = new Map<number, PeerReport>();
-  /** Probers a WELCOME reply chain is already in flight for — dedupes a
-   *  second `onProbeHeard` for the same device while the first reply
-   *  attempt is still waiting out its slot(s). */
-  private readonly pendingReplyTo = new Set<number>();
+  /**
+   * Replies owed to probers, keyed by prober id.
+   *
+   * A queue rather than a state-gated side effect. Reply duty used to exist
+   * only in 'idle', so a probe heard in any other state updated the member
+   * table and sent nothing — and two devices joining within a few seconds of
+   * each other are BOTH in joinWait when the other's probe arrives, so
+   * neither ever welcomed and both declared an empty room. Now the reply is
+   * recorded when the probe is heard and sent when our own transmitter is
+   * next free (see canTransmitReply).
+   *
+   * `scheduled` is the dedupe that `pendingReplyTo` used to be: it marks an
+   * entry whose slot chain is already in flight, so a repeat probe from the
+   * same device — or a setState that re-drains the queue — cannot start a
+   * second chain for it.
+   */
+  private readonly replyQueue = new Map<number, PendingReply>();
 
   constructor(private readonly deps: RoomDeps) {}
 
@@ -188,7 +221,7 @@ export class RoomProtocol {
     this.pendingSendFile = null;
     this.activeFileParams = null;
     this.collectedReports.clear();
-    this.pendingReplyTo.clear();
+    this.replyQueue.clear();
     this.setState('cold');
   }
 
@@ -207,30 +240,15 @@ export class RoomProtocol {
     const existing = this._members.get(deviceId);
     this._members.set(deviceId, { ...existing, deviceId, lastHeardMs: this.deps.now(), heardGrid: grid });
 
-    // Only 'idle' carries reply duty — a probe heard mid-join or mid-rollcall
-    // just refreshes the member table. (Task 3 replaces this gate with a
-    // queue; the reply TYPE is what changes here.) Dedupe by prober: a repeat
-    // probe from the same device while its reply chain is still waiting out a
-    // slot must not start a second, redundant reply chain.
-    //
-    // WELCOME vs REPORT now comes off the wire (see PROBE_PURPOSE), not from
-    // whether we already know this prober. That inference was one-sided in
-    // both directions: a device rejoining with the same id (page refresh,
-    // reconnect, a second start()) is a stranger to itself but a known member
-    // to us, so it received a REPORT when it needed a WELCOME; and a peer
-    // whose WELCOME we lost still thinks we are a stranger, so it answered our
-    // roll call with a WELCOME. handleWelcome and handleReport keep their
-    // tolerance for the "wrong" reply type regardless, so a peer running an
-    // older build degrades rather than breaks.
-    if (this._state === 'idle' && !this.pendingReplyTo.has(deviceId)) {
-      this.pendingReplyTo.add(deviceId);
-      this.scheduleReply(
-        this.deps.now(),
-        Array.from({ length: ROOM_TIMING.replySlots }, (_unused, i) => i),
-        deviceId,
-        purpose === PROBE_PURPOSE.rollCall,
-      );
-    }
+    // Reply type comes off the wire (see PROBE_PURPOSE), not from whether we
+    // already know this prober — see the note kept from the previous change.
+    // A fresh probe overwrites a queued entry's purpose: the newest
+    // announcement is the true one.
+    const queued = this.replyQueue.get(deviceId);
+    if (queued) queued.purpose = purpose;
+    else this.replyQueue.set(deviceId, { proberId: deviceId, purpose, attempts: 0, scheduled: false });
+
+    this.drainReplyQueue();
   }
 
   /** worker decoded a control message */
@@ -470,14 +488,40 @@ export class RoomProtocol {
 
   // ---- reply-to-probe: slotted, carrier-sensed, re-rolling among later slots ----
 
-  private scheduleReply(
-    baseTimeMs: number,
-    candidateSlots: number[],
-    proberId: number,
-    replyWithReport: boolean,
-  ): void {
+  /**
+   * Whether a reply may be transmitted right now.
+   *
+   * Not a single state: what matters is that OUR transmitter is free, which is
+   * true in 'idle' and in 'joinWait'. joinWait is safe because
+   * beginAnnounceJoin awaits its own playProbe before entering it, so nothing
+   * of ours is in the air, and the joinWait deadline already allows for a full
+   * control message (see beginAnnounceJoin's timer).
+   *
+   * 'listening' and 'collecting' are excluded for a different reason than
+   * 'announcing'/'sending'/'receiving': in those two we are measuring the air
+   * or counting replies, and our own burst would corrupt the measurement.
+   */
+  private canTransmitReply(): boolean {
+    return this._state === 'idle' || this._state === 'joinWait';
+  }
+
+  /** Start a slot chain for every queued reply that does not already have one. */
+  private drainReplyQueue(): void {
+    if (!this.canTransmitReply()) return;
+    for (const entry of Array.from(this.replyQueue.values())) {
+      if (entry.scheduled) continue;
+      entry.scheduled = true;
+      this.scheduleReply(
+        this.deps.now(),
+        Array.from({ length: ROOM_TIMING.replySlots }, (_unused, i) => i),
+        entry,
+      );
+    }
+  }
+
+  private scheduleReply(baseTimeMs: number, candidateSlots: number[], entry: PendingReply): void {
     if (candidateSlots.length === 0) {
-      this.pendingReplyTo.delete(proberId); // give up — no slot left to try
+      this.replyQueue.delete(entry.proberId); // give up — no slot left to try
       return;
     }
     const idx = Math.floor(this.deps.rng() * candidateSlots.length);
@@ -486,43 +530,45 @@ export class RoomProtocol {
     const delay = Math.max(0, baseTimeMs + slot * ROOM_TIMING.replySlotMs - this.deps.now());
 
     this.timer(delay, async () => {
-      if (this._state !== 'idle') {
-        this.pendingReplyTo.delete(proberId);
+      // Not eligible any more (a transfer started, a roll call began): HOLD
+      // the entry and clear `scheduled` so the next setState into an eligible
+      // state re-drains it. Dropping it here is the old bug.
+      if (!this.canTransmitReply()) {
+        entry.scheduled = false;
         return;
       }
       try {
         const busy = await this.deps.isAirBusy();
-        if (this._state !== 'idle') {
-          this.pendingReplyTo.delete(proberId);
+        if (!this.canTransmitReply()) {
+          entry.scheduled = false;
           return;
         }
 
         if (busy) {
-          this.scheduleReply(baseTimeMs, laterSlots, proberId, replyWithReport); // still pending — chain continues
+          this.scheduleReply(baseTimeMs, laterSlots, entry); // still pending — chain continues
           return;
         }
-        const heardGrid = this._members.get(proberId)?.heardGrid ?? [];
+        const heardGrid = this._members.get(entry.proberId)?.heardGrid ?? [];
         await this.deps.sendMessage(
-          replyWithReport
+          entry.purpose === PROBE_PURPOSE.rollCall
             ? {
                 type: ControlType.Report,
                 senderId: this.deps.deviceId,
-                targetId: proberId,
+                targetId: entry.proberId,
                 payload: packReport(heardGrid),
               }
             : {
                 type: ControlType.Welcome,
                 senderId: this.deps.deviceId,
-                targetId: proberId,
+                targetId: entry.proberId,
                 payload: packWelcome({ claim: DEFAULT_CLAIM, grid: heardGrid }),
               },
         );
-        this.pendingReplyTo.delete(proberId);
+        this.replyQueue.delete(entry.proberId);
       } catch (err) {
-        // isAirBusy/sendMessage rejected — we're already 'idle', so there's
-        // no state to unwind, just surface the error and stop dedupe-blocking
+        // isAirBusy/sendMessage rejected — surface the error and stop blocking
         // this prober.
-        this.pendingReplyTo.delete(proberId);
+        this.replyQueue.delete(entry.proberId);
         this._lastError = err instanceof Error ? err.message : String(err);
       }
     });
@@ -548,7 +594,7 @@ export class RoomProtocol {
     if (fallback === 'cold') {
       this.pendingSendFile = null;
       this.activeFileParams = null;
-      this.pendingReplyTo.clear();
+      this.replyQueue.clear();
       this.setState('cold');
     } else {
       this.activeFileParams = null;
@@ -559,6 +605,10 @@ export class RoomProtocol {
   private setState(next: RoomState): void {
     this._state = next;
     this.deps.onStateChange?.(next, Array.from(this._members.values()));
+    // Entering an eligible state is the moment a held reply can go out. Every
+    // transition routes through here, so this is the single re-arm point —
+    // there is no state whose entry can forget to check the queue.
+    if (next === 'idle' || next === 'joinWait') this.drainReplyQueue();
   }
 
   /** Register a cancelable timer, tracked in `pendingTimers` so `stop()` can

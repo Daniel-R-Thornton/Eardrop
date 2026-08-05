@@ -258,6 +258,99 @@ describe('room protocol', () => {
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
 
+  it('replies to a probe heard while in joinWait', async () => {
+    // The bug this covers: reply duty used to exist only in 'idle'. Two
+    // devices joining within a few seconds of each other are BOTH in joinWait
+    // when the other's probe lands, so each recorded the other and neither
+    // welcomed — both then declared an empty room.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + 50);
+    expect(h.room.state).toBe('joinWait');
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+
+    const welcome = h.sent.find((m) => m.type === ControlType.Welcome);
+    expect(welcome).toBeDefined();
+    expect(welcome.targetId).toBe(9);
+  });
+
+  it('holds a probe heard mid-announce and replies once the transmitter frees up', async () => {
+    // 'announcing' is genuinely busy — our own probe is playing. The reply
+    // must be queued rather than dropped, then sent when we reach joinWait.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs - 10);
+    expect(h.room.state).toBe('listening');
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
+
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+  });
+
+  it('two devices in joinWait each welcome the other', async () => {
+    // The reported symptom, as a test: neither device is idle, both hear the
+    // other, both must welcome.
+    const a = makeHarness(1);
+    const b = makeHarness(2);
+    a.room.start();
+    b.room.start();
+    await a.tick(ROOM_TIMING.listenMs + 50);
+    await b.tick(ROOM_TIMING.listenMs + 50);
+    expect(a.room.state).toBe('joinWait');
+    expect(b.room.state).toBe('joinWait');
+
+    a.room.onProbeHeard(2, flatGrid, PROBE_PURPOSE.joining);
+    b.room.onProbeHeard(1, flatGrid, PROBE_PURPOSE.joining);
+    await a.tick(ROOM_TIMING.replySlotMs + 100);
+    await b.tick(ROOM_TIMING.replySlotMs + 100);
+
+    expect(a.sent.find((m) => m.type === ControlType.Welcome)?.targetId).toBe(2);
+    expect(b.sent.find((m) => m.type === ControlType.Welcome)?.targetId).toBe(1);
+  });
+
+  it('replies with the type the newest probe asked for', async () => {
+    // A queued reply's purpose is overwritten by a fresh probe, because the
+    // newest announcement is the true one: a device that ran a roll call and
+    // then refreshed and rejoined needs a WELCOME, not the REPORT its earlier
+    // probe queued.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs - 10); // 'listening' — transmitter held
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.rollCall);
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+
+    expect(h.sent.filter((m) => m.type === ControlType.Report)).toHaveLength(0);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+  });
+
+  it('does not reply while sending or receiving', async () => {
+    // Our transmitter is genuinely occupied by a file. Queue, do not talk
+    // over it.
+    const h = makeHarness(3);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.onMessage({
+      type: ControlType.FileComing, senderId: 8, targetId: 0,
+      payload: packFileComing({ pilotFreqHz: 6300, toneStartHz: 600, toneCount: 32, settleSymbols: 16, fileBytes: 100, durationMs: 2000 }),
+    });
+    expect(h.room.state).toBe('receiving');
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
+
+    // ...but once the transfer's deadline returns us to idle, it goes out.
+    await h.tick(2000 + 5000 + ROOM_TIMING.replySlotMs + 200);
+    expect(h.room.state).toBe('idle');
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+  });
+
   it('answers a roll-call probe with a REPORT even from a device it has never seen', async () => {
     // The reply type now comes from the purpose bit, not from whether we
     // already know the prober. A never-seen device running a roll call needs
