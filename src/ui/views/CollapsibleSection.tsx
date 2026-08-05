@@ -6,9 +6,13 @@
  * sections from `isWideViewport()` at mount and needs them in its own state.
  *
  * Children are NOT rendered while closed, which matters beyond saving a few
- * nodes: the graph and spectrum canvases size themselves from a
- * ResizeObserver, and a canvas left mounted inside a hidden box measures zero
- * and does not recover when reopened. Unmounting means it re-measures cleanly.
+ * nodes: the graph and spectrum canvases size themselves from a ResizeObserver,
+ * and a canvas left mounted inside a hidden box measures zero. Unmounting keeps
+ * that from happening — but it only gets the canvas back if the consumer
+ * re-measures the box that remounts. RoomMode's useMeasuredSize uses a callback
+ * ref for exactly that reason; a ref read once at mount leaves a
+ * initially-closed section permanently blank. Unmounting here is half of the
+ * contract, not all of it.
  *
  * `summary` is what the section says while shut — a node count, a packet
  * count — so collapsing it costs the number but not the awareness.
@@ -21,12 +25,24 @@ import { T } from '../theme/labaccent/tokens';
 const HEADER_MIN_HEIGHT = 44;
 
 export function CollapsibleSection({
-  title, summary, open, onToggle, children,
+  title, summary, open, onToggle, grow = false, children,
 }: {
   title: string;
   summary?: string;
   open: boolean;
   onToggle: () => void;
+  /**
+   * Let this section grow into the surplus height of its flex line.
+   *
+   * Off by default, and it must stay that way: a collapsed section is a
+   * fixed-height strip, and several growing siblings would divide the page
+   * between their header bars. The one caller that needs it is RoomMode's graph.
+   * Without it the root below is a flex item at the default `0 1 auto`, so its
+   * height is its content height — a growing WRAPPER around this component
+   * cannot pass that growth through, and the surplus shows up as dead space
+   * above the section rather than a bigger canvas inside it.
+   */
+  grow?: boolean;
   children: ReactNode;
 }) {
   const header: CSSProperties = {
@@ -37,7 +53,11 @@ export function CollapsibleSection({
     cursor: 'pointer', textAlign: 'left',
   };
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+    <div style={{
+      display: 'flex', flexDirection: 'column', minHeight: 0,
+      // Only when open: a shut section is a strip, whatever `grow` says.
+      flex: grow && open ? '1 1 auto' : undefined,
+    }}>
       <button type="button" style={header} onClick={onToggle} aria-expanded={open}>
         {/* Caret and title live in separate spans rather than one
             `{caret} {title}` span: RTL's getByText matches a node by its OWN

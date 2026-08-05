@@ -17,14 +17,22 @@
  * (roster/spectrum/packets) start open; after that the operator's toggles own
  * them and nothing re-reads it.
  *
- * The graph and spectrum canvases are sized from their container via
- * ResizeObserver (see useMeasuredSize below), not hardcoded pixels. That is why
- * CollapsibleSection unmounts its children when shut rather than hiding them:
- * a canvas left mounted inside a zero-height box measures zero and never
- * recovers when reopened, whereas an unmounted one re-measures cleanly on the
- * way back in.
+ * The graph and spectrum canvases are sized from their container, not from
+ * hardcoded pixels. Two halves make that survive collapsing, and BOTH are
+ * required: CollapsibleSection unmounts its children when shut, so no canvas is
+ * left measuring zero inside a hidden box; and useMeasuredSize hands out a
+ * callback ref, so the box that mounts on the way back in is measured afresh.
+ * Unmounting alone is not enough — with a ref object read once at mount, a
+ * section that starts closed is never measured at all. See useMeasuredSize
+ * below; there is a regression test for it in RoomMode.test.tsx.
+ *
+ * The column scrolls internally (overflowY on the stack below). BenchApp pins
+ * this mode to exactly the viewport with overflow hidden, so a stack taller than
+ * the screen has no page scroll to fall back on — without a scroll container
+ * here, whatever does not fit is simply clipped away unreachably, and the chat
+ * composer at the bottom is the first thing to go.
  */
-import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type RefObject } from 'react';
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import { useStore } from '../Store';
 import { T } from '../theme/labaccent/tokens';
 import { Screen } from '../components/instrument/Screen';
@@ -119,18 +127,35 @@ function nodeXY(w: number, h: number, angle: number, radius: number) {
  * Tracks an element's content-box size so a canvas can be sized to fill its
  * container instead of a hardcoded pixel box.
  *
- * The first measurement is taken synchronously in a layout effect rather than
- * waiting for ResizeObserver's initial callback. RO delivers its callbacks as
- * part of the rendering steps, so a window that is occluded or throttled can
- * defer them indefinitely — the canvas then never gets a non-zero size and
- * simply never appears. Measuring up front makes the first paint independent
- * of that; the observer only handles later resizes.
+ * The first measurement is taken synchronously, the moment the node arrives,
+ * rather than waiting for ResizeObserver's initial callback. RO delivers its
+ * callbacks as part of the rendering steps, so a window that is occluded or
+ * throttled can defer them indefinitely — the canvas then never gets a
+ * non-zero size and simply never appears. Measuring up front makes the first
+ * paint independent of that; the observer only handles later resizes.
+ *
+ * Returns a CALLBACK REF, not a ref object, and this is the load-bearing part.
+ * It was a `useRef` + `useLayoutEffect(…, [])`, which read `ref.current` exactly
+ * once at RoomMode mount and never again. Every box it measures now lives inside
+ * a CollapsibleSection, and a closed section does not render its children — so
+ * on a phone, where SPECTRUM seeds closed, `ref.current` was null at that one
+ * moment, the effect bailed, and no observer was ever attached. Expanding the
+ * section mounted a brand-new box that nothing re-measured: the size stayed
+ * {0,0}, the `w > 0 && h > 0` render guard never passed, and the spectrum was a
+ * blank strip for the rest of the session. The same mechanism spoiled any
+ * collapse → resize → reopen on desktop, drawing at the stale pre-collapse size
+ * with the observer left on a detached node.
+ *
+ * A callback ref fixes that at the root: React invokes it with the node on
+ * attach and runs the returned cleanup on detach, so measurement is
+ * re-established whenever the element changes for ANY reason. Threading each
+ * section's `open` flag in as an effect dep would also work, but it would make
+ * this hook know why its node comes and goes — and it would silently break again
+ * the next time a box is made conditional on something else.
  */
-function useMeasuredSize<T extends HTMLElement>(): [RefObject<T | null>, { w: number; h: number }] {
-  const ref = useRef<T | null>(null);
+function useMeasuredSize<T extends HTMLElement>(): [(el: T | null) => void, { w: number; h: number }] {
   const [size, setSize] = useState({ w: 0, h: 0 });
-  useLayoutEffect(() => {
-    const el = ref.current;
+  const attach = useCallback((el: T | null) => {
     if (!el) return;
     // Re-setting an identical size would re-render, and any render that can
     // nudge layout turns the observer into a feedback loop — so bail on no-ops.
@@ -146,9 +171,12 @@ function useMeasuredSize<T extends HTMLElement>(): [RefObject<T | null>, { w: nu
       if (box) apply(box.width, box.height);
     });
     ro.observe(el);
+    // React 19 runs a ref callback's returned function on detach. Returning it
+    // explicitly (rather than relying on the older callback-with-null contract)
+    // keeps the observer's lifetime tied to the node that owns it.
     return () => ro.disconnect();
   }, []);
-  return [ref, size];
+  return [attach, size];
 }
 
 export function RoomMode({ onExit }: { onExit: () => void }) {
@@ -559,59 +587,72 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
         </div>
       )}
 
-      {/* One vertical column at every width — see the file header for why. */}
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: '1 1 auto', minHeight: 0 }}>
-        {/* Graph — flexes when open so it takes whatever slack a phone gives
-         *  it, and shrinks to its header strip when shut. */}
-        <div style={{ display: 'flex', flexDirection: 'column', flex: graphOpen ? '1 1 auto' : '0 0 auto', minHeight: 0 }}>
-          <CollapsibleSection
-            title={`NODE GRAPH — ${s.chatterOn ? `this device is ${hex(s.chatterDeviceId)}` : 'not joined'}`}
-            summary={`${members.length} node${members.length === 1 ? '' : 's'}`}
-            open={graphOpen}
-            onToggle={() => setGraphOpen((v) => !v)}
-          >
-            {/* basis 0, not auto: the box's height must come from the flex
-             *  line alone, never from what it contains. */}
-            <div ref={graphBoxRef} style={{ position: 'relative', flex: '1 1 0', minHeight: 220 }}>
-              {graphSize.w > 0 && graphSize.h > 0 && (
-                <>
-                  {/* Absolutely positioned so the canvas contributes NOTHING to
-                   *  this box's content size. In normal flow it fed its own
-                   *  measured height back into the box's `flex: 1 1 auto`
-                   *  basis, so every measurement grew the box and re-triggered
-                   *  the observer — the panel visibly pulsed. */}
-                  <div style={{ position: 'absolute', inset: 0 }}>
-                    <Screen width={graphSize.w} height={graphSize.h} draw={drawGraph} grid={false} />
-                  </div>
-                  {/* invisible hit-targets over each node, so the canvas graph stays hover/select-able */}
-                  <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
-                    {nodes.map((n) => {
-                      const { x, y } = nodeXY(graphSize.w, graphSize.h, n.angle, n.radius);
-                      return (
-                        <div
-                          key={n.m.deviceId}
-                          onMouseEnter={() => setHoveredId(n.m.deviceId)}
-                          onMouseLeave={() => setHoveredId((h2) => (h2 === n.m.deviceId ? null : h2))}
-                          onClick={() => setSelectedId((sel) => (sel === n.m.deviceId ? null : n.m.deviceId))}
-                          // 44px, not the 24px this started as: a node is
-                          // selected with a thumb on a phone, and 24px is well
-                          // under a comfortable touch target. The offsets are
-                          // half the size so the circle stays centred on the
-                          // node the canvas drew at the same (x, y).
-                          style={{
-                            position: 'absolute', left: x - 22, top: y - 22, width: 44, height: 44,
-                            borderRadius: '50%', pointerEvents: 'auto', cursor: 'pointer',
-                          }}
-                          title={`${hex(n.m.deviceId)} · ${formatAgo(n.ageMs)}${n.m.linkDb !== undefined ? ` · ${n.m.linkDb.toFixed(0)}dB` : ''}`}
-                        />
-                      );
-                    })}
-                  </div>
-                </>
-              )}
-            </div>
-          </CollapsibleSection>
-        </div>
+      {/* One vertical column at every width — see the file header for why.
+       *  overflowY is not optional: BenchApp pins this mode to 100vh with
+       *  overflow hidden, so without a scroll container here anything past the
+       *  fold is clipped with no way to reach it. The floors below are kept low
+       *  enough that the composer fits on a phone-class viewport unscrolled;
+       *  this is the safety net for the ones where it does not. */}
+      <div style={{
+        display: 'flex', flexDirection: 'column', gap: 8,
+        flex: '1 1 auto', minHeight: 0, overflowY: 'auto',
+      }}>
+        {/* Graph — grows into the column's surplus when open (via CollapsibleSection's
+         *  `grow`, which has to be set on the section itself: a growing wrapper
+         *  around it cannot push height through a default-basis flex item), and
+         *  collapses to its header strip when shut. */}
+        <CollapsibleSection
+          title={`NODE GRAPH — ${s.chatterOn ? `this device is ${hex(s.chatterDeviceId)}` : 'not joined'}`}
+          summary={`${members.length} node${members.length === 1 ? '' : 's'}`}
+          open={graphOpen}
+          onToggle={() => setGraphOpen((v) => !v)}
+          grow
+        >
+          {/* basis 0, not auto: the box's height must come from the flex
+           *  line alone, never from what it contains. The floor is 120, not
+           *  the 220 this started at — the column has to fit inside a pinned
+           *  viewport, and a 220px floor here plus the other hard minimums
+           *  pushed the chat composer past the clip line on a phone. 120px
+           *  still gives the graph a ~53px radius, enough for the node labels. */}
+          <div ref={graphBoxRef} style={{ position: 'relative', flex: '1 1 0', minHeight: 120 }}>
+            {graphSize.w > 0 && graphSize.h > 0 && (
+              <>
+                {/* Absolutely positioned so the canvas contributes NOTHING to
+                 *  this box's content size. In normal flow it fed its own
+                 *  measured height back into the box's `flex: 1 1 auto`
+                 *  basis, so every measurement grew the box and re-triggered
+                 *  the observer — the panel visibly pulsed. */}
+                <div style={{ position: 'absolute', inset: 0 }}>
+                  <Screen width={graphSize.w} height={graphSize.h} draw={drawGraph} grid={false} />
+                </div>
+                {/* invisible hit-targets over each node, so the canvas graph stays hover/select-able */}
+                <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
+                  {nodes.map((n) => {
+                    const { x, y } = nodeXY(graphSize.w, graphSize.h, n.angle, n.radius);
+                    return (
+                      <div
+                        key={n.m.deviceId}
+                        onMouseEnter={() => setHoveredId(n.m.deviceId)}
+                        onMouseLeave={() => setHoveredId((h2) => (h2 === n.m.deviceId ? null : h2))}
+                        onClick={() => setSelectedId((sel) => (sel === n.m.deviceId ? null : n.m.deviceId))}
+                        // 44px, not the 24px this started as: a node is
+                        // selected with a thumb on a phone, and 24px is well
+                        // under a comfortable touch target. The offsets are
+                        // half the size so the circle stays centred on the
+                        // node the canvas drew at the same (x, y).
+                        style={{
+                          position: 'absolute', left: x - 22, top: y - 22, width: 44, height: 44,
+                          borderRadius: '50%', pointerEvents: 'auto', cursor: 'pointer',
+                        }}
+                        title={`${hex(n.m.deviceId)} · ${formatAgo(n.ageMs)}${n.m.linkDb !== undefined ? ` · ${n.m.linkDb.toFixed(0)}dB` : ''}`}
+                      />
+                    );
+                  })}
+                </div>
+              </>
+            )}
+          </div>
+        </CollapsibleSection>
 
         {/* The two actions that put something on the air. */}
         <div style={{ display: 'flex', gap: 8, flex: '0 0 auto' }}>
@@ -693,7 +734,10 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
           onToggle={() => setSpectrumOpen((v) => !v)}
         >
           <div style={{ ...panel(false), display: 'flex', flexDirection: 'column' }}>
-            <div ref={spectrumBoxRef} style={{ position: 'relative', flex: '0 0 90px', minHeight: 60 }}>
+            {/* 90px basis, but shrinkable: the column lives inside a pinned
+             *  viewport, so every box that CAN give height back should. The
+             *  minHeight floors it at 60 either way. */}
+            <div ref={spectrumBoxRef} style={{ position: 'relative', flex: '1 1 90px', minHeight: 60 }}>
               {spectrumSize.w > 0 && spectrumSize.h > 0 && (
                 // Out of flow for the same reason as the graph canvas above.
                 <div style={{ position: 'absolute', inset: 0 }}>
@@ -717,8 +761,11 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
           </div>
         </CollapsibleSection>
 
-        {/* Chat — flexes so it takes the space the collapsed panels give back. */}
-        <div style={{ ...panel(false), display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 160 }}>
+        {/* Chat — flexes so it takes the space the collapsed panels give back.
+         *  The floor is 120, down from 160, for the same budget reason as the
+         *  graph box: the composer plus one line of transcript is what has to
+         *  survive on a phone, and anything above that is slack it can claim. */}
+        <div style={{ ...panel(false), display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 120 }}>
           <div style={title}>CHAT</div>
           <ChatMessageList
             messages={s.chatterMessages}
