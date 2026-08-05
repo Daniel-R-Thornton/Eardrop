@@ -260,6 +260,98 @@ Section C:
   written without it, or without C1 producing an equivalent. Everything else in
   this spec is independent of it and can proceed.
 
+## Outcome
+
+Implemented across 22 commits on `chatter-control-plane-fixes`. Every task was
+reviewed; a final whole-branch review found one Critical and five Important
+issues, all fixed. Gates at merge: `npm run typecheck` clean, `npm run build`
+succeeds, `npm run test` 589 passed with the 3 pre-existing `pipeline.test.ts`
+BPSK Doppler/stress failures still red, `npm run lint` at its 410-problem
+baseline.
+
+Two changes were made to the design as specified:
+
+- **A3's acknowledgement is not implementable as written.** The spec assumed a
+  reply could be acked by "any traffic from that prober". Nothing in
+  `RoomProtocol` transmits in response to a WELCOME or a REPORT, so the ack
+  never clears in the ordinary flow and `MAX_REPLY_ATTEMPTS = 2` means "every
+  reply is sent twice, always" rather than "retry on loss". A retry also cannot
+  arrive before the joiner's 5800 ms `joinWait` closes, since the first send
+  alone ends at ≥3150 ms — though it does still register the peer afterwards.
+  Retries for `rollCall`-purpose replies were removed outright (see below);
+  whether to keep the WELCOME retry at all is an open decision.
+
+- **`sendFileComingAndTransmit` now carrier-senses.** It was the only transmit
+  path in the machine without it. Combined with A3's retry this was a silent
+  file-loss bug: `collectExtraMs` was sized so one reply in the last slot
+  finishes inside the collect window (4650 ms of 5800 ms), but a retry fires
+  1800 ms after the first send completes — outside it. In roughly 6 of 36 slot
+  pairs a peer was mid-retry when FILE_COMING went out, with its own RX muted
+  by its playback, so it never armed its receiver and the sender transmitted
+  the whole file to nobody with `lastError === null`. Busy air now aborts the
+  roll call to `idle` with `lastError` set, which is a visible failure rather
+  than a silent one.
+
+## Required for the over-the-air measurement
+
+The relocated band is committed and unmeasured. Beyond the MER comparison in
+Verification above, the run must check:
+
+1. **Whether the handshake chirp landing inside a negotiated target band causes
+   the documented compression swing.** `settingsPick` slides a 1550 Hz window
+   across 1500-7800 Hz, so any 32-tone window starting in 2850-4400 Hz contains
+   the 4400 Hz chirp — and 2-4 kHz is where phone hardware scores best, which
+   is this work's own premise. Checked against the handshake tones during
+   implementation, never against the target band. Note the chirp is amplitude
+   **0.12**, not the 0.6 of the era when the 17 dB swing was measured, so the
+   hazard is real but materially smaller; size the measurement against 0.12.
+2. **Whether the handshake sync template false-triggers on a probe burst.**
+   4400 Hz is exactly the probe's down-chirp start frequency. The defence is
+   direction reversal (the probe sweeps down, the sync chirp up), which still
+   holds, but the two now share a centre frequency.
+3. **The 2000 Hz pilot's 150 Hz clearance from the global chirp template**
+   (1750-1950), which the post-hop target engine correlates against. Partway
+   back toward a documented false-trigger mechanism; `gapSymbols` still
+   mitigates it and `tuning.test.ts` now guards the clearance.
+4. **Whether an 800 ms up-sweep at chirp level is reproduced at 4400 Hz at
+   all.** That "works on this hardware" claim is inherited from the probe's
+   down-chirp, not measured for this waveform.
+
+## Follow-ups, in rough priority order
+
+1. **Decide the fate of the WELCOME retry** (see Outcome above). It costs
+   ~3.15 s of airtime on essentially every join, in a half-duplex room.
+2. **`FLOOR_SETTINGS` is still 6900-7050 Hz** (`settingsPick.ts`) — the room's
+   last-resort band when no window clears −18 dB. This work established that
+   region is the worst part of a phone's response, and removed the comment
+   justifying the choice ("the handshake band already proved itself there").
+   Nothing regressed, because the fallback is only reached when the transfer
+   would fail on any band — but the better fix is probably to drop the
+   hardcoded band and use the best-scoring window even below threshold, which
+   needs its own measurement.
+3. **The streamed chatter file transmits ~2.2-2.8 dB below the old batch
+   path.** `play()` normalised every buffer to a 0.95 peak; the streaming path
+   cannot, because it never sees the whole waveform. Closing this properly
+   wants `TxEngine` to expose its deterministic transmission peak — the
+   modulator already computes `budget`, `safeScale` and a measured
+   `syncBurstPeak`. An SNR shortfall, not a wire mismatch: the receiver trains
+   its amplitude reference on the same transmission.
+   **Do not simply raise `FILE_STREAM_GAIN`** — the per-chunk clamp in
+   `playStream` runs on the raw chunk *before* the gain node, so a gain above
+   1.0 clips at the destination silently, with no clamp and no log.
+4. **`settingsPick` emits `toneStartHz = 200`, which `ofdmToneFrequencies`
+   clamps to `MIN_TONE_START_HZ` = 600.** Both ends clamp identically so
+   nothing breaks, but every negotiated band is used 400 Hz above the band that
+   was measured and chosen, with the per-tone gains applied to the wrong
+   frequencies. Predates this work.
+5. **Overlapping retry arms for one prober share a single ack-table key** with
+   no per-arm identity check, so two overlapping chains can yield 3 sends
+   rather than 2. Bounded and non-spiralling, and largely unreachable now that
+   `rollCall` replies arm no retry.
+6. **`ControlType.Bye` clears the pending ack, but the room still has no
+   dedicated ack frame** — "acknowledged" remains "any traffic from that
+   prober", which is what makes follow-up 1 a real question.
+
 ## Noticed while writing this, not fixed here
 
 `settingsPick` splits its chosen band as `pilotFreqHz = firstToneHz - 200` and
