@@ -41,7 +41,13 @@ function makeHarness(
       const due = timers.filter((x) => !x.dead && x.at <= end).sort((a, b) => a.at - b.at)[0];
       if (!due) break;
       t = due.at; due.dead = true; due.fn();
-      await Promise.resolve(); await Promise.resolve(); // drain microtasks
+      // Drain generously. A timer callback can chain several awaits before it
+      // registers its own follow-up timer — sendFileComingAndTransmit now
+      // awaits isAirBusy AND sendMessage before arming fileComingLeadMs — and
+      // each `await asyncFn()` costs two microtask turns. Too few drains here
+      // and the follow-up timer simply isn't registered yet when the loop looks
+      // for the next due one, so the chain silently stalls mid-tick.
+      for (let k = 0; k < 8; k++) await Promise.resolve();
     }
     t = end;
   };
@@ -515,7 +521,13 @@ describe('room protocol', () => {
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
 
-  it('retries a reply once when the prober never answers', async () => {
+  it('sends a joining reply twice when nothing at all is heard from the prober', async () => {
+    // NOT "retries on loss": nothing in RoomProtocol transmits in response to
+    // a WELCOME, so there is no path on which the prober answers unprompted.
+    // The ack clears only if the prober independently sends something (a fresh
+    // probe, a REPORT, a FILE_COMING, a BYE) inside the window — so in the
+    // ordinary two-device flow this second send happens every time. Asserted
+    // as the behaviour it actually is, not as loss recovery.
     const h = makeHarness(2);
     h.room.start();
     await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
@@ -527,6 +539,74 @@ describe('room protocol', () => {
     // Nothing heard back within one slot window → one more attempt.
     await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.replySlotMs + 200);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(2);
+  });
+
+  it('never arms a retry for a roll-call reply', async () => {
+    // A REPORT retry fires ~4950 ms after the roll-call probe's slot window
+    // opened, which is outside the prober's collect window (5800 ms measured
+    // from the same origin, minus the slot offsets) often enough to be a
+    // routine collision: the prober is then transmitting FILE_COMING while
+    // this device is transmitting a redundant REPORT with its own RX muted, so
+    // it never arms its receiver and the whole file goes to nobody. A REPORT's
+    // loss costs one negotiation; the retry can cost a transfer.
+    //
+    // Deliberately paired with the joining case below, which must still retry
+    // — the two purposes are the only difference between them.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.rollCall);
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    expect(h.sent.filter((m) => m.type === ControlType.Report)).toHaveLength(1);
+
+    // Well past every retry deadline, and nothing was ever heard from 9.
+    await h.tick(60000);
+    expect(h.sent.filter((m) => m.type === ControlType.Report)).toHaveLength(1);
+    expect((h.room as any).awaitingAck.size).toBe(0);
+  });
+
+  it('still arms a retry for a joining reply', async () => {
+    // The mirror of the test above: same silence, same clock, only the probe's
+    // purpose differs — so a change that stopped arming retries at all, rather
+    // than only for roll calls, fails here.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+    expect((h.room as any).awaitingAck.get(9)).toBeDefined();
+
+    await h.tick(60000);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(2);
+  });
+
+  it('does not send FILE_COMING while the air is busy — the roll call aborts with lastError', async () => {
+    // FILE_COMING was the one transmit path with no carrier sense, and it is
+    // the announcement that arms every receiver: transmitting it over someone
+    // else's burst means nobody arms, and the sender then broadcasts an entire
+    // file to a room that never listened, finishing with lastError === null.
+    // Busy air must abort visibly instead.
+    let busy = false;
+    const h = makeHarness(1, { busy: () => busy });
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+
+    h.room.sendFile(1000, 30000);
+    await h.tick(ROOM_TIMING.listenMs + 100); // carrier-sense (still quiet) + probe
+    h.room.onMessage({ type: ControlType.Report, senderId: 5, targetId: 1, payload: packReport(flatGrid) });
+
+    // Someone starts talking during the collect window — e.g. a peer that drew
+    // a late reply slot, or another device's own roll call.
+    busy = true;
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 500);
+
+    expect(h.sent.some((m) => m.type === ControlType.FileComing)).toBe(false);
+    expect(h.calls).not.toContain('fileTx');
+    expect(h.room.state).toBe('idle');
+    expect(h.room.lastError).toMatch(/busy/i);
   });
 
   it('stops after two attempts', async () => {
@@ -611,17 +691,19 @@ describe('room protocol', () => {
 
   it('does not retry once the prober is heard from via a WELCOME', async () => {
     // Mirror of "does not retry once the prober is heard from" (which covers
-    // handleReport), for handleWelcome: a peer that answers our roll-call
-    // probe with a WELCOME instead of a REPORT (inference mismatch, older
-    // build — handleWelcome already tolerates this) is still proof the link
-    // works and must clear the pending ack.
+    // handleReport), for handleWelcome. The reply we owe must be a WELCOME —
+    // a REPORT arms no ack at all now (see 'never arms a retry for a roll-call
+    // reply'), so pinning handleWelcome's clear on a roll-call reply would be
+    // vacuous. Two devices joining within a few seconds of each other is the
+    // real case: we welcome 9, and 9's own WELCOME to us is proof the link
+    // works even though it is not a response to ours.
     const h = makeHarness(2);
     h.room.start();
     await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
 
-    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.rollCall); // we owe a REPORT
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining); // we owe a WELCOME
     await h.tick(ROOM_TIMING.replySlotMs + 100);
-    expect(h.sent.filter((m) => m.type === ControlType.Report)).toHaveLength(1);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
 
     h.room.onMessage({
       type: ControlType.Welcome,
@@ -630,7 +712,55 @@ describe('room protocol', () => {
       payload: packWelcome({ claim: { lowHz: 1500, highHz: 7800, maxQamOrder: 6 }, grid: flatGrid }),
     });
     await h.tick(60000);
-    expect(h.sent.filter((m) => m.type === ControlType.Report)).toHaveLength(1);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+  });
+
+  it('a BYE from the prober clears the pending ack', async () => {
+    // awaitingAck's invariant is "anything at all heard from that prober"
+    // clears it, and a BYE is traffic from that prober. Without this, a peer
+    // that heard our WELCOME and then left still earned a ~3 s retransmission
+    // aimed at a device that has announced it is gone.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+
+    h.room.onMessage({ type: ControlType.Bye, senderId: 9, targetId: 0, payload: new Uint8Array(0) });
+    await h.tick(60000);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+  });
+
+  it('a FILE_COMING from the prober clears the pending ack', async () => {
+    // The one that matters most: without it a receiver holds a pending ack
+    // across an ENTIRE transfer, and the retry timer fires the moment the
+    // transfer's own deadline drops it back to idle — long after the WELCOME
+    // could still be useful, and while the sender may still be finishing.
+    // Cleared ahead of handleFileComing's own state/address guards, so it
+    // holds even for a transfer we are not the addressee of.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+
+    // Addressed to a third device (7), so we neither arm RX nor leave idle.
+    h.room.onMessage({
+      type: ControlType.FileComing,
+      senderId: 9,
+      targetId: 7,
+      payload: packFileComing({
+        pilotFreqHz: 2000, toneStartHz: 600, toneCount: 8,
+        settleSymbols: 8, fileBytes: 100, durationMs: 4000,
+      }),
+    });
+    expect(h.room.state).toBe('idle');
+    await h.tick(60000);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
 
   it('a fresh probe clears the pending ack, so a stale retry timer does not fire a redundant send', async () => {

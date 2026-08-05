@@ -79,15 +79,24 @@ function makeClock() {
     timers.push(rec);
     return () => { rec.dead = true; };
   };
+  const drain = async (): Promise<void> => {
+    // Generous on purpose: a timer callback can chain several awaits before it
+    // registers its own follow-up timer (sendFileComingAndTransmit awaits
+    // isAirBusy AND sendMessage before arming fileComingLeadMs), and each
+    // `await asyncFn()` costs two microtask turns. Under-draining leaves the
+    // follow-up timer unregistered when the loop below looks for the next due
+    // one, stalling the chain mid-tick.
+    for (let k = 0; k < 8; k++) await Promise.resolve();
+  };
   const tick = async (ms: number) => {
     const end = t + ms;
     for (;;) {
-      await Promise.resolve(); await Promise.resolve();
+      await drain();
       const due = timers.filter((x) => !x.dead && x.at <= end).sort((a, b) => a.at - b.at)[0];
       if (!due) break;
       t = due.at; due.dead = true; due.fn();
     }
-    await Promise.resolve(); await Promise.resolve();
+    await drain();
     t = end;
   };
   return { now, schedule, tick };

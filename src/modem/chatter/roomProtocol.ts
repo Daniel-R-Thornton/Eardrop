@@ -20,8 +20,8 @@
  *
  *   idle --sendFile()--> listening --(quiet)--> rollCall --> collecting
  *     ^                                                          |
- *     |                                              reports==0  |  reports>0
- *     +---------------------- lastError set <--------------------+
+ *     |                                 reports==0 / air busy  |  reports>0,
+ *     +---------------------- lastError set <--------------------+  air quiet
  *     |                                                          |
  *     |                                        FILE_COMING sent, wait
  *     |                                        fileComingLeadMs, startFileTx
@@ -42,7 +42,9 @@
  * 'joinWait'), so it gates on membership in `awaitingAck` instead — cleared
  * by any contact from the prober, and by `stop()`/the cold error path
  * alongside `replyQueue.clear()` — which is the same "stale timer is a
- * no-op" property, just keyed on the map rather than on `this.state`.
+ * no-op" property, just keyed on the map rather than on `this.state`. Only
+ * 'joining'-purpose replies ever arm that timer at all — see armReplyAck for
+ * why a roll-call reply must never be retried.
  *
  * `listening` is shared by both carrier-sense phases (join and roll-call) —
  * carrier sense is carrier sense regardless of what comes after it.
@@ -137,10 +139,17 @@ const DEFAULT_CLAIM: BestRangeClaim = { lowHz: 1500, highHz: 7800, maxQamOrder: 
  *  last frame's tail and any scheduling jitter. */
 const TRANSFER_TAIL_MARGIN_MS = 5000;
 
-/** Total sends per owed reply, including the first. A lost WELCOME leaves the
- *  joiner believing the room is empty, so one retry is worth roughly two
- *  seconds of extra airtime; more than that just makes a genuinely deaf peer
- *  expensive for everyone else. */
+/** Total sends per owed WELCOME, including the first (a REPORT is never
+ *  retried — see armReplyAck). A lost WELCOME leaves the joiner believing the
+ *  room is empty, so one retry is worth roughly two seconds of extra airtime;
+ *  more than that just makes a genuinely deaf peer expensive for everyone
+ *  else.
+ *
+ *  Note what this is NOT: a retry-on-loss. Nothing in this class transmits in
+ *  response to a WELCOME, so a joiner that heard us perfectly stays silent
+ *  and the ack only clears if it happens to send something of its own (a
+ *  fresh probe, a roll call, a FILE_COMING, a BYE) inside the window. In the
+ *  ordinary two-device flow the second send therefore happens every time. */
 const MAX_REPLY_ATTEMPTS = 2;
 
 interface PendingFile {
@@ -203,9 +212,15 @@ export class RoomProtocol {
    * Replies transmitted but not yet known to have landed, keyed by prober id.
    *
    * "Acknowledged" is deliberately loose: anything at all heard from that
-   * prober (a fresh probe, a REPORT, a WELCOME) proves the link works in the
-   * direction that matters, and the room has no dedicated ack frame. Entries
-   * that age out without any of that are re-queued once.
+   * prober (a fresh probe, a REPORT, a WELCOME, a FILE_COMING, a BYE) proves
+   * the link works in the direction that matters, and the room has no
+   * dedicated ack frame. Entries that age out without any of that are
+   * re-queued once.
+   *
+   * None of those is a RESPONSE to the reply, though — this class transmits
+   * nothing on receiving a WELCOME or a REPORT — so an entry aging out means
+   * "the prober happened to stay quiet", not "the reply was lost". See
+   * MAX_REPLY_ATTEMPTS.
    */
   private readonly awaitingAck = new Map<number, PendingReply>();
 
@@ -301,6 +316,12 @@ export class RoomProtocol {
         break;
       case ControlType.Bye:
         // Member aging is the UI's problem — protocol never evicts.
+        //
+        // It IS traffic from that sender, though, so it clears any reply we
+        // were still waiting to see acknowledged (see awaitingAck): a peer
+        // that heard our WELCOME and then left must not still earn a ~3 s
+        // retransmission aimed at a device that has announced it is gone.
+        this.awaitingAck.delete(msg.senderId);
         break;
     }
   }
@@ -382,6 +403,14 @@ export class RoomProtocol {
   }
 
   private handleFileComing(msg: ControlMessage): void {
+    // Ack-clearing FIRST, ahead of both guards below: a FILE_COMING is traffic
+    // from that sender whether or not we are in a state that can act on it and
+    // whether or not it is addressed to us (see awaitingAck). Deferring it
+    // past the guards is what let a receiver hold a pending ack across an
+    // entire transfer — the retry timer would then fire the moment the
+    // transfer's own deadline dropped us back to idle, long after the reply
+    // could still matter.
+    this.awaitingAck.delete(msg.senderId);
     if (this._state !== 'idle' && this._state !== 'joinWait') return;
     // Addressed transfers: everyone in earshot demodulates this announcement,
     // but only the addressee acts on it. Without the check every device would
@@ -497,6 +526,31 @@ export class RoomProtocol {
     if (!fileParams) return; // stop() cleared it mid-flight
 
     try {
+      // Carrier-sense before the announcement — the same deps.isAirBusy()
+      // idiom every reply uses (see scheduleReply). This was the only transmit
+      // path in the machine without it, and it is the path that can least
+      // afford a collision: FILE_COMING is what arms every receiver, so a peer
+      // still transmitting over it hears nothing, arms nothing, and stays out
+      // of bandHandshake mode while we broadcast an entire file to a room that
+      // never listened — and its burst corrupts the announcement for every
+      // other member too. `lastError` stayed null throughout, so the send read
+      // as successful.
+      //
+      // Busy air ABORTS the roll call rather than waiting. A bounded wait
+      // would need a fresh deadline inside a window that has already expired
+      // (collectExtraMs is spent by the time finishRollCall runs) and would
+      // leave the collected reports aging while it ran; a retry chain is the
+      // very mechanism that produced this collision (see armReplyAck). An
+      // abort with lastError set is a failure the operator can see and act on
+      // — "the channel was busy, send it again" — which is the whole point.
+      if (await this.deps.isAirBusy()) {
+        this._lastError = 'file send aborted: channel busy when FILE_COMING was due';
+        this.activeFileParams = null;
+        this.finishToIdle();
+        return;
+      }
+      if (this._state !== 'collecting') return; // stale guard (e.g. stop() mid-await)
+
       await this.deps.sendMessage({
         type: ControlType.FileComing,
         senderId: this.deps.deviceId,
@@ -637,9 +691,38 @@ export class RoomProtocol {
     });
   }
 
-  /** Watch for an answer from `entry.proberId`; re-queue the reply once if
-   *  none arrives within a slot window. */
+  /**
+   * Watch for traffic from `entry.proberId`; re-queue the reply once if none
+   * arrives within a slot window. Only 'joining'-purpose replies (WELCOMEs)
+   * are ever watched — see below.
+   *
+   * Note this is not a retry-on-loss: nothing here transmits in response to a
+   * WELCOME, so a prober that heard us perfectly is silent and the second send
+   * happens anyway. See MAX_REPLY_ATTEMPTS and awaitingAck.
+   */
   private armReplyAck(entry: PendingReply): void {
+    // NEVER retry a roll-call reply. This is structural, not a tuning choice.
+    //
+    // ROOM_TIMING.collectExtraMs (4000) is sized so that one reply drawing the
+    // LAST slot still finishes INSIDE the prober's collect window: the last
+    // slot opens at 1500 ms, a control message is ~3.15 s of audio, worst case
+    // ends at 4650 ms inside a 5800 ms window. A retry fires one slot window
+    // (1800 ms) after the FIRST SEND COMPLETED — roughly s + 4950 + r ms for
+    // slot offsets s and r — which is structurally outside that window.
+    // Whenever s + r < 850 ms (6 of 36 equally likely slot pairs) the retry is
+    // still in the air when the prober's collect deadline expires and it
+    // announces FILE_COMING: our RX is muted for our own playback, so we never
+    // demodulate the announcement, never arm the receiver, and the sender
+    // broadcasts the whole file to nobody — while our burst also corrupts that
+    // announcement for every other member.
+    //
+    // A lost REPORT costs this peer inclusion in ONE negotiation, not its
+    // membership, and the prober is about to seize the channel anyway. So the
+    // retry has nothing to win there and an entire transfer to lose. A lost
+    // WELCOME is the opposite: it leaves the joiner believing the room is
+    // empty, with nothing about to reveal otherwise.
+    if (entry.purpose === PROBE_PURPOSE.rollCall) return;
+
     const attempts = entry.attempts + 1;
     if (attempts >= MAX_REPLY_ATTEMPTS) return;
 
