@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { RoomProtocol, ROOM_TIMING } from '../chatter/roomProtocol';
-import { ControlType, packReport, packWelcome, packFileComing } from '../protocol/controlFrame';
+import {
+  ControlType, packReport, packWelcome, packFileComing,
+  packText, packAck, parseText, parseAck, TEXT_MAX_BYTES,
+} from '../protocol/controlFrame';
 import { PROBE_PURPOSE } from '../protocol/probeBurst';
 
 /** Manual clock + timer wheel so every test is deterministic. */
@@ -18,6 +21,8 @@ function makeHarness(
   const timers: { at: number; fn: () => void; dead: boolean }[] = [];
   const sent: any[] = [];
   const calls: string[] = [];
+  const textReceived: any[] = [];
+  const textAcked: any[] = [];
   const deps = {
     deviceId,
     now: () => t,
@@ -32,6 +37,8 @@ function makeHarness(
     isAirBusy: opts.isAirBusy ?? (async () => opts.busy?.() ?? false),
     startFileTx: () => calls.push('fileTx'),
     armFileRx: () => calls.push('fileRx'),
+    onTextReceived: (msg: any) => textReceived.push(msg),
+    onTextAcked: (msgId: number, byDeviceId: number) => textAcked.push({ msgId, by: byDeviceId }),
   };
   const room = new RoomProtocol(deps as any);
   /** advance the clock, firing due timers in order */
@@ -51,7 +58,9 @@ function makeHarness(
     }
     t = end;
   };
-  return { room, tick, sent, calls };
+  return {
+    room, tick, sent, calls, textReceived, textAcked,
+  };
 }
 
 const flatGrid = Array.from({ length: 64 }, () => 1);
@@ -812,5 +821,104 @@ describe('room protocol', () => {
     busy = false;
     await h.tick(2000);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+  });
+
+  it('sends a broadcast TEXT from idle', async () => {
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    const msgId = h.room.sendText('hello room');
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    const sent = h.sent.find((m) => m.type === ControlType.Text);
+    expect(sent).toBeDefined();
+    expect(sent.targetId).toBe(0);
+    expect(parseText(sent.payload)).toEqual({ msgId, text: 'hello room' });
+  });
+
+  it('addresses a DM to one device', async () => {
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.sendText('just you', 7);
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    expect(h.sent.find((m) => m.type === ControlType.Text).targetId).toBe(7);
+  });
+
+  it('rejects text over the byte cap', () => {
+    const h = makeHarness(1);
+    expect(() => h.room.sendText('x'.repeat(TEXT_MAX_BYTES + 1))).toThrow(/cap|exceeds/i);
+  });
+
+  it('a received broadcast TEXT is delivered and ACKed exactly once', async () => {
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.onMessage({
+      type: ControlType.Text, senderId: 9, targetId: 0, payload: packText(3, 'hi all'),
+    });
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+
+    expect(h.textReceived).toEqual([{ msgId: 3, senderId: 9, targetId: 0, text: 'hi all' }]);
+    const acks = h.sent.filter((m) => m.type === ControlType.Ack);
+    expect(acks).toHaveLength(1);
+    expect(acks[0].targetId).toBe(9);
+    expect(parseAck(acks[0].payload)).toEqual({ msgId: 3 });
+  });
+
+  it('a duplicate (senderId, msgId) is neither re-delivered nor re-ACKed', async () => {
+    // A retried TEXT arrives twice. The receiver must show it once and must
+    // still ACK it once — the sender is retrying because it heard no ACK, so
+    // a second ACK is not wrong, but a second delivery to the UI is.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    const dup = { type: ControlType.Text, senderId: 9, targetId: 0, payload: packText(3, 'hi all') };
+    h.room.onMessage(dup);
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    h.room.onMessage(dup);
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+
+    expect(h.textReceived).toHaveLength(1);
+  });
+
+  it('ignores a DM addressed to someone else', async () => {
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.onMessage({
+      type: ControlType.Text, senderId: 9, targetId: 5, payload: packText(4, 'not for you'),
+    });
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    expect(h.textReceived).toHaveLength(0);
+    expect(h.sent.filter((m) => m.type === ControlType.Ack)).toHaveLength(0);
+  });
+
+  it('a received ACK reports the acking device', async () => {
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    const msgId = h.room.sendText('hello');
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    h.room.onMessage({ type: ControlType.Ack, senderId: 8, targetId: 1, payload: packAck(msgId) });
+    expect(h.textAcked).toEqual([{ msgId, by: 8 }]);
+  });
+
+  it('a TEXT queued while receiving is held, then sent on return to idle', async () => {
+    const h = makeHarness(3);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.onMessage({
+      type: ControlType.FileComing, senderId: 8, targetId: 0,
+      payload: packFileComing({ pilotFreqHz: 6300, toneStartHz: 600, toneCount: 32, settleSymbols: 16, fileBytes: 100, durationMs: 2000 }),
+    });
+    expect(h.room.state).toBe('receiving');
+
+    h.room.sendText('during a transfer');
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(0);
+
+    await h.tick(2000 + 5000 + ROOM_TIMING.replySlotMs + 300);
+    expect(h.room.state).toBe('idle');
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(1);
   });
 });

@@ -65,9 +65,15 @@ import {
   packWelcome,
   packReport,
   packFileComing,
+  packText,
+  packAck,
   parseWelcome,
   parseReport,
   parseFileComing,
+  parseText,
+  parseAck,
+  textByteLength,
+  TEXT_MAX_BYTES,
   type ControlMessage,
   type BestRangeClaim,
   type FileComingPayload,
@@ -110,6 +116,13 @@ export interface RoomDeps {
   /** Arm the receive path (HandshakeReceiver) for an incoming transfer. */
   armFileRx(info: FileComingPayload): void;
   onStateChange?(state: RoomState, members: Member[]): void;
+  /** Display-only: a TEXT was delivered to the UI. Never read by a protocol
+   *  decision — the ACK is sent regardless of whether this is wired up. */
+  onTextReceived?(msg: { msgId: number; senderId: number; targetId: number; text: string }): void;
+  /** Display-only: an ACK for a message this device sent came back. Never
+   *  read by a protocol decision (no retry/delivery-state tracking lives here
+   *  yet — see the follow-up task). */
+  onTextAcked?(msgId: number, byDeviceId: number): void;
 }
 
 export const ROOM_TIMING = {
@@ -157,6 +170,11 @@ const TRANSFER_TAIL_MARGIN_MS = 5000;
  *  fresh probe, a roll call, a FILE_COMING, a BYE) inside the window. In the
  *  ordinary two-device flow the second send therefore happens every time. */
 const MAX_REPLY_ATTEMPTS = 2;
+
+/** Bound on the received-TEXT dedup set (see `seenText`), not an LRU cache.
+ *  msgId wraps at 256, so 128 also caps how far back a wrap could collide;
+ *  an unbounded set would otherwise grow for the whole session. */
+const SEEN_TEXT_MAX = 128;
 
 interface PendingFile {
   fileBytes: number;
@@ -238,6 +256,14 @@ export class RoomProtocol {
    * MAX_REPLY_ATTEMPTS.
    */
   private readonly awaitingAck = new Map<number, PendingAck>();
+  /** Next msgId this device will assign to an outgoing TEXT. Wraps at 256 —
+   *  see packText's doc comment for why the receiver dedupes on
+   *  (senderId, msgId) rather than treating it as globally unique. */
+  private nextMsgId = 0;
+  /** Recently delivered (senderId:msgId) keys, newest last, bounded so a long
+   *  session cannot grow it without limit. msgId wraps at 256, so the bound
+   *  also caps how far back a wrap could collide. */
+  private readonly seenText: Set<string> = new Set();
 
   constructor(private readonly deps: RoomDeps) {
     this.outbox = new Outbox({
@@ -297,6 +323,7 @@ export class RoomProtocol {
     this.outbox.clear();
     this.replyPurpose.clear();
     this.awaitingAck.clear();
+    this.seenText.clear();
     this.setState('cold');
   }
 
@@ -308,6 +335,35 @@ export class RoomProtocol {
       return;
     }
     this.beginRollCall({ fileBytes, durationMs, targetId });
+  }
+
+  /**
+   * Queue a text message. `targetId` 0 broadcasts to the room; anything else
+   * addresses one device — the air carries it either way, so this only
+   * decides who ACTS on it, exactly as an addressed file transfer does.
+   *
+   * Returns the assigned msgId so the caller can track delivery. Throws on
+   * over-long text rather than truncating: cutting UTF-8 at a byte boundary
+   * can split a codepoint, and encodeControlMessage would reject the
+   * oversized payload anyway. Callers check `textByteLength` first.
+   */
+  sendText(text: string, targetId = 0): number {
+    if (textByteLength(text) > TEXT_MAX_BYTES) {
+      throw new Error(`room: text ${textByteLength(text)} B exceeds ${TEXT_MAX_BYTES} B cap`);
+    }
+    const msgId = this.nextMsgId;
+    this.nextMsgId = (this.nextMsgId + 1) & 0xff;
+    const payload = packText(msgId, text);
+    this.outbox.enqueue({
+      kind: 'text',
+      targetId,
+      dedupKey: `text:${msgId}`,
+      build: () => ({
+        type: ControlType.Text, senderId: this.deps.deviceId, targetId, payload,
+      }),
+    });
+    this.outbox.drain();
+    return msgId;
   }
 
   /** worker heard a probe: id + measured grid + what it announced */
@@ -356,6 +412,12 @@ export class RoomProtocol {
         break;
       case ControlType.FileComing:
         this.handleFileComing(msg);
+        break;
+      case ControlType.Text:
+        this.handleText(msg);
+        break;
+      case ControlType.Ack:
+        this.handleAck(msg);
         break;
       case ControlType.Bye:
         // Member aging is the UI's problem — protocol never evicts.
@@ -474,6 +536,64 @@ export class RoomProtocol {
       if (this._state !== 'receiving') return;
       this.finishToIdle();
     });
+  }
+
+  /** Received text: deliver once, then owe the sender an ACK. */
+  private handleText(msg: ControlMessage): void {
+    // Everyone in earshot demodulates a DM; only the addressee acts on it.
+    // 0 is the broadcast address, same convention as FILE_COMING.
+    if (msg.targetId !== 0 && msg.targetId !== this.deps.deviceId) return;
+    const parsed = parseText(msg.payload);
+    if (!parsed) return;
+
+    // Contact from this peer, so any reply we were waiting to see acked is
+    // acked (see awaitingAck).
+    this.awaitingAck.delete(msg.senderId);
+
+    const key = `${msg.senderId}:${parsed.msgId}`;
+    const fresh = !this.seenText.has(key);
+    if (fresh) {
+      this.rememberText(key);
+      this.deps.onTextReceived?.({
+        msgId: parsed.msgId, senderId: msg.senderId, targetId: msg.targetId, text: parsed.text,
+      });
+    }
+
+    // ACK even a duplicate: a repeat means the sender heard no ACK, so
+    // staying silent guarantees it retries again. Only the UI delivery is
+    // deduped. dedupKey collapses two ACKs for the same message into one.
+    this.outbox.enqueue({
+      kind: 'ack',
+      targetId: msg.senderId,
+      dedupKey: `ack:${msg.senderId}:${parsed.msgId}`,
+      build: () => ({
+        type: ControlType.Ack,
+        senderId: this.deps.deviceId,
+        targetId: msg.senderId,
+        payload: packAck(parsed.msgId),
+      }),
+    });
+    this.outbox.drain();
+  }
+
+  private handleAck(msg: ControlMessage): void {
+    if (msg.targetId !== this.deps.deviceId) return;
+    const parsed = parseAck(msg.payload);
+    if (!parsed) return;
+    this.awaitingAck.delete(msg.senderId);
+    this.deps.onTextAcked?.(parsed.msgId, msg.senderId);
+  }
+
+  /** Record a delivered (senderId:msgId) key, evicting the oldest insertion
+   *  once the bound is exceeded. Not an LRU: re-adding an existing key does
+   *  not refresh its position — the goal is bounding memory and the msgId-wrap
+   *  collision window, not tracking recency. */
+  private rememberText(key: string): void {
+    this.seenText.add(key);
+    if (this.seenText.size > SEEN_TEXT_MAX) {
+      const oldest = this.seenText.values().next().value as string | undefined;
+      if (oldest !== undefined) this.seenText.delete(oldest);
+    }
   }
 
   // ---- join / roll-call carrier-sense (shared 'listening' state) ----
