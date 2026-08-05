@@ -8,7 +8,7 @@ const base: ChatMessage = {
   seq: 1, msgId: 3, senderId: 1, targetId: 0, text: 'hello room',
   tMs: 1000, dir: 'tx', ackedBy: [], state: 'sending',
 };
-const props = { ownDeviceId: 1, roomState: 'idle', nowMs: 5000, onResend: () => {} };
+const props = { roomState: 'idle', nowMs: 5000, onResend: () => {} };
 
 describe('ChatMessageList', () => {
   // vitest.config.ts has no test.globals, so RTL's automatic afterEach(cleanup)

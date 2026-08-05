@@ -1,16 +1,28 @@
 /**
  * RoomMode.tsx — full-screen "room mode": the chatter room, presentation-
- * style. Centrepiece is a hand-drawn constellation graph (this device at
- * the centre, each detected member placed around it by link quality), a live
- * packet stream, and a per-node spectrum sparkline. Mirrors the layout idiom
- * of PresentationMode.tsx (header with an onExit "back to bench" button,
- * beige panel sections) but reads only from the Store + dispatches the same
- * join/leave events ChatterPanel already uses — no protocol logic here.
+ * style. Centrepiece is a hand-drawn constellation graph (this device at the
+ * centre, each detected member placed around it by link quality); below it the
+ * two actions that put something on the air, the roster, a per-node spectrum
+ * sparkline, a live packet stream, and the room's chat. Reads only from the
+ * Store and dispatches the same custom events ChatterPanel already uses —
+ * join/leave, file selection, and now chat text — so no protocol logic lives
+ * here.
+ *
+ * ONE VERTICAL COLUMN, at every width. This was a two-column grid with a fixed
+ * 340px track, which on a 390px phone left the graph about 50px — and this mode
+ * is largely driven from a phone, since that is what gets carried to the other
+ * side of the room. A single column is responsive by construction: there is no
+ * second layout tree to keep in step, and no fixed track to overrun. Width is
+ * read once, via isWideViewport(), only to decide whether the debug sections
+ * (roster/spectrum/packets) start open; after that the operator's toggles own
+ * them and nothing re-reads it.
  *
  * The graph and spectrum canvases are sized from their container via
- * ResizeObserver (see useMeasuredSize below), not hardcoded pixels, so the
- * graph is a genuine hero at any viewport width and the mode fills the
- * screen instead of stranding a small canvas in a sea of empty panel.
+ * ResizeObserver (see useMeasuredSize below), not hardcoded pixels. That is why
+ * CollapsibleSection unmounts its children when shut rather than hiding them:
+ * a canvas left mounted inside a zero-height box measures zero and never
+ * recovers when reopened, whereas an unmounted one re-measures cleanly on the
+ * way back in.
  */
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type RefObject } from 'react';
 import { useStore } from '../Store';
@@ -19,6 +31,10 @@ import { Screen } from '../components/instrument/Screen';
 import { PacketStream } from './RoomModePacketStream';
 import { hex, formatAgo } from './roomModeFormat';
 import { LogShare } from './LogShare';
+import { CollapsibleSection } from './CollapsibleSection';
+import { ChatMessageList } from './ChatMessageList';
+import { ChatComposer } from './ChatComposer';
+import { isWideViewport } from './viewport';
 import { dlog } from '../../lib/debug/dlog';
 
 const dispatch = (type: string) => window.dispatchEvent(new CustomEvent(type));
@@ -151,15 +167,27 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
   /** True while a file is being dragged over the mode — drives the drop overlay. */
   const [dragging, setDragging] = useState(false);
   /**
-   * Who the next chosen file is addressed to: 0 for the whole room. Set by a
-   * node's "send file to" button just before the picker opens, and cleared
-   * once the file is handed off, so a later drag-and-drop is a broadcast again
-   * rather than silently inheriting the last node clicked.
+   * Who the next thing sent is addressed to: 0 for the whole room. Owned by the
+   * composer's recipient picker, so text and files are addressed in one place.
+   * A drag-and-drop still passes 0 explicitly — a drop on the whole mode is a
+   * broadcast and must not silently inherit whatever the picker was left on.
    */
   const [sendTargetId, setSendTargetId] = useState(0);
   /** Session-log viewer — room mode is full-screen, and on a phone this is the
    *  only way to read what the radio actually did. */
   const [showLog, setShowLog] = useState(false);
+
+  // Debug panels start open on a desktop-width viewport and shut on a phone,
+  // then the operator's toggles own them. isWideViewport is read ONCE here for
+  // that seed — the layout itself is one column at every width, so nothing
+  // re-reads it (see viewport.ts). The graph starts open regardless: it is the
+  // view's centrepiece, and a room page that opens showing nothing but a
+  // collapsed strip and a chat box hides what the mode is for.
+  const wide = isWideViewport();
+  const [graphOpen, setGraphOpen] = useState(true);
+  const [rosterOpen, setRosterOpen] = useState(wide);
+  const [spectrumOpen, setSpectrumOpen] = useState(wide);
+  const [packetsOpen, setPacketsOpen] = useState(wide);
 
   // Quiet the modem's per-symbol logging for as long as this mode is on
   // screen, so the room's own lines are readable in the console. Restored on
@@ -241,6 +269,15 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
   const now = performance.now();
   const members = s.chatterMembers;
   const focusMember = members.find((m) => m.deviceId === focusId) ?? null;
+
+  // A node the operator addressed can age out of the roster while selected.
+  // Fall back to the room rather than leaving a target that no longer exists —
+  // same discipline the file path already uses when it resets to 0 after a send.
+  useEffect(() => {
+    if (sendTargetId !== 0 && !members.some((m) => m.deviceId === sendTargetId)) {
+      setSendTargetId(0);
+    }
+  }, [members, sendTargetId]);
 
   // Per-node geometry (angle, radius, strength) depends only on deviceId /
   // linkDb — genuinely cheap arithmetic, not worth memoizing against `now`
@@ -386,6 +423,16 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
       color: active ? color : T.panelInk,
     };
   };
+  /** The two primary actions. `flex: 1 1 0` so they split the width evenly
+   *  whatever their labels say, and minHeight 44 because this page is driven
+   *  with a thumb — the same touch floor CollapsibleSection and ChatComposer
+   *  use for their controls. */
+  const actionBtn: CSSProperties = {
+    fontFamily: T.mono, fontSize: 12, letterSpacing: 1, minHeight: 44,
+    flex: '1 1 0', cursor: 'pointer',
+    border: `1px solid ${T.panelEdge}`, borderRadius: T.radius,
+    background: T.panel, color: T.panelInk,
+  };
   const panel = (highlight = false): CSSProperties => ({
     background: T.panel,
     border: `1px solid ${highlight ? T.phosphor : T.panelEdge}`,
@@ -427,6 +474,19 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
     setSendTargetId(0); // next file is a broadcast unless a node is chosen again
   };
 
+  /** Dispatch a chat message the same way a chosen file is dispatched — as an
+   *  event app.ts routes, so this view keeps no protocol logic. Unlike a file,
+   *  the target is NOT reset afterwards: a conversation with one node is a
+   *  run of messages, and clearing the picker after each would make every
+   *  follow-up an accidental broadcast. */
+  const sendText = (text: string) => {
+    setLocalNotice(null);
+    dlog('UI', { textSend: text.length, to: sendTargetId || 'broadcast' }, { level: 'warn' });
+    window.dispatchEvent(new CustomEvent('eardrop-chatter-text', {
+      detail: { text, targetId: sendTargetId },
+    }));
+  };
+
   return (
     // Room mode replaces the whole bench, TxPanel's drop zone included — so
     // the mode itself has to accept files, or the "drop a file" affordance is
@@ -466,21 +526,10 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
           }}>
             {s.chatterOn ? s.chatterState.toUpperCase() : 'OFF'}
           </span>
-          <button
-            style={btn(pending !== null ? true : !s.chatterOn, pending !== null ? 'amber' : 'phosphor')}
-            disabled={pending !== null}
-            onClick={() => {
-              // User actions belong in the log: without them a dump shows the
-              // radio reacting to nothing, and there is no way to tell a
-              // protocol that never started from one that started and failed.
-              dlog('UI', { pressed: s.chatterOn ? 'leave' : 'join' }, { level: 'warn' });
-              setPending(s.chatterOn ? 'leave' : 'join');
-              setLocalNotice(null);
-              dispatch(s.chatterOn ? 'eardrop-chatter-leave' : 'eardrop-chatter-join');
-            }}
-          >
-            {joinLeaveLabel}
-          </button>
+          {/* Join/Leave lives in the action row further down, not up here:
+              it is one of the two things that put something on the air, and it
+              belongs at a thumb-sized target next to "send file" rather than
+              squeezed into a header beside two navigation buttons. */}
           <button onClick={() => setShowLog(true)} style={btn(false)}>▤ log</button>
           <button onClick={onExit} style={btn(false)}>← back to bench</button>
         </div>
@@ -510,16 +559,17 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
         </div>
       )}
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 340px', gap: 12, flex: '1 1 auto', minHeight: 0 }}>
-        {/* left column: the graph (hero) + spectrum */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0, height: '100%' }}>
-          <div style={{ ...panel(true), flex: '1 1 70%', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6, flex: '0 0 auto' }}>
-              <span style={title as CSSProperties}>NODE GRAPH — {s.chatterOn ? `this device is ${hex(s.chatterDeviceId)}` : 'not joined'}</span>
-              <span style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk, opacity: 0.7 }}>
-                {members.length} node{members.length === 1 ? '' : 's'} detected
-              </span>
-            </div>
+      {/* One vertical column at every width — see the file header for why. */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: '1 1 auto', minHeight: 0 }}>
+        {/* Graph — flexes when open so it takes whatever slack a phone gives
+         *  it, and shrinks to its header strip when shut. */}
+        <div style={{ display: 'flex', flexDirection: 'column', flex: graphOpen ? '1 1 auto' : '0 0 auto', minHeight: 0 }}>
+          <CollapsibleSection
+            title={`NODE GRAPH — ${s.chatterOn ? `this device is ${hex(s.chatterDeviceId)}` : 'not joined'}`}
+            summary={`${members.length} node${members.length === 1 ? '' : 's'}`}
+            open={graphOpen}
+            onToggle={() => setGraphOpen((v) => !v)}
+          >
             {/* basis 0, not auto: the box's height must come from the flex
              *  line alone, never from what it contains. */}
             <div ref={graphBoxRef} style={{ position: 'relative', flex: '1 1 0', minHeight: 220 }}>
@@ -543,8 +593,13 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
                           onMouseEnter={() => setHoveredId(n.m.deviceId)}
                           onMouseLeave={() => setHoveredId((h2) => (h2 === n.m.deviceId ? null : h2))}
                           onClick={() => setSelectedId((sel) => (sel === n.m.deviceId ? null : n.m.deviceId))}
+                          // 44px, not the 24px this started as: a node is
+                          // selected with a thumb on a phone, and 24px is well
+                          // under a comfortable touch target. The offsets are
+                          // half the size so the circle stays centred on the
+                          // node the canvas drew at the same (x, y).
                           style={{
-                            position: 'absolute', left: x - 12, top: y - 12, width: 24, height: 24,
+                            position: 'absolute', left: x - 22, top: y - 22, width: 44, height: 44,
                             borderRadius: '50%', pointerEvents: 'auto', cursor: 'pointer',
                           }}
                           title={`${hex(n.m.deviceId)} · ${formatAgo(n.ageMs)}${n.m.linkDb !== undefined ? ` · ${n.m.linkDb.toFixed(0)}dB` : ''}`}
@@ -555,13 +610,90 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
                 </>
               )}
             </div>
-          </div>
+          </CollapsibleSection>
+        </div>
 
-          <div style={{ ...panel(false), flex: '0 0 180px', display: 'flex', flexDirection: 'column' }}>
-            <div style={{ ...title, flex: '0 0 auto' }}>
-              SPECTRUM {focusMember ? `— node ${hex(focusMember.deviceId)}` : ''}
-            </div>
-            <div ref={spectrumBoxRef} style={{ position: 'relative', flex: '1 1 0', minHeight: 60 }}>
+        {/* The two actions that put something on the air. */}
+        <div style={{ display: 'flex', gap: 8, flex: '0 0 auto' }}>
+          <button
+            type="button"
+            style={actionBtn}
+            onClick={() => document.getElementById('roommode-file')?.click()}
+          >
+            send file
+          </button>
+          <button
+            type="button"
+            style={actionBtn}
+            disabled={pending !== null}
+            onClick={() => {
+              // User actions belong in the log: without them a dump shows the
+              // radio reacting to nothing, and there is no way to tell a
+              // protocol that never started from one that started and failed.
+              dlog('UI', { pressed: s.chatterOn ? 'leave' : 'join' }, { level: 'warn' });
+              setPending(s.chatterOn ? 'leave' : 'join');
+              setLocalNotice(null);
+              dispatch(s.chatterOn ? 'eardrop-chatter-leave' : 'eardrop-chatter-join');
+            }}
+          >
+            {joinLeaveLabel}
+          </button>
+        </div>
+
+        <CollapsibleSection
+          title="ROSTER"
+          summary={`${members.length} nodes`}
+          open={rosterOpen}
+          onToggle={() => setRosterOpen((v) => !v)}
+        >
+          <div style={{ ...panel(false), overflowY: 'auto', minHeight: 0, maxHeight: 200 }}>
+            {!s.chatterOn && (
+              <div style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk, opacity: 0.6 }}>
+                Join the room to see who else is around.
+              </div>
+            )}
+            {s.chatterOn && members.length === 0 && (
+              <div style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk, opacity: 0.6 }}>
+                (no other members heard yet)
+              </div>
+            )}
+            {s.chatterOn && members.length > 0 && (
+              // No per-node "send file to" button any more: the composer's
+              // recipient picker addresses files and text alike, so a second
+              // way to choose a target would be a second source of truth.
+              <ul style={{ margin: 0, padding: 0, listStyle: 'none', fontFamily: T.mono, fontSize: 11 }}>
+                {nodes.map(({ m, ageMs, agedOut }) => (
+                  <li
+                    key={m.deviceId}
+                    onMouseEnter={() => setHoveredId(m.deviceId)}
+                    onMouseLeave={() => setHoveredId((h2) => (h2 === m.deviceId ? null : h2))}
+                    onClick={() => setSelectedId((sel) => (sel === m.deviceId ? null : m.deviceId))}
+                    style={{
+                      marginBottom: 4, minHeight: 28, cursor: 'pointer',
+                      opacity: agedOut ? 0.4 : 1,
+                      textDecoration: agedOut ? 'line-through' : 'none',
+                      color: selectedId === m.deviceId ? T.amber : undefined,
+                    }}
+                  >
+                    <span style={{ color: T.phosphor }}>{hex(m.deviceId)}</span>
+                    {` · ${formatAgo(ageMs)}`}
+                    {m.linkDb !== undefined && <span style={{ opacity: 0.7 }}>{` · ${m.linkDb.toFixed(0)}dB`}</span>}
+                    {agedOut && <span style={{ opacity: 0.7 }}> · aged out</span>}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </CollapsibleSection>
+
+        <CollapsibleSection
+          title="SPECTRUM"
+          summary={focusMember ? `node ${hex(focusMember.deviceId)}` : 'no node selected'}
+          open={spectrumOpen}
+          onToggle={() => setSpectrumOpen((v) => !v)}
+        >
+          <div style={{ ...panel(false), display: 'flex', flexDirection: 'column' }}>
+            <div ref={spectrumBoxRef} style={{ position: 'relative', flex: '0 0 90px', minHeight: 60 }}>
               {spectrumSize.w > 0 && spectrumSize.h > 0 && (
                 // Out of flow for the same reason as the graph canvas above.
                 <div style={{ position: 'absolute', inset: 0 }}>
@@ -570,79 +702,37 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
               )}
             </div>
           </div>
-        </div>
+        </CollapsibleSection>
 
-        {/* right column: roster + packet stream */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0, height: '100%' }}>
-          <div style={{ ...panel(false), flex: '0 1 40%', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-            <div style={{ ...title, flex: '0 0 auto' }}>ROSTER</div>
-            <div style={{ overflowY: 'auto', minHeight: 0, flex: '1 1 auto' }}>
-              {!s.chatterOn && (
-                <div style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk, opacity: 0.6 }}>
-                  Join the room to see who else is around.
-                </div>
-              )}
-              {s.chatterOn && members.length === 0 && (
-                <div style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk, opacity: 0.6 }}>
-                  (no other members heard yet)
-                </div>
-              )}
-              {s.chatterOn && members.length > 0 && (
-                <ul style={{ margin: 0, padding: 0, listStyle: 'none', fontFamily: T.mono, fontSize: 11 }}>
-                  {nodes.map(({ m, ageMs, agedOut }) => (
-                    <li
-                      key={m.deviceId}
-                      onMouseEnter={() => setHoveredId(m.deviceId)}
-                      onMouseLeave={() => setHoveredId((h2) => (h2 === m.deviceId ? null : h2))}
-                      onClick={() => setSelectedId((sel) => (sel === m.deviceId ? null : m.deviceId))}
-                      style={{
-                        marginBottom: 4, cursor: 'pointer',
-                        opacity: agedOut ? 0.4 : 1,
-                        textDecoration: agedOut ? 'line-through' : 'none',
-                        color: selectedId === m.deviceId ? T.amber : undefined,
-                      }}
-                    >
-                      <span style={{ color: T.phosphor }}>{hex(m.deviceId)}</span>
-                      {` · ${formatAgo(ageMs)}`}
-                      {m.linkDb !== undefined && <span style={{ opacity: 0.7 }}>{` · ${m.linkDb.toFixed(0)}dB`}</span>}
-                      {agedOut && <span style={{ opacity: 0.7 }}> · aged out</span>}
-                      {selectedId === m.deviceId && s.chatterState === 'idle' && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation(); // don't toggle the selection off
-                            dlog('UI', { pressed: 'sendTo', target: m.deviceId }, { level: 'warn' });
-                            setSendTargetId(m.deviceId);
-                            document.getElementById('roommode-file')?.click();
-                          }}
-                          style={{ ...btn(false), marginLeft: 8, padding: '1px 6px', fontSize: 10 }}
-                        >
-                          send file to {hex(m.deviceId)}
-                        </button>
-                      )}
-                    </li>
-                  ))}
-                </ul>
-              )}
-              {s.chatterOn && s.chatterState === 'idle' && (
-                <div
-                  onClick={() => document.getElementById('roommode-file')?.click()}
-                  style={{
-                    fontFamily: T.mono, fontSize: 11, color: T.panelInk, opacity: 0.6,
-                    marginTop: 8, cursor: 'pointer', textDecoration: 'underline dotted',
-                  }}
-                >
-                  drop a file anywhere to broadcast — or click to browse
-                </div>
-              )}
-            </div>
-          </div>
-
-          <div style={{ ...panel(false), flex: '1 1 auto', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-            <div style={{ ...title, flex: '0 0 auto' }}>PACKETS {s.chatterPackets.length ? `(${s.chatterPackets.length})` : ''}</div>
+        <CollapsibleSection
+          title="PACKETS"
+          summary={String(s.chatterPackets.length)}
+          open={packetsOpen}
+          onToggle={() => setPacketsOpen((v) => !v)}
+        >
+          <div style={{ ...panel(false), display: 'flex', flexDirection: 'column', minHeight: 0, maxHeight: 220 }}>
             <div style={{ flex: '1 1 auto', minHeight: 0 }}>
               <PacketStream packets={s.chatterPackets} now={now} />
             </div>
           </div>
+        </CollapsibleSection>
+
+        {/* Chat — flexes so it takes the space the collapsed panels give back. */}
+        <div style={{ ...panel(false), display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 160 }}>
+          <div style={title}>CHAT</div>
+          <ChatMessageList
+            messages={s.chatterMessages}
+            roomState={s.chatterOn ? s.chatterState : 'off'}
+            nowMs={now}
+            onResend={sendText}
+          />
+          <ChatComposer
+            targetId={sendTargetId}
+            onTargetChange={setSendTargetId}
+            nodeIds={members.map((m) => m.deviceId)}
+            onSend={sendText}
+            disabledReason={s.chatterOn ? null : 'join the room to send a message'}
+          />
         </div>
       </div>
     </div>

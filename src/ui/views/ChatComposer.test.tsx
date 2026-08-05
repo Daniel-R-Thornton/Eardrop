@@ -73,6 +73,13 @@ describe('ChatComposer', () => {
     fireEvent.change(getByRole('textbox'), { target: { value: 'hi' } });
     expect((getByRole('button', { name: /send/i }) as HTMLButtonElement).disabled).toBe(true);
     expect(getByText('join the room first')).toBeTruthy();
+    // The INPUT stays enabled while send is blocked, deliberately: the outbox
+    // queues a message and holds it until the transmitter is free, so blocking
+    // typing would fight it and stop the operator drafting a reply while
+    // another device is talking. Pinned because a refactor that gave the input
+    // and the button one shared `disabled` prop would reintroduce that
+    // silently, with a green suite.
+    expect((getByRole('textbox') as HTMLInputElement).disabled).toBe(false);
   });
 
   it('offers the room plus every known node, and reports a change', () => {

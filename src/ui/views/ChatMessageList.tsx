@@ -32,10 +32,12 @@ function statusLine(m: ChatMessage, roomState: string, nowMs: number): string | 
 }
 
 export function ChatMessageList({
-  messages, ownDeviceId, roomState, nowMs, onResend,
+  messages, roomState, nowMs, onResend,
 }: {
   messages: ChatMessage[];
-  ownDeviceId: number;
+  // No ownDeviceId: "is this mine" comes from `m.dir === 'tx'`, which the store
+  // already decided when it recorded the message. Taking the id as well would
+  // oblige every caller to pass a number nothing here reads.
   roomState: string;
   nowMs: number;
   onResend: (text: string) => void;
