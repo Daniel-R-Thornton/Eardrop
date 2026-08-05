@@ -6,6 +6,7 @@
  */
 import type { ModemConfig } from '../modem/types';
 import type { Run } from '../modem/protocol/captureTypes';
+import type { ProbePurpose } from '../modem/protocol/probeBurst';
 
 export interface RxProgress {
   state: number; // RxState enum value
@@ -72,7 +73,7 @@ export type ModemCommand =
    *  what the RECIPIENT reported hearing of us. Omitted for a broadcast or
    *  before any measurement exists, which keeps the band flat. */
   | { type: 'encodeControl'; id: number; msg: { type: number; senderId: number; targetId: number; payload: ArrayBuffer }; toneGains?: number[] }
-  | { type: 'encodeProbe'; id: number; deviceId: number }
+  | { type: 'encodeProbe'; id: number; deviceId: number; purpose: ProbePurpose }
   | { type: 'airCheck'; id: number }
   | { type: 'setRxMuted'; muted: boolean };
 
@@ -93,8 +94,19 @@ export type ModemEvent =
   | { type: 'flushed'; id: number; fileReady: boolean }
   /** Either a formatted console line or the structured event behind it. */
   | { type: 'dlog'; line?: string; rec?: { tag: string; fields: Record<string, unknown> } }
-  | { type: 'error'; id?: number; error: string }
+  | {
+      type: 'error';
+      id?: number;
+      error: string;
+      /** Error constructor name — a browser allocation failure is a
+       *  RangeError on some engines and a bare Error on others, and the
+       *  message alone does not say which. */
+      errorName?: string;
+      /** The command that failed, so a log line points at a cause rather than
+       *  just an effect. */
+      command?: string;
+    }
   // ─── Chatter room (see chatterWorker.test.ts) ───
-  | { type: 'probeHeard'; deviceId: number; grid: number[] }
+  | { type: 'probeHeard'; deviceId: number; grid: number[]; purpose: ProbePurpose }
   | { type: 'controlMessage'; msg: { type: number; senderId: number; targetId: number; payload: ArrayBuffer } }
   | { type: 'airStatus'; id: number; busy: boolean; rms: number };

@@ -30,8 +30,11 @@ export class OFDMEngine {
   private pilotFreqHz: number;
   private sampleRate: number;
   private symSamples: number;
-  /** Chirp span (Hz) around pilot; sweep goes pilot±span/2 */
+  /** Chirp span (Hz); sweep goes chirpCenterHz±span/2 — NOT the pilot, see below */
   private chirpSpanHz: number;
+  /** Chirp centre (Hz) — see OFDM_TUNING.chirpCenterHz and, for the handshake
+   *  band's own value, OFDM_HANDSHAKE.chirpCenterHz. */
+  private chirpCenterHz: number;
 
   // Per-tone bit-loading (Phase 3). Default: every tone QPSK, which keeps
   // modulateFrame() on the untouched legacy 4-tone/nibble-lane path (see
@@ -47,6 +50,7 @@ export class OFDMEngine {
     pilotFreqHz?: number;
     pilotAmplitude?: number;
     chirpSpanHz?: number;
+    chirpCenterHz?: number;
     qamScaleOverride?: number;
     toneStartHz?: number;
     /** Per-tone pre-emphasis (linear); see OFDMQPSKModulatorConfig.toneGains. */
@@ -64,6 +68,7 @@ export class OFDMEngine {
     this.pilotFreqHz = pilotFreqHz;
     this.sampleRate = cfg.sampleRate;
     this.chirpSpanHz = cfg.chirpSpanHz ?? 200;
+    this.chirpCenterHz = cfg.chirpCenterHz ?? OFDM_TUNING.chirpCenterHz;
     const { symSamples } = ofdmSamples(cfg.sampleRate);
     this.symSamples = symSamples;
 
@@ -151,18 +156,27 @@ export class OFDMEngine {
     // chirp loudness from estimate accuracy, which is what the settle period
     // was added for.
     //
-    // In practice OFDM_TUNING.chirpAmplitude (0.6) binds at every tone count,
-    // so this lands just under the preamble peak — the level the chirp had
-    // before any of this, which is also the level at which sync was reliable
-    // (measured norm 0.67-0.72 at 32 tones).
+    // In practice OFDM_TUNING.chirpAmplitude (0.12) binds at every tone count,
+    // so the coherent-peak match above is a CEILING that never actually applies
+    // — the chirp goes out at 0.12, well below the ~0.63 preamble peak. That is
+    // deliberate and measured: 0.6 was tried and detected WORSE (norm
+    // 0.476-0.581 against 0.686-0.703 at 0.12), because the detection score is
+    // normalized by input RMS and a hotter chirp gains nothing once the
+    // acoustic chain compresses on it. See OFDM_TUNING.chirpAmplitude for the
+    // bench run. The match is kept as the ceiling so a future raise of
+    // chirpAmplitude cannot exceed the headroom the waveform behind it asks
+    // for.
     const levels = this.syncSymbolLevels();
     const matchedAmplitude = levels.coherentPeak;
     const amplitude = Math.min(OFDM_TUNING.chirpAmplitude, matchedAmplitude);
 
     const chirpCfg: ChirpConfig = {
-      // Centred on OFDM_TUNING.chirpCenterHz, NOT the pilot — see that field.
-      fStart: OFDM_TUNING.chirpCenterHz - halfSpan,
-      fEnd: OFDM_TUNING.chirpCenterHz + halfSpan,
+      // Centred on this engine's chirpCenterHz, NOT the pilot — see
+      // OFDM_TUNING.chirpCenterHz. Per-engine because a future tone move on
+      // the handshake band would put it low enough that the global centre
+      // becomes adjacent to its tones — see OFDM_HANDSHAKE.chirpCenterHz.
+      fStart: this.chirpCenterHz - halfSpan,
+      fEnd: this.chirpCenterHz + halfSpan,
       durationSec,
       sampleRate: this.sampleRate,
       amplitude,

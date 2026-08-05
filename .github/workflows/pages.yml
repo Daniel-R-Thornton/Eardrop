@@ -3,6 +3,8 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -11,7 +13,14 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
+  # Scoped per event+ref, not a single shared "pages" group: with pull_request
+  # now also triggering this workflow, a shared group would let opening/
+  # updating a PR cancel an in-progress production deploy of main (and let
+  # two PRs cancel each other's checks) via cancel-in-progress, before the
+  # deploy job's own `if: github.event_name != 'pull_request'` gate ever runs
+  # — that gate only stops the PR run from deploying, not from cancelling
+  # someone else's run. Keep this scoped if another trigger is added later.
+  group: pages-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -26,6 +35,7 @@ jobs:
       # eslint-config-airbnb pins eslint ^7/^8 while the repo is on eslint 10;
       # local installs resolve with legacy peer handling, match that here.
       - run: npm ci --legacy-peer-deps
+      - run: npm run typecheck
       - run: npm run build
         env:
           VITE_BASE: /Eardrop/
@@ -34,6 +44,10 @@ jobs:
           path: dist
 
   deploy:
+    # PR runs only need the build/typecheck signal above — deploying a PR's
+    # build to production Pages would be wrong (and the github-pages
+    # environment isn't set up to authorize it for arbitrary branches).
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     environment:

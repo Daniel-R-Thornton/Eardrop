@@ -21,7 +21,7 @@ import { TxEngine } from '../protocol/txEngine';
 import { RxEngine } from '../protocol/rxEngine';
 import { HandshakeReceiver } from '../protocol/handshakeReceiver';
 import { ProbeDetector } from '../../workers/modemService';
-import { buildProbeBurst } from '../protocol/probeBurst';
+import { buildProbeBurst, PROBE_PURPOSE, type ProbePurpose } from '../protocol/probeBurst';
 import { encodeControlMessage, type ControlMessage } from '../protocol/controlFrame';
 import type { PickedSettings } from '../chatter/settingsPick';
 import { ofdmSamples } from '../types';
@@ -42,15 +42,15 @@ function makeListeners(selfId: number, room: { current: RoomProtocol | null }) {
   } as ConstructorParameters<typeof RxEngine>[0]);
   listener.onControlMessage = (msg: ControlMessage) => room.current?.onMessage(msg);
 
-  const detector = new ProbeDetector(selfId, SR, (deviceId, grid) => room.current?.onProbeHeard(deviceId, grid));
+  const detector = new ProbeDetector(selfId, SR, (deviceId, grid, purpose) => room.current?.onProbeHeard(deviceId, grid, purpose));
 
   return { listener, detector };
 }
 
 /** Feed a probe burst the way a real mic stream would: padded with quiet on
  *  both sides (see chatterWorker.test.ts's ProbeDetector tests). */
-function feedProbe(detector: ProbeDetector, deviceId: number): void {
-  const burst = buildProbeBurst(deviceId, SR);
+function feedProbe(detector: ProbeDetector, deviceId: number, purpose: ProbePurpose = PROBE_PURPOSE.joining): void {
+  const burst = buildProbeBurst(deviceId, SR, purpose);
   const pad = Math.round(SR * 0.2);
   const padded = new Float32Array(pad + burst.length + pad);
   padded.set(burst, pad);
@@ -79,15 +79,24 @@ function makeClock() {
     timers.push(rec);
     return () => { rec.dead = true; };
   };
+  const drain = async (): Promise<void> => {
+    // Generous on purpose: a timer callback can chain several awaits before it
+    // registers its own follow-up timer (sendFileComingAndTransmit awaits
+    // isAirBusy AND sendMessage before arming fileComingLeadMs), and each
+    // `await asyncFn()` costs two microtask turns. Under-draining leaves the
+    // follow-up timer unregistered when the loop below looks for the next due
+    // one, stalling the chain mid-tick.
+    for (let k = 0; k < 8; k++) await Promise.resolve();
+  };
   const tick = async (ms: number) => {
     const end = t + ms;
     for (;;) {
-      await Promise.resolve(); await Promise.resolve();
+      await drain();
       const due = timers.filter((x) => !x.dead && x.at <= end).sort((a, b) => a.at - b.at)[0];
       if (!due) break;
       t = due.at; due.dead = true; due.fn();
     }
-    await Promise.resolve(); await Promise.resolve();
+    await drain();
     t = end;
   };
   return { now, schedule, tick };
@@ -122,7 +131,7 @@ describe('chatter loopback: join, roll call, negotiated transfer', () => {
         now: clock.now,
         rng: () => 0, // slot 0 always — no busy air to force a re-roll in this scenario
         schedule: clock.schedule,
-        playProbe: async () => feedProbe(bListeners.detector, A_ID), // B hears A
+        playProbe: async (purpose) => feedProbe(bListeners.detector, A_ID, purpose), // B hears A
         sendMessage: async (msg) => feedControl(bListeners.listener, controlTx, msg), // B hears A
         isAirBusy: async () => false, // turn-taking is scripted by the scenario
         startFileTx: (settings) => {
@@ -152,7 +161,7 @@ describe('chatter loopback: join, roll call, negotiated transfer', () => {
         now: clock.now,
         rng: () => 0,
         schedule: clock.schedule,
-        playProbe: async () => feedProbe(aListeners.detector, B_ID), // A hears B
+        playProbe: async (purpose) => feedProbe(aListeners.detector, B_ID, purpose), // A hears B
         sendMessage: async (msg) => feedControl(aListeners.listener, controlTx, msg), // A hears B
         isAirBusy: async () => false,
         startFileTx: () => {

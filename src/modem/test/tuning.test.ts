@@ -14,14 +14,52 @@ test('handshake pilot sits directly below its tones', () => {
   // pilot uncertainty was enough to cross QPSK's 45 degree decision boundary
   // at the top tone. Loopback is noise-free and decoded fine; over the air
   // two devices never demodulated a single control frame in either direction.
-  // Keep the factor near 1 or that returns, silently and only on hardware.
+  // Keep the factor well below that or the same failure returns, silently and
+  // only on hardware. Pilot 2000 under tones ending at 2950 puts it at ~1.48
+  // — still well inside the range documented as harmless (1.15 measured safe,
+  // 3.9 measured catastrophic). Same invariant as bandHandshake.test.ts's
+  // "hardware sweet spot" test — 1.6 is the live ~1.48 ratio plus headroom,
+  // not a measured safety threshold, so the two assertions must move
+  // together if either bound is ever raised (headroom over 1.475 is already
+  // only ~8%, so the next deliberate move is likely to hit it again).
   const firstTone = OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz;
   const topTone = firstTone + (OFDM_HANDSHAKE.toneCount - 1) * OFDM_DEFAULTS.toneSpacingHz;
-  expect(topTone / OFDM_HANDSHAKE.pilotFreqHz).toBeLessThan(1.2);
+  expect(topTone / OFDM_HANDSHAKE.pilotFreqHz).toBeLessThan(1.6);
 
   // The pilot must also stay clear of the chirp template's centre, or the
   // correlator can fire on the pilot itself (see OFDM_HANDSHAKE's comment).
-  expect(Math.abs(OFDM_HANDSHAKE.pilotFreqHz - OFDM_TUNING.chirpCenterHz)).toBeGreaterThan(500);
+  // The handshake band's own correlator reads OFDM_HANDSHAKE.chirpCenterHz,
+  // not the global OFDM_TUNING value (see rxEngine's bandHandshake block) —
+  // that pairing is the one actually live for this band, so it's the one
+  // this assertion must guard.
+  expect(Math.abs(OFDM_HANDSHAKE.pilotFreqHz - OFDM_HANDSHAKE.chirpCenterHz)).toBeGreaterThan(500);
+});
+
+test('handshake pilot clears the GLOBAL chirp template too', () => {
+  // The post-hop TARGET engine (not the handshake band's own receiver)
+  // correlates against OFDM_TUNING.chirpCenterHz, a linear sweep spanning
+  // +/-halfSpan around that centre (OFDMEngine/rxEngine default chirpSpanHz
+  // 200, i.e. halfSpan 100 — see bandHandshake.test.ts's own copy of this
+  // constant). Old pilot 1850 sat exactly ON that centre, which is the
+  // false-trigger mechanism documented on OFDM_HANDSHAKE.gapSymbols: the
+  // correlator fired on the card symbols' pilot at norm ~0.15, and because
+  // cards are real OFDM with real cyclic prefixes the CP probe VALIDATED the
+  // false detect. New pilot 2000 is no longer ON the centre, but it is only
+  // 150 Hz away, and the template's swept edge (1850+100=1950) is just 50 Hz
+  // below it — a partial return toward the same mechanism, not an escape
+  // from it. The gap (OFDM_HANDSHAKE.gapSymbols) and HandshakeReceiver's
+  // sample discard are the actual mitigation and are untouched; this
+  // assertion exists so a future move of either frequency doesn't silently
+  // close the clearance further with nothing to catch it.
+  //
+  // Bound: halfSpan (100, the swept edge itself) + one tone-spacing grid
+  // step (50 Hz, OFDM_DEFAULTS.toneSpacingHz) as the minimum safety margin
+  // outside the swept range — not the live 150 Hz value with a hair added.
+  const halfSpan = 100; // OFDMEngine's default chirpSpanHz is 200
+  const minClearance = halfSpan + OFDM_DEFAULTS.toneSpacingHz;
+  expect(Math.abs(OFDM_HANDSHAKE.pilotFreqHz - OFDM_TUNING.chirpCenterHz)).toBeGreaterThanOrEqual(
+    minClearance,
+  );
 });
 
 test('sync burst covers detection + alignment slack + settle + training', () => {

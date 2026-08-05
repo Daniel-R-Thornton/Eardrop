@@ -18,6 +18,7 @@ import {
   decodeProbeId,
   measureProbeSweep,
   buildProbeBurst,
+  type ProbePurpose,
 } from '../modem/protocol/probeBurst';
 import { encodeControlMessage, ControlType, type ControlMessage } from '../modem/protocol/controlFrame';
 
@@ -83,8 +84,8 @@ export class AirNoiseTracker {
  * ProbeDetector — passive listener for chatter-room probe bursts (see
  * probeBurst.ts): a down-chirp anchor (reverse direction from the modem's
  * own up-chirp sync burst, specifically so ordinary data traffic can never
- * false-trigger this), followed by a coarse channel sweep and a 12-bit
- * pulse-keyed device ID.
+ * false-trigger this), followed by a coarse channel sweep and a 13-bit
+ * pulse-keyed device ID and purpose.
  *
  * Runs a normalized cross-correlation of a rolling 0.5 s buffer against the
  * down-chirp template every `scanHop` (4096) samples. At full rate that's
@@ -118,7 +119,7 @@ export class ProbeDetector {
   constructor(
     private readonly ownDeviceId: number,
     private readonly sampleRate: number,
-    private readonly onProbe: (deviceId: number, grid: number[]) => void,
+    private readonly onProbe: (deviceId: number, grid: number[], purpose: ProbePurpose) => void,
   ) {
     this.template = probeChirpTemplate(sampleRate);
     this.ringCap = Math.round(sampleRate * 0.5);
@@ -172,11 +173,11 @@ export class ProbeDetector {
   private finishCapture(): void {
     const samples = new Float32Array(this.pending!.buf);
     this.pending = null;
-    const deviceId = decodeProbeId(samples, 0, this.sampleRate);
-    if (deviceId === null || deviceId === this.ownDeviceId) return; // CRC fail or our own probe
+    const decoded = decodeProbeId(samples, 0, this.sampleRate);
+    if (decoded === null || decoded.deviceId === this.ownDeviceId) return; // CRC fail or our own probe
     const grid = measureProbeSweep(samples, 0, this.sampleRate);
     if (!grid) return;
-    this.onProbe(deviceId, grid);
+    this.onProbe(decoded.deviceId, grid, decoded.purpose);
   }
 }
 
@@ -405,14 +406,14 @@ export class ModemService {
           );
         };
         this.chatterRx = engine;
-        this.probeDetector = new ProbeDetector(cmd.deviceId, this.config.sampleRate, (deviceId, grid) => {
+        this.probeDetector = new ProbeDetector(cmd.deviceId, this.config.sampleRate, (deviceId, grid, purpose) => {
           // A probe burst just went through — whatever the control listener
           // thinks it is part-way through demodulating, it is not a control
           // message. Re-arm it, or a false sync on the burst's sweep (which
           // crosses the handshake band) leaves it stuck out of WAITING and
           // deaf to every reply that follows.
           this.chatterRx?.rearmForNextControlMessage();
-          this.emit({ type: 'probeHeard', deviceId, grid });
+          this.emit({ type: 'probeHeard', deviceId, grid, purpose });
         });
         break;
       }
@@ -442,13 +443,15 @@ export class ModemService {
             [samples.buffer as ArrayBuffer],
           );
         } catch (err) {
-          this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
+          const e = err as Error;
+          dlog('TX-COMP', { encodeControlFailed: e.name, msg: e.message }, { level: 'warn' });
+          this.emit({ type: 'error', id: cmd.id, error: e.message, errorName: e.name, command: 'encodeControl' });
         }
         break;
       }
       case 'encodeProbe': {
         if (!this.config) { this.emit({ type: 'error', id: cmd.id, error: 'encodeProbe before configure' }); return; }
-        const samples = buildProbeBurst(cmd.deviceId, this.config.sampleRate);
+        const samples = buildProbeBurst(cmd.deviceId, this.config.sampleRate, cmd.purpose);
         this.emit(
           { type: 'encoded', id: cmd.id, samples: samples.buffer as ArrayBuffer, sampleRate: this.config.sampleRate },
           [samples.buffer as ArrayBuffer],
@@ -528,7 +531,9 @@ export class ModemService {
         [samples.buffer as ArrayBuffer],
       );
     } catch (err) {
-      this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
+      const e = err as Error;
+      dlog('TX-COMP', { encodeFileFailed: e.name, msg: e.message }, { level: 'warn' });
+      this.emit({ type: 'error', id: cmd.id, error: e.message, errorName: e.name, command: 'encodeFile' });
     }
   }
 
@@ -554,7 +559,9 @@ export class ModemService {
       this.emit({ type: 'streamStart', id: cmd.id, sampleRate: this.config.sampleRate, totalSamples });
     } catch (err) {
       this.stream = null;
-      this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
+      const e = err as Error;
+      dlog('TX-COMP', { encodeStreamStartFailed: e.name, msg: e.message }, { level: 'warn' });
+      this.emit({ type: 'error', id: cmd.id, error: e.message, errorName: e.name, command: 'encodeStreamStart' });
     }
   }
 

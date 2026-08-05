@@ -64,9 +64,13 @@ export interface PickedSettings {
   floor: boolean;
 }
 
-/** Worst-case floor: QPSK, 4 tones, right where the handshake band already
- *  proved itself — tones at 6900-7050 Hz, same first-tone frequency as
- *  OFDM_HANDSHAKE (pilot 1850 + start 5050 = 6900). */
+/** Worst-case floor: QPSK, 4 tones at 6900-7050 Hz. This no longer has
+ *  anything to do with OFDM_HANDSHAKE — that band moved to 2600-2950 Hz
+ *  precisely because 6900-7250 was found to be the worst part of a phone's
+ *  speaker/mic response. This floor's rationale ("proved itself") is now
+ *  stale: the room's last-resort fallback sits exactly where the control
+ *  plane was evacuated from. Left as-is because changing it is a design
+ *  decision needing its own measurement, tracked separately. */
 export const FLOOR_SETTINGS: PickedSettings = {
   pilotFreqHz: 6700,
   toneStartHz: 200,
@@ -130,8 +134,37 @@ interface Window {
   score: number;
 }
 
-/** Best-scoring (widest-tolerant) window for a given toneCount, or null if
- *  no window fits in the sweep band at all. */
+/**
+ * Best-scoring (widest-tolerant) window for a given toneCount, or null if no
+ * window fits in the sweep band at all.
+ *
+ * NOTE, UNGUARDED HAZARD — the search range includes the handshake band's sync
+ * chirp. OFDM_HANDSHAKE.chirpCenterHz is 4400 Hz with a 200 Hz span, and this
+ * search runs 1500-7800 Hz, so any 32-tone window starting between 2850 and
+ * 4400 Hz contains it. It precedes the band card that announces the very window
+ * chosen here, so a window containing 4400 Hz is one whose band gets compressed
+ * by that chirp and released across the frames that follow — the documented
+ * 17 dB-swing geometry (see OFDM_TUNING.chirpCenterHz for the measurement, and
+ * OFDM_HANDSHAKE.chirpCenterHz for why this is not excluded here rather than
+ * simply not noticed).
+ *
+ * How big the hazard is, honestly: the chirp is 800 ms
+ * (OFDM_TUNING.chirpSymbols) at amplitude 0.12 (OFDM_TUNING.chirpAmplitude —
+ * 0.6 was tried and detected WORSE, partly because it compressed the chain), so
+ * it is NOT the loudest thing in the transmission by peak; the preamble symbols
+ * reach ~0.63. What drives the mechanism is concentration, not peak: the chain
+ * compresses per band, and a sustained narrow sweep is the shape it adapts to,
+ * where a multi-tone grid of the same total power was measured untouched. So the
+ * risk is real but far smaller than the 0.6 figure this note first carried
+ * would imply — which matters for sizing the measurement below, not just for
+ * accuracy.
+ *
+ * Left unexcluded on purpose: carving 4300-4500 out of the search would
+ * disqualify most candidate windows in the 2-4 kHz region phone hardware
+ * scores best in, on a hypothesis, while the band position itself is still
+ * awaiting its first over-the-air measurement. Flagged for that measurement
+ * instead.
+ */
 function bestWindow(worst: number[], toneCount: number): Window | null {
   // Span from the first tone to the last is (toneCount-1) spacings, not
   // toneCount*50 — a toneCount-tone comb has toneCount-1 gaps between tones.

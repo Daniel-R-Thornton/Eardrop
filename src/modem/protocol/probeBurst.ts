@@ -14,7 +14,7 @@
  *   [chirpMs, chirpMs+gapMs)                   gap (silence)
  *   [..., ...+sweep audio length)              coarse sweep (CHATTER_SWEEP)
  *   [..., ...+gapMs)                           gap (silence)
- *   [..., ...+idSlots*idSlotMs)                12 pulse-keyed ID bits
+ *   [..., ...+idSlots*idSlotMs)                13 pulse-keyed bits (8 id + 1 purpose + 4 CRC)
  *
  * A 100 ms silent lead-in precedes the chirp in the buffer `buildProbeBurst`
  * returns, purely so a receiver's ring buffer has quiet on both sides of the
@@ -27,7 +27,7 @@
  * Reversing direction makes the probe's anchor a shape that data transmission
  * never produces.
  *
- * WHY pulse-keyed (not QAM) for the ID: 12 bits is little enough that on/off
+ * WHY pulse-keyed (not QAM) for the ID: 13 bits is little enough that on/off
  * keying a single tone, gated by a threshold measured against the OTHER
  * slots in the same burst, needs no amplitude reference, no channel
  * estimate, and no clock recovery beyond the chirp's own anchor. That
@@ -81,12 +81,32 @@ export function reportGridFreqs(): number[] {
   return freqs;
 }
 
+/**
+ * What a probe burst is announcing, so a listener knows which reply to send
+ * instead of guessing.
+ *
+ * Before this bit existed the wire-level burst was identical for a join and a
+ * roll call, and the only way to tell them apart was whether the listener
+ * already knew the prober — which is one-sided and wrong in both directions.
+ * A device rejoining with the same id (page refresh, reconnect) is a stranger
+ * to itself but a known member to everyone else, so it received a REPORT when
+ * it needed a WELCOME; and a peer whose WELCOME was lost still considers us a
+ * stranger, so it answers our roll call with a WELCOME. See
+ * roomProtocol.ts's onProbeHeard for the inference this replaces.
+ */
+export const PROBE_PURPOSE = { joining: 0, rollCall: 1 } as const;
+export type ProbePurpose = (typeof PROBE_PURPOSE)[keyof typeof PROBE_PURPOSE];
+
 /** Burst layout timing, all in ms except slot count. */
 export const PROBE_LAYOUT = {
   chirpMs: 150,
   gapMs: 50,
   idSlotMs: 40,
-  idSlots: 12,
+  // 13, not 12: 8 id bits + 1 purpose bit + 4 CRC bits. One extra 40 ms slot
+  // (~3.74 s burst, up from ~3.70 s) buys an explicitly signalled reply type.
+  // Wire constant — both ends read it, and a mismatch fails CRC, so an
+  // old-build peer's probes are dropped rather than misread.
+  idSlots: 13,
 } as const;
 
 /** Down-chirp shape: 4400→1200 Hz, reversed direction vs the sync chirp so
@@ -105,9 +125,27 @@ export function probeChirpTemplate(sampleRate: number): Float32Array {
  *  decode functions measure from — they all key off the chirp's own anchor. */
 const LEAD_IN_MS = 100;
 
-/** ID pulse tone — arbitrary but fixed so encode/decode agree, and far enough
- *  from both the chirp's sweep range and the coarse sweep's band that it
- *  cannot be confused with either. */
+/**
+ * ID pulse tone — arbitrary but fixed so encode/decode agree.
+ *
+ * The old claim here ("far enough from both the chirp's sweep range and the
+ * coarse sweep's band that it cannot be confused with either") was written
+ * when the handshake band sat at 6900-7250 Hz, and it enumerated only two of
+ * the three neighbours this tone now has. 2500 Hz is:
+ *   - inside the down-chirp's own sweep (4400->1200) and inside the coarse
+ *     sweep's band (1500-7800) — it was never actually clear of either, which
+ *     is fine: the ID slots are separated from both in TIME, not in frequency,
+ *     and every decode is anchored on the down-chirp;
+ *   - 100 Hz BELOW OFDM_HANDSHAKE's first tone (2600) and 500 Hz above its
+ *     pilot (2000), since that band moved down to 2600-2950.
+ *
+ * No decode path breaks on that last one: decodeProbeId only ever runs off a
+ * down-chirp anchor, so a control message's tones are never read as ID slots,
+ * and the worker re-arms the control listener after every burst. But NOTHING
+ * CURRENTLY CONSTRAINS PULSE_HZ against OFDM_HANDSHAKE — no test, no derived
+ * clearance — so a future move of either value can put them on top of each
+ * other with nothing complaining.
+ */
 const PULSE_HZ = 2500;
 const PULSE_MS = 25;
 const PULSE_AMPLITUDE = 0.15;
@@ -131,16 +169,17 @@ function sweepSampleCount(sampleRate: number): number {
   return steps * ms(sampleRate, stepMs);
 }
 
-/** Slot k carries bit k of the 12-bit word V = (deviceId << 4) | crc4(deviceId),
- *  LSB-first — so slot 0 is the CRC's own least-significant bit and slot 11
- *  is the device ID's most-significant bit. Sent LSB-first (rather than the
- *  more obvious MSB-first) so that decoding does not depend on either field's
- *  own endpoint bit, which is what a plain MSB/LSB-first split of the two
- *  fields separately would do. */
-function idBits(deviceId: number): number[] {
-  const packed = ((deviceId & 0xff) << 4) | crc4(deviceId & 0xff);
+/** Slot k carries bit k of the 13-bit word
+ *  V = (word << 4) | crc4Bits(word, 9), where word = (deviceId << 1) | purpose
+ *  — LSB-first, so slot 0 is the CRC's least-significant bit, slot 4 is the
+ *  purpose bit, and slot 12 is the device ID's most-significant bit. Sent
+ *  LSB-first (rather than the more obvious MSB-first) so that decoding does
+ *  not depend on either field's own endpoint bit. */
+function idBits(deviceId: number, purpose: ProbePurpose): number[] {
+  const word = ((deviceId & 0xff) << 1) | (purpose & 1);
+  const packed = (word << 4) | crc4Bits(word, 9);
   const bits: number[] = [];
-  for (let k = 0; k < 12; k++) bits.push((packed >> k) & 1);
+  for (let k = 0; k < PROBE_LAYOUT.idSlots; k++) bits.push((packed >> k) & 1);
   return bits;
 }
 
@@ -167,12 +206,16 @@ function buildIdSlot(bit: number, sampleRate: number): Float32Array {
   return slot;
 }
 
-/** silence(100ms) + downChirp + gap + sweep + gap + 12 pulse slots. */
-export function buildProbeBurst(deviceId: number, sampleRate: number): Float32Array {
+/** silence(100ms) + downChirp + gap + sweep + gap + 13 pulse slots. */
+export function buildProbeBurst(
+  deviceId: number,
+  sampleRate: number,
+  purpose: ProbePurpose = PROBE_PURPOSE.joining,
+): Float32Array {
   const chirp = generateChirp({ ...DOWN_CHIRP, sampleRate, amplitude: 0.5 });
   const gap = new Float32Array(ms(sampleRate, PROBE_LAYOUT.gapMs));
   const sweep = sweepPlan(sampleRate).audio;
-  const bits = idBits(deviceId);
+  const bits = idBits(deviceId, purpose);
   const slots = bits.map((bit) => buildIdSlot(bit, sampleRate));
 
   const leadIn = new Float32Array(ms(sampleRate, LEAD_IN_MS));
@@ -209,7 +252,11 @@ function idSlotsStart(sampleRate: number): number {
 
 /** anchor = sample index where the chirp STARTS in `samples`.
  *  Returns null on CRC failure. */
-export function decodeProbeId(samples: Float32Array, anchor: number, sampleRate: number): number | null {
+export function decodeProbeId(
+  samples: Float32Array,
+  anchor: number,
+  sampleRate: number,
+): { deviceId: number; purpose: ProbePurpose } | null {
   // chirpCorrelate returns peakIndex -1 when its template is longer than the
   // signal — never a real anchor. Guard here rather than let it silently
   // slice into whatever precedes `samples[0]`.
@@ -225,13 +272,14 @@ export function decodeProbeId(samples: Float32Array, anchor: number, sampleRate:
     mags.push(Math.hypot(i, q));
   }
 
-  // Self-referencing threshold: split the 12 slot magnitudes into "pulse
+  // Self-referencing threshold: split the 13 slot magnitudes into "pulse
   // present" / "pulse absent" clusters by the largest gap in sorted order.
   // A single fixed multiple of the literal median breaks down whenever half
-  // or more of the 12 bits are 1 (the median then falls IN the "on" cluster,
+  // or more of the 13 bits are 1 (the median then falls IN the "on" cluster,
   // so no on-slot can ever be 4x itself) — which is a common case, not an
-  // edge case, for an 8-bit ID + 4-bit CRC. The largest-gap split has no such
-  // failure mode: it works for any on/off ratio from 1-in-12 to 11-in-12.
+  // edge case, for an 8-bit ID + 1 purpose bit + 4-bit CRC. The largest-gap
+  // split has no such failure mode: it works for any on/off ratio from
+  // 1-in-13 to 12-in-13.
   const sorted = mags.slice().sort((a, b) => a - b);
   let gapIdx = 0;
   let gapSize = -Infinity;
@@ -244,12 +292,12 @@ export function decodeProbeId(samples: Float32Array, anchor: number, sampleRate:
 
   // Undo the LSB-first packing from idBits: bits[k] is bit k of V.
   let packed = 0;
-  for (let k = 0; k < 12; k++) packed |= bits[k] << k;
-  const deviceId = (packed >> 4) & 0xff;
+  for (let k = 0; k < PROBE_LAYOUT.idSlots; k++) packed |= bits[k] << k;
+  const word = (packed >> 4) & 0x1ff;
   const crc = packed & 0xf;
 
-  if (crc4(deviceId) !== crc) return null;
-  return deviceId;
+  if (crc4Bits(word, 9) !== crc) return null;
+  return { deviceId: (word >> 1) & 0xff, purpose: (word & 1) as ProbePurpose };
 }
 
 /** Measure the burst's sweep, sampled onto REPORT_GRID (linear mags). */
@@ -266,14 +314,26 @@ export function measureProbeSweep(samples: Float32Array, anchor: number, sampleR
   return sampleResponseAt(result, reportGridFreqs());
 }
 
-/** CRC-4 (poly x^4+x+1, MSB-first, non-reflected) over the 8 id bits. */
-export function crc4(byte: number): number {
+/** CRC-4 (poly x^4+x+1, MSB-first, non-reflected) over the low `bitCount`
+ *  bits of `value`. Parameterised because the ID word grew from 8 bits to 9
+ *  when the purpose bit was added, and the CRC has to cover the purpose bit
+ *  too — a silent flip there sends the wrong reply type, which is the exact
+ *  failure the bit exists to prevent. */
+function crc4Bits(value: number, bitCount: number): number {
   let crc = 0;
-  for (let i = 7; i >= 0; i--) {
-    const bit = (byte >> i) & 1;
+  for (let i = bitCount - 1; i >= 0; i--) {
+    const bit = (value >> i) & 1;
     const feedback = ((crc >> 3) & 1) ^ bit;
     crc = (crc << 1) & 0xf;
     if (feedback) crc ^= 0b0011;
   }
   return crc & 0xf;
+}
+
+/** CRC-4 over the 8 id bits — the pre-purpose-bit form. TEST-ONLY: no
+ *  production caller remains (the wire format covers 9 bits, see idBits), and
+ *  probeBurst.test.ts is the sole consumer. It used to say "kept for callers
+ *  that only have a device id"; there are none. */
+export function crc4(byte: number): number {
+  return crc4Bits(byte & 0xff, 8);
 }

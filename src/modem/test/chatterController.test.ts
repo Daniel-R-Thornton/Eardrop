@@ -8,8 +8,9 @@
 import { describe, expect, it, beforeEach } from 'vitest';
 import { ChatterController, type ModemWorkerHandle, type AudioPlayerLike } from '../../ui/controllers/chatterController';
 import { ROOM_TIMING } from '../chatter/roomProtocol';
-import { ControlType, packFileComing, CONTROL_HEADER_WIRE, controlPayloadWireSize } from '../protocol/controlFrame';
+import { ControlType, packFileComing, packReport, CONTROL_HEADER_WIRE, controlPayloadWireSize } from '../protocol/controlFrame';
 import { getState, setState, CHATTER_PACKET_LOG_MAX } from '../../ui/Store';
+import { PROBE_PURPOSE, type ProbePurpose } from '../protocol/probeBurst';
 
 /** Manual clock + timer wheel, mirroring roomProtocol.test.ts's harness. */
 function makeClock() {
@@ -51,7 +52,7 @@ function makeFakeWorker() {
   const handlers = new Map<string, Set<(ev: any) => void>>();
   let airBusy = false;
 
-  const worker: ModemWorkerHandle & { emit: (type: string, ev: any) => void; calls: string[]; configs: any[]; muteLog: boolean[]; setAirBusy: (b: boolean) => void } = {
+  const worker: ModemWorkerHandle & { emit: (type: string, ev: any) => void; calls: string[]; configs: any[]; muteLog: boolean[]; setAirBusy: (b: boolean) => void; probePurposes: ProbePurpose[] } = {
     sampleRate: 48000,
     calls,
     configs,
@@ -71,11 +72,23 @@ function makeFakeWorker() {
       calls.push(`encodeFile:${fileName}`);
       return { samples: new Float32Array(4), sampleRate: 48000 };
     },
+    startFileStream: async () => {
+      calls.push('startFileStream');
+      let served = false;
+      return {
+        sampleRate: 48000,
+        totalSamples: 8,
+        pull: async () => (served ? null : ((served = true), new Float32Array(8))),
+        cancel: () => { calls.push('startFileStream:cancel'); },
+      };
+    },
     chatterStart: (deviceId: number) => { calls.push(`chatterStart:${deviceId}`); },
     chatterStop: () => { calls.push('chatterStop'); },
     chatterScanPaused: (paused: boolean) => { calls.push(`chatterScanPaused:${paused}`); },
-    encodeProbe: async () => {
+    probePurposes: [] as ProbePurpose[],
+    encodeProbe: async (deviceId: number, purpose: ProbePurpose) => {
       calls.push('encodeProbe');
+      worker.probePurposes.push(purpose);
       return { samples: new Float32Array(4), sampleRate: 48000 };
     },
     encodeControl: async (msg) => {
@@ -91,10 +104,33 @@ function makeFakeWorker() {
 
 function makeFakePlayer() {
   const played: { samples: Float32Array; sampleRate: number }[] = [];
-  const player: AudioPlayerLike & { played: typeof played } = {
+  const calls: string[] = [];
+  /** fixedGain argument of every playStream call — the file path must pass an
+   *  explicit, volume-independent one (see FILE_STREAM_GAIN). */
+  const streamGains: (number | undefined)[] = [];
+  const player: AudioPlayerLike & {
+    played: typeof played; calls: typeof calls; streamGains: typeof streamGains;
+  } = {
     played,
+    calls,
+    streamGains,
     play: async (samples: Float32Array, sampleRate: number) => {
       played.push({ samples, sampleRate });
+    },
+    playStream: async (
+      pull: () => Promise<Float32Array | null>,
+      _sampleRate: number,
+      _deviceId?: string,
+      _onProgress?: (scheduledSec: number) => void,
+      fixedGain?: number,
+    ) => {
+      calls.push('playStream');
+      streamGains.push(fixedGain);
+      // Drain like the real player does, so a generator bug surfaces here.
+      for (;;) {
+        const chunk = await pull();
+        if (chunk === null) break;
+      }
     },
   };
   return player;
@@ -146,6 +182,28 @@ describe('ChatterController', () => {
 
     await clock.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 100);
     expect(getState().chatterState).toBe('idle');
+  });
+
+  it('announces a join as joining and a roll call as a roll call', async () => {
+    // The purpose bit is what tells a listener which reply to send. If both
+    // announcements went out as the same purpose, a roll call would be
+    // answered with WELCOMEs (no channel measurement) or a join with REPORTs
+    // (the joiner never learns the room is occupied).
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
+
+    await controller.joinRoom();
+    await clock.tick(ROOM_TIMING.listenMs + 100);
+    expect(worker.probePurposes).toEqual([PROBE_PURPOSE.joining]);
+
+    await clock.tick(
+      ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
+    );
+    await controller.broadcastFile('a.txt', new Uint8Array(10));
+    await clock.tick(ROOM_TIMING.listenMs + 100);
+    expect(worker.probePurposes).toEqual([PROBE_PURPOSE.joining, PROBE_PURPOSE.rollCall]);
   });
 
   it('a second joinRoom call while the first is still in flight is a no-op', async () => {
@@ -439,5 +497,109 @@ describe('ChatterController', () => {
     expect(cfg.pilotFreqHz).toBe(6300);
     expect(cfg.toneCount).toBe(32);
     expect(worker.calls).toContain('startListening');
+  });
+
+  it('surfaces a failed file encode as chatterError instead of an unhandled rejection', async () => {
+    // startFileTx fires transmitFile with `void`, so a rejection inside it had
+    // nowhere to go: chatterError stayed null and the room sat in 'sending'
+    // until its deadline, showing a transfer that was already dead. This is
+    // the only signal a phone gets.
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
+    worker.startFileStream = async () => { throw new Error('Out of memory'); };
+
+    await controller.joinRoom();
+    await clock.tick(
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS
+      + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
+    );
+    await controller.broadcastFile('a.txt', new Uint8Array(40));
+    // Reaching 'collecting' costs listenMs (carrier-sense wait) PLUS the roll
+    // call probe's own MUTE_TAIL_MS echo tail (see doPlayAndMute) — without
+    // the tail this fires while still 'rollCall', and the REPORT below lands
+    // outside the collecting window and gets silently dropped.
+    await clock.tick(ROOM_TIMING.listenMs + MUTE_TAIL_MS + 100);
+    worker.emit('controlMessage', {
+      msg: { type: ControlType.Report, senderId: 5, targetId: getState().chatterDeviceId, payload: packReport(flatGrid).buffer },
+    });
+    await clock.tick(
+      ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200,
+    );
+
+    expect(getState().chatterError).toMatch(/Out of memory/);
+  });
+
+  it('transmits a chatter file through the streaming path, not the batch encoder', async () => {
+    // Batch encode builds the whole waveform in the worker, transfers it
+    // whole, and hands it to play() — which is the largest single allocation
+    // in a send. The streaming path bounds it to one chunk and already backs
+    // the bench path.
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
+
+    await controller.joinRoom();
+    await clock.tick(
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS
+      + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
+    );
+    await controller.broadcastFile('a.txt', new Uint8Array(40));
+    // Reaching 'collecting' costs listenMs (carrier-sense wait) PLUS the roll
+    // call probe's own MUTE_TAIL_MS echo tail (see doPlayAndMute) — without
+    // the tail this fires while still 'rollCall', and the REPORT below lands
+    // outside the collecting window and gets silently dropped.
+    await clock.tick(ROOM_TIMING.listenMs + MUTE_TAIL_MS + 100);
+    worker.emit('controlMessage', {
+      msg: { type: ControlType.Report, senderId: 5, targetId: getState().chatterDeviceId, payload: packReport(flatGrid).buffer },
+    });
+    await clock.tick(
+      ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200,
+    );
+
+    expect(worker.calls).toContain('startFileStream');
+    // encodeFile pushes `encodeFile:${fileName}` (a prefixed marker, unlike
+    // startFileStream's bare string) — toContain('encodeFile') would never
+    // match that element and pass unconditionally, missing the worst case
+    // here: both paths firing and the file going out twice.
+    expect(worker.calls.some((c) => c.startsWith('encodeFile'))).toBe(false);
+    expect(player.calls).toContain('playStream');
+    // An explicit fixed gain, not the volume slider: the batch path this
+    // replaced normalised every buffer to a fixed peak regardless of volume,
+    // so probes/control messages and the file they negotiate must not go out
+    // at levels that move independently of each other. `undefined` here would
+    // mean the file's level rides the UI volume again.
+    expect(player.streamGains).toEqual([1]);
+  });
+
+  it('cancels the worker-side stream generator when playStream fails, and surfaces the error', async () => {
+    // doPlayStreamAndMute's cancel() call is the leak-prevention path: without
+    // it, a failed transfer leaves the worker holding the whole encode until
+    // the next stream replaces it. Force playStream to throw and confirm both
+    // the cancel marker and chatterError land.
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
+    player.playStream = async () => { throw new Error('playback failed'); };
+
+    await controller.joinRoom();
+    await clock.tick(
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS
+      + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
+    );
+    await controller.broadcastFile('a.txt', new Uint8Array(40));
+    await clock.tick(ROOM_TIMING.listenMs + MUTE_TAIL_MS + 100);
+    worker.emit('controlMessage', {
+      msg: { type: ControlType.Report, senderId: 5, targetId: getState().chatterDeviceId, payload: packReport(flatGrid).buffer },
+    });
+    await clock.tick(
+      ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200,
+    );
+
+    expect(worker.calls).toContain('startFileStream:cancel');
+    expect(getState().chatterError).toMatch(/playback failed/);
   });
 });

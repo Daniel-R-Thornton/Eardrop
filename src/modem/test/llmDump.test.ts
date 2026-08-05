@@ -245,7 +245,7 @@ describe('chatter diagnostics survive compression', () => {
     const out = compressRecords([
       rec('REC-CAP', { agc: true, ns: false, aec: false, rate: 48000, ch: 1, ctxRate: 48000 }),
       rec('ROOM', { rollCallDone: true, target: 'broadcast', reports: 0, from: 'none', knownMembers: '183', us: 123 }),
-      rec('ROOM', { probeFrom: 183, meanDb: '-10.1', handshakeBandDb: '-24.8', band: '6900-7250Hz' }),
+      rec('ROOM', { probeFrom: 183, meanDb: '-10.1', handshakeBandDb: '-24.8', band: '2600-2950Hz' }),
     ]);
     expect(out).toMatch(/CAP agc=true ns=false aec=false rate=48000 ch=1/);
     expect(out).toMatch(/RCALL us=123 n=0 from=none known=183/);

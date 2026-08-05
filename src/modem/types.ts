@@ -192,54 +192,133 @@ export const OFDM_DEFAULTS = {
  * here (see bandCard.ts); the card announces the real band and both sides
  * hop, the receiver by swapping in a fresh engine (HandshakeReceiver).
  *
- * Values chosen from bench measurements, not aesthetics: 8 QPSK tones at
- * 6900-7250 Hz decoded at MER 21-22 dB on the weakest hardware measured (a
- * laptop DMIC + micro-speaker) — QPSK needs ~10 dB, so the handshake carries
- * ~11 dB of margin. Few tones = maximum power per tone. CHANGING ANY VALUE
- * BREAKS COMPATIBILITY with every deployed receiver — this is a wire
- * constant, not a tuning knob.
+ * 8 QPSK tones at 2600-2950 Hz. Few tones = maximum power per tone.
+ *
+ * WHY THIS BAND, and not the 6900-7250 Hz it shipped with: that range decoded
+ * at MER 21-22 dB on the weakest hardware then measured (a laptop DMIC +
+ * micro-speaker), which is ~11 dB of margin over QPSK's ~10 dB. But it is also
+ * where phone speakers and microphones are both at their worst, and this band
+ * carries EVERY control message — so on a phone the entire control plane sat
+ * in the least reproducible part of the spectrum while the probe burst it is
+ * paired with sweeps 1500-7800 Hz and decodes reliably. 2600-2950 is inside
+ * the same 2-4 kHz sweet spot OFDM_DEFAULTS targets.
+ *
+ * CHANGING ANY VALUE BREAKS COMPATIBILITY with every deployed receiver — this
+ * is a wire constant, not a tuning knob. Both devices must update together.
  *
  * The PILOT sits directly below the tones, and must stay there. Drift
  * correction extrapolates the pilot's measured phase by toneFreq/pilotFreq
- * (see rxEngine), so the further the pilot is from the band, the more a small
- * timing error is amplified — the same trap documented on OFDM_TUNING's
- * chirpCenterHz, which is why the main band moved its pilot up to 6300.
- *
- * A pure timing offset extrapolates exactly; what the ratio multiplies is any
- * ERROR in the pilot phase measurement — noise, a fractional-sample estimate,
- * residual drift. This band shipped with the pilot left at 1850 while its
- * tones sat at 6900-7250, a factor of ~3.9, so roughly 12 degrees of pilot
+ * (see rxEngine), so the further the pilot is from the band, the more any
+ * ERROR in that phase measurement is amplified — noise, a fractional-sample
+ * estimate, residual drift. A pure timing offset extrapolates exactly; the
+ * ratio multiplies the error. This band shipped with the pilot at 1850 while
+ * its tones sat at 6900-7250, a factor of ~3.9, so roughly 12 degrees of pilot
  * uncertainty was enough to cross QPSK's 45 degree decision boundary at the
- * top tone. Loopback is noise-free and decoded perfectly; over the air
- * nothing ever did — two devices in a room detected each other's chirps
- * (norm 0.6, handoff score 0.75, training collected) and then failed to
- * demodulate a single control frame in either direction, with no sentinel
- * ever found. Pilot 6800 puts the factor at ~1.07.
+ * top tone. Loopback is noise-free and decoded perfectly; over the air nothing
+ * ever did — two devices in a room detected each other's chirps (norm 0.6,
+ * handoff score 0.75, training collected) and then failed to demodulate a
+ * single control frame in either direction, with no sentinel ever found.
+ * Pilot 2000 under tones ending at 2950 puts the factor at ~1.48.
  *
- * Moving it also clears an overlap with chirpCenterHz, which is 1850 — the
- * old pilot sat exactly on the chirp template's centre, the false-trigger
- * mechanism described below.
+ * toneStartHz stays at 600 rather than tightening the ratio further:
+ * ofdmToneFrequencies clamps the offset to MIN_TONE_START_HZ (600) so tones
+ * can never land on the pilot, and that constant is GLOBAL — shared by every
+ * caller, TX and RX alike, precisely so the clamp cannot diverge between the
+ * two sides. Lowering it to buy a 1.33 ratio here would silently move every
+ * chatter-negotiated band as well, which is a far larger blast radius than the
+ * ratio is worth at these frequencies.
+ *
+ * chirpCenterHz: see the field's own comment. In short, the global 1850 Hz
+ * centre was chosen to sit far below any data band, and once this band moved
+ * down to 2600 Hz it was no longer far from it.
  *
  * gapSymbols: silence between the handshake segment and the target-band
  * transmission. The post-hop engine must meet the target chirp the way a
  * cold receiver does — quiet first. Bench 2026-08-03: without the gap, the
- * chirp correlator fired on the card symbols' 1850 Hz pilot (the template
- * sweeps through 1850) at norm ~0.15, the CP probe then VALIDATED the false
- * detect because cards are real OFDM with real cyclic prefixes, and the
- * engine trained during the actual chirp — target tones measured ~1e-4 and
- * the transfer was dead before it started.
+ * chirp correlator fired on the card symbols' pilot at norm ~0.15 (the
+ * template sweeps through 1850, and the old pilot sat exactly on that
+ * centre), the CP probe then VALIDATED the false detect because cards are
+ * real OFDM with real cyclic prefixes, and the engine trained during the
+ * actual chirp — target tones measured ~1e-4 and the transfer was dead
+ * before it started. Moving the pilot to 2000 does not retire this: the
+ * global template still spans 1750-1950 (chirpCenterHz 1850 +/- the 100 Hz
+ * half-span), so 2000 clears the swept edge by only 50 Hz — a partial return
+ * toward the same mechanism, not an escape from it. The gap and
+ * HandshakeReceiver's sample discard are what actually prevent it; see
+ * tuning.test.ts's guard on this exact clearance.
  */
 export const OFDM_HANDSHAKE = {
-  // 6300 rather than something snugger: ofdmToneFrequencies clamps the offset
-  // to MIN_TONE_START_HZ (600) so tones can never land on the pilot, and a
-  // smaller number here is silently raised to 600 — which shifts the TONES up
-  // instead of moving the pilot closer, the opposite of the intent. 6300 + 600
-  // lands the tones back on the bench-measured 6900-7250 with the factor at
-  // 1.15. It is also the pilot the main band settled on for the same reason.
-  pilotFreqHz: 6300,
-  toneStartHz: 600, // offset above the pilot — tones at 6900-7250 Hz
+  pilotFreqHz: 2000,
+  toneStartHz: 600, // offset above the pilot — tones at 2600-2950 Hz
   toneCount: 8,
   gapSymbols: 8,
+  /**
+   * Sync-chirp centre for THIS band only, decoupled from
+   * OFDM_TUNING.chirpCenterHz.
+   *
+   * The chirp is the loudest thing in a transmission and the transmit chain
+   * compresses per band, so a chirp sitting next to the tones it precedes
+   * compresses them and then releases across the frame — measured as the
+   * received pilot going 0.367 during training to 2.67 during data, a 17 dB
+   * swing, with no frame decoding (see OFDM_TUNING.chirpCenterHz). The global
+   * value is parked at 1850 Hz for exactly that reason, well below any data
+   * band — historically this band's own 6900-7250 Hz tones too. This band's
+   * tones have since moved DOWN to 2600-2950 Hz, at which point 1850 stopped
+   * being "well below" and became "adjacent" — this field exists so that move
+   * didn't also drag the chirp into the band it precedes.
+   *
+   * 4400 Hz: the probe burst's own down-chirp already sweeps through here and
+   * is decoded reliably on this hardware. It clears the handshake tones
+   * (2600-2950) by ~1.35 kHz — comfortably more than the ~500 Hz separation
+   * that failed for the TARGET band: pilot 6300 dragged its chirp to
+   * 6200-6400 under its own tones at 6900+ (see OFDM_TUNING.chirpCenterHz).
+   *
+   * WHAT CONSTRAINS THIS VALUE — it is emphatically not unconstrained, which
+   * is what this comment used to claim. The chirp carries no information (it
+   * only provides coarse timing, see rxEngine's chirpCorrelate), but its
+   * FREQUENCY is constrained by the same mechanism as the global centre:
+   * anything the chirp sits next to gets compressed and then released across
+   * the frame. Three separate clearances have to hold, and only the first two
+   * were checked when 4400 was chosen:
+   *
+   *   1. this band's own tones (2600-2950) — cleared by ~1.35 kHz;
+   *   2. the global chirp/pilot template (1750-1950) — cleared by 2.35 kHz, so
+   *      the two correlation templates cannot be confused;
+   *   3. the NEGOTIATED TARGET band, which is not a constant and was missed.
+   *
+   * HAZARD, UNRESOLVED (3): settingsPick.bestWindow slides its window across
+   * 1500-7800 Hz and tries 32 tones (a 1550 Hz span) first, so ANY 32-tone
+   * window starting between 2850 and 4400 Hz contains 4400 Hz — and 2-4 kHz is
+   * exactly where phone hardware scores best, which is this branch's premise
+   * for moving the control plane there. So the 800 ms handshake chirp
+   * (OFDM_TUNING.chirpSymbols) frequently lands INSIDE the target band, shortly
+   * before that band's own preamble: the 17 dB-swing geometry, on the target
+   * band this time.
+   *
+   * Its amplitude is 0.12 (OFDM_TUNING.chirpAmplitude), NOT the 0.6 an earlier
+   * draft of this note claimed — 0.6 was replaced precisely because it detected
+   * worse and compressed the chain. At 0.12 the chirp is well below the
+   * preamble's own ~0.63 peak, so what drives the mechanism here is a sustained
+   * narrow sweep concentrating energy in one band, not raw loudness. The hazard
+   * is real and unguarded, but an order less severe than 0.6 would suggest, and
+   * the measurement below has to be sized against 0.12.
+   *
+   * NOT guarded here, deliberately. Excluding a band around this centre from
+   * settingsPick would delete most candidate windows in the best part of the
+   * spectrum on a hypothesis, and the target band's position is already
+   * pending an over-the-air measurement it has never had. What mitigates it
+   * today is distance in TIME rather than frequency — the card x3, gapSymbols
+   * of silence, and the target band's own trainingSettleSymbols, which exists
+   * precisely to discard the symbols a loud chirp compressed. Whether that is
+   * enough is a measurement, not an argument: it is recorded as a required
+   * item for the pending hardware run (see the plan ledger), and settingsPick
+   * carries the matching note at its window search.
+   *
+   * TX and RX must agree: both derive it from `bandHandshake` mode rather than
+   * passing it around, so there is no configuration in which one side reads
+   * this and the other does not.
+   */
+  chirpCenterHz: 4400,
 } as const;
 
 /**
@@ -282,9 +361,16 @@ export const OFDM_TUNING = {
    *
    * So the chirp keeps its own low band, well away from any usable data
    * frequency. It only provides coarse timing (see rxEngine's chirpCorrelate),
-   * so its frequency is unconstrained by anything else. TX and RX must agree —
-   * both read this value, and a mismatch makes the correlation template the
-   * wrong shape and nothing syncs.
+   * so its frequency is unconstrained by anything else.
+   *
+   * This value governs the TARGET band only. The fixed handshake band has its
+   * own chirp centre, OFDM_HANDSHAKE.chirpCenterHz, for the same reason this
+   * one exists — see that field's comment. TX and RX must agree on whichever
+   * of the two applies, and both derive that choice the same way (from
+   * `bandHandshake` mode) rather than having it passed around, so there is no
+   * configuration in which one side reads one value and the other reads the
+   * other. A mismatch would make the correlation template the wrong shape and
+   * nothing would sync.
    */
   chirpCenterHz: 1850,
   /**

@@ -13,15 +13,15 @@
  *   cold --start()--> listening --(quiet)--> announcing --> joinWait --> idle
  *     ^                   |                                              |  ^
  *     |            (busy, re-check                                      |  |
- *     |             up to listenCapMs,                            onProbeHeard
- *     |             then force through)                           (reply slot)
+ *     |             up to listenCapMs,                        queued onProbeHeard
+ *     |             then force through)                     reply (see below)
  *     |                                                                  |
  *     +-------------------------- stop() -------------------------------+
  *
  *   idle --sendFile()--> listening --(quiet)--> rollCall --> collecting
  *     ^                                                          |
- *     |                                              reports==0  |  reports>0
- *     +---------------------- lastError set <--------------------+
+ *     |                                 reports==0 / air busy  |  reports>0,
+ *     +---------------------- lastError set <--------------------+  air quiet
  *     |                                                          |
  *     |                                        FILE_COMING sent, wait
  *     |                                        fileComingLeadMs, startFileTx
@@ -30,15 +30,30 @@
  *
  *   idle/joinWait --onMessage(FILE_COMING)--> receiving --durationMs+5000--> idle
  *
+ *   idle/joinWait --onProbeHeard--> (queued reply, slotted + carrier-sensed)
+ *
  * Every state reached via a timer carries its OWN deadline back to idle (or
  * cold, for the pre-join chain) so nothing can get stuck; `stop()` cancels
- * every outstanding timer via a single `pendingTimers` set. Timer callbacks
- * re-check `this.state` before acting (and again after every await) so a
- * stale timer firing after a later transition is a no-op, never a
- * regression to an earlier state.
+ * every outstanding timer via a single `pendingTimers` set. Most timer
+ * callbacks re-check `this.state` before acting (and again after every
+ * await) so a stale timer firing after a later transition is a no-op, never
+ * a regression to an earlier state. `armReplyAck`'s retry timer is the
+ * exception: it isn't state-shaped (a reply can be owed in either 'idle' or
+ * 'joinWait'), so it gates on membership in `awaitingAck` instead — cleared
+ * by any contact from the prober, and by `stop()`/the cold error path
+ * alongside `replyQueue.clear()` — which is the same "stale timer is a
+ * no-op" property, just keyed on the map rather than on `this.state`. Only
+ * 'joining'-purpose replies ever arm that timer at all — see armReplyAck for
+ * why a roll-call reply must never be retried.
  *
  * `listening` is shared by both carrier-sense phases (join and roll-call) —
  * carrier sense is carrier sense regardless of what comes after it.
+ *
+ * Replies to probes are QUEUED, not state-gated: `onProbeHeard` records what
+ * is owed and `drainReplyQueue` sends it whenever the local transmitter is
+ * free (`canTransmitReply`). Gating the send on a single state meant two
+ * devices joining at once were both in `joinWait` when the other's probe
+ * arrived and neither ever replied.
  */
 import {
   ControlType,
@@ -53,6 +68,7 @@ import {
   type FileComingPayload,
 } from '../protocol/controlFrame';
 import { pickSettings, type PeerReport, type PickedSettings } from './settingsPick';
+import { PROBE_PURPOSE, type ProbePurpose } from '../protocol/probeBurst';
 import { OFDM_TUNING } from '../types';
 import { dlog } from '../../lib/debug/dlog';
 
@@ -75,8 +91,10 @@ export interface RoomDeps {
   now(): number; // ms, monotonic
   rng(): number; // [0,1)
   schedule(fn: () => void, delayMs: number): () => void; // returns cancel
-  /** Play the probe burst; resolves when playback finishes. */
-  playProbe(): Promise<void>;
+  /** Play the probe burst; resolves when playback finishes. `purpose` goes on
+   *  the air so listeners know whether to answer WELCOME or REPORT — see
+   *  PROBE_PURPOSE. */
+  playProbe(purpose: ProbePurpose): Promise<void>;
   /** Encode + play a control message; resolves when playback finishes. */
   sendMessage(msg: ControlMessage): Promise<void>;
   /** Band RMS check — true = someone is talking. */
@@ -121,6 +139,19 @@ const DEFAULT_CLAIM: BestRangeClaim = { lowHz: 1500, highHz: 7800, maxQamOrder: 
  *  last frame's tail and any scheduling jitter. */
 const TRANSFER_TAIL_MARGIN_MS = 5000;
 
+/** Total sends per owed WELCOME, including the first (a REPORT is never
+ *  retried — see armReplyAck). A lost WELCOME leaves the joiner believing the
+ *  room is empty, so one retry is worth roughly two seconds of extra airtime;
+ *  more than that just makes a genuinely deaf peer expensive for everyone
+ *  else.
+ *
+ *  Note what this is NOT: a retry-on-loss. Nothing in this class transmits in
+ *  response to a WELCOME, so a joiner that heard us perfectly stays silent
+ *  and the ack only clears if it happens to send something of its own (a
+ *  fresh probe, a roll call, a FILE_COMING, a BYE) inside the window. In the
+ *  ordinary two-device flow the second send therefore happens every time. */
+const MAX_REPLY_ATTEMPTS = 2;
+
 interface PendingFile {
   fileBytes: number;
   durationMs: number;
@@ -135,6 +166,21 @@ interface PendingFile {
   targetId: number;
 }
 
+interface PendingReply {
+  proberId: number;
+  /** What the prober announced — decides WELCOME vs REPORT. Overwritten by a
+   *  fresh probe, because the newest announcement is the true one: a device
+   *  that ran a roll call and then refreshed and rejoined needs a WELCOME. */
+  purpose: ProbePurpose;
+  /** Sends attempted for this reply so far, including the first — read by
+   *  armReplyAck to decide whether a retry is still owed. Capped at
+   *  MAX_REPLY_ATTEMPTS: once attempts reaches it, the prober is given up on
+   *  rather than retried again. */
+  attempts: number;
+  /** A slot chain is already in flight for this entry. */
+  scheduled: boolean;
+}
+
 export class RoomProtocol {
   private _state: RoomState = 'cold';
   private readonly _members = new Map<number, Member>();
@@ -145,10 +191,38 @@ export class RoomProtocol {
   private pendingSendFile: PendingFile | null = null;
   private activeFileParams: PendingFile | null = null;
   private readonly collectedReports = new Map<number, PeerReport>();
-  /** Probers a WELCOME reply chain is already in flight for — dedupes a
-   *  second `onProbeHeard` for the same device while the first reply
-   *  attempt is still waiting out its slot(s). */
-  private readonly pendingReplyTo = new Set<number>();
+  /**
+   * Replies owed to probers, keyed by prober id.
+   *
+   * A queue rather than a state-gated side effect. Reply duty used to exist
+   * only in 'idle', so a probe heard in any other state updated the member
+   * table and sent nothing — and two devices joining within a few seconds of
+   * each other are BOTH in joinWait when the other's probe arrives, so
+   * neither ever welcomed and both declared an empty room. Now the reply is
+   * recorded when the probe is heard and sent when our own transmitter is
+   * next free (see canTransmitReply).
+   *
+   * `scheduled` is the dedupe that `pendingReplyTo` used to be: it marks an
+   * entry whose slot chain is already in flight, so a repeat probe from the
+   * same device — or a setState that re-drains the queue — cannot start a
+   * second chain for it.
+   */
+  private readonly replyQueue = new Map<number, PendingReply>();
+  /**
+   * Replies transmitted but not yet known to have landed, keyed by prober id.
+   *
+   * "Acknowledged" is deliberately loose: anything at all heard from that
+   * prober (a fresh probe, a REPORT, a WELCOME, a FILE_COMING, a BYE) proves
+   * the link works in the direction that matters, and the room has no
+   * dedicated ack frame. Entries that age out without any of that are
+   * re-queued once.
+   *
+   * None of those is a RESPONSE to the reply, though — this class transmits
+   * nothing on receiving a WELCOME or a REPORT — so an entry aging out means
+   * "the prober happened to stay quiet", not "the reply was lost". See
+   * MAX_REPLY_ATTEMPTS.
+   */
+  private readonly awaitingAck = new Map<number, PendingReply>();
 
   constructor(private readonly deps: RoomDeps) {}
 
@@ -185,7 +259,8 @@ export class RoomProtocol {
     this.pendingSendFile = null;
     this.activeFileParams = null;
     this.collectedReports.clear();
-    this.pendingReplyTo.clear();
+    this.replyQueue.clear();
+    this.awaitingAck.clear();
     this.setState('cold');
   }
 
@@ -199,42 +274,32 @@ export class RoomProtocol {
     this.beginRollCall({ fileBytes, durationMs, targetId });
   }
 
-  /** worker heard a probe: id + measured grid */
-  onProbeHeard(deviceId: number, grid: number[]): void {
+  /** worker heard a probe: id + measured grid + what it announced */
+  onProbeHeard(deviceId: number, grid: number[], purpose: ProbePurpose = PROBE_PURPOSE.joining): void {
     const existing = this._members.get(deviceId);
     this._members.set(deviceId, { ...existing, deviceId, lastHeardMs: this.deps.now(), heardGrid: grid });
+    // Any traffic from this prober proves the direction that matters — see
+    // awaitingAck's doc comment — so a fresh probe clears a pending retry
+    // just as a REPORT or WELCOME does.
+    this.awaitingAck.delete(deviceId);
 
-    // Only 'idle' carries reply duty — a probe heard mid-join or mid-rollcall
-    // just refreshes the member table (simultaneous announce is a collision
-    // both sides retry naturally at the next roll call). Dedupe by prober:
-    // a repeat probe from the same device while its reply chain is still
-    // waiting out a slot must not start a second, redundant reply chain.
+    // Reply type comes off the wire (see PROBE_PURPOSE), not from whether we
+    // already know this prober. That inference was one-sided in both
+    // directions: a device rejoining with the same id (page refresh,
+    // reconnect, a second start()) is a stranger to itself but a known member
+    // to us, so it received a REPORT when it needed a WELCOME; and a peer
+    // whose WELCOME we lost still thinks we are a stranger, so it answered our
+    // roll call with a WELCOME. handleWelcome and handleReport keep their
+    // tolerance for the "wrong" reply type regardless, so a peer running an
+    // older build degrades rather than breaks.
     //
-    // WELCOME vs REPORT: the wire-level probe burst is identical for a join
-    // announcement and a roll-call announcement (see probeBurst.ts) — there
-    // is no purpose bit on the air, so a listener can only tell the two
-    // apart by whether it already knows this prober. A never-seen-before
-    // device is joining (reply WELCOME, onboarding it); an already-known
-    // member is running a roll call (reply REPORT — "roll-call ack" per the
-    // design spec's control-message table), since a member we've already
-    // welcomed needs a fresh channel measurement, not another welcome.
-    // Consequence: a device rejoining with the same deviceId while peers
-    // still hold it in _members (page refresh, reconnect, a second start())
-    // gets a REPORT while sitting in joinWait, not a WELCOME — see
-    // handleReport, which treats that as a member refresh rather than
-    // dropping it. The real fix is a purpose bit on the probe burst so
-    // WELCOME vs REPORT is signaled explicitly instead of inferred from
-    // membership.
-    if (this._state === 'idle' && !this.pendingReplyTo.has(deviceId)) {
-      this.pendingReplyTo.add(deviceId);
-      const alreadyKnown = existing !== undefined;
-      this.scheduleReply(
-        this.deps.now(),
-        Array.from({ length: ROOM_TIMING.replySlots }, (_unused, i) => i),
-        deviceId,
-        alreadyKnown,
-      );
-    }
+    // A fresh probe overwrites a queued entry's purpose: the newest
+    // announcement is the true one.
+    const queued = this.replyQueue.get(deviceId);
+    if (queued) queued.purpose = purpose;
+    else this.replyQueue.set(deviceId, { proberId: deviceId, purpose, attempts: 0, scheduled: false });
+
+    this.drainReplyQueue();
   }
 
   /** worker decoded a control message */
@@ -251,6 +316,12 @@ export class RoomProtocol {
         break;
       case ControlType.Bye:
         // Member aging is the UI's problem — protocol never evicts.
+        //
+        // It IS traffic from that sender, though, so it clears any reply we
+        // were still waiting to see acknowledged (see awaitingAck): a peer
+        // that heard our WELCOME and then left must not still earn a ~3 s
+        // retransmission aimed at a device that has announced it is gone.
+        this.awaitingAck.delete(msg.senderId);
         break;
     }
   }
@@ -277,15 +348,19 @@ export class RoomProtocol {
       claim: parsed.claim,
       theirViewOfUs: parsed.grid,
     });
+    // A WELCOME is traffic from the sender — it proves any reply we owed them
+    // landed, whatever that reply was.
+    this.awaitingAck.delete(msg.senderId);
 
-    // A WELCOME arriving during a roll call counts as a report. Which reply a
-    // peer sends is inferred from whether it already knows us (see
-    // onProbeHeard), and that inference is one-sided: if our WELCOME to them
-    // was lost when they joined, they still consider us a stranger and answer
-    // our roll call with a WELCOME rather than a REPORT. Ignoring it fails the
-    // roll call with "nobody home" while a peer is audibly replying — observed
-    // on hardware. The payload carries the same measured grid a REPORT does,
-    // so there is no reason to discard it.
+    // A WELCOME arriving during a roll call counts as a report. Reply type is
+    // decided by the purpose bit on the wire (see onProbeHeard / PROBE_PURPOSE),
+    // not by whether the replier already knows us — but a peer on an older
+    // build may still be running the inference this replaced, or may simply
+    // have lost our probe's purpose bit, and answer our roll call with a
+    // WELCOME rather than a REPORT. Ignoring it fails the roll call with
+    // "nobody home" while a peer is audibly replying — observed on hardware.
+    // The payload carries the same measured grid a REPORT does, so there is
+    // no reason to discard it.
     if (this._state === 'collecting') {
       this.collectedReports.set(msg.senderId, { deviceId: msg.senderId, grid: parsed.grid });
     }
@@ -301,13 +376,14 @@ export class RoomProtocol {
     const grid = parseReport(msg.payload);
     if (!grid) return;
 
-    // A REPORT is also a member refresh, independent of roll-call state: a
-    // device rejoining with the same deviceId (page refresh, reconnect, a
-    // second start()) while peers still hold it in _members receives REPORT
-    // (not WELCOME, see onProbeHeard) even while it sits in joinWait. Drop
-    // that silently and the rejoiner finishes joining knowing nothing about
-    // this peer — so always upsert the sender here, mirroring what
-    // handleWelcome refreshes.
+    // A REPORT is also a member refresh, independent of roll-call state. A
+    // rejoining device (page refresh, reconnect, a second start()) announces
+    // 'joining' and gets a WELCOME even though we still hold it in _members
+    // from before — but a peer on an older build, or one running the
+    // membership-based inference this replaced, may still answer with a
+    // REPORT while the rejoiner sits in joinWait. Drop that silently and the
+    // rejoiner finishes joining knowing nothing about this peer — so always
+    // upsert the sender here, mirroring what handleWelcome refreshes.
     const existing = this._members.get(msg.senderId);
     this._members.set(msg.senderId, {
       ...existing,
@@ -315,6 +391,9 @@ export class RoomProtocol {
       lastHeardMs: this.deps.now(),
       theirViewOfUs: grid,
     });
+    // Same reasoning as handleWelcome: a REPORT is traffic from the sender,
+    // so any reply we owed them is acknowledged.
+    this.awaitingAck.delete(msg.senderId);
 
     // Roll-call accumulation (feeds pickSettings) only happens while actively
     // collecting — a REPORT arriving outside that window is member-refresh
@@ -324,6 +403,14 @@ export class RoomProtocol {
   }
 
   private handleFileComing(msg: ControlMessage): void {
+    // Ack-clearing FIRST, ahead of both guards below: a FILE_COMING is traffic
+    // from that sender whether or not we are in a state that can act on it and
+    // whether or not it is addressed to us (see awaitingAck). Deferring it
+    // past the guards is what let a receiver hold a pending ack across an
+    // entire transfer — the retry timer would then fire the moment the
+    // transfer's own deadline dropped us back to idle, long after the reply
+    // could still matter.
+    this.awaitingAck.delete(msg.senderId);
     if (this._state !== 'idle' && this._state !== 'joinWait') return;
     // Addressed transfers: everyone in earshot demodulates this announcement,
     // but only the addressee acts on it. Without the check every device would
@@ -374,7 +461,7 @@ export class RoomProtocol {
 
   private async beginAnnounceJoin(): Promise<void> {
     this.setState('announcing');
-    await this.deps.playProbe();
+    await this.deps.playProbe(PROBE_PURPOSE.joining);
     if (this._state !== 'announcing') return; // stale guard (e.g. stop() mid-await)
 
     this.setState('joinWait');
@@ -390,7 +477,7 @@ export class RoomProtocol {
 
   private async beginAnnounceRollCall(): Promise<void> {
     this.setState('rollCall');
-    await this.deps.playProbe();
+    await this.deps.playProbe(PROBE_PURPOSE.rollCall);
     if (this._state !== 'rollCall') return;
 
     this.setState('collecting');
@@ -439,6 +526,31 @@ export class RoomProtocol {
     if (!fileParams) return; // stop() cleared it mid-flight
 
     try {
+      // Carrier-sense before the announcement — the same deps.isAirBusy()
+      // idiom every reply uses (see scheduleReply). This was the only transmit
+      // path in the machine without it, and it is the path that can least
+      // afford a collision: FILE_COMING is what arms every receiver, so a peer
+      // still transmitting over it hears nothing, arms nothing, and stays out
+      // of bandHandshake mode while we broadcast an entire file to a room that
+      // never listened — and its burst corrupts the announcement for every
+      // other member too. `lastError` stayed null throughout, so the send read
+      // as successful.
+      //
+      // Busy air ABORTS the roll call rather than waiting. A bounded wait
+      // would need a fresh deadline inside a window that has already expired
+      // (collectExtraMs is spent by the time finishRollCall runs) and would
+      // leave the collected reports aging while it ran; a retry chain is the
+      // very mechanism that produced this collision (see armReplyAck). An
+      // abort with lastError set is a failure the operator can see and act on
+      // — "the channel was busy, send it again" — which is the whole point.
+      if (await this.deps.isAirBusy()) {
+        this._lastError = 'file send aborted: channel busy when FILE_COMING was due';
+        this.activeFileParams = null;
+        this.finishToIdle();
+        return;
+      }
+      if (this._state !== 'collecting') return; // stale guard (e.g. stop() mid-await)
+
       await this.deps.sendMessage({
         type: ControlType.FileComing,
         senderId: this.deps.deviceId,
@@ -465,8 +577,9 @@ export class RoomProtocol {
         });
       });
     } catch (err) {
-      // sendMessage rejected (e.g. audio glitch mid-broadcast) — this is a
-      // roll call in progress, so the existing zero-report deadline
+      // isAirBusy/sendMessage rejected (e.g. audio glitch mid-broadcast, or the
+      // air check itself failing now that this path carrier-senses first) —
+      // this is a roll call in progress, so the existing zero-report deadline
       // destination (idle) is the right fallback, not a stuck 'collecting'.
       this.handleDepsError(err, 'idle');
     }
@@ -474,14 +587,46 @@ export class RoomProtocol {
 
   // ---- reply-to-probe: slotted, carrier-sensed, re-rolling among later slots ----
 
-  private scheduleReply(
-    baseTimeMs: number,
-    candidateSlots: number[],
-    proberId: number,
-    replyWithReport: boolean,
-  ): void {
+  /**
+   * Whether a reply may be transmitted right now.
+   *
+   * Not a single state: what matters is that OUR transmitter is free, which is
+   * true in 'idle' and in 'joinWait'. joinWait is safe because
+   * beginAnnounceJoin awaits its own playProbe before entering it, so nothing
+   * of ours is in the air, and the joinWait deadline already allows for a full
+   * control message (see beginAnnounceJoin's timer).
+   *
+   * 'listening' and 'collecting' are excluded for a different reason than
+   * 'announcing'/'rollCall'/'sending'/'receiving': in those two we are
+   * measuring the air or counting replies, and our own burst would corrupt
+   * the measurement. 'announcing' and 'rollCall' are excluded because our own
+   * probe is playing; 'sending'/'receiving' because a file transfer owns the
+   * transmitter. 'cold' is excluded because there is no room to reply into.
+   */
+  private canTransmitReply(): boolean {
+    return this._state === 'idle' || this._state === 'joinWait';
+  }
+
+  /** Start a slot chain for every queued reply that does not already have one. */
+  private drainReplyQueue(): void {
+    if (!this.canTransmitReply()) return;
+    for (const entry of Array.from(this.replyQueue.values())) {
+      if (entry.scheduled) continue;
+      entry.scheduled = true;
+      this.scheduleReply(
+        this.deps.now(),
+        Array.from({ length: ROOM_TIMING.replySlots }, (_unused, i) => i),
+        entry,
+      );
+    }
+  }
+
+  private scheduleReply(baseTimeMs: number, candidateSlots: number[], entry: PendingReply): void {
     if (candidateSlots.length === 0) {
-      this.pendingReplyTo.delete(proberId); // give up — no slot left to try
+      // Give up — no slot left to try. Narrower exposure than the two delete
+      // sites below (nothing has awaited across this one), but the identity
+      // check is here anyway for consistency of the invariant.
+      if (this.replyQueue.get(entry.proberId) === entry) this.replyQueue.delete(entry.proberId);
       return;
     }
     const idx = Math.floor(this.deps.rng() * candidateSlots.length);
@@ -490,45 +635,109 @@ export class RoomProtocol {
     const delay = Math.max(0, baseTimeMs + slot * ROOM_TIMING.replySlotMs - this.deps.now());
 
     this.timer(delay, async () => {
-      if (this._state !== 'idle') {
-        this.pendingReplyTo.delete(proberId);
+      // Not eligible any more (a transfer started, a roll call began): HOLD
+      // the entry and clear `scheduled` so the next setState into an eligible
+      // state re-drains it. Dropping it here is the old bug.
+      if (!this.canTransmitReply()) {
+        entry.scheduled = false;
         return;
       }
       try {
         const busy = await this.deps.isAirBusy();
-        if (this._state !== 'idle') {
-          this.pendingReplyTo.delete(proberId);
+        if (!this.canTransmitReply()) {
+          entry.scheduled = false;
           return;
         }
 
         if (busy) {
-          this.scheduleReply(baseTimeMs, laterSlots, proberId, replyWithReport); // still pending — chain continues
+          this.scheduleReply(baseTimeMs, laterSlots, entry); // still pending — chain continues
           return;
         }
-        const heardGrid = this._members.get(proberId)?.heardGrid ?? [];
+        const heardGrid = this._members.get(entry.proberId)?.heardGrid ?? [];
         await this.deps.sendMessage(
-          replyWithReport
+          entry.purpose === PROBE_PURPOSE.rollCall
             ? {
                 type: ControlType.Report,
                 senderId: this.deps.deviceId,
-                targetId: proberId,
+                targetId: entry.proberId,
                 payload: packReport(heardGrid),
               }
             : {
                 type: ControlType.Welcome,
                 senderId: this.deps.deviceId,
-                targetId: proberId,
+                targetId: entry.proberId,
                 payload: packWelcome({ claim: DEFAULT_CLAIM, grid: heardGrid }),
               },
         );
-        this.pendingReplyTo.delete(proberId);
+        // sendMessage is ~3s of audio; a `stop()`/cold-error/re-probe can
+        // replace the queue entry at this key while we were awaiting it (a
+        // cleared queue plus a fresh probe from the same prober creates a
+        // brand-new, not-yet-sent entry under the same id). Delete only if
+        // the entry still at this key is the one we just sent — a plain
+        // delete-by-key would discard that newer, unsent entry. armReplyAck
+        // must stay INSIDE this guard too: if it ran unconditionally, a send
+        // that resolves after stop()/a cold error torn down this room would
+        // arm a retry into a room that no longer exists (or one we've since
+        // rejoined under a fresh id table).
+        if (this.replyQueue.get(entry.proberId) === entry) {
+          this.replyQueue.delete(entry.proberId);
+          this.armReplyAck(entry);
+        }
       } catch (err) {
-        // isAirBusy/sendMessage rejected — we're already 'idle', so there's
-        // no state to unwind, just surface the error and stop dedupe-blocking
-        // this prober.
-        this.pendingReplyTo.delete(proberId);
+        // isAirBusy/sendMessage rejected — surface the error and stop blocking
+        // this prober. Same identity check as the success path above.
+        if (this.replyQueue.get(entry.proberId) === entry) this.replyQueue.delete(entry.proberId);
         this._lastError = err instanceof Error ? err.message : String(err);
       }
+    });
+  }
+
+  /**
+   * Watch for traffic from `entry.proberId`; re-queue the reply once if none
+   * arrives within a slot window. Only 'joining'-purpose replies (WELCOMEs)
+   * are ever watched — see below.
+   *
+   * Note this is not a retry-on-loss: nothing here transmits in response to a
+   * WELCOME, so a prober that heard us perfectly is silent and the second send
+   * happens anyway. See MAX_REPLY_ATTEMPTS and awaitingAck.
+   */
+  private armReplyAck(entry: PendingReply): void {
+    // NEVER retry a roll-call reply. This is structural, not a tuning choice.
+    //
+    // ROOM_TIMING.collectExtraMs (4000) is sized so that one reply drawing the
+    // LAST slot still finishes INSIDE the prober's collect window: the last
+    // slot opens at 1500 ms, a control message is ~3.15 s of audio, worst case
+    // ends at 4650 ms inside a 5800 ms window. A retry fires one slot window
+    // (1800 ms) after the FIRST SEND COMPLETED — roughly s + 4950 + r ms for
+    // slot offsets s and r — which is structurally outside that window.
+    // Whenever s + r < 850 ms (6 of 36 equally likely slot pairs) the retry is
+    // still in the air when the prober's collect deadline expires and it
+    // announces FILE_COMING: our RX is muted for our own playback, so we never
+    // demodulate the announcement, never arm the receiver, and the sender
+    // broadcasts the whole file to nobody — while our burst also corrupts that
+    // announcement for every other member.
+    //
+    // A lost REPORT costs this peer inclusion in ONE negotiation, not its
+    // membership, and the prober is about to seize the channel anyway. So the
+    // retry has nothing to win there and an entire transfer to lose. A lost
+    // WELCOME is the opposite: it leaves the joiner believing the room is
+    // empty, with nothing about to reveal otherwise.
+    if (entry.purpose === PROBE_PURPOSE.rollCall) return;
+
+    const attempts = entry.attempts + 1;
+    if (attempts >= MAX_REPLY_ATTEMPTS) return;
+
+    const retry: PendingReply = { ...entry, attempts, scheduled: false };
+    this.awaitingAck.set(entry.proberId, retry);
+    this.timer(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs, () => {
+      const pending = this.awaitingAck.get(entry.proberId);
+      if (!pending) return; // acknowledged — nothing to do
+      this.awaitingAck.delete(entry.proberId);
+      // A newer probe already queued a fresh reply; that one supersedes this
+      // retry (and carries the newer purpose).
+      if (this.replyQueue.has(entry.proberId)) return;
+      this.replyQueue.set(entry.proberId, pending);
+      this.drainReplyQueue();
     });
   }
 
@@ -552,7 +761,8 @@ export class RoomProtocol {
     if (fallback === 'cold') {
       this.pendingSendFile = null;
       this.activeFileParams = null;
-      this.pendingReplyTo.clear();
+      this.replyQueue.clear();
+      this.awaitingAck.clear();
       this.setState('cold');
     } else {
       this.activeFileParams = null;
@@ -563,6 +773,10 @@ export class RoomProtocol {
   private setState(next: RoomState): void {
     this._state = next;
     this.deps.onStateChange?.(next, Array.from(this._members.values()));
+    // Entering an eligible state is the moment a held reply can go out. Every
+    // transition routes through here, so this is the single re-arm point —
+    // there is no state whose entry can forget to check the queue.
+    if (next === 'idle' || next === 'joinWait') this.drainReplyQueue();
   }
 
   /** Register a cancelable timer, tracked in `pendingTimers` so `stop()` can

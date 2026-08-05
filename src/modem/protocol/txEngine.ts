@@ -162,6 +162,10 @@ export class TxEngine {
           pilotAmplitude: OFDM_DEFAULTS.pilotAmplitude,
           toneCount: OFDM_HANDSHAKE.toneCount,
           toneStartHz: OFDM_HANDSHAKE.toneStartHz,
+          // The handshake band's own chirp centre — see
+          // OFDM_HANDSHAKE.chirpCenterHz for why it's decoupled from the
+          // global 1850 Hz value.
+          chirpCenterHz: OFDM_HANDSHAKE.chirpCenterHz,
           // Pre-emphasis for the handshake band ONLY — never the target band's
           // calibration, which would be measured for different frequencies
           // entirely. Supplied per transmission by the caller from what the

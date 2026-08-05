@@ -8,6 +8,7 @@ import type { ModemCommand, ModemEvent } from '../../workers/modemSchema';
 import type { buildModemConfig } from './buildModemConfig';
 import type { Run } from '../../modem/protocol/captureTypes';
 import type { ControlMessage } from '../../modem/protocol/controlFrame';
+import type { ProbePurpose } from '../../modem/protocol/probeBurst';
 
 type Handler<T extends ModemEvent['type']> = (ev: Extract<ModemEvent, { type: T }>) => void;
 
@@ -94,8 +95,11 @@ export class ModemController {
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       this.pending.set(id, (ev) => {
-        if (ev.type === 'encoded') resolve({ samples: new Float32Array(ev.samples), sampleRate: ev.sampleRate });
-        else reject(new Error((ev as { error?: string }).error ?? 'encode failed'));
+        if (ev.type === 'encoded') { resolve({ samples: new Float32Array(ev.samples), sampleRate: ev.sampleRate }); return; }
+        const errEv = ev as { error?: string; errorName?: string };
+        const e = new Error(errEv.error ?? 'encode failed');
+        if (errEv.errorName) e.name = errEv.errorName;
+        reject(e);
       });
       const copy = new Uint8Array(data);
       this.post({ type: 'encodeFile', id, fileName, data: copy.buffer }, [copy.buffer]);
@@ -133,7 +137,9 @@ export class ModemController {
           if (ev.id !== id) return;
           offStart();
           offErr();
-          reject(new Error(ev.error));
+          const e = new Error(ev.error);
+          if (ev.errorName) e.name = ev.errorName;
+          reject(e);
         });
         const copy = new Uint8Array(data);
         this.post({ type: 'encodeStreamStart', id, fileName, data: copy.buffer }, [copy.buffer]);
@@ -166,7 +172,9 @@ export class ModemController {
           offChunk();
           offEnd();
           offErr();
-          reject(new Error(ev.error));
+          const e = new Error(ev.error);
+          if (ev.errorName) e.name = ev.errorName;
+          reject(e);
         });
         this.post({ type: 'encodeStreamPull', id });
       });
@@ -243,14 +251,17 @@ export class ModemController {
   }
 
   /** Encode a join/roll-call probe burst for the given device id. */
-  encodeProbe(deviceId: number): Promise<{ samples: Float32Array; sampleRate: number }> {
+  encodeProbe(deviceId: number, purpose: ProbePurpose): Promise<{ samples: Float32Array; sampleRate: number }> {
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       this.pending.set(id, (ev) => {
-        if (ev.type === 'encoded') resolve({ samples: new Float32Array(ev.samples), sampleRate: ev.sampleRate });
-        else reject(new Error((ev as { error?: string }).error ?? 'encodeProbe failed'));
+        if (ev.type === 'encoded') { resolve({ samples: new Float32Array(ev.samples), sampleRate: ev.sampleRate }); return; }
+        const errEv = ev as { error?: string; errorName?: string };
+        const e = new Error(errEv.error ?? 'encodeProbe failed');
+        if (errEv.errorName) e.name = errEv.errorName;
+        reject(e);
       });
-      this.post({ type: 'encodeProbe', id, deviceId });
+      this.post({ type: 'encodeProbe', id, deviceId, purpose });
     });
   }
 
@@ -262,8 +273,11 @@ export class ModemController {
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       this.pending.set(id, (ev) => {
-        if (ev.type === 'encoded') resolve({ samples: new Float32Array(ev.samples), sampleRate: ev.sampleRate });
-        else reject(new Error((ev as { error?: string }).error ?? 'encodeControl failed'));
+        if (ev.type === 'encoded') { resolve({ samples: new Float32Array(ev.samples), sampleRate: ev.sampleRate }); return; }
+        const errEv = ev as { error?: string; errorName?: string };
+        const e = new Error(errEv.error ?? 'encodeControl failed');
+        if (errEv.errorName) e.name = errEv.errorName;
+        reject(e);
       });
       const payload = new Uint8Array(msg.payload);
       this.post({

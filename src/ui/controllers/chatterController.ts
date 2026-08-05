@@ -28,11 +28,11 @@ import {
   type FileComingPayload,
 } from '../../modem/protocol/controlFrame';
 import type { ModemEvent } from '../../workers/modemSchema';
-import { AudioPlayer } from '../../audio/player';
+import { AudioPlayer, PLAYBACK_TARGET_PEAK } from '../../audio/player';
 import { buildModemConfig } from './buildModemConfig';
 import { getState, setState, CHATTER_PACKET_LOG_MAX, type ChatterPacket } from '../Store';
 import { OFDM_DEFAULTS, OFDM_HANDSHAKE } from '../../modem/types';
-import { reportGridFreqs } from '../../modem/protocol/probeBurst';
+import { reportGridFreqs, type ProbePurpose } from '../../modem/protocol/probeBurst';
 import { dlog } from '../../lib/debug/dlog';
 import { handshakeToneGains } from '../../modem/chatter/handshakeGains';
 
@@ -41,6 +41,65 @@ const OFDM_TONE_SPACING_HZ = OFDM_DEFAULTS.toneSpacingHz;
 
 /** Echo tail after our own playback ends, before RX un-mutes (room echo settle). */
 const MUTE_TAIL_MS = 150;
+
+/**
+ * Peak the transmitter AIMS under, not a peak it guarantees.
+ *
+ * Every segment `TxEngine.frameSegments` yields — handshake preamble, band
+ * card, target-band preamble, data frames — is emitted at ONE fixed
+ * deterministic scale, set as `0.95 / budget` by the modulator's own level
+ * maths. But that budget is a measured PAPR budget: OFDMQPSKModulator's scale
+ * doc states outright that it "IS NO LONGER A PROOF" and holds only up to
+ * PAPR_CREST standard deviations, accepting occasional tail clipping in
+ * exchange for not paying a permanent ~9 dB level penalty. So 0.95 is a design
+ * target with a measured (and deliberately non-zero) exceedance probability,
+ * and this constant is the transmitter's aim point — not a licence to assume
+ * any particular sample is below it.
+ */
+const FRAME_SEGMENT_PEAK_AIM = 0.95;
+
+/**
+ * Fixed playback gain for the streamed file transmission.
+ *
+ * Volume-INDEPENDENT on purpose. The batch `play()` path normalises every
+ * buffer to PLAYBACK_TARGET_PEAK regardless of `volume`, so probes and control
+ * messages — which still go out through it — leave this device at one fixed
+ * absolute level. The roll-call channel measurement and the -18 dB band pick
+ * are made from probes at that level, and the file's own handshake segment is
+ * the sync-critical head of the transmission on a band this branch documents
+ * as unmeasured over the air. Letting the file's level ride the UI volume
+ * slider meant the negotiation and the transfer it negotiates for went out at
+ * different levels, quieter by 20·log10(volume) dB for any volume < 1.
+ *
+ * Derived from the transmitter's own aim point, NOT from measuring chunks:
+ * per-chunk normalisation is banned outright (see AudioPlayer.playStream's
+ * `schedule()` — it was measured stepping the level between chunks and
+ * wrecking every channel estimate downstream), and buffering the whole
+ * waveform to measure its true peak would give back the memory saving the
+ * streaming path exists for.
+ *
+ * Residual, recorded honestly: this maps the transmitter's AIM POINT onto the
+ * batch path's target peak, so it reproduces the batch level exactly only for a
+ * transmission that actually reaches that aim. A real chatter waveform peaks
+ * lower (0.69-0.74 measured across 4/8/16/32-tone configs, flat and tilted
+ * gains), where batch `play()`'s peak-normalisation amplified it by 1/peak into
+ * 0.95 — so the streamed file still goes out ~2.2-2.8 dB below the batch path.
+ * Closing that last gap needs the waveform's real peak, which cannot be had
+ * without measuring it.
+ *
+ * DO NOT RAISE THIS ABOVE 1.0 to chase that 2.2-2.8 dB. The only clip guard on
+ * this path is in `playStream`'s `schedule()`, and it inspects the RAW chunk
+ * BEFORE the gain node applies this number — so a gain above unity clips at the
+ * destination with no clamp and no `clipClamped` log line, leaving a wrecked
+ * transfer with nothing in the log to explain it. `playStream` clamps
+ * `fixedGain` to 1.0 for exactly this reason, so raising it here would silently
+ * do nothing rather than fail loudly. The transmitter's peak is also only a
+ * measured PAPR aim (see FRAME_SEGMENT_PEAK_AIM), so headroom above it is not
+ * actually free even in principle. The legitimate route is a TX-side
+ * deterministic peak for the transmission about to be emitted, computed from
+ * the configuration and plumbed through to here.
+ */
+const FILE_STREAM_GAIN = PLAYBACK_TARGET_PEAK / FRAME_SEGMENT_PEAK_AIM;
 
 /** Fudge factor + floor over a floor-settings bit-rate estimate for the
  *  FILE_COMING durationMs field. The real settings aren't picked until AFTER
@@ -82,6 +141,15 @@ const JOIN_MIC_TIMEOUT_MS = 13000;
  *  supply a fake without touching AudioContext. */
 export interface AudioPlayerLike {
   play(samples: Float32Array, sampleRate: number, deviceId?: string, clean?: boolean): Promise<void>;
+  /** Chunked playback — see AudioPlayer.playStream. Used for the file path so
+   *  peak memory is one chunk rather than the whole waveform. */
+  playStream(
+    pull: () => Promise<Float32Array | null>,
+    sampleRate: number,
+    deviceId?: string,
+    onProgress?: (scheduledSec: number) => void,
+    fixedGain?: number,
+  ): Promise<void>;
 }
 
 /**
@@ -102,9 +170,16 @@ export interface ModemWorkerHandle {
   startListening(micGain: number, deviceId?: string, deviceLabel?: string): Promise<void>;
   stopListening(): void;
   encodeFile(fileName: string, data: Uint8Array): Promise<{ samples: Float32Array; sampleRate: number }>;
+  /** Streaming encode — see ModemController.startFileStream. */
+  startFileStream(fileName: string, data: Uint8Array): Promise<{
+    sampleRate: number;
+    totalSamples: number;
+    pull: () => Promise<Float32Array | null>;
+    cancel: () => void;
+  }>;
   chatterStart(deviceId: number): void;
   chatterStop(): void;
-  encodeProbe(deviceId: number): Promise<{ samples: Float32Array; sampleRate: number }>;
+  encodeProbe(deviceId: number, purpose: ProbePurpose): Promise<{ samples: Float32Array; sampleRate: number }>;
   encodeControl(msg: ControlMessage, toneGains?: number[]): Promise<{ samples: Float32Array; sampleRate: number }>;
   chatterScanPaused(paused: boolean): void;
   airCheck(): Promise<{ busy: boolean; rms: number }>;
@@ -147,7 +222,10 @@ function computeLinkInfo(rawGrid: number[]): { linkDb: number; grid: number[] } 
 function handshakeBandDb(grid: number[]): number | null {
   const freqs = reportGridFreqs();
   const lo = OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz;
-  const hi = lo + OFDM_HANDSHAKE.toneCount * OFDM_TONE_SPACING_HZ;
+  // toneCount - 1: N tones spaced toneSpacingHz apart span (N-1) * spacing,
+  // not N * spacing (8 tones 50 Hz apart cover 350 Hz, not 400) — this was
+  // an off-by-one that made the logged/measured window run 50 Hz high.
+  const hi = lo + (OFDM_HANDSHAKE.toneCount - 1) * OFDM_TONE_SPACING_HZ;
   const peak = Math.max(...grid);
   if (!(peak > 0)) return null;
   const inBand = grid.filter((_m, i) => freqs[i] >= lo - 100 && freqs[i] <= hi + 100);
@@ -238,7 +316,7 @@ export class ChatterController {
       now,
       rng: this.rng,
       schedule: this.schedule,
-      playProbe: () => this.playAndMute(() => this.worker.encodeProbe(this.deviceId), {
+      playProbe: (purpose) => this.playAndMute(() => this.worker.encodeProbe(this.deviceId, purpose), {
         kind: 'probe',
         peerId: 0,
         bytes: 0,
@@ -277,7 +355,7 @@ export class ChatterController {
     // per join/leave cycle), so there's no matching `off()`/teardown here;
     // joinRoom/leaveRoom only start and stop the ROOM, not these listeners.
     worker.on('probeHeard', (ev) => {
-      this.room.onProbeHeard(ev.deviceId, ev.grid);
+      this.room.onProbeHeard(ev.deviceId, ev.grid, ev.purpose);
       const info = computeLinkInfo(ev.grid);
       // The probe just measured this peer's whole passband — report what it
       // found where the control messages actually live. A healthy probe with
@@ -288,8 +366,10 @@ export class ChatterController {
         probeFrom: ev.deviceId,
         meanDb: info ? info.linkDb.toFixed(1) : 'n/a',
         handshakeBandDb: hsDb === null ? 'n/a' : hsDb.toFixed(1),
+        // toneCount - 1, not toneCount: see handshakeBandDb's identical fix.
         band: `${OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz}-${
-          OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz + OFDM_HANDSHAKE.toneCount * OFDM_TONE_SPACING_HZ}Hz`,
+          OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz
+            + (OFDM_HANDSHAKE.toneCount - 1) * OFDM_TONE_SPACING_HZ}Hz`,
       }, { level: 'warn' });
       this.recordPacket({
         dir: 'rx',
@@ -482,6 +562,48 @@ export class ChatterController {
     return attempt;
   }
 
+  /** Streaming counterpart of `playAndMute` — same packet recording, same
+   *  mute discipline and echo tail, same selected-speaker routing; the audio
+   *  arrives in chunks instead of one buffer. Kept as a sibling rather than a
+   *  flag on playAndMute because the two take different callbacks and share no
+   *  body beyond the bookkeeping. */
+  private playStreamAndMute(
+    start: () => Promise<{ sampleRate: number; pull: () => Promise<Float32Array | null>; cancel: () => void }>,
+    packet: Omit<ChatterPacket, 'seq' | 'tMs' | 'dir'>,
+  ): Promise<void> {
+    this.recordPacket({ dir: 'tx', ...packet });
+    setState({ chatterLastTx: this.deps.now() });
+    const attempt = this.doPlayStreamAndMute(start);
+    this.lastPlayback = attempt.catch(() => {});
+    return attempt;
+  }
+
+  private async doPlayStreamAndMute(
+    start: () => Promise<{ sampleRate: number; pull: () => Promise<Float32Array | null>; cancel: () => void }>,
+  ): Promise<void> {
+    const { sampleRate, pull, cancel } = await start();
+    this.worker.setRxMuted(true);
+    try {
+      // Read the output device at play time, so a device change mid-session
+      // takes effect on the next burst (same reason as doPlayAndMute).
+      //
+      // FILE_STREAM_GAIN, not the volume slider: the control plane this
+      // transfer was negotiated over goes out through batch play(), whose
+      // normalisation makes its level volume-independent. See the constant.
+      await this.player.playStream(
+        pull, sampleRate, getState().selectedOutputId, undefined, FILE_STREAM_GAIN,
+      );
+    } catch (err) {
+      // Cancel the worker-side generator, or a failed playback leaves it
+      // holding the whole encode until the next stream replaces it.
+      cancel();
+      throw err;
+    } finally {
+      await this.timeout(MUTE_TAIL_MS);
+      this.worker.setRxMuted(false);
+    }
+  }
+
   /** Push one ChatterPacket onto the bounded ring (display-only — never
    *  read by any protocol decision). */
   private recordPacket(p: Omit<ChatterPacket, 'seq' | 'tMs'>): void {
@@ -635,11 +757,26 @@ export class ChatterController {
     // wire size isn't a simple formula here (depends on the negotiated
     // per-tone bit-loading in cfg.qamMap above), so this reports the file
     // size itself rather than approximating the wire size.
-    await this.playAndMute(() => this.worker.encodeFile(pending.fileName, pending.data), {
-      kind: 'file',
-      peerId: 0,
-      bytes: pending.data.byteLength,
-      note: pending.fileName,
-    });
+    // A rejection here used to vanish: startFileTx calls this with `void`, so
+    // an encode or playback failure became an unhandled rejection —
+    // chatterError stayed null and RoomProtocol sat in 'sending' until its own
+    // deadline, presenting a dead transfer as a live one. On a phone, where
+    // there is no console to check, that is the difference between a
+    // diagnosable failure and a silent one.
+    try {
+      await this.playStreamAndMute(
+        () => this.worker.startFileStream(pending.fileName, pending.data),
+        {
+          kind: 'file',
+          peerId: 0,
+          bytes: pending.data.byteLength,
+          note: pending.fileName,
+        },
+      );
+    } catch (err) {
+      const reason = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      dlog('ROOM', { fileTxFailed: reason, name: pending.fileName, bytes: pending.data.byteLength }, { level: 'warn' });
+      setState({ chatterError: `send failed: ${reason}` });
+    }
   }
 }

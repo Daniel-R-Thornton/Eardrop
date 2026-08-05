@@ -20,7 +20,8 @@ import { describe, expect, it } from 'vitest';
 import { TxEngine } from '../protocol/txEngine';
 import { RxEngine } from '../protocol/rxEngine';
 import { HandshakeReceiver } from '../protocol/handshakeReceiver';
-import { OFDM_HANDSHAKE, OFDM_TUNING, ofdmSamples } from '../types';
+import { OFDMEngine } from '../protocol/ofdmEngine';
+import { OFDM_DEFAULTS, OFDM_HANDSHAKE, OFDM_TUNING, ofdmSamples } from '../types';
 
 const SAMPLE_RATE = 48000;
 const { symSamples: SYM_LEN } = ofdmSamples(SAMPLE_RATE);
@@ -136,6 +137,59 @@ describe('band handshake: TX', () => {
     },
     TIMEOUT,
   );
+
+  it(
+    'puts the handshake segment chirp on the handshake band\'s own centre, not the target band\'s',
+    () => {
+      // The chirp is the loudest thing in a transmission and the chain
+      // compresses per band, so it must not sit next to the tones it precedes
+      // (types.ts documents a 17 dB received-level swing and zero decoded
+      // frames from exactly that). The handshake band therefore carries its
+      // own chirp centre, and the target band keeps OFDM_TUNING's.
+      expect(OFDM_HANDSHAKE.chirpCenterHz).not.toBe(OFDM_TUNING.chirpCenterHz);
+
+      const handshake = new OFDMEngine({
+        sampleRate: SAMPLE_RATE,
+        toneCount: OFDM_HANDSHAKE.toneCount,
+        pilotFreqHz: OFDM_HANDSHAKE.pilotFreqHz,
+        toneStartHz: OFDM_HANDSHAKE.toneStartHz,
+        chirpCenterHz: OFDM_HANDSHAKE.chirpCenterHz,
+      });
+      const target = new OFDMEngine({ sampleRate: SAMPLE_RATE, toneCount: 32 });
+
+      const hsCfg = handshake.generateChirpBurst(OFDM_TUNING.chirpSymbols).chirpCfg;
+      const tgtCfg = target.generateChirpBurst(OFDM_TUNING.chirpSymbols).chirpCfg;
+
+      expect((hsCfg.fStart + hsCfg.fEnd) / 2).toBeCloseTo(OFDM_HANDSHAKE.chirpCenterHz, 6);
+      expect((tgtCfg.fStart + tgtCfg.fEnd) / 2).toBeCloseTo(OFDM_TUNING.chirpCenterHz, 6);
+    },
+    TIMEOUT,
+  );
+
+  it('keeps the handshake band inside the hardware sweet spot and clear of its chirp', () => {
+    // This band carries every control message. At 6900-7250 Hz it sat where
+    // phone speakers and mics are both worst, which is a single point of
+    // failure for the whole control plane.
+    const firstTone = OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz;
+    const lastTone = firstTone + (OFDM_HANDSHAKE.toneCount - 1) * OFDM_DEFAULTS.toneSpacingHz;
+
+    expect(firstTone).toBe(2600);
+    expect(lastTone).toBe(2950);
+
+    // Pilot phase is extrapolated to each tone by toneFreq/pilotFreq, so any
+    // error in the pilot measurement is multiplied by this. 3.9 shipped
+    // broken; 1.15 was fine. Same invariant as tuning.test.ts's "handshake
+    // pilot sits directly below its tones" — 1.6 is the live 1.475 ratio plus
+    // headroom, not a measured safety threshold, so if either assertion ever
+    // needs raising, raise both together and re-check the margin is still
+    // meaningful (headroom over 1.475 is already only ~8%).
+    expect(lastTone / OFDM_HANDSHAKE.pilotFreqHz).toBeLessThan(1.6);
+
+    // The chirp must stay far from the tones it precedes — 500 Hz was not
+    // enough (types.ts documents the 17 dB swing).
+    const halfSpan = 100; // OFDMEngine's default chirpSpanHz is 200
+    expect(OFDM_HANDSHAKE.chirpCenterHz - halfSpan - lastTone).toBeGreaterThan(1000);
+  });
 });
 
 describe('band handshake: RX end-to-end (the oracle)', () => {
