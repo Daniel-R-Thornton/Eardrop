@@ -347,6 +347,21 @@ export class RoomProtocol {
         // and it surfaces in the UI exactly as it did before the extraction.
         if (err !== undefined) this._lastError = err instanceof Error ? err.message : String(err);
         if (entry.kind === 'reply') this.forgetReplyPurpose(entry.targetId);
+        // A TEXT that never made it onto the air at all — every slot in the
+        // window found the air busy, or sendMessage itself threw — is a
+        // DIFFERENT failure than an ACK timeout, and must not be handled by
+        // armTextAck: nothing was sent, so no ackWindowMs timer is ever armed
+        // for it, and without this branch the SentText record just sits in
+        // `sentText` at attempts:0 forever — stuck on 'sending' in the UI for
+        // the rest of the session, the exact silent-failure shape this whole
+        // task exists to eliminate, just relocated here from the ACK path.
+        // No automatic retry: slot exhaustion means the air was demonstrably
+        // busy across the WHOLE ~1.8 s carrier-sense window, so an automatic
+        // second attempt would add traffic to a room that just proved itself
+        // congested — same reasoning as broadcast-retries-only-on-zero-acks,
+        // just applied before the first send rather than after it. Report
+        // 'failed' and let the operator resend deliberately.
+        if (entry.kind === 'text') this.failSentText(entry.dedupKey);
       },
     });
   }
@@ -984,6 +999,32 @@ export class RoomProtocol {
   // ---- TEXT retry policy: same "one retry, then give up" discipline as a
   //      reply, but keyed on a real ACK frame rather than any-traffic-at-all,
   //      and with a broadcast rule a DM doesn't need — see checkTextAck.
+
+  /**
+   * A TEXT never made it onto the air at all — the outbox exhausted every
+   * slot with the air busy, or `sendMessage` itself threw. Unlike a
+   * checkTextAck failure (which follows an ACK window that only exists
+   * because a send DID go out), nothing here armed any timer, so nothing
+   * would otherwise ever resolve this record — it would sit in `sentText`
+   * at attempts:0, reported 'sending' forever. Report 'failed' and remove
+   * the record now rather than leaving a message the operator believes is
+   * still in flight.
+   *
+   * No retry: slot exhaustion means the air was busy across the WHOLE
+   * ~1.8 s carrier-sense window, not just one check, so the room has just
+   * demonstrated it is congested. Spending more airtime on a second attempt
+   * would punish everyone in a half-duplex room the same way an unconditional
+   * broadcast retry would — see checkTextAck's broadcast rule for the same
+   * reasoning applied one step earlier.
+   */
+  private failSentText(dedupKey: string): void {
+    const msgId = textMsgIdFromDedupKey(dedupKey);
+    if (msgId === undefined) return; // not a dedupKey this class produced
+    const rec = this.sentText.get(msgId);
+    if (!rec) return; // stop() cleared it already
+    this.sentText.delete(msgId);
+    this.deps.onTextStateChange?.(msgId, 'failed', [...rec.ackedBy]);
+  }
 
   /** Arm the ACK-window timer for a TEXT that just went out. */
   private armTextAck(entry: OutboxEntry): void {

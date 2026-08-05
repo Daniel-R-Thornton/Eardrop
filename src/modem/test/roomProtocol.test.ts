@@ -971,6 +971,27 @@ describe('room protocol', () => {
     expect(h.textStates[h.textStates.length - 1]).toMatchObject({ state: 'delivered', ackedBy: [5, 6] });
   });
 
+  it('a TEXT that exhausts every slot with the air busy reports failed and does not strand', async () => {
+    // Slot exhaustion is a DIFFERENT failure than an ACK timeout: nothing was
+    // ever transmitted, so armTextAck never got a chance to arm anything.
+    // Without a dedicated onFailed branch the SentText record would sit in
+    // `sentText` forever, reported 'sending' for the rest of the session —
+    // the same silent-failure shape this whole task exists to eliminate, just
+    // moved earlier in the pipeline.
+    let busy = false;
+    const h = makeHarness(1, { busy: () => busy });
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+
+    busy = true; // every slot in the window will find the air busy
+    const msgId = h.room.sendText('anyone?');
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 500);
+
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(0);
+    expect(h.textStates[h.textStates.length - 1]).toMatchObject({ state: 'failed' });
+    expect((h.room as any).sentText.has(msgId)).toBe(false);
+  });
+
   it('a TEXT queued while receiving is held, then sent on return to idle', async () => {
     const h = makeHarness(3);
     h.room.start();
