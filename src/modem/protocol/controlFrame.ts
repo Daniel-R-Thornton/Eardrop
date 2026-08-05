@@ -5,16 +5,16 @@
  * between devices without ever leaving the handshake band (the same band
  * `bandCard.ts` uses to announce a target-band hop). A control message is a
  * 9-byte BCH-coded header — same sentinel + BCH(63,30)x3 skeleton as the
- * band card — followed by a variable-length BCH-coded payload (0-48 raw
- * bytes, capped so the largest payload, WELCOME's 35 bytes, still fits a
- * handful of codewords):
+ * band card — followed by a variable-length BCH-coded payload (0-255 raw
+ * bytes; the ceiling is the `payloadLen` header byte itself, not any
+ * per-message-type size — see CONTROL_PAYLOAD_MAX below):
  *
  *   Header (9 raw bytes, BCH-chunked exactly like the band card):
  *     byte 0  CONTROL_MAGIC (0xC7) — identifies a control header, not a card
  *     byte 1  ControlType
  *     byte 2  senderId (1-255)
  *     byte 3  targetId (0 = broadcast)
- *     byte 4  payloadLen (raw bytes, 0-48)
+ *     byte 4  payloadLen (raw bytes, 0-255)
  *     byte 5  CRC-8 over bytes 0-4
  *     bytes 6-8 reserved (0)
  *
@@ -44,13 +44,15 @@ export enum ControlType {
   Report = 2,
   FileComing = 3,
   Bye = 4,
+  Text = 5,
+  Ack = 6,
 }
 
 export interface ControlMessage {
   type: ControlType;
   senderId: number; // 1-255
   targetId: number; // 0 = broadcast
-  payload: Uint8Array; // 0-48 raw bytes
+  payload: Uint8Array; // 0-255 raw bytes
 }
 
 /** Raw (pre-BCH) header size. */
@@ -59,8 +61,33 @@ const CONTROL_HEADER_RAW_SIZE = 9;
 /** Wire bytes of sentinel + BCH-coded header. */
 export const CONTROL_HEADER_WIRE = SENTINEL_SIZE + BCH_HEADER_SIZE; // 27
 
-/** Largest raw payload a control message may carry. */
-export const CONTROL_PAYLOAD_MAX = 48;
+/**
+ * Largest raw payload a control message may carry.
+ *
+ * 255, not the 48 this shipped with. 48 was never structural — it was picked
+ * so the largest payload then in use (WELCOME's 35 bytes) "still fits a
+ * handful of codewords". The header carries `payloadLen` as a full byte, so
+ * the frame is already variable-length and self-describing: the receiver
+ * reads exactly as many bytes as the header declares, and 255 is that field's
+ * true ceiling.
+ *
+ * Nothing downstream assumed the smaller value — SentinelScanner's collect
+ * size is retargeted per message via `continueCollecting`, and both that
+ * sizing and `decodeControlPayload` read `header.payloadLen`.
+ *
+ * COST OF A LONG PAYLOAD: BCH decodes per three-byte chunk and
+ * `bchDecodeChunks` returns null if ANY chunk is uncorrectable, so a control
+ * message is all-or-nothing. A 255-byte payload is 86 chunks — one bad chunk
+ * loses the whole message. A message this long is also ~10.4 s of air, four
+ * times anything the control plane previously carried, which is why the
+ * receiver's sync watchdog had to become length-aware (see rxEngine's
+ * OFDM_WATCHDOG_WINDOWS).
+ */
+export const CONTROL_PAYLOAD_MAX = 255;
+
+/** Largest text a TEXT payload can carry: the payload cap less the 1-byte
+ *  msgId. Counted in UTF-8 BYTES, not characters — an emoji is 4. */
+export const TEXT_MAX_BYTES = CONTROL_PAYLOAD_MAX - 1;
 
 /** Wire bytes of the BCH-coded payload for a given raw payload length. */
 export function controlPayloadWireSize(payloadLen: number): number {
@@ -338,4 +365,52 @@ export function parseFileComing(b: Uint8Array): FileComingPayload | null {
     fileBytes: view.getUint32(4, true),
     durationMs: view.getUint32(8, true),
   };
+}
+
+/** UTF-8 byte length of `text` — what the TEXT cap is measured in, and what a
+ *  composer's live counter must display. `text.length` is UTF-16 code units
+ *  and would under-count every emoji. */
+export function textByteLength(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+/**
+ * TEXT payload: [msgId:1][utf8 text: 0..TEXT_MAX_BYTES].
+ *
+ * `msgId` is monotonic per sender and wraps at 256; the receiver dedupes on
+ * (senderId, msgId). Throws rather than truncating an over-long message:
+ * cutting UTF-8 at a byte boundary can split a codepoint and put invalid
+ * bytes on the air, and `encodeControlMessage` would reject the oversized
+ * payload anyway. Callers must check `textByteLength` first.
+ */
+export function packText(msgId: number, text: string): Uint8Array {
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.length > TEXT_MAX_BYTES) {
+    throw new Error(`control frame: text ${bytes.length} B exceeds ${TEXT_MAX_BYTES} B cap`);
+  }
+  const out = new Uint8Array(1 + bytes.length);
+  out[0] = msgId & 0xff;
+  out.set(bytes, 1);
+  return out;
+}
+
+export function parseText(b: Uint8Array): { msgId: number; text: string } | null {
+  if (b.length < 1) return null;
+  return { msgId: b[0], text: new TextDecoder().decode(b.subarray(1)) };
+}
+
+/**
+ * ACK payload: [msgId:1].
+ *
+ * Nothing else is needed to identify the acked message: an ACK's `targetId`
+ * is the original sender and its `senderId` is the acknowledging device, so
+ * (targetId, msgId) is unique — msgId is only ever unique per sender.
+ */
+export function packAck(msgId: number): Uint8Array {
+  return new Uint8Array([msgId & 0xff]);
+}
+
+export function parseAck(b: Uint8Array): { msgId: number } | null {
+  if (b.length < 1) return null;
+  return { msgId: b[0] };
 }

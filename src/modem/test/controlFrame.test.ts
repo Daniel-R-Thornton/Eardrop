@@ -5,8 +5,9 @@ import {
   packWelcome, parseWelcome, packReport, parseReport,
   packFileComing, parseFileComing, quantizeGrid, dequantizeGrid,
   ControlType, CONTROL_HEADER_WIRE, controlPayloadWireSize,
+  packText, parseText, packAck, parseAck, textByteLength, TEXT_MAX_BYTES,
 } from '../protocol/controlFrame';
-import { SENTINEL_SIZE } from '../protocol/atomicFrame';
+import { SENTINEL_SIZE, BCH_HEADER_SIZE } from '../protocol/atomicFrame';
 
 const grid64 = Array.from({ length: 64 }, (_, i) => 1 / (1 + i / 16)); // sloped response
 
@@ -81,8 +82,9 @@ describe('control frame', () => {
     expect(() => encodeControlMessage({ type: ControlType.Bye, senderId: 1, targetId: 256, payload: new Uint8Array(0) })).toThrow();
   });
 
-  it('rejects a payload over the 48 B cap', () => {
-    expect(() => encodeControlMessage({ type: ControlType.Bye, senderId: 1, targetId: 0, payload: new Uint8Array(49) })).toThrow();
+  it('rejects a payload over the 255 B cap', () => {
+    // Cap raised 48 -> 255 for TEXT (see controlFrame.ts); 49 B is legal now, 256 B is not.
+    expect(() => encodeControlMessage({ type: ControlType.Bye, senderId: 1, targetId: 0, payload: new Uint8Array(256) })).toThrow();
   });
 
   it('rejects a WELCOME claim with out-of-range Hz instead of silently truncating', () => {
@@ -94,5 +96,69 @@ describe('control frame', () => {
   it('rejects FILE_COMING pilot/tone-start Hz out of range instead of silently truncating', () => {
     expect(() => packFileComing({ pilotFreqHz: 12800, toneStartHz: 600, toneCount: 32, settleSymbols: 16, fileBytes: 1, durationMs: 1 })).toThrow();
     expect(() => packFileComing({ pilotFreqHz: 6300, toneStartHz: 0, toneCount: 32, settleSymbols: 16, fileBytes: 1, durationMs: 1 })).toThrow();
+  });
+});
+
+describe('TEXT / ACK control payloads', () => {
+  it('round-trips a short message', () => {
+    const p = packText(7, 'ready?');
+    expect(parseText(p)).toEqual({ msgId: 7, text: 'ready?' });
+  });
+
+  it('round-trips an empty message', () => {
+    // Not useful to send, but the codec must not mis-handle a zero-length
+    // payload — payloadLen 1 is a legal frame.
+    expect(parseText(packText(0, ''))).toEqual({ msgId: 0, text: '' });
+  });
+
+  it('round-trips multi-byte UTF-8 at exactly the cap', () => {
+    // The cap is BYTES, not characters. An emoji is 4 bytes, so 63 of them
+    // plus a 2-byte character is 254 — the largest legal text.
+    const text = '🦻'.repeat(63) + 'é';
+    expect(textByteLength(text)).toBe(TEXT_MAX_BYTES);
+    const parsed = parseText(packText(255, text));
+    expect(parsed).toEqual({ msgId: 255, text });
+  });
+
+  it('rejects text one byte over the cap rather than splitting a codepoint', () => {
+    // Truncating mid-codepoint would put invalid UTF-8 on the air, and
+    // encodeControlMessage would throw on the oversized payload anyway.
+    const text = 'a'.repeat(TEXT_MAX_BYTES + 1);
+    expect(() => packText(1, text)).toThrow(/254|cap|too long/i);
+  });
+
+  it('round-trips an ACK', () => {
+    expect(parseAck(packAck(200))).toEqual({ msgId: 200 });
+  });
+
+  it('parseText and parseAck reject a payload that is too short', () => {
+    expect(parseText(new Uint8Array(0))).toBeNull();
+    expect(parseAck(new Uint8Array(0))).toBeNull();
+  });
+
+  it('a 255-byte payload survives the full control-frame wire round trip', () => {
+    // The old CONTROL_PAYLOAD_MAX was 48. This proves nothing downstream
+    // baked that in: header payloadLen is a full byte, so 255 is legal and
+    // the BCH chunking and CRC-16 must both scale to it.
+    const text = 'x'.repeat(TEXT_MAX_BYTES);
+    const msg = { type: ControlType.Text, senderId: 3, targetId: 0, payload: packText(9, text) };
+    expect(msg.payload.length).toBe(255);
+
+    const wire = encodeControlMessage(msg);
+    const header = decodeControlHeader(wire.slice(SENTINEL_SIZE, SENTINEL_SIZE + BCH_HEADER_SIZE));
+    expect(header).not.toBeNull();
+    expect(header!.type).toBe(ControlType.Text);
+    expect(header!.payloadLen).toBe(255);
+
+    const payloadWire = wire.slice(SENTINEL_SIZE + BCH_HEADER_SIZE);
+    expect(payloadWire.length).toBe(controlPayloadWireSize(255));
+    const payload = decodeControlPayload(payloadWire, header!.payloadLen);
+    expect(payload).not.toBeNull();
+    expect(parseText(payload!)).toEqual({ msgId: 9, text });
+  });
+
+  it('rejects a payload above the new cap', () => {
+    const msg = { type: ControlType.Text, senderId: 3, targetId: 0, payload: new Uint8Array(256) };
+    expect(() => encodeControlMessage(msg)).toThrow(/256 B exceeds 255 B cap/);
   });
 });
