@@ -53,6 +53,7 @@ import {
   type FileComingPayload,
 } from '../protocol/controlFrame';
 import { pickSettings, type PeerReport, type PickedSettings } from './settingsPick';
+import { PROBE_PURPOSE, type ProbePurpose } from '../protocol/probeBurst';
 import { OFDM_TUNING } from '../types';
 import { dlog } from '../../lib/debug/dlog';
 
@@ -75,8 +76,10 @@ export interface RoomDeps {
   now(): number; // ms, monotonic
   rng(): number; // [0,1)
   schedule(fn: () => void, delayMs: number): () => void; // returns cancel
-  /** Play the probe burst; resolves when playback finishes. */
-  playProbe(): Promise<void>;
+  /** Play the probe burst; resolves when playback finishes. `purpose` goes on
+   *  the air so listeners know whether to answer WELCOME or REPORT — see
+   *  PROBE_PURPOSE. */
+  playProbe(purpose: ProbePurpose): Promise<void>;
   /** Encode + play a control message; resolves when playback finishes. */
   sendMessage(msg: ControlMessage): Promise<void>;
   /** Band RMS check — true = someone is talking. */
@@ -199,40 +202,33 @@ export class RoomProtocol {
     this.beginRollCall({ fileBytes, durationMs, targetId });
   }
 
-  /** worker heard a probe: id + measured grid */
-  onProbeHeard(deviceId: number, grid: number[]): void {
+  /** worker heard a probe: id + measured grid + what it announced */
+  onProbeHeard(deviceId: number, grid: number[], purpose: ProbePurpose = PROBE_PURPOSE.joining): void {
     const existing = this._members.get(deviceId);
     this._members.set(deviceId, { ...existing, deviceId, lastHeardMs: this.deps.now(), heardGrid: grid });
 
     // Only 'idle' carries reply duty — a probe heard mid-join or mid-rollcall
-    // just refreshes the member table (simultaneous announce is a collision
-    // both sides retry naturally at the next roll call). Dedupe by prober:
-    // a repeat probe from the same device while its reply chain is still
-    // waiting out a slot must not start a second, redundant reply chain.
+    // just refreshes the member table. (Task 3 replaces this gate with a
+    // queue; the reply TYPE is what changes here.) Dedupe by prober: a repeat
+    // probe from the same device while its reply chain is still waiting out a
+    // slot must not start a second, redundant reply chain.
     //
-    // WELCOME vs REPORT: the wire-level probe burst is identical for a join
-    // announcement and a roll-call announcement (see probeBurst.ts) — there
-    // is no purpose bit on the air, so a listener can only tell the two
-    // apart by whether it already knows this prober. A never-seen-before
-    // device is joining (reply WELCOME, onboarding it); an already-known
-    // member is running a roll call (reply REPORT — "roll-call ack" per the
-    // design spec's control-message table), since a member we've already
-    // welcomed needs a fresh channel measurement, not another welcome.
-    // Consequence: a device rejoining with the same deviceId while peers
-    // still hold it in _members (page refresh, reconnect, a second start())
-    // gets a REPORT while sitting in joinWait, not a WELCOME — see
-    // handleReport, which treats that as a member refresh rather than
-    // dropping it. The real fix is a purpose bit on the probe burst so
-    // WELCOME vs REPORT is signaled explicitly instead of inferred from
-    // membership.
+    // WELCOME vs REPORT now comes off the wire (see PROBE_PURPOSE), not from
+    // whether we already know this prober. That inference was one-sided in
+    // both directions: a device rejoining with the same id (page refresh,
+    // reconnect, a second start()) is a stranger to itself but a known member
+    // to us, so it received a REPORT when it needed a WELCOME; and a peer
+    // whose WELCOME we lost still thinks we are a stranger, so it answered our
+    // roll call with a WELCOME. handleWelcome and handleReport keep their
+    // tolerance for the "wrong" reply type regardless, so a peer running an
+    // older build degrades rather than breaks.
     if (this._state === 'idle' && !this.pendingReplyTo.has(deviceId)) {
       this.pendingReplyTo.add(deviceId);
-      const alreadyKnown = existing !== undefined;
       this.scheduleReply(
         this.deps.now(),
         Array.from({ length: ROOM_TIMING.replySlots }, (_unused, i) => i),
         deviceId,
-        alreadyKnown,
+        purpose === PROBE_PURPOSE.rollCall,
       );
     }
   }
@@ -374,7 +370,7 @@ export class RoomProtocol {
 
   private async beginAnnounceJoin(): Promise<void> {
     this.setState('announcing');
-    await this.deps.playProbe();
+    await this.deps.playProbe(PROBE_PURPOSE.joining);
     if (this._state !== 'announcing') return; // stale guard (e.g. stop() mid-await)
 
     this.setState('joinWait');
@@ -390,7 +386,7 @@ export class RoomProtocol {
 
   private async beginAnnounceRollCall(): Promise<void> {
     this.setState('rollCall');
-    await this.deps.playProbe();
+    await this.deps.playProbe(PROBE_PURPOSE.rollCall);
     if (this._state !== 'rollCall') return;
 
     this.setState('collecting');

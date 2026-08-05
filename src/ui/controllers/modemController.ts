@@ -8,6 +8,7 @@ import type { ModemCommand, ModemEvent } from '../../workers/modemSchema';
 import type { buildModemConfig } from './buildModemConfig';
 import type { Run } from '../../modem/protocol/captureTypes';
 import type { ControlMessage } from '../../modem/protocol/controlFrame';
+import type { ProbePurpose } from '../../modem/protocol/probeBurst';
 
 type Handler<T extends ModemEvent['type']> = (ev: Extract<ModemEvent, { type: T }>) => void;
 
@@ -243,14 +244,14 @@ export class ModemController {
   }
 
   /** Encode a join/roll-call probe burst for the given device id. */
-  encodeProbe(deviceId: number): Promise<{ samples: Float32Array; sampleRate: number }> {
+  encodeProbe(deviceId: number, purpose: ProbePurpose): Promise<{ samples: Float32Array; sampleRate: number }> {
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       this.pending.set(id, (ev) => {
         if (ev.type === 'encoded') resolve({ samples: new Float32Array(ev.samples), sampleRate: ev.sampleRate });
         else reject(new Error((ev as { error?: string }).error ?? 'encodeProbe failed'));
       });
-      this.post({ type: 'encodeProbe', id, deviceId });
+      this.post({ type: 'encodeProbe', id, deviceId, purpose });
     });
   }
 

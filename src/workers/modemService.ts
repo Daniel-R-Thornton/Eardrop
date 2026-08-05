@@ -18,6 +18,7 @@ import {
   decodeProbeId,
   measureProbeSweep,
   buildProbeBurst,
+  type ProbePurpose,
 } from '../modem/protocol/probeBurst';
 import { encodeControlMessage, ControlType, type ControlMessage } from '../modem/protocol/controlFrame';
 
@@ -118,7 +119,7 @@ export class ProbeDetector {
   constructor(
     private readonly ownDeviceId: number,
     private readonly sampleRate: number,
-    private readonly onProbe: (deviceId: number, grid: number[]) => void,
+    private readonly onProbe: (deviceId: number, grid: number[], purpose: ProbePurpose) => void,
   ) {
     this.template = probeChirpTemplate(sampleRate);
     this.ringCap = Math.round(sampleRate * 0.5);
@@ -176,7 +177,7 @@ export class ProbeDetector {
     if (decoded === null || decoded.deviceId === this.ownDeviceId) return; // CRC fail or our own probe
     const grid = measureProbeSweep(samples, 0, this.sampleRate);
     if (!grid) return;
-    this.onProbe(decoded.deviceId, grid);
+    this.onProbe(decoded.deviceId, grid, decoded.purpose);
   }
 }
 
@@ -405,14 +406,14 @@ export class ModemService {
           );
         };
         this.chatterRx = engine;
-        this.probeDetector = new ProbeDetector(cmd.deviceId, this.config.sampleRate, (deviceId, grid) => {
+        this.probeDetector = new ProbeDetector(cmd.deviceId, this.config.sampleRate, (deviceId, grid, purpose) => {
           // A probe burst just went through — whatever the control listener
           // thinks it is part-way through demodulating, it is not a control
           // message. Re-arm it, or a false sync on the burst's sweep (which
           // crosses the handshake band) leaves it stuck out of WAITING and
           // deaf to every reply that follows.
           this.chatterRx?.rearmForNextControlMessage();
-          this.emit({ type: 'probeHeard', deviceId, grid });
+          this.emit({ type: 'probeHeard', deviceId, grid, purpose });
         });
         break;
       }
@@ -448,7 +449,7 @@ export class ModemService {
       }
       case 'encodeProbe': {
         if (!this.config) { this.emit({ type: 'error', id: cmd.id, error: 'encodeProbe before configure' }); return; }
-        const samples = buildProbeBurst(cmd.deviceId, this.config.sampleRate);
+        const samples = buildProbeBurst(cmd.deviceId, this.config.sampleRate, cmd.purpose);
         this.emit(
           { type: 'encoded', id: cmd.id, samples: samples.buffer as ArrayBuffer, sampleRate: this.config.sampleRate },
           [samples.buffer as ArrayBuffer],

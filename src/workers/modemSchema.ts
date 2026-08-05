@@ -6,6 +6,7 @@
  */
 import type { ModemConfig } from '../modem/types';
 import type { Run } from '../modem/protocol/captureTypes';
+import type { ProbePurpose } from '../modem/protocol/probeBurst';
 
 export interface RxProgress {
   state: number; // RxState enum value
@@ -72,7 +73,7 @@ export type ModemCommand =
    *  what the RECIPIENT reported hearing of us. Omitted for a broadcast or
    *  before any measurement exists, which keeps the band flat. */
   | { type: 'encodeControl'; id: number; msg: { type: number; senderId: number; targetId: number; payload: ArrayBuffer }; toneGains?: number[] }
-  | { type: 'encodeProbe'; id: number; deviceId: number }
+  | { type: 'encodeProbe'; id: number; deviceId: number; purpose: ProbePurpose }
   | { type: 'airCheck'; id: number }
   | { type: 'setRxMuted'; muted: boolean };
 
@@ -95,6 +96,6 @@ export type ModemEvent =
   | { type: 'dlog'; line?: string; rec?: { tag: string; fields: Record<string, unknown> } }
   | { type: 'error'; id?: number; error: string }
   // ─── Chatter room (see chatterWorker.test.ts) ───
-  | { type: 'probeHeard'; deviceId: number; grid: number[] }
+  | { type: 'probeHeard'; deviceId: number; grid: number[]; purpose: ProbePurpose }
   | { type: 'controlMessage'; msg: { type: number; senderId: number; targetId: number; payload: ArrayBuffer } }
   | { type: 'airStatus'; id: number; busy: boolean; rms: number };

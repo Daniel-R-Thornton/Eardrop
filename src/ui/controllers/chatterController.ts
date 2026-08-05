@@ -32,7 +32,7 @@ import { AudioPlayer } from '../../audio/player';
 import { buildModemConfig } from './buildModemConfig';
 import { getState, setState, CHATTER_PACKET_LOG_MAX, type ChatterPacket } from '../Store';
 import { OFDM_DEFAULTS, OFDM_HANDSHAKE } from '../../modem/types';
-import { reportGridFreqs } from '../../modem/protocol/probeBurst';
+import { reportGridFreqs, type ProbePurpose } from '../../modem/protocol/probeBurst';
 import { dlog } from '../../lib/debug/dlog';
 import { handshakeToneGains } from '../../modem/chatter/handshakeGains';
 
@@ -104,7 +104,7 @@ export interface ModemWorkerHandle {
   encodeFile(fileName: string, data: Uint8Array): Promise<{ samples: Float32Array; sampleRate: number }>;
   chatterStart(deviceId: number): void;
   chatterStop(): void;
-  encodeProbe(deviceId: number): Promise<{ samples: Float32Array; sampleRate: number }>;
+  encodeProbe(deviceId: number, purpose: ProbePurpose): Promise<{ samples: Float32Array; sampleRate: number }>;
   encodeControl(msg: ControlMessage, toneGains?: number[]): Promise<{ samples: Float32Array; sampleRate: number }>;
   chatterScanPaused(paused: boolean): void;
   airCheck(): Promise<{ busy: boolean; rms: number }>;
@@ -238,7 +238,7 @@ export class ChatterController {
       now,
       rng: this.rng,
       schedule: this.schedule,
-      playProbe: () => this.playAndMute(() => this.worker.encodeProbe(this.deviceId), {
+      playProbe: (purpose) => this.playAndMute(() => this.worker.encodeProbe(this.deviceId, purpose), {
         kind: 'probe',
         peerId: 0,
         bytes: 0,
@@ -277,7 +277,7 @@ export class ChatterController {
     // per join/leave cycle), so there's no matching `off()`/teardown here;
     // joinRoom/leaveRoom only start and stop the ROOM, not these listeners.
     worker.on('probeHeard', (ev) => {
-      this.room.onProbeHeard(ev.deviceId, ev.grid);
+      this.room.onProbeHeard(ev.deviceId, ev.grid, ev.purpose);
       const info = computeLinkInfo(ev.grid);
       // The probe just measured this peer's whole passband — report what it
       // found where the control messages actually live. A healthy probe with

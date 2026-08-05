@@ -10,6 +10,7 @@ import { ChatterController, type ModemWorkerHandle, type AudioPlayerLike } from 
 import { ROOM_TIMING } from '../chatter/roomProtocol';
 import { ControlType, packFileComing, CONTROL_HEADER_WIRE, controlPayloadWireSize } from '../protocol/controlFrame';
 import { getState, setState, CHATTER_PACKET_LOG_MAX } from '../../ui/Store';
+import { PROBE_PURPOSE, type ProbePurpose } from '../protocol/probeBurst';
 
 /** Manual clock + timer wheel, mirroring roomProtocol.test.ts's harness. */
 function makeClock() {
@@ -51,7 +52,7 @@ function makeFakeWorker() {
   const handlers = new Map<string, Set<(ev: any) => void>>();
   let airBusy = false;
 
-  const worker: ModemWorkerHandle & { emit: (type: string, ev: any) => void; calls: string[]; configs: any[]; muteLog: boolean[]; setAirBusy: (b: boolean) => void } = {
+  const worker: ModemWorkerHandle & { emit: (type: string, ev: any) => void; calls: string[]; configs: any[]; muteLog: boolean[]; setAirBusy: (b: boolean) => void; probePurposes: ProbePurpose[] } = {
     sampleRate: 48000,
     calls,
     configs,
@@ -74,8 +75,10 @@ function makeFakeWorker() {
     chatterStart: (deviceId: number) => { calls.push(`chatterStart:${deviceId}`); },
     chatterStop: () => { calls.push('chatterStop'); },
     chatterScanPaused: (paused: boolean) => { calls.push(`chatterScanPaused:${paused}`); },
-    encodeProbe: async () => {
+    probePurposes: [] as ProbePurpose[],
+    encodeProbe: async (deviceId: number, purpose: ProbePurpose) => {
       calls.push('encodeProbe');
+      worker.probePurposes.push(purpose);
       return { samples: new Float32Array(4), sampleRate: 48000 };
     },
     encodeControl: async (msg) => {
@@ -146,6 +149,28 @@ describe('ChatterController', () => {
 
     await clock.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 100);
     expect(getState().chatterState).toBe('idle');
+  });
+
+  it('announces a join as joining and a roll call as a roll call', async () => {
+    // The purpose bit is what tells a listener which reply to send. If both
+    // announcements went out as the same purpose, a roll call would be
+    // answered with WELCOMEs (no channel measurement) or a join with REPORTs
+    // (the joiner never learns the room is occupied).
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
+
+    await controller.joinRoom();
+    await clock.tick(ROOM_TIMING.listenMs + 100);
+    expect(worker.probePurposes).toEqual([PROBE_PURPOSE.joining]);
+
+    await clock.tick(
+      ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
+    );
+    await controller.broadcastFile('a.txt', new Uint8Array(10));
+    await clock.tick(ROOM_TIMING.listenMs + 100);
+    expect(worker.probePurposes).toEqual([PROBE_PURPOSE.joining, PROBE_PURPOSE.rollCall]);
   });
 
   it('a second joinRoom call while the first is still in flight is a no-op', async () => {

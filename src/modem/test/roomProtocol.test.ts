@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { RoomProtocol, ROOM_TIMING } from '../chatter/roomProtocol';
 import { ControlType, packReport, packWelcome, packFileComing } from '../protocol/controlFrame';
+import { PROBE_PURPOSE } from '../protocol/probeBurst';
 
 /** Manual clock + timer wheel so every test is deterministic. */
 function makeHarness(
@@ -254,6 +255,42 @@ describe('room protocol', () => {
     h.room.onProbeHeard(9, flatGrid);
     h.room.onProbeHeard(9, flatGrid); // duplicate, same prober, reply chain already pending
     await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 100);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+  });
+
+  it('answers a roll-call probe with a REPORT even from a device it has never seen', async () => {
+    // The reply type now comes from the purpose bit, not from whether we
+    // already know the prober. A never-seen device running a roll call needs
+    // a channel measurement, not a welcome.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    expect(h.room.state).toBe('idle');
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.rollCall);
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
+    const report = h.sent.find((m) => m.type === ControlType.Report);
+    expect(report).toBeDefined();
+    expect(report.targetId).toBe(9);
+  });
+
+  it('answers a joining probe with a WELCOME even from a device it already knows', async () => {
+    // The mirror case: a device rejoining with the same id (page refresh)
+    // is already in _members, and used to receive a REPORT while sitting in
+    // joinWait — so it finished joining knowing nothing about this peer.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.rollCall);
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    expect(h.room.members.get(9)).toBeDefined();
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining); // 9 refreshed and rejoined
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
 });
