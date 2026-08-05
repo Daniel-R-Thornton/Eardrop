@@ -82,6 +82,14 @@ const JOIN_MIC_TIMEOUT_MS = 13000;
  *  supply a fake without touching AudioContext. */
 export interface AudioPlayerLike {
   play(samples: Float32Array, sampleRate: number, deviceId?: string, clean?: boolean): Promise<void>;
+  /** Chunked playback — see AudioPlayer.playStream. Used for the file path so
+   *  peak memory is one chunk rather than the whole waveform. */
+  playStream(
+    pull: () => Promise<Float32Array | null>,
+    sampleRate: number,
+    deviceId?: string,
+    onProgress?: (scheduledSec: number) => void,
+  ): Promise<void>;
 }
 
 /**
@@ -102,6 +110,13 @@ export interface ModemWorkerHandle {
   startListening(micGain: number, deviceId?: string, deviceLabel?: string): Promise<void>;
   stopListening(): void;
   encodeFile(fileName: string, data: Uint8Array): Promise<{ samples: Float32Array; sampleRate: number }>;
+  /** Streaming encode — see ModemController.startFileStream. */
+  startFileStream(fileName: string, data: Uint8Array): Promise<{
+    sampleRate: number;
+    totalSamples: number;
+    pull: () => Promise<Float32Array | null>;
+    cancel: () => void;
+  }>;
   chatterStart(deviceId: number): void;
   chatterStop(): void;
   encodeProbe(deviceId: number, purpose: ProbePurpose): Promise<{ samples: Float32Array; sampleRate: number }>;
@@ -487,6 +502,42 @@ export class ChatterController {
     return attempt;
   }
 
+  /** Streaming counterpart of `playAndMute` — same packet recording, same
+   *  mute discipline and echo tail, same selected-speaker routing; the audio
+   *  arrives in chunks instead of one buffer. Kept as a sibling rather than a
+   *  flag on playAndMute because the two take different callbacks and share no
+   *  body beyond the bookkeeping. */
+  private playStreamAndMute(
+    start: () => Promise<{ sampleRate: number; pull: () => Promise<Float32Array | null>; cancel: () => void }>,
+    packet: Omit<ChatterPacket, 'seq' | 'tMs' | 'dir'>,
+  ): Promise<void> {
+    this.recordPacket({ dir: 'tx', ...packet });
+    setState({ chatterLastTx: this.deps.now() });
+    const attempt = this.doPlayStreamAndMute(start);
+    this.lastPlayback = attempt.catch(() => {});
+    return attempt;
+  }
+
+  private async doPlayStreamAndMute(
+    start: () => Promise<{ sampleRate: number; pull: () => Promise<Float32Array | null>; cancel: () => void }>,
+  ): Promise<void> {
+    const { sampleRate, pull, cancel } = await start();
+    this.worker.setRxMuted(true);
+    try {
+      // Read the output device at play time, so a device change mid-session
+      // takes effect on the next burst (same reason as doPlayAndMute).
+      await this.player.playStream(pull, sampleRate, getState().selectedOutputId);
+    } catch (err) {
+      // Cancel the worker-side generator, or a failed playback leaves it
+      // holding the whole encode until the next stream replaces it.
+      cancel();
+      throw err;
+    } finally {
+      await this.timeout(MUTE_TAIL_MS);
+      this.worker.setRxMuted(false);
+    }
+  }
+
   /** Push one ChatterPacket onto the bounded ring (display-only — never
    *  read by any protocol decision). */
   private recordPacket(p: Omit<ChatterPacket, 'seq' | 'tMs'>): void {
@@ -647,12 +698,15 @@ export class ChatterController {
     // there is no console to check, that is the difference between a
     // diagnosable failure and a silent one.
     try {
-      await this.playAndMute(() => this.worker.encodeFile(pending.fileName, pending.data), {
-        kind: 'file',
-        peerId: 0,
-        bytes: pending.data.byteLength,
-        note: pending.fileName,
-      });
+      await this.playStreamAndMute(
+        () => this.worker.startFileStream(pending.fileName, pending.data),
+        {
+          kind: 'file',
+          peerId: 0,
+          bytes: pending.data.byteLength,
+          note: pending.fileName,
+        },
+      );
     } catch (err) {
       const reason = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
       dlog('ROOM', { fileTxFailed: reason, name: pending.fileName, bytes: pending.data.byteLength }, { level: 'warn' });

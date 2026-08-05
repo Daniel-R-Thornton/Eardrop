@@ -72,6 +72,16 @@ function makeFakeWorker() {
       calls.push(`encodeFile:${fileName}`);
       return { samples: new Float32Array(4), sampleRate: 48000 };
     },
+    startFileStream: async () => {
+      calls.push('startFileStream');
+      let served = false;
+      return {
+        sampleRate: 48000,
+        totalSamples: 8,
+        pull: async () => (served ? null : ((served = true), new Float32Array(8))),
+        cancel: () => { calls.push('startFileStream:cancel'); },
+      };
+    },
     chatterStart: (deviceId: number) => { calls.push(`chatterStart:${deviceId}`); },
     chatterStop: () => { calls.push('chatterStop'); },
     chatterScanPaused: (paused: boolean) => { calls.push(`chatterScanPaused:${paused}`); },
@@ -94,10 +104,20 @@ function makeFakeWorker() {
 
 function makeFakePlayer() {
   const played: { samples: Float32Array; sampleRate: number }[] = [];
-  const player: AudioPlayerLike & { played: typeof played } = {
+  const calls: string[] = [];
+  const player: AudioPlayerLike & { played: typeof played; calls: typeof calls } = {
     played,
+    calls,
     play: async (samples: Float32Array, sampleRate: number) => {
       played.push({ samples, sampleRate });
+    },
+    playStream: async (pull: () => Promise<Float32Array | null>) => {
+      calls.push('playStream');
+      // Drain like the real player does, so a generator bug surfaces here.
+      for (;;) {
+        const chunk = await pull();
+        if (chunk === null) break;
+      }
     },
   };
   return player;
@@ -475,7 +495,7 @@ describe('ChatterController', () => {
     const player = makeFakePlayer();
     const clock = makeClock();
     const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
-    worker.encodeFile = async () => { throw new Error('Out of memory'); };
+    worker.startFileStream = async () => { throw new Error('Out of memory'); };
 
     await controller.joinRoom();
     await clock.tick(
@@ -496,5 +516,38 @@ describe('ChatterController', () => {
     );
 
     expect(getState().chatterError).toMatch(/Out of memory/);
+  });
+
+  it('transmits a chatter file through the streaming path, not the batch encoder', async () => {
+    // Batch encode builds the whole waveform in the worker, transfers it
+    // whole, and hands it to play() — which is the largest single allocation
+    // in a send. The streaming path bounds it to one chunk and already backs
+    // the bench path.
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
+
+    await controller.joinRoom();
+    await clock.tick(
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS
+      + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
+    );
+    await controller.broadcastFile('a.txt', new Uint8Array(40));
+    // Reaching 'collecting' costs listenMs (carrier-sense wait) PLUS the roll
+    // call probe's own MUTE_TAIL_MS echo tail (see doPlayAndMute) — without
+    // the tail this fires while still 'rollCall', and the REPORT below lands
+    // outside the collecting window and gets silently dropped.
+    await clock.tick(ROOM_TIMING.listenMs + MUTE_TAIL_MS + 100);
+    worker.emit('controlMessage', {
+      msg: { type: ControlType.Report, senderId: 5, targetId: getState().chatterDeviceId, payload: packReport(flatGrid).buffer },
+    });
+    await clock.tick(
+      ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200,
+    );
+
+    expect(worker.calls).toContain('startFileStream');
+    expect(worker.calls).not.toContain('encodeFile');
+    expect(player.calls).toContain('playStream');
   });
 });
