@@ -479,7 +479,12 @@ function compressOne(rec: DlogRecord): string | null {
           + ` known=${asString(f.knownMembers)}`;
       }
       if (has('probeFrom')) {
-        return `PRB ${asNum(f.probeFrom)} mean=${asString(f.meanDb)} hs=${asString(f.handshakeBandDb)}`;
+        // hsSpread is the one to read: the eight control tones sit inside one
+        // 350 Hz block, so `hs` (their mean) stays healthy-looking while a
+        // single one of them is in a null — and one dead tone breaks a
+        // 12-chunk REPORT while leaving a 1-chunk ACK intact.
+        return `PRB ${asNum(f.probeFrom)} mean=${asString(f.meanDb)} hs=${asString(f.handshakeBandDb)}`
+          + ` hsMin=${asString(f.hsMinDb)} hsSpread=${asString(f.hsSpreadDb)} worst=${asString(f.hsWorstHz)}Hz`;
       }
       // A reply that arrived while the prober was one state short of
       // 'collecting' is discarded, and produces the same "nobody home" as a

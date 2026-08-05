@@ -37,7 +37,7 @@ import {
 import { OFDM_DEFAULTS, OFDM_HANDSHAKE } from '../../modem/types';
 import { reportGridFreqs, type ProbePurpose } from '../../modem/protocol/probeBurst';
 import { dlog } from '../../lib/debug/dlog';
-import { handshakeToneGains } from '../../modem/chatter/handshakeGains';
+import { handshakeToneGains, handshakeToneMags, handshakeToneHz } from '../../modem/chatter/handshakeGains';
 
 /** OFDM tone spacing — the handshake band's tones sit on this grid. */
 const OFDM_TONE_SPACING_HZ = OFDM_DEFAULTS.toneSpacingHz;
@@ -237,6 +237,39 @@ function handshakeBandDb(grid: number[]): number | null {
   return mean > 0 ? 20 * Math.log10(mean / peak) : GRID_FLOOR_DB;
 }
 
+/**
+ * Per-tone shape of the handshake band, in dB relative to the sweep's peak.
+ *
+ * `handshakeBandDb` above averages the band, and an average is exactly the
+ * wrong statistic for the failure this is hunting: eight tones at 50 Hz
+ * spacing all live inside one 350 Hz block, so a single room or speaker null
+ * can swallow one tone while the mean still reads healthy. One dead tone is
+ * not a level problem — it corrupts 2 bits of EVERY 16-bit QPSK symbol, which
+ * is ~4 error positions per 63-bit BCH codeword against a t=6 budget. A
+ * 1-chunk ACK rides that out; a 12-chunk REPORT needs all twelve chunks to
+ * stay under the budget, and reliably doesn't.
+ *
+ * `spread` is the number to read: flat (a few dB) means the band is fine and
+ * a failing REPORT is being killed by something transient; large means a tone
+ * is in a hole and no amount of retrying will fix it.
+ */
+function handshakeToneProfile(
+  grid: number[],
+): { minDb: number; maxDb: number; spreadDb: number; worstHz: number } | null {
+  const mags = handshakeToneMags(grid);
+  if (!mags) return null;
+  const peak = Math.max(...grid);
+  if (!(peak > 0)) return null;
+  const db = mags.map((m) => (m > 0 ? 20 * Math.log10(m / peak) : GRID_FLOOR_DB));
+  const minDb = Math.min(...db);
+  return {
+    minDb,
+    maxDb: Math.max(...db),
+    spreadDb: Math.max(...db) - minDb,
+    worstHz: handshakeToneHz(db.indexOf(minDb)),
+  };
+}
+
 /** Actual over-the-air bytes for a control message with `payloadLen` raw
  *  payload bytes: the fixed BCH-coded header plus the BCH-coded payload —
  *  same wire shape controlFrame.ts uses to encode/decode it. */
@@ -387,10 +420,15 @@ export class ChatterController {
       // a collapsed handshake band is the signature of "we can see each other
       // but never exchange a control frame".
       const hsDb = handshakeBandDb(ev.grid);
+      const hsProfile = handshakeToneProfile(ev.grid);
       dlog('ROOM', {
         probeFrom: ev.deviceId,
         meanDb: info ? info.linkDb.toFixed(1) : 'n/a',
         handshakeBandDb: hsDb === null ? 'n/a' : hsDb.toFixed(1),
+        // Per-tone, not just the band mean — see handshakeToneProfile.
+        hsMinDb: hsProfile ? hsProfile.minDb.toFixed(1) : 'n/a',
+        hsSpreadDb: hsProfile ? hsProfile.spreadDb.toFixed(1) : 'n/a',
+        hsWorstHz: hsProfile ? hsProfile.worstHz : 'n/a',
         // toneCount - 1, not toneCount: see handshakeBandDb's identical fix.
         band: `${OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz}-${
           OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz

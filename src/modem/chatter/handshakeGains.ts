@@ -49,6 +49,33 @@ function responseAt(grid: number[], hz: number): number {
   return grid[i] * (1 - frac) + grid[i + 1] * frac;
 }
 
+/** Frequency of handshake tone `t`. */
+export function handshakeToneHz(t: number): number {
+  return OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz + t * OFDM_DEFAULTS.toneSpacingHz;
+}
+
+/**
+ * The measured response AT each of the eight handshake tones, linear.
+ *
+ * Split out from `handshakeToneGains` because the same eight numbers answer a
+ * question the gains cannot: whether one control tone is sitting in a null.
+ * The band mean hides exactly that case, and a dead tone is not a level
+ * problem — it puts 2 bad bits in EVERY QPSK symbol, ~4 error positions per
+ * 63-bit BCH codeword against a t=6 budget, which a 1-chunk ACK survives and
+ * a 12-chunk REPORT does not.
+ *
+ * KNOWN LIMIT: REPORT_GRID is sampled every 100 Hz and the tones are 50 Hz
+ * apart, so every second tone here is INTERPOLATED between grid points. A
+ * notch narrower than 100 Hz can sit between two samples and not appear at
+ * all — a clean profile is therefore weaker evidence than a bad one.
+ */
+export function handshakeToneMags(grid: number[] | undefined): number[] | undefined {
+  if (!grid || grid.length !== REPORT_GRID.points) return undefined;
+  const mags: number[] = [];
+  for (let t = 0; t < OFDM_HANDSHAKE.toneCount; t++) mags.push(responseAt(grid, handshakeToneHz(t)));
+  return mags;
+}
+
 /**
  * Per-tone gains for the handshake band from a peer's measured view of us.
  *
@@ -57,13 +84,8 @@ function responseAt(grid: number[], hz: number): number {
  * inventing a correction from nothing.
  */
 export function handshakeToneGains(theirViewOfUs: number[] | undefined): number[] | undefined {
-  if (!theirViewOfUs || theirViewOfUs.length !== REPORT_GRID.points) return undefined;
-
-  const first = OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz;
-  const mags: number[] = [];
-  for (let t = 0; t < OFDM_HANDSHAKE.toneCount; t++) {
-    mags.push(responseAt(theirViewOfUs, first + t * OFDM_DEFAULTS.toneSpacingHz));
-  }
+  const mags = handshakeToneMags(theirViewOfUs);
+  if (!mags) return undefined;
 
   const strongest = Math.max(...mags);
   if (!(strongest > 0)) return undefined;

@@ -83,6 +83,7 @@ console log if a specific symbol needs inspecting.
 | `CFG` | `restart` | OFDM settings changed, RX restarted |
 | `SNAP` | note from`->`to | pilot or tone start snapped to the FFT bin grid |
 | `X` | `r` `t` `bch` `rs` `smer` | frame failure: reason, type, per-block BCH/RS error counts, staged MER |
+| `PRB` | `from` `mean` `hs` `hsMin` `hsSpread` `worst` | probe heard: peer id, sweep mean dB, handshake-band mean dB, and the band's PER-TONE worst/spread with the frequency of the worst tone. **`hsSpread` is the one to read** — the eight control tones share one 350 Hz block, so `hs` can look healthy while one tone sits in a null, which breaks a 12-chunk REPORT and leaves a 1-chunk ACK intact. Every second tone is interpolated (100 Hz grid, 50 Hz tones), so a clean profile is weaker evidence than a dirty one |
 | `RRC` | `from` `n` | roll call counted a REPORT; `n` = total collected so far |
 | `!ROC` | `from` `st` | a REPORT arrived while the prober was NOT in `collecting` — discarded. `st=rollCall` means our own probe playback had not resolved yet |
 | `!STALL` | what `st` | a dep (probe playback, air check, FILE_COMING send) never settled; the room gave up on it and fell back |

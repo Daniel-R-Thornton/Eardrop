@@ -3,7 +3,7 @@
  * the curve a peer reported hearing of our probe.
  */
 import { describe, expect, it } from 'vitest';
-import { handshakeToneGains } from '../chatter/handshakeGains';
+import { handshakeToneGains, handshakeToneMags, handshakeToneHz } from '../chatter/handshakeGains';
 import { REPORT_GRID, reportGridFreqs } from '../protocol/probeBurst';
 import { OFDM_HANDSHAKE, OFDM_DEFAULTS } from '../types';
 
@@ -51,5 +51,43 @@ describe('handshakeToneGains', () => {
     const grid = flat().map((_v, i) => (i % 3 === 0 ? 0 : 1));
     const gains = handshakeToneGains(grid)!;
     gains.forEach((g) => expect(Number.isFinite(g)).toBe(true));
+  });
+});
+
+describe('handshakeToneMags', () => {
+  // The band MEAN cannot answer "is one control tone in a null", and that is
+  // the case that breaks a 12-chunk REPORT while leaving a 1-chunk ACK alone.
+  it('reports one value per control tone', () => {
+    expect(handshakeToneMags(flat())).toHaveLength(OFDM_HANDSHAKE.toneCount);
+    expect(handshakeToneMags(undefined)).toBeUndefined();
+    expect(handshakeToneMags([1, 2, 3])).toBeUndefined();
+  });
+
+  it('exposes a single-tone null that the band mean hides', () => {
+    const freqs = reportGridFreqs();
+    const notchHz = handshakeToneHz(5);
+    const grid = freqs.map((f) => (Math.abs(f - notchHz) < 60 ? 1e-3 : 1));
+
+    const mags = handshakeToneMags(grid)!;
+    const worst = Math.min(...mags);
+    const best = Math.max(...mags);
+    const mean = mags.reduce((s, m) => s + m, 0) / mags.length;
+    const worstDb = 20 * Math.log10(worst / best);
+    const meanDb = 20 * Math.log10(mean / best);
+
+    // The null is plainly visible per-tone.
+    expect(worstDb).toBeLessThan(-20);
+    // The band mean barely registers it — that GAP is the whole point. A
+    // reading of a few dB down looks like an ordinary quiet band, while the
+    // tone actually carrying two bits of every symbol is 30+ dB below its
+    // neighbours.
+    expect(meanDb - worstDb).toBeGreaterThan(30);
+  });
+
+  it('places the tones on the real 50 Hz grid', () => {
+    expect(handshakeToneHz(0)).toBe(OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz);
+    expect(handshakeToneHz(OFDM_HANDSHAKE.toneCount - 1))
+      .toBe(OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz
+        + (OFDM_HANDSHAKE.toneCount - 1) * OFDM_DEFAULTS.toneSpacingHz);
   });
 });
