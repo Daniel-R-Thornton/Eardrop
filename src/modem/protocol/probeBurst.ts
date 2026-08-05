@@ -125,9 +125,27 @@ export function probeChirpTemplate(sampleRate: number): Float32Array {
  *  decode functions measure from — they all key off the chirp's own anchor. */
 const LEAD_IN_MS = 100;
 
-/** ID pulse tone — arbitrary but fixed so encode/decode agree, and far enough
- *  from both the chirp's sweep range and the coarse sweep's band that it
- *  cannot be confused with either. */
+/**
+ * ID pulse tone — arbitrary but fixed so encode/decode agree.
+ *
+ * The old claim here ("far enough from both the chirp's sweep range and the
+ * coarse sweep's band that it cannot be confused with either") was written
+ * when the handshake band sat at 6900-7250 Hz, and it enumerated only two of
+ * the three neighbours this tone now has. 2500 Hz is:
+ *   - inside the down-chirp's own sweep (4400->1200) and inside the coarse
+ *     sweep's band (1500-7800) — it was never actually clear of either, which
+ *     is fine: the ID slots are separated from both in TIME, not in frequency,
+ *     and every decode is anchored on the down-chirp;
+ *   - 100 Hz BELOW OFDM_HANDSHAKE's first tone (2600) and 500 Hz above its
+ *     pilot (2000), since that band moved down to 2600-2950.
+ *
+ * No decode path breaks on that last one: decodeProbeId only ever runs off a
+ * down-chirp anchor, so a control message's tones are never read as ID slots,
+ * and the worker re-arms the control listener after every burst. But NOTHING
+ * CURRENTLY CONSTRAINS PULSE_HZ against OFDM_HANDSHAKE — no test, no derived
+ * clearance — so a future move of either value can put them on top of each
+ * other with nothing complaining.
+ */
 const PULSE_HZ = 2500;
 const PULSE_MS = 25;
 const PULSE_AMPLITUDE = 0.15;
@@ -312,8 +330,10 @@ function crc4Bits(value: number, bitCount: number): number {
   return crc & 0xf;
 }
 
-/** CRC-4 over the 8 id bits — the pre-purpose-bit form, kept for callers that
- *  only have a device id. */
+/** CRC-4 over the 8 id bits — the pre-purpose-bit form. TEST-ONLY: no
+ *  production caller remains (the wire format covers 9 bits, see idBits), and
+ *  probeBurst.test.ts is the sole consumer. It used to say "kept for callers
+ *  that only have a device id"; there are none. */
 export function crc4(byte: number): number {
   return crc4Bits(byte & 0xff, 8);
 }
