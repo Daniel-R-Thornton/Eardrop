@@ -30,7 +30,10 @@ import {
 import type { ModemEvent } from '../../workers/modemSchema';
 import { AudioPlayer, PLAYBACK_TARGET_PEAK } from '../../audio/player';
 import { buildModemConfig } from './buildModemConfig';
-import { getState, setState, CHATTER_PACKET_LOG_MAX, type ChatterPacket } from '../Store';
+import {
+  getState, setState, CHATTER_PACKET_LOG_MAX, CHATTER_MESSAGE_LOG_MAX,
+  type ChatterPacket, type ChatMessage,
+} from '../Store';
 import { OFDM_DEFAULTS, OFDM_HANDSHAKE } from '../../modem/types';
 import { reportGridFreqs, type ProbePurpose } from '../../modem/protocol/probeBurst';
 import { dlog } from '../../lib/debug/dlog';
@@ -248,6 +251,8 @@ function controlKindFromType(type: ControlType): ChatterPacket['kind'] {
     case ControlType.Welcome: return 'welcome';
     case ControlType.FileComing: return 'fileComing';
     case ControlType.Bye: return 'bye';
+    case ControlType.Text: return 'text';
+    case ControlType.Ack: return 'ack';
     case ControlType.Report:
     default:
       return 'report';
@@ -299,6 +304,8 @@ export class ChatterController {
   private lastPlayback: Promise<void> = Promise.resolve();
   /** Monotonic counter for ChatterPacket.seq (React key) — session-scoped, never reset. */
   private packetSeq = 0;
+  /** Monotonic counter for ChatMessage.seq (React key) — session-scoped, never reset. */
+  private messageSeq = 0;
 
   constructor(private readonly worker: ModemWorkerHandle, options: ChatterControllerOptions = {}) {
     this.player = options.player ?? new AudioPlayer();
@@ -346,6 +353,24 @@ export class ChatterController {
           chatterMembers: toStoreMembers(members),
           chatterError: this.room.lastError,
         });
+      },
+      // A received TEXT is definitionally delivered here — the ACK RoomProtocol
+      // sends back is unconditional, not contingent on this callback existing.
+      onTextReceived: ({ msgId, senderId, targetId, text }) => {
+        this.recordMessage({
+          msgId, senderId, targetId, text, dir: 'rx', ackedBy: [], state: 'delivered',
+        });
+      },
+      // Patches the matching outbound message in place rather than appending
+      // — the store holds ONE row per sent message, and ackedBy/state are its
+      // mutable fields as delivery progresses.
+      onTextAcked: (msgId, byDeviceId) => {
+        this.patchSentMessage(msgId, (m) => ({
+          ackedBy: m.ackedBy.includes(byDeviceId) ? m.ackedBy : [...m.ackedBy, byDeviceId],
+        }));
+      },
+      onTextStateChange: (msgId, state, ackedBy) => {
+        this.patchSentMessage(msgId, () => ({ state, ackedBy: [...ackedBy] }));
       },
     };
     this.room = new RoomProtocol(this.deps);
@@ -520,6 +545,25 @@ export class ChatterController {
     this.room.sendFile(data.byteLength, durationMs, targetId);
   }
 
+  /** Send a chat message. `targetId` 0 (the default) goes to the whole room;
+   *  anything else addresses one member. Rejects over-long text via the
+   *  protocol's own cap rather than silently truncating. */
+  sendText(text: string, targetId = 0): void {
+    if (!getState().chatterOn) {
+      setState({ chatterError: 'join the room before sending a message' });
+      return;
+    }
+    try {
+      const msgId = this.room.sendText(text, targetId);
+      this.recordMessage({
+        msgId, senderId: this.deviceId, targetId, text,
+        dir: 'tx', ackedBy: [], state: 'sending',
+      });
+    } catch (err) {
+      setState({ chatterError: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
   /**
    * Handshake-band pre-emphasis for a control message aimed at `targetId`.
    *
@@ -609,6 +653,27 @@ export class ChatterController {
   private recordPacket(p: Omit<ChatterPacket, 'seq' | 'tMs'>): void {
     const packet: ChatterPacket = { seq: this.packetSeq++, tMs: this.deps.now(), ...p };
     setState({ chatterPackets: [...getState().chatterPackets, packet].slice(-CHATTER_PACKET_LOG_MAX) });
+  }
+
+  /** Push one ChatMessage onto the bounded ring (display-only — never read
+   *  by any protocol decision), mirroring `recordPacket`'s shape. */
+  private recordMessage(m: Omit<ChatMessage, 'seq' | 'tMs'>): void {
+    const message: ChatMessage = { seq: this.messageSeq++, tMs: this.deps.now(), ...m };
+    setState({ chatterMessages: [...getState().chatterMessages, message].slice(-CHATTER_MESSAGE_LOG_MAX) });
+  }
+
+  /** Patch the fields a delivery-state update touches on the outbound
+   *  message matching `msgId` (only ever `dir: 'tx'` — an inbound message has
+   *  no delivery state of its own to track). A no-op if the message has
+   *  scrolled out of the bounded ring already, or was never recorded (e.g. an
+   *  ack for a session that predates this controller instance). */
+  private patchSentMessage(msgId: number, patch: (m: ChatMessage) => Partial<ChatMessage>): void {
+    const messages = getState().chatterMessages;
+    const idx = messages.findIndex((m) => m.dir === 'tx' && m.msgId === msgId);
+    if (idx === -1) return;
+    const next = messages.slice();
+    next[idx] = { ...next[idx], ...patch(next[idx]) };
+    setState({ chatterMessages: next });
   }
 
   /** Patch `linkDb`/`grid` into the store's `chatterMembers` mirror for one

@@ -20,6 +20,8 @@ const KIND_COLOR: Record<ChatterPacket['kind'], string> = {
   fileComing: TONE_TRACE[3],
   bye: T.led,
   file: TONE_TRACE[4],
+  text: TONE_TRACE[5],
+  ack: TONE_TRACE[7],
 };
 
 export function PacketStream({ packets, now }: { packets: ChatterPacket[]; now: number }) {

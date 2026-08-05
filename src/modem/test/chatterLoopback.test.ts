@@ -219,4 +219,95 @@ describe('chatter loopback: join, roll call, negotiated transfer', () => {
     },
     TIMEOUT,
   );
+
+  it(
+    'A sends text, B decodes it and ACKs, A\'s message reaches delivered',
+    async () => {
+      // Same bridge idiom as the file-transfer scenario above, minus the
+      // file plumbing this scenario never touches — join, mutual WELCOME,
+      // then TEXT -> ACK over the same real-audio control path.
+      const clock = makeClock();
+
+      const aRoomRef: { current: RoomProtocol | null } = { current: null };
+      const bRoomRef: { current: RoomProtocol | null } = { current: null };
+
+      const aListeners = makeListeners(A_ID, aRoomRef); // A's ears: hears B
+      const bListeners = makeListeners(B_ID, bRoomRef); // B's ears: hears A
+
+      const controlTx = new TxEngine({
+        useOFDM: true, sampleRate: SR, bandHandshake: true,
+        pilotFreqHz: 6300, toneStartHz: 600, toneCount: 32,
+      } as ConstructorParameters<typeof TxEngine>[0]);
+
+      const bReceived: { msgId: number; senderId: number; targetId: number; text: string }[] = [];
+      const aAcked: { msgId: number; byDeviceId: number }[] = [];
+      const aStateChanges: { msgId: number; state: string; ackedBy: number[] }[] = [];
+
+      const aDeps: RoomDeps = {
+        deviceId: A_ID,
+        now: clock.now,
+        rng: () => 0, // slot 0 always — no busy air to force a re-roll in this scenario
+        schedule: clock.schedule,
+        playProbe: async (purpose) => feedProbe(bListeners.detector, A_ID, purpose), // B hears A
+        sendMessage: async (msg) => feedControl(bListeners.listener, controlTx, msg), // B hears A
+        isAirBusy: async () => false, // turn-taking is scripted by the scenario
+        startFileTx: () => { throw new Error('A never sends a file in this scenario'); },
+        armFileRx: () => { throw new Error('A never receives a file in this scenario'); },
+        onTextAcked: (msgId, byDeviceId) => aAcked.push({ msgId, byDeviceId }),
+        onTextStateChange: (msgId, state, ackedBy) => aStateChanges.push({ msgId, state, ackedBy: [...ackedBy] }),
+      };
+
+      const bDeps: RoomDeps = {
+        deviceId: B_ID,
+        now: clock.now,
+        rng: () => 0,
+        schedule: clock.schedule,
+        playProbe: async (purpose) => feedProbe(aListeners.detector, B_ID, purpose), // A hears B
+        sendMessage: async (msg) => feedControl(aListeners.listener, controlTx, msg), // A hears B
+        isAirBusy: async () => false,
+        startFileTx: () => { throw new Error('B never sends a file in this scenario'); },
+        armFileRx: () => { throw new Error('B never receives a file in this scenario'); },
+        onTextReceived: (msg) => bReceived.push(msg),
+      };
+
+      const aRoom = new RoomProtocol(aDeps);
+      const bRoom = new RoomProtocol(bDeps);
+      aRoomRef.current = aRoom;
+      bRoomRef.current = bRoom;
+
+      // --- 1. A joins an empty room -> idle, no members. ---
+      aRoom.start();
+      await clock.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+      expect(aRoom.state).toBe('idle');
+
+      // --- 2. B joins -> mutual WELCOME, both idle with member entries. ---
+      bRoom.start();
+      await clock.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+      expect(aRoom.state).toBe('idle');
+      expect(bRoom.state).toBe('idle');
+      expect(aRoom.members.get(B_ID)).toBeDefined();
+      expect(bRoom.members.get(A_ID)).toBeDefined();
+
+      // --- 3. A broadcasts a TEXT; B decodes it and owes an ACK. ---
+      const msgId = aRoom.sendText('hello room', 0);
+      await clock.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 500);
+
+      expect(bReceived).toHaveLength(1);
+      expect(bReceived[0]).toMatchObject({ msgId, senderId: A_ID, targetId: 0, text: 'hello room' });
+
+      // --- 4. B's ACK reaches A before the ACK window's retry fires, and A's
+      //     message settles as delivered. ---
+      await clock.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 500);
+
+      expect(aAcked).toHaveLength(1);
+      expect(aAcked[0]).toMatchObject({ msgId, byDeviceId: B_ID });
+      const lastState = aStateChanges[aStateChanges.length - 1];
+      expect(lastState).toMatchObject({ msgId, state: 'delivered', ackedBy: [B_ID] });
+
+      // No retry: the outbox never re-sent the TEXT after the first delivery.
+      const textPackets = aStateChanges.filter((s) => s.msgId === msgId);
+      expect(textPackets.filter((s) => s.state === 'failed')).toHaveLength(0);
+    },
+    TIMEOUT,
+  );
 });

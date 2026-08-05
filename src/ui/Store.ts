@@ -257,8 +257,8 @@ export interface AppState {
   /** performance.now() of this device's last own transmission (for the "talking" pulse); null until the first one. */
   chatterLastTx: number | null;
   /** Bounded ring of chat messages, newest last, for the room-mode text UI.
-   *  Not wired up yet — the controller that pushes into this lives in a
-   *  follow-up task. */
+   *  Pushed into by ChatterController.sendText/recordMessage and the
+   *  onTextReceived/onTextAcked/onTextStateChange RoomDeps callbacks. */
   chatterMessages: ChatMessage[];
 }
 
@@ -289,7 +289,7 @@ export interface ChatterPacket {
   /** performance.now() at observation. */
   tMs: number;
   dir: 'tx' | 'rx';
-  kind: 'probe' | 'welcome' | 'report' | 'fileComing' | 'bye' | 'file';
+  kind: 'probe' | 'welcome' | 'report' | 'fileComing' | 'bye' | 'file' | 'text' | 'ack';
   /** Sender for rx, target for tx. 0 = broadcast, undefined = unknown. */
   peerId?: number;
   /** Wire bytes on the air for this event (probe = burst samples ÷ sampleRate → use 0). */
