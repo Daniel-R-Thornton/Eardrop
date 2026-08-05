@@ -56,6 +56,18 @@ function makeHarness(
 
 const flatGrid = Array.from({ length: 64 }, () => 1);
 
+/**
+ * The reply queue lives in the Outbox now (see outbox.ts), keyed on a
+ * monotonic entry id rather than on the prober — a TEXT broadcast is not keyed
+ * by a peer. `reply:<proberId>` is the dedup key that restores the old
+ * one-chain-per-peer rule, so these two stand in for what used to be
+ * `(room as any).replyQueue.get(id)` and `.size`.
+ */
+const queuedReply = (room: any, proberId: number): any =>
+  Array.from(room.outbox.entries.values() as Iterable<any>)
+    .find((e: any) => e.dedupKey === `reply:${proberId}`);
+const replyQueueSize = (room: any): number => room.outbox.size;
+
 describe('room protocol', () => {
   it('joins an empty room: listen → announce → joinWait → idle', async () => {
     const h = makeHarness(1);
@@ -401,7 +413,7 @@ describe('room protocol', () => {
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
     // Entry is scheduled and mid-slot-wait; nothing sent yet.
-    expect((h.room as any).replyQueue.get(9)?.scheduled).toBe(true);
+    expect(queuedReply(h.room, 9)?.scheduled).toBe(true);
 
     // Steal the transmitter: a FILE_COMING lands while we're still waiting
     // out the slot, and joinWait accepts it (handleFileComing allows
@@ -419,7 +431,7 @@ describe('room protocol', () => {
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
     // HELD, not dropped: the entry is still queued, and `scheduled` was
     // cleared so a later setState re-drains it.
-    const held = (h.room as any).replyQueue.get(9);
+    const held = queuedReply(h.room, 9);
     expect(held).toBeDefined();
     expect(held.scheduled).toBe(false);
 
@@ -459,7 +471,7 @@ describe('room protocol', () => {
     await h.tick(ROOM_TIMING.replySlotMs + 100); // slot 0 fires, isAirBusy steals the transmitter mid-await
     expect(h.room.state).toBe('receiving');
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
-    const held = (h.room as any).replyQueue.get(9);
+    const held = queuedReply(h.room, 9);
     expect(held).toBeDefined();
     expect(held.scheduled).toBe(false);
 
@@ -475,11 +487,11 @@ describe('room protocol', () => {
     expect(h.room.state).toBe('idle');
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
-    expect((h.room as any).replyQueue.size).toBe(1);
+    expect(replyQueueSize(h.room)).toBe(1);
 
     h.room.stop(); // cancels the pending slot timer before it fires
     expect(h.room.state).toBe('cold');
-    expect((h.room as any).replyQueue.size).toBe(0);
+    expect(replyQueueSize(h.room)).toBe(0);
 
     await h.tick(60000); // nothing left to fire
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
@@ -671,8 +683,8 @@ describe('room protocol', () => {
     expect(h.room.state).toBe('idle');
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
-    expect((h.room as any).replyQueue.get(9)).toBeDefined();
-    const freshEntry = (h.room as any).replyQueue.get(9);
+    expect(queuedReply(h.room, 9)).toBeDefined();
+    const freshEntry = queuedReply(h.room, 9);
 
     // Now let the original, stale sendMessage resolve. Its timer callback
     // will check `replyQueue.get(9) === <original entry>` — false, since a
@@ -682,7 +694,7 @@ describe('room protocol', () => {
     resolveSend();
     await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
 
-    expect((h.room as any).replyQueue.get(9)).toBe(freshEntry);
+    expect(queuedReply(h.room, 9)).toBe(freshEntry);
 
     // And it does eventually go out.
     await h.tick(ROOM_TIMING.replySlotMs + 100);
