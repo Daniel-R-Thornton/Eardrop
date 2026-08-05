@@ -6,7 +6,12 @@ import { PROBE_PURPOSE } from '../protocol/probeBurst';
 /** Manual clock + timer wheel so every test is deterministic. */
 function makeHarness(
   deviceId: number,
-  opts: { busy?: () => boolean; playProbe?: () => Promise<void> } = {},
+  opts: {
+    busy?: () => boolean;
+    playProbe?: () => Promise<void>;
+    rng?: () => number;
+    isAirBusy?: () => Promise<boolean>;
+  } = {},
 ) {
   let t = 0;
   const timers: { at: number; fn: () => void; dead: boolean }[] = [];
@@ -15,7 +20,7 @@ function makeHarness(
   const deps = {
     deviceId,
     now: () => t,
-    rng: () => 0, // slot 0 always — collisions forced by `busy`
+    rng: opts.rng ?? (() => 0), // slot 0 always — collisions forced by `busy`
     schedule: (fn: () => void, d: number) => {
       const rec = { at: t + d, fn, dead: false };
       timers.push(rec);
@@ -23,7 +28,7 @@ function makeHarness(
     },
     playProbe: opts.playProbe ?? (async () => { calls.push('probe'); }),
     sendMessage: async (m: any) => { sent.push(m); },
-    isAirBusy: async () => opts.busy?.() ?? false,
+    isAirBusy: opts.isAirBusy ?? (async () => opts.busy?.() ?? false),
     startFileTx: () => calls.push('fileTx'),
     armFileRx: () => calls.push('fileRx'),
   };
@@ -276,9 +281,12 @@ describe('room protocol', () => {
     expect(welcome.targetId).toBe(9);
   });
 
-  it('holds a probe heard mid-announce and replies once the transmitter frees up', async () => {
-    // 'announcing' is genuinely busy — our own probe is playing. The reply
-    // must be queued rather than dropped, then sent when we reach joinWait.
+  it('holds a probe heard while listening and replies once the transmitter frees up', async () => {
+    // 'listening' precedes drainReplyQueue ever registering a timer for this
+    // entry — canTransmitReply() is false at the top of drainReplyQueue, so
+    // the entry sits queued (scheduled: false) with no chain in flight until
+    // a later setState (into joinWait) drains it. This is the queuing half of
+    // the fix; the in-timer HOLD branch is covered separately below.
     const h = makeHarness(2);
     h.room.start();
     await h.tick(ROOM_TIMING.listenMs - 10);
@@ -349,6 +357,105 @@ describe('room protocol', () => {
     await h.tick(2000 + 5000 + ROOM_TIMING.replySlotMs + 200);
     expect(h.room.state).toBe('idle');
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+  });
+
+  it('holds a chain already in flight when the transmitter goes busy mid-slot-wait, and resumes once free', async () => {
+    // The hazard the brief calls out explicitly: "dropping it here is the old
+    // bug". This reaches the HOLD branch INSIDE the timer callback (entry
+    // already scheduled=true, chain in flight) rather than the earlier gate
+    // at the top of drainReplyQueue — a custom rng forces a late slot so the
+    // chain is still waiting when a FILE_COMING arrives and steals the
+    // transmitter out from under it.
+    const rng = () => 0.99; // picks the last of 6 slots every time
+    const h = makeHarness(2, { rng });
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + 50);
+    expect(h.room.state).toBe('joinWait');
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    // Entry is scheduled and mid-slot-wait; nothing sent yet.
+    expect((h.room as any).replyQueue.get(9)?.scheduled).toBe(true);
+
+    // Steal the transmitter: a FILE_COMING lands while we're still waiting
+    // out the slot, and joinWait accepts it (handleFileComing allows
+    // idle/joinWait), moving us to 'receiving'.
+    h.room.onMessage({
+      type: ControlType.FileComing, senderId: 8, targetId: 0,
+      payload: packFileComing({ pilotFreqHz: 6300, toneStartHz: 600, toneCount: 32, settleSymbols: 16, fileBytes: 100, durationMs: 2000 }),
+    });
+    expect(h.room.state).toBe('receiving');
+
+    // Let the slot timer (5 * replySlotMs after the probe) fire while we're
+    // still 'receiving' — this is the in-timer canTransmitReply() check, not
+    // the gate at the top of drainReplyQueue.
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 100);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
+    // HELD, not dropped: the entry is still queued, and `scheduled` was
+    // cleared so a later setState re-drains it.
+    const held = (h.room as any).replyQueue.get(9);
+    expect(held).toBeDefined();
+    expect(held.scheduled).toBe(false);
+
+    // The transfer's own deadline (durationMs + 5000) returns us to idle,
+    // which re-drains the queue and finally sends the WELCOME.
+    await h.tick(2000 + 5000 + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    expect(h.room.state).toBe('idle');
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+  });
+
+  it('does not send a reply if the transmitter becomes busy during the isAirBusy check itself', async () => {
+    // Covers the SECOND canTransmitReply() re-check in scheduleReply, after
+    // `await this.deps.isAirBusy()` — state can change across that await even
+    // though it was fine when the timer fired. A custom isAirBusy triggers
+    // that transition (a FILE_COMING arrives) before resolving.
+    // Guard on state, not a one-shot flag: beginListening's own carrier-sense
+    // also calls isAirBusy, and that happens first (while still 'listening'),
+    // so a plain "first call" flag would fire — and get silently ignored by
+    // handleFileComing's idle/joinWait check — before the reply's own
+    // isAirBusy call ever runs.
+    const h = makeHarness(2, {
+      isAirBusy: async () => {
+        if (h.room.state === 'joinWait') {
+          h.room.onMessage({
+            type: ControlType.FileComing, senderId: 8, targetId: 0,
+            payload: packFileComing({ pilotFreqHz: 6300, toneStartHz: 600, toneCount: 32, settleSymbols: 16, fileBytes: 100, durationMs: 2000 }),
+          });
+        }
+        return false;
+      },
+    });
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + 50);
+    expect(h.room.state).toBe('joinWait');
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    await h.tick(ROOM_TIMING.replySlotMs + 100); // slot 0 fires, isAirBusy steals the transmitter mid-await
+    expect(h.room.state).toBe('receiving');
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
+    const held = (h.room as any).replyQueue.get(9);
+    expect(held).toBeDefined();
+    expect(held.scheduled).toBe(false);
+
+    await h.tick(2000 + 5000 + ROOM_TIMING.replySlotMs + 200);
+    expect(h.room.state).toBe('idle');
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+  });
+
+  it('stop() mid-chain clears the queue and sends nothing afterward', async () => {
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    expect(h.room.state).toBe('idle');
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    expect((h.room as any).replyQueue.size).toBe(1);
+
+    h.room.stop(); // cancels the pending slot timer before it fires
+    expect(h.room.state).toBe('cold');
+    expect((h.room as any).replyQueue.size).toBe(0);
+
+    await h.tick(60000); // nothing left to fire
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
   });
 
   it('answers a roll-call probe with a REPORT even from a device it has never seen', async () => {

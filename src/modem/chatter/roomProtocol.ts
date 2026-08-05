@@ -13,8 +13,8 @@
  *   cold --start()--> listening --(quiet)--> announcing --> joinWait --> idle
  *     ^                   |                                              |  ^
  *     |            (busy, re-check                                      |  |
- *     |             up to listenCapMs,                            onProbeHeard
- *     |             then force through)                           (reply slot)
+ *     |             up to listenCapMs,                        queued onProbeHeard
+ *     |             then force through)                     reply (see below)
  *     |                                                                  |
  *     +-------------------------- stop() -------------------------------+
  *
@@ -241,7 +241,15 @@ export class RoomProtocol {
     this._members.set(deviceId, { ...existing, deviceId, lastHeardMs: this.deps.now(), heardGrid: grid });
 
     // Reply type comes off the wire (see PROBE_PURPOSE), not from whether we
-    // already know this prober — see the note kept from the previous change.
+    // already know this prober. That inference was one-sided in both
+    // directions: a device rejoining with the same id (page refresh,
+    // reconnect, a second start()) is a stranger to itself but a known member
+    // to us, so it received a REPORT when it needed a WELCOME; and a peer
+    // whose WELCOME we lost still thinks we are a stranger, so it answered our
+    // roll call with a WELCOME. handleWelcome and handleReport keep their
+    // tolerance for the "wrong" reply type regardless, so a peer running an
+    // older build degrades rather than breaks.
+    //
     // A fresh probe overwrites a queued entry's purpose: the newest
     // announcement is the true one.
     const queued = this.replyQueue.get(deviceId);
@@ -292,14 +300,15 @@ export class RoomProtocol {
       theirViewOfUs: parsed.grid,
     });
 
-    // A WELCOME arriving during a roll call counts as a report. Which reply a
-    // peer sends is inferred from whether it already knows us (see
-    // onProbeHeard), and that inference is one-sided: if our WELCOME to them
-    // was lost when they joined, they still consider us a stranger and answer
-    // our roll call with a WELCOME rather than a REPORT. Ignoring it fails the
-    // roll call with "nobody home" while a peer is audibly replying — observed
-    // on hardware. The payload carries the same measured grid a REPORT does,
-    // so there is no reason to discard it.
+    // A WELCOME arriving during a roll call counts as a report. Reply type is
+    // decided by the purpose bit on the wire (see onProbeHeard / PROBE_PURPOSE),
+    // not by whether the replier already knows us — but a peer on an older
+    // build may still be running the inference this replaced, or may simply
+    // have lost our probe's purpose bit, and answer our roll call with a
+    // WELCOME rather than a REPORT. Ignoring it fails the roll call with
+    // "nobody home" while a peer is audibly replying — observed on hardware.
+    // The payload carries the same measured grid a REPORT does, so there is
+    // no reason to discard it.
     if (this._state === 'collecting') {
       this.collectedReports.set(msg.senderId, { deviceId: msg.senderId, grid: parsed.grid });
     }
@@ -315,13 +324,14 @@ export class RoomProtocol {
     const grid = parseReport(msg.payload);
     if (!grid) return;
 
-    // A REPORT is also a member refresh, independent of roll-call state: a
-    // device rejoining with the same deviceId (page refresh, reconnect, a
-    // second start()) while peers still hold it in _members receives REPORT
-    // (not WELCOME, see onProbeHeard) even while it sits in joinWait. Drop
-    // that silently and the rejoiner finishes joining knowing nothing about
-    // this peer — so always upsert the sender here, mirroring what
-    // handleWelcome refreshes.
+    // A REPORT is also a member refresh, independent of roll-call state. A
+    // rejoining device (page refresh, reconnect, a second start()) announces
+    // 'joining' and gets a WELCOME even though we still hold it in _members
+    // from before — but a peer on an older build, or one running the
+    // membership-based inference this replaced, may still answer with a
+    // REPORT while the rejoiner sits in joinWait. Drop that silently and the
+    // rejoiner finishes joining knowing nothing about this peer — so always
+    // upsert the sender here, mirroring what handleWelcome refreshes.
     const existing = this._members.get(msg.senderId);
     this._members.set(msg.senderId, {
       ...existing,
@@ -498,8 +508,11 @@ export class RoomProtocol {
    * control message (see beginAnnounceJoin's timer).
    *
    * 'listening' and 'collecting' are excluded for a different reason than
-   * 'announcing'/'sending'/'receiving': in those two we are measuring the air
-   * or counting replies, and our own burst would corrupt the measurement.
+   * 'announcing'/'rollCall'/'sending'/'receiving': in those two we are
+   * measuring the air or counting replies, and our own burst would corrupt
+   * the measurement. 'announcing' and 'rollCall' are excluded because our own
+   * probe is playing; 'sending'/'receiving' because a file transfer owns the
+   * transmitter. 'cold' is excluded because there is no room to reply into.
    */
   private canTransmitReply(): boolean {
     return this._state === 'idle' || this._state === 'joinWait';
@@ -564,11 +577,17 @@ export class RoomProtocol {
                 payload: packWelcome({ claim: DEFAULT_CLAIM, grid: heardGrid }),
               },
         );
-        this.replyQueue.delete(entry.proberId);
+        // sendMessage is ~3s of audio; a `stop()`/cold-error/re-probe can
+        // replace the queue entry at this key while we were awaiting it (a
+        // cleared queue plus a fresh probe from the same prober creates a
+        // brand-new, not-yet-sent entry under the same id). Delete only if
+        // the entry still at this key is the one we just sent — a plain
+        // delete-by-key would discard that newer, unsent entry.
+        if (this.replyQueue.get(entry.proberId) === entry) this.replyQueue.delete(entry.proberId);
       } catch (err) {
         // isAirBusy/sendMessage rejected — surface the error and stop blocking
-        // this prober.
-        this.replyQueue.delete(entry.proberId);
+        // this prober. Same identity check as the success path above.
+        if (this.replyQueue.get(entry.proberId) === entry) this.replyQueue.delete(entry.proberId);
         this._lastError = err instanceof Error ? err.message : String(err);
       }
     });
