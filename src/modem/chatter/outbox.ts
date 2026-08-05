@@ -31,7 +31,18 @@
  */
 import type { ControlMessage } from '../protocol/controlFrame';
 
-export type OutboxKind = 'welcome' | 'report' | 'text' | 'ack';
+/**
+ * What class of transmission an entry is — the owner's own taxonomy, used only
+ * to route `onSent`/`onFailed` back to the right policy.
+ *
+ * A reply is ONE kind, not a welcome kind and a report kind. Which of the two a
+ * reply turns out to be is decided at send time from the prober's newest
+ * announcement (see roomProtocol's replyPurpose), and that can flip after the
+ * entry is queued — so a `kind` fixed at enqueue would be a field that lies
+ * about what actually went on the air, and the first thing to branch on it
+ * would be wrong.
+ */
+export type OutboxKind = 'reply' | 'text' | 'ack';
 
 export interface OutboxEntry {
   /** Monotonic, unique per Outbox — the queue key. */
@@ -115,6 +126,13 @@ export class Outbox {
     return this.find(dedupKey) !== undefined;
   }
 
+  /** The unsent entry under `dedupKey`, if any. Exists so an owner (or a test)
+   *  can inspect `scheduled`/`attempts` without reaching through two layers of
+   *  `private` into the entry map. */
+  peek(dedupKey: string): OutboxEntry | undefined {
+    return this.find(dedupKey);
+  }
+
   get size(): number {
     return this.entries.size;
   }
@@ -149,9 +167,9 @@ export class Outbox {
 
   private scheduleEntry(baseTimeMs: number, candidateSlots: number[], entry: OutboxEntry): void {
     if (candidateSlots.length === 0) {
-      // Give up — no slot left to try. Narrower exposure than the two delete
-      // sites below (nothing has awaited across this one), but the identity
-      // check is here anyway for consistency of the invariant.
+      // Give up — no slot left to try. Nothing has awaited across this path, so
+      // the entry cannot have been replaced under it; the identity check is
+      // here for consistency of the invariant the two sites below rely on.
       if (this.entries.get(entry.id) === entry) this.entries.delete(entry.id);
       this.deps.onFailed?.(entry);
       return;
@@ -186,15 +204,22 @@ export class Outbox {
         }
         entry.attempts += 1;
         await this.deps.sendMessage(entry.build());
-        // sendMessage is ~3s of audio; a `clear()` plus a fresh enqueue can
-        // replace what sits under this dedupKey while we were awaiting it (a
-        // cleared queue plus a fresh probe from the same prober creates a
-        // brand-new, not-yet-sent entry). Delete only if the entry still at
-        // this id is the one we just sent — a plain delete would discard that
-        // newer, unsent entry. `onSent` must stay INSIDE this guard too: if it
-        // ran unconditionally, a send that resolves after the owner tore its
-        // room down would arm a retry into a room that no longer exists (or
-        // one we've since rejoined under a fresh id table).
+        // sendMessage is ~3s of audio, and a `clear()` plus a fresh enqueue can
+        // happen inside that window. Because `nextId` is monotonic and survives
+        // `clear()`, this identity check can only ever see its own entry or
+        // nothing — so what it enforces is "am I still queued?", and a newer
+        // entry for the same dedupKey lives under a different id where no stale
+        // closure can touch it. Kept as an identity comparison rather than a
+        // `has`, because it is the invariant that makes that reasoning true
+        // rather than incidental.
+        //
+        // `onSent` must stay INSIDE the guard. That half is load-bearing and
+        // not merely defensive: a send resolving after the owner tore its room
+        // down would otherwise arm a retry into a room that no longer exists.
+        // In roomProtocol that means a rejoined session transmitting ~3 s of
+        // unsolicited WELCOME to a peer that never probed it — from joinWait,
+        // which is transmit-eligible, so possibly straight into another
+        // device's collect window.
         if (this.entries.get(entry.id) === entry) {
           this.entries.delete(entry.id);
           this.deps.onSent?.(entry);

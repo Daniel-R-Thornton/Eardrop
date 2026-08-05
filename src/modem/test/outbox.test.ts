@@ -159,9 +159,16 @@ describe('outbox', () => {
   });
 
   it('a stale send does not delete a newer entry with the same dedupKey', async () => {
-    // The identity-guard the predecessor branch had to add: a send is seconds
-    // of audio, and clear()+re-enqueue during it must not be discarded by the
-    // old closure completing.
+    // A send is seconds of audio, and a clear()+re-enqueue during it must not
+    // be discarded by the old closure completing.
+    //
+    // Note what this does NOT prove. `nextId` is monotonic and survives
+    // clear(), so the stale closure's id (1) can never be reoccupied by the
+    // fresh entry (2): replacing the guarded delete with a plain
+    // `entries.delete(entry.id)` leaves this green, because deleting 1 is a
+    // no-op. The guard is still right — it is what makes "a stale closure
+    // cannot reach a live entry" true rather than incidental — but the half
+    // that a bypass would actually break is the onSent gate below.
     let release: (() => void) | undefined;
     let t = 0;
     const timers: { at: number; fn: () => void; dead: boolean }[] = [];
@@ -199,5 +206,55 @@ describe('outbox', () => {
     expect(outbox.size).toBe(1);
     expect(outbox.has('text:1')).toBe(true);
     expect(freshId).not.toBe(0);
+  });
+
+  it('does not call onSent for a send that resolves after clear()', async () => {
+    // The load-bearing half of the identity guard, and the only test that
+    // fails if onSent escapes it.
+    //
+    // onSent is where the owner arms follow-up work. A send that resolves after
+    // the owner tore its room down must arm nothing: in roomProtocol an escaped
+    // onSent here sets awaitingAck for a peer and starts a retry timer, and one
+    // slot window later a freshly rejoined session transmits ~3 s of
+    // unsolicited WELCOME to a peer that never probed it — from joinWait, which
+    // is transmit-eligible, so possibly straight into another device's collect
+    // window. Nothing errors; the room just talks over someone.
+    let release: (() => void) | undefined;
+    let t = 0;
+    const timers: { at: number; fn: () => void; dead: boolean }[] = [];
+    const events: string[] = [];
+    const outbox = new Outbox({
+      now: () => t,
+      rng: () => 0,
+      schedule: (fn, d) => {
+        const rec = { at: t + d, fn, dead: false };
+        timers.push(rec);
+        return () => { rec.dead = true; };
+      },
+      isAirBusy: async () => false,
+      sendMessage: () => new Promise<void>((res) => { release = res; }),
+      canTransmit: () => true,
+      replySlots: 6,
+      replySlotMs: 300,
+      onSent: (e: OutboxEntry) => events.push(`sent:${e.kind}:${e.id}`),
+      onFailed: (e: OutboxEntry) => events.push(`failed:${e.kind}:${e.id}`),
+    });
+    outbox.enqueue({ kind: 'reply', targetId: 9, dedupKey: 'reply:9', build: () => textMsg(9) });
+    outbox.drain();
+
+    const due = timers.filter((x) => !x.dead).sort((a, b) => a.at - b.at)[0];
+    t = due.at; due.dead = true; due.fn();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+    // Suspended inside sendMessage, mid-transmission.
+    expect(release).toBeDefined();
+    expect(events).toEqual([]);
+
+    // The room is torn down while the audio is still playing out.
+    outbox.clear();
+    release!();
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+
+    expect(events).toEqual([]); // nothing armed for a room that no longer exists
+    expect(outbox.size).toBe(0);
   });
 });

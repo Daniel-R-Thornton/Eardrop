@@ -63,9 +63,7 @@ const flatGrid = Array.from({ length: 64 }, () => 1);
  * one-chain-per-peer rule, so these two stand in for what used to be
  * `(room as any).replyQueue.get(id)` and `.size`.
  */
-const queuedReply = (room: any, proberId: number): any =>
-  Array.from(room.outbox.entries.values() as Iterable<any>)
-    .find((e: any) => e.dedupKey === `reply:${proberId}`);
+const queuedReply = (room: any, proberId: number): any => room.outbox.peek(`reply:${proberId}`);
 const replyQueueSize = (room: any): number => room.outbox.size;
 
 describe('room protocol', () => {
@@ -647,13 +645,18 @@ describe('room protocol', () => {
   });
 
   it('does not let a stale in-flight send discard a fresh reply queued under the same prober id', async () => {
-    // Regression pin for the identity check on the three replyQueue.delete
-    // sites in scheduleReply: a plain delete-by-key would discard a newer,
-    // not-yet-sent entry that reoccupies the same key while an earlier send
-    // is still in flight (sendMessage is ~3s of audio, and stop()/start()/a
-    // fresh probe can all happen inside that window). Reverting the guards
-    // to a plain delete keeps every OTHER test green, so this is the only
-    // thing that would catch that regression.
+    // A fresh reply queued while an earlier send is still in flight must
+    // survive that send completing (sendMessage is ~3s of audio, and
+    // stop()/start()/a fresh probe can all happen inside that window).
+    //
+    // This test no longer pins the identity check it was written for. When the
+    // queue was keyed by proberId, a plain delete-by-key here would have
+    // discarded the fresh entry; now that the outbox keys on a monotonic id
+    // that survives clear(), the stale closure's id is simply absent and a
+    // plain delete would be a harmless no-op. So this passes either way — it
+    // pins the OUTCOME (the fresh reply is not lost and does go out), not the
+    // mechanism. The half of the guard that is still load-bearing is the one
+    // around onSent, pinned in outbox.test.ts.
     let resolveSend: () => void = () => {};
     const sendGate = new Promise<void>((resolve) => { resolveSend = resolve; });
     const h = makeHarness(2, {
@@ -686,11 +689,9 @@ describe('room protocol', () => {
     expect(queuedReply(h.room, 9)).toBeDefined();
     const freshEntry = queuedReply(h.room, 9);
 
-    // Now let the original, stale sendMessage resolve. Its timer callback
-    // will check `replyQueue.get(9) === <original entry>` — false, since a
-    // new entry occupies that key — and must NOT delete the fresh entry. A
-    // plain delete-by-key would discard it here, and it would never be sent
-    // or re-added.
+    // Now let the original, stale sendMessage resolve. Its closure holds the
+    // first entry, which is no longer in the queue, so it must not touch the
+    // fresh one — and must not arm an ack for a send this room never made.
     resolveSend();
     await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
 

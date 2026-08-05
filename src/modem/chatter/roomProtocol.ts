@@ -250,12 +250,13 @@ export class RoomProtocol {
       replySlots: ROOM_TIMING.replySlots,
       replySlotMs: ROOM_TIMING.replySlotMs,
       onSent: (entry) => this.onOutboxSent(entry),
-      onFailed: (_entry, err) => {
+      onFailed: (entry, err) => {
         // Exhausting every slot is not an error the operator can act on — the
         // air was busy for a whole slot window and the reply is simply given
         // up on. A rejected isAirBusy/sendMessage is: that is an audio fault,
         // and it surfaces in the UI exactly as it did before the extraction.
         if (err !== undefined) this._lastError = err instanceof Error ? err.message : String(err);
+        if (entry.kind === 'reply') this.forgetReplyPurpose(entry.targetId);
       },
     });
   }
@@ -335,7 +336,7 @@ export class RoomProtocol {
     // must not restart a chain that is already in flight.
     this.replyPurpose.set(deviceId, purpose);
     this.outbox.enqueue({
-      kind: purpose === PROBE_PURPOSE.rollCall ? 'report' : 'welcome',
+      kind: 'reply',
       targetId: deviceId,
       dedupKey: replyKey(deviceId),
       build: () => this.buildReply(deviceId),
@@ -659,6 +660,11 @@ export class RoomProtocol {
    * carry the freshest thing we know about that peer.
    */
   private buildReply(proberId: number): ControlMessage {
+    // The `??` is unreachable in practice: forgetReplyPurpose only drops a
+    // peer's purpose once nothing is queued or awaiting ack for it, so an entry
+    // being built always has one. Defaulting to a WELCOME rather than a REPORT
+    // is still the right way to be wrong — a lost WELCOME leaves a joiner
+    // believing the room is empty, whereas a REPORT costs one negotiation.
     const purpose = this.replyPurpose.get(proberId) ?? PROBE_PURPOSE.joining;
     const heardGrid = this._members.get(proberId)?.heardGrid ?? [];
     return purpose === PROBE_PURPOSE.rollCall
@@ -676,15 +682,32 @@ export class RoomProtocol {
         };
   }
 
+  /**
+   * Drop a peer's recorded reply purpose once nothing is owed to it.
+   *
+   * The purpose describes an owed reply, so it must not outlive the entry it
+   * describes — otherwise it accumulates one stale entry per peer ever heard and
+   * buildReply's fallback becomes load-bearing instead of belt-and-braces. Both
+   * conditions have to be checked: a reply may be queued again (a fresh probe
+   * arriving while a retry was pending) or still awaiting ack, and either one
+   * still needs the purpose.
+   */
+  private forgetReplyPurpose(proberId: number): void {
+    if (this.outbox.has(replyKey(proberId))) return;
+    if (this.awaitingAck.has(proberId)) return;
+    this.replyPurpose.delete(proberId);
+  }
+
   /** A queued transmission made it onto the air. The outbox is done with it;
    *  everything from here is this room's own policy. */
   private onOutboxSent(entry: OutboxEntry): void {
     // Reply policy only — any other kind of owed transmission owns its own
-    // follow-up. Which of the two reply kinds it was does NOT decide whether a
-    // retry is armed: `kind` is fixed at enqueue and a fresh probe can change
-    // what is owed after that, so armReplyAck consults replyPurpose instead.
-    if (entry.kind !== 'welcome' && entry.kind !== 'report') return;
+    // follow-up. A reply is one kind: WELCOME-vs-REPORT is not recorded on the
+    // entry at all, because a fresh probe can change it after the entry is
+    // queued, so armReplyAck reads replyPurpose for the truth.
+    if (entry.kind !== 'reply') return;
     this.armReplyAck(entry.targetId, entry.attempts);
+    this.forgetReplyPurpose(entry.targetId);
   }
 
   /**
@@ -728,13 +751,19 @@ export class RoomProtocol {
     this.awaitingAck.set(proberId, retry);
     this.timer(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs, () => {
       const pending = this.awaitingAck.get(proberId);
-      if (!pending) return; // acknowledged — nothing to do
+      if (!pending) {
+        // Acknowledged — nothing more is owed, so the purpose can go too
+        // (unless a fresh probe queued a new reply, which forgetReplyPurpose
+        // checks for).
+        this.forgetReplyPurpose(proberId);
+        return;
+      }
       this.awaitingAck.delete(proberId);
       // A newer probe already queued a fresh reply; that one supersedes this
       // retry (and carries the newer purpose).
       if (this.outbox.has(replyKey(proberId))) return;
       this.outbox.enqueue({
-        kind: 'welcome',
+        kind: 'reply',
         targetId: proberId,
         dedupKey: replyKey(proberId),
         build: () => this.buildReply(proberId),
