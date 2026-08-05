@@ -132,6 +132,12 @@ const DEFAULT_CLAIM: BestRangeClaim = { lowHz: 1500, highHz: 7800, maxQamOrder: 
  *  last frame's tail and any scheduling jitter. */
 const TRANSFER_TAIL_MARGIN_MS = 5000;
 
+/** Total sends per owed reply, including the first. A lost WELCOME leaves the
+ *  joiner believing the room is empty, so one retry is worth roughly two
+ *  seconds of extra airtime; more than that just makes a genuinely deaf peer
+ *  expensive for everyone else. */
+const MAX_REPLY_ATTEMPTS = 2;
+
 interface PendingFile {
   fileBytes: number;
   durationMs: number;
@@ -185,6 +191,15 @@ export class RoomProtocol {
    * second chain for it.
    */
   private readonly replyQueue = new Map<number, PendingReply>();
+  /**
+   * Replies transmitted but not yet known to have landed, keyed by prober id.
+   *
+   * "Acknowledged" is deliberately loose: anything at all heard from that
+   * prober (a fresh probe, a REPORT, a WELCOME) proves the link works in the
+   * direction that matters, and the room has no dedicated ack frame. Entries
+   * that age out without any of that are re-queued once.
+   */
+  private readonly awaitingAck = new Map<number, PendingReply>();
 
   constructor(private readonly deps: RoomDeps) {}
 
@@ -222,6 +237,7 @@ export class RoomProtocol {
     this.activeFileParams = null;
     this.collectedReports.clear();
     this.replyQueue.clear();
+    this.awaitingAck.clear();
     this.setState('cold');
   }
 
@@ -239,6 +255,10 @@ export class RoomProtocol {
   onProbeHeard(deviceId: number, grid: number[], purpose: ProbePurpose = PROBE_PURPOSE.joining): void {
     const existing = this._members.get(deviceId);
     this._members.set(deviceId, { ...existing, deviceId, lastHeardMs: this.deps.now(), heardGrid: grid });
+    // Any traffic from this prober proves the direction that matters — see
+    // awaitingAck's doc comment — so a fresh probe clears a pending retry
+    // just as a REPORT or WELCOME does.
+    this.awaitingAck.delete(deviceId);
 
     // Reply type comes off the wire (see PROBE_PURPOSE), not from whether we
     // already know this prober. That inference was one-sided in both
@@ -299,6 +319,9 @@ export class RoomProtocol {
       claim: parsed.claim,
       theirViewOfUs: parsed.grid,
     });
+    // A WELCOME is traffic from the sender — it proves any reply we owed them
+    // landed, whatever that reply was.
+    this.awaitingAck.delete(msg.senderId);
 
     // A WELCOME arriving during a roll call counts as a report. Reply type is
     // decided by the purpose bit on the wire (see onProbeHeard / PROBE_PURPOSE),
@@ -339,6 +362,9 @@ export class RoomProtocol {
       lastHeardMs: this.deps.now(),
       theirViewOfUs: grid,
     });
+    // Same reasoning as handleWelcome: a REPORT is traffic from the sender,
+    // so any reply we owed them is acknowledged.
+    this.awaitingAck.delete(msg.senderId);
 
     // Roll-call accumulation (feeds pickSettings) only happens while actively
     // collecting — a REPORT arriving outside that window is member-refresh
@@ -534,7 +560,10 @@ export class RoomProtocol {
 
   private scheduleReply(baseTimeMs: number, candidateSlots: number[], entry: PendingReply): void {
     if (candidateSlots.length === 0) {
-      this.replyQueue.delete(entry.proberId); // give up — no slot left to try
+      // Give up — no slot left to try. Narrower exposure than the two delete
+      // sites below (nothing has awaited across this one), but the identity
+      // check is here anyway for consistency of the invariant.
+      if (this.replyQueue.get(entry.proberId) === entry) this.replyQueue.delete(entry.proberId);
       return;
     }
     const idx = Math.floor(this.deps.rng() * candidateSlots.length);
@@ -583,13 +612,36 @@ export class RoomProtocol {
         // brand-new, not-yet-sent entry under the same id). Delete only if
         // the entry still at this key is the one we just sent — a plain
         // delete-by-key would discard that newer, unsent entry.
-        if (this.replyQueue.get(entry.proberId) === entry) this.replyQueue.delete(entry.proberId);
+        if (this.replyQueue.get(entry.proberId) === entry) {
+          this.replyQueue.delete(entry.proberId);
+          this.armReplyAck(entry);
+        }
       } catch (err) {
         // isAirBusy/sendMessage rejected — surface the error and stop blocking
         // this prober. Same identity check as the success path above.
         if (this.replyQueue.get(entry.proberId) === entry) this.replyQueue.delete(entry.proberId);
         this._lastError = err instanceof Error ? err.message : String(err);
       }
+    });
+  }
+
+  /** Watch for an answer from `entry.proberId`; re-queue the reply once if
+   *  none arrives within a slot window. */
+  private armReplyAck(entry: PendingReply): void {
+    const attempts = entry.attempts + 1;
+    if (attempts >= MAX_REPLY_ATTEMPTS) return;
+
+    const retry: PendingReply = { ...entry, attempts, scheduled: false };
+    this.awaitingAck.set(entry.proberId, retry);
+    this.timer(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs, () => {
+      const pending = this.awaitingAck.get(entry.proberId);
+      if (!pending) return; // acknowledged — nothing to do
+      this.awaitingAck.delete(entry.proberId);
+      // A newer probe already queued a fresh reply; that one supersedes this
+      // retry (and carries the newer purpose).
+      if (this.replyQueue.has(entry.proberId)) return;
+      this.replyQueue.set(entry.proberId, pending);
+      this.drainReplyQueue();
     });
   }
 
@@ -614,6 +666,7 @@ export class RoomProtocol {
       this.pendingSendFile = null;
       this.activeFileParams = null;
       this.replyQueue.clear();
+      this.awaitingAck.clear();
       this.setState('cold');
     } else {
       this.activeFileParams = null;

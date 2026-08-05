@@ -11,6 +11,7 @@ function makeHarness(
     playProbe?: () => Promise<void>;
     rng?: () => number;
     isAirBusy?: () => Promise<boolean>;
+    sendMessage?: (m: any) => Promise<void>;
   } = {},
 ) {
   let t = 0;
@@ -27,7 +28,7 @@ function makeHarness(
       return () => { rec.dead = true; };
     },
     playProbe: opts.playProbe ?? (async () => { calls.push('probe'); }),
-    sendMessage: async (m: any) => { sent.push(m); },
+    sendMessage: opts.sendMessage ?? (async (m: any) => { sent.push(m); }),
     isAirBusy: opts.isAirBusy ?? (async () => opts.busy?.() ?? false),
     startFileTx: () => calls.push('fileTx'),
     armFileRx: () => calls.push('fileRx'),
@@ -259,7 +260,12 @@ describe('room protocol', () => {
     await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
     h.room.onProbeHeard(9, flatGrid);
     h.room.onProbeHeard(9, flatGrid); // duplicate, same prober, reply chain already pending
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 100);
+    // Measured over a window shorter than one slot window: the retry arms
+    // only after the first WELCOME actually sends, so this still isolates
+    // "one chain per prober" from the retry behaviour covered separately
+    // below (a window covering a full slot window would let a retry fire
+    // too, which is correct but not what this test is checking).
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
 
@@ -295,7 +301,10 @@ describe('room protocol', () => {
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
 
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    // A window shorter than one slot window after the send: long enough to
+    // catch listening finish through the (slot-0, rng fixed to 0) send, short
+    // of the Task-4 retry that arms one slot window after it.
+    await h.tick(ROOM_TIMING.replySlotMs + 200);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
 
@@ -331,7 +340,10 @@ describe('room protocol', () => {
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.rollCall);
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    // Shorter than one slot window after the send, for the same reason as
+    // above: the Task-4 retry arms one slot window after this send and would
+    // otherwise fire inside a longer window.
+    await h.tick(ROOM_TIMING.replySlotMs + 200);
 
     expect(h.sent.filter((m) => m.type === ControlType.Report)).toHaveLength(0);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
@@ -354,7 +366,10 @@ describe('room protocol', () => {
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
 
     // ...but once the transfer's deadline returns us to idle, it goes out.
-    await h.tick(2000 + 5000 + ROOM_TIMING.replySlotMs + 200);
+    // Window kept short of a full slot window past that send (subtract one)
+    // so the Task-4 retry, armed one slot window after it, does not also
+    // land inside this tick.
+    await h.tick(2000 + 5000 + 200 - ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs);
     expect(h.room.state).toBe('idle');
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
@@ -492,5 +507,99 @@ describe('room protocol', () => {
     await h.tick(ROOM_TIMING.replySlotMs + 100);
 
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+  });
+
+  it('retries a reply once when the prober never answers', async () => {
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+
+    // Nothing heard back within one slot window → one more attempt.
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.replySlotMs + 200);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(2);
+  });
+
+  it('stops after two attempts', async () => {
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    await h.tick(60000);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(2);
+  });
+
+  it('does not retry once the prober is heard from', async () => {
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+
+    // 9 answers — a REPORT addressed to us proves it heard the welcome.
+    h.room.onMessage({ type: ControlType.Report, senderId: 9, targetId: 2, payload: packReport(flatGrid) });
+    await h.tick(60000);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+  });
+
+  it('does not let a stale in-flight send discard a fresh reply queued under the same prober id', async () => {
+    // Regression pin for the identity check on the three replyQueue.delete
+    // sites in scheduleReply: a plain delete-by-key would discard a newer,
+    // not-yet-sent entry that reoccupies the same key while an earlier send
+    // is still in flight (sendMessage is ~3s of audio, and stop()/start()/a
+    // fresh probe can all happen inside that window). Reverting the guards
+    // to a plain delete keeps every OTHER test green, so this is the only
+    // thing that would catch that regression.
+    let resolveSend: () => void = () => {};
+    const sendGate = new Promise<void>((resolve) => { resolveSend = resolve; });
+    const h = makeHarness(2, {
+      sendMessage: async (m: any) => {
+        h.sent.push(m);
+        await sendGate; // hangs until the test releases it
+      },
+    });
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    expect(h.room.state).toBe('idle');
+
+    // First probe: slot 0 fires, scheduleReply's timer calls sendMessage,
+    // which is now hung awaiting sendGate. The original PendingReply object
+    // is captured in that timer's closure but no longer sits in replyQueue —
+    // it's "in flight".
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+
+    // Leave and rejoin while that send is still in flight, then hear a new
+    // probe from the same prober id (9). This creates a DISTINCT PendingReply
+    // object under the same key, queued and drained fresh in the new room.
+    h.room.stop();
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    expect(h.room.state).toBe('idle');
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    expect((h.room as any).replyQueue.get(9)).toBeDefined();
+    const freshEntry = (h.room as any).replyQueue.get(9);
+
+    // Now let the original, stale sendMessage resolve. Its timer callback
+    // will check `replyQueue.get(9) === <original entry>` — false, since a
+    // new entry occupies that key — and must NOT delete the fresh entry. A
+    // plain delete-by-key would discard it here, and it would never be sent
+    // or re-added.
+    resolveSend();
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+
+    expect((h.room as any).replyQueue.get(9)).toBe(freshEntry);
+
+    // And it does eventually go out.
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(2);
   });
 });
