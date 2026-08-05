@@ -4,6 +4,65 @@
  */
 import { dlog } from '../lib/debug/dlog';
 
+/**
+ * Apply playback volume and the auto-normalise/clamp policy, writing into
+ * `out` rather than returning a new array — the caller already has a
+ * destination (an AudioBuffer's channel data), and allocating a scratch copy
+ * here meant three copies of every waveform were live at once.
+ *
+ * Extracted from `play` so the level maths is testable without an
+ * AudioContext. Getting it wrong is not a cosmetic bug: the receiver trains
+ * its amplitude reference on the preamble and applies it to the data, so a
+ * scaling error corrupts every channel estimate downstream.
+ */
+export function shapeForPlayback(
+  samples: Float32Array,
+  out: Float32Array,
+  volume: number,
+  clean: boolean,
+): { peak: number; scale: number; clips: number } {
+  if (clean) {
+    out.set(samples);
+    return { peak: 0, scale: 1.0, clips: 0 };
+  }
+
+  let peak = 0;
+  for (const element of samples) {
+    const abs = Math.abs(element);
+    if (abs > peak) peak = abs;
+  }
+  // Scale so that peak * volume * scale = 0.95 (no clipping). Capped at 5x so
+  // a near-silent buffer is not amplified into noise.
+  const targetPeak = 0.95;
+  const scale = peak > 0 ? Math.min(targetPeak / (peak * volume), 5.0) : 1.0;
+
+  // Clamp, never rescale, the samples that still overshoot: the cap above
+  // means overshoot is possible, and clamping distorts a handful of samples
+  // while a rescale would step the whole buffer's level.
+  //
+  // In practice this branch is unreachable with the formula above, so `clips`
+  // is expected to be 0: if the cap doesn't bind, scale = 0.95/(peak*volume),
+  // so peak*volume*scale = 0.95 exactly; if the cap does bind (peak*volume <
+  // 0.19), scale = 5.0, so peak*volume*scale = peak*volume*5 < 0.95. Either
+  // way the largest-magnitude sample tops out at 0.95, under unity. It's kept
+  // as a guard against a future change to `scale` that reopens the
+  // possibility, not because it currently fires.
+  let clips = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const sample = samples[i] * volume * scale;
+    if (sample > 1.0) {
+      out[i] = 1.0;
+      clips++;
+    } else if (sample < -1.0) {
+      out[i] = -1.0;
+      clips++;
+    } else {
+      out[i] = sample;
+    }
+  }
+  return { peak, scale, clips };
+}
+
 export class AudioPlayer {
   private ctx: AudioContext;
   private currentSource: AudioBufferSourceNode | null = null;
@@ -51,44 +110,22 @@ export class AudioPlayer {
     }
 
     return new Promise((resolve) => {
-      // Apply volume, auto-normalize to prevent clipping
-      const buf = new Float32Array(samples.length);
-      if (clean) {
-        buf.set(samples);
-      } else {
-        // Find peak to auto-normalize
-        let peak = 0;
-        for (const element of samples) {
-          const abs = Math.abs(element);
-          if (abs > peak) peak = abs;
-        }
-        // Scale so that peak * volume * scale = 0.95 (no clipping)
-        const targetPeak = 0.95;
-        const scale = peak > 0 ? Math.min(targetPeak / (peak * this.volume), 5.0) : 1.0;
+      // Write straight into the AudioBuffer's channel data.
+      //
+      // This used to build a scratch Float32Array, fill it, then `set()` it
+      // into the buffer — so three copies of every waveform were live at once
+      // (the caller's samples, the scratch, and the buffer's own backing
+      // store). The buffer has to be allocated either way; the scratch does
+      // not.
+      const buffer = ctx.createBuffer(1, samples.length, sampleRate);
+      const { peak, scale, clips } = shapeForPlayback(samples, buffer.getChannelData(0), this.volume, clean);
 
-        if (scale < 1.0) {
-          dlog('PLAY', { autoNorm: scale, peak, vol: this.volume }, { level: 'debug' });
-        }
-
-        let clips = 0;
-        for (let i = 0; i < samples.length; i++) {
-          const sample = samples[i] * this.volume * scale;
-          if (sample > 1.0) {
-            buf[i] = 1.0;
-            clips++;
-          } else if (sample < -1.0) {
-            buf[i] = -1.0;
-            clips++;
-          } else {
-            buf[i] = sample;
-          }
-        }
-        if (clips > 0) {
-          dlog('PLAY', { clipped: clips }, { level: 'warn' });
-        }
+      if (!clean && scale < 1.0) {
+        dlog('PLAY', { autoNorm: scale, peak, vol: this.volume }, { level: 'debug' });
       }
-      const buffer = ctx.createBuffer(1, buf.length, sampleRate);
-      buffer.getChannelData(0).set(buf);
+      if (clips > 0) {
+        dlog('PLAY', { clipped: clips }, { level: 'warn' });
+      }
 
       const source = ctx.createBufferSource();
       source.buffer = buffer;
