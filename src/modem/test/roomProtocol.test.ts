@@ -23,6 +23,7 @@ function makeHarness(
   const calls: string[] = [];
   const textReceived: any[] = [];
   const textAcked: any[] = [];
+  const textStates: any[] = [];
   const deps = {
     deviceId,
     now: () => t,
@@ -39,6 +40,7 @@ function makeHarness(
     armFileRx: () => calls.push('fileRx'),
     onTextReceived: (msg: any) => textReceived.push(msg),
     onTextAcked: (msgId: number, byDeviceId: number) => textAcked.push({ msgId, by: byDeviceId }),
+    onTextStateChange: (msgId: number, state: string, ackedBy: number[]) => textStates.push({ msgId, state, ackedBy }),
   };
   const room = new RoomProtocol(deps as any);
   /** advance the clock, firing due timers in order */
@@ -59,7 +61,7 @@ function makeHarness(
     t = end;
   };
   return {
-    room, tick, sent, calls, textReceived, textAcked,
+    room, tick, sent, calls, textReceived, textAcked, textStates,
   };
 }
 
@@ -901,6 +903,72 @@ describe('room protocol', () => {
     await h.tick(ROOM_TIMING.replySlotMs + 100);
     h.room.onMessage({ type: ControlType.Ack, senderId: 8, targetId: 1, payload: packAck(msgId) });
     expect(h.textAcked).toEqual([{ msgId, by: 8 }]);
+  });
+
+  it('a DM with no ACK retries once, then fails', async () => {
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.sendText('you there?', 7);
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(1);
+
+    await h.tick(ROOM_TIMING.ackWindowMs + ROOM_TIMING.replySlotMs + 200);
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(2);
+
+    await h.tick(ROOM_TIMING.ackWindowMs + ROOM_TIMING.replySlotMs + 200);
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(2); // capped
+    expect(h.textStates[h.textStates.length - 1]).toMatchObject({ state: 'failed' });
+  });
+
+  it('a DM that is ACKed does not retry', async () => {
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    const msgId = h.room.sendText('you there?', 7);
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    h.room.onMessage({ type: ControlType.Ack, senderId: 7, targetId: 1, payload: packAck(msgId) });
+
+    await h.tick(60000);
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(1);
+    expect(h.textStates[h.textStates.length - 1]).toMatchObject({ state: 'delivered', ackedBy: [7] });
+  });
+
+  it('a broadcast with one ACK does not retry', async () => {
+    // Retrying because one of several peers missed it would spend seconds of
+    // air punishing the ones that heard it.
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    const msgId = h.room.sendText('hello room');
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    h.room.onMessage({ type: ControlType.Ack, senderId: 5, targetId: 1, payload: packAck(msgId) });
+
+    await h.tick(60000);
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(1);
+    expect(h.textStates[h.textStates.length - 1]).toMatchObject({ state: 'delivered', ackedBy: [5] });
+  });
+
+  it('a broadcast with zero ACKs retries once', async () => {
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.sendText('anyone?');
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(ROOM_TIMING.ackWindowMs + ROOM_TIMING.replySlotMs + 200);
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(2);
+  });
+
+  it('records every acking device on a broadcast', async () => {
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    const msgId = h.room.sendText('roll up');
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    h.room.onMessage({ type: ControlType.Ack, senderId: 5, targetId: 1, payload: packAck(msgId) });
+    h.room.onMessage({ type: ControlType.Ack, senderId: 6, targetId: 1, payload: packAck(msgId) });
+    h.room.onMessage({ type: ControlType.Ack, senderId: 5, targetId: 1, payload: packAck(msgId) }); // dup
+    expect(h.textStates[h.textStates.length - 1]).toMatchObject({ state: 'delivered', ackedBy: [5, 6] });
   });
 
   it('a TEXT queued while receiving is held, then sent on return to idle', async () => {

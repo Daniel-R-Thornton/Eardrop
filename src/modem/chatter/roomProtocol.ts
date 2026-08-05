@@ -120,24 +120,40 @@ export interface RoomDeps {
    *  decision — the ACK is sent regardless of whether this is wired up. */
   onTextReceived?(msg: { msgId: number; senderId: number; targetId: number; text: string }): void;
   /** Display-only: an ACK for a message this device sent came back. Never
-   *  read by a protocol decision (no retry/delivery-state tracking lives here
-   *  yet — see the follow-up task). */
+   *  read by a protocol decision — the retry/delivery-state tracking that
+   *  reacts to an ACK lives in `handleAck` itself, not in the UI. */
   onTextAcked?(msgId: number, byDeviceId: number): void;
+  /** Display-only: a sent TEXT's delivery state changed. `ackedBy` is every
+   *  device that has acked so far (deduped), meaningful mainly for a
+   *  broadcast that may collect more than one. */
+  onTextStateChange?(msgId: number, state: 'sending' | 'delivered' | 'failed', ackedBy: number[]): void;
 }
+
+// Hoisted above ROOM_TIMING because that object is an `as const` literal and
+// cannot reference its own fields during construction — ackWindowMs below
+// needs replySlots/replySlotMs, so all three live here and ROOM_TIMING's
+// fields are themselves derived from them (never the other way around).
+
+/** JOIN_WAIT and COLLECT both.
+ *
+ *  300 ms, not the 1 s this shipped with. Slots exist so two peers do not
+ *  start talking at the same instant, but listen-before-talk is what
+ *  actually prevents the collision — the slot only has to be long enough
+ *  that a peer who started in the previous one is visible to the next
+ *  device's carrier sense. That check averages the last 250 ms of audio, so
+ *  300 ms clears it with margin. A full second bought nothing and cost up to
+ *  five seconds of the join, which is most of the time a two-device room
+ *  spends waiting. */
+const REPLY_SLOTS = 6;
+const REPLY_SLOT_MS = 300;
+
+/** Measured air time of a 1-byte control payload: 35 wire bytes over 8 QPSK
+ *  tones plus the fixed ~1.5 s preamble. Used below to size the ACK window. */
+const ACK_AIR_MS = 2000;
 
 export const ROOM_TIMING = {
   listenMs: 1000, listenCapMs: 10000,
-  // JOIN_WAIT and COLLECT both.
-  //
-  // 300 ms, not the 1 s this shipped with. Slots exist so two peers do not
-  // start talking at the same instant, but listen-before-talk is what
-  // actually prevents the collision — the slot only has to be long enough
-  // that a peer who started in the previous one is visible to the next
-  // device's carrier sense. That check averages the last 250 ms of audio, so
-  // 300 ms clears it with margin. A full second bought nothing and cost up to
-  // five seconds of the join, which is most of the time a two-device room
-  // spends waiting.
-  replySlots: 6, replySlotMs: 300,
+  replySlots: REPLY_SLOTS, replySlotMs: REPLY_SLOT_MS,
   // Grace after the last reply slot opens.
   //
   // Must exceed one whole control message, because a peer that draws the
@@ -147,6 +163,18 @@ export const ROOM_TIMING = {
   // answer lands just after everyone stopped listening for it.
   collectExtraMs: 4000,
   fileComingLeadMs: 700,
+  /**
+   * How long a sent TEXT waits for an ACK before its one retry.
+   *
+   * DERIVED, never hardcoded: the slot span every ACK is drawn from, plus one
+   * whole ACK's airtime. `collectExtraMs` was a hardcoded window sized
+   * against an assumption a later change invalidated, and the result was a
+   * retried reply landing outside it and silently killing a file transfer —
+   * see this module's history. ACK_AIR_MS is the measured air time of a
+   * 1-byte control payload: 35 wire bytes over 8 QPSK tones plus the fixed
+   * ~1.5 s preamble.
+   */
+  ackWindowMs: REPLY_SLOTS * REPLY_SLOT_MS + ACK_AIR_MS,
 } as const;
 
 /** A device's real self-knowledge (measured passband/QAM ceiling) arrives in
@@ -170,6 +198,11 @@ const TRANSFER_TAIL_MARGIN_MS = 5000;
  *  fresh probe, a roll call, a FILE_COMING, a BYE) inside the window. In the
  *  ordinary two-device flow the second send therefore happens every time. */
 const MAX_REPLY_ATTEMPTS = 2;
+
+/** Total sends per text message, including the first — same discipline as
+ *  MAX_REPLY_ATTEMPTS. A failed 254-byte message already costs ~21 s of air
+ *  across two attempts. */
+const MAX_TEXT_ATTEMPTS = 2;
 
 /** Bound on the received-TEXT dedup set (see `seenText`), not an LRU cache.
  *  msgId wraps at 256, so 128 also caps how far back a wrap could collide;
@@ -199,6 +232,23 @@ interface PendingAck {
   attempts: number;
 }
 
+/**
+ * A TEXT this device has sent, tracked from its first send until it is
+ * acked or gives up. Unlike `PendingAck` (which watches for ANY traffic
+ * proving a reply landed), a TEXT has an actual ACK frame to wait for, so
+ * this only needs the send count and who has acked so far.
+ */
+interface SentText {
+  msgId: number;
+  /** 0 = broadcast. */
+  targetId: number;
+  payload: Uint8Array;
+  /** Sends spent, including the first — capped at MAX_TEXT_ATTEMPTS. */
+  attempts: number;
+  /** Devices that have acked this message so far, deduped, in arrival order. */
+  ackedBy: number[];
+}
+
 /** The outbox dedup key for a reply owed to `proberId`.
  *
  *  The outbox keys entries on a monotonic id, because a TEXT broadcast is not
@@ -206,6 +256,17 @@ interface PendingAck {
  *  prober-keyed map gave for free: at most one reply chain in flight per peer,
  *  so a repeat probe — or a setState that re-drains — cannot start a second. */
 const replyKey = (proberId: number): string => `reply:${proberId}`;
+
+/** Recover the msgId from a `text:<msgId>` dedupKey — the inverse of the
+ *  literal built in sendText/checkTextAck. `onOutboxSent` only gets the
+ *  entry, not the SentText record, and the entry itself carries no msgId
+ *  field (a text broadcast has no peer to key on the way a reply does), so
+ *  this is the one place that needs to parse it back out. */
+const textMsgIdFromDedupKey = (dedupKey: string): number | undefined => {
+  if (!dedupKey.startsWith('text:')) return undefined;
+  const n = Number(dedupKey.slice('text:'.length));
+  return Number.isFinite(n) ? n : undefined;
+};
 
 export class RoomProtocol {
   private _state: RoomState = 'cold';
@@ -264,6 +325,9 @@ export class RoomProtocol {
    *  session cannot grow it without limit. msgId wraps at 256, so the bound
    *  also caps how far back a wrap could collide. */
   private readonly seenText: Set<string> = new Set();
+  /** TEXTs sent by this device, awaiting ACK or already resolved, keyed by
+   *  msgId. Cleared in `stop()` alongside the other retry state. */
+  private readonly sentText = new Map<number, SentText>();
 
   constructor(private readonly deps: RoomDeps) {
     this.outbox = new Outbox({
@@ -324,6 +388,7 @@ export class RoomProtocol {
     this.replyPurpose.clear();
     this.awaitingAck.clear();
     this.seenText.clear();
+    this.sentText.clear();
     this.setState('cold');
   }
 
@@ -354,6 +419,12 @@ export class RoomProtocol {
     const msgId = this.nextMsgId;
     this.nextMsgId = (this.nextMsgId + 1) & 0xff;
     const payload = packText(msgId, text);
+    // Recorded before the first send so armTextAck (fired from the outbox's
+    // onSent) has somewhere to write attempts, and so a retry rebuilds from
+    // the same payload rather than needing the original string kept alive.
+    this.sentText.set(msgId, {
+      msgId, targetId, payload, attempts: 0, ackedBy: [],
+    });
     this.outbox.enqueue({
       kind: 'text',
       targetId,
@@ -363,6 +434,7 @@ export class RoomProtocol {
       }),
     });
     this.outbox.drain();
+    this.deps.onTextStateChange?.(msgId, 'sending', []);
     return msgId;
   }
 
@@ -582,6 +654,18 @@ export class RoomProtocol {
     if (!parsed) return;
     this.awaitingAck.delete(msg.senderId);
     this.deps.onTextAcked?.(parsed.msgId, msg.senderId);
+
+    const rec = this.sentText.get(parsed.msgId);
+    if (!rec) return; // not one of ours, or already cleared by stop()
+    // A repeat ACK from a device already recorded is not news — the sender
+    // side already reported this ack; re-reporting would just replay the
+    // same delivered state with the same ackedBy list.
+    if (rec.ackedBy.includes(msg.senderId)) return;
+    rec.ackedBy.push(msg.senderId);
+    // Any ack at all makes this message delivered, DM or broadcast — the
+    // retry timer (see checkTextAck) is what still decides whether a
+    // broadcast needed MORE than one before it stops chasing.
+    this.deps.onTextStateChange?.(rec.msgId, 'delivered', [...rec.ackedBy]);
   }
 
   /** Record a delivered (senderId:msgId) key, evicting the oldest insertion
@@ -821,13 +905,17 @@ export class RoomProtocol {
   /** A queued transmission made it onto the air. The outbox is done with it;
    *  everything from here is this room's own policy. */
   private onOutboxSent(entry: OutboxEntry): void {
-    // Reply policy only — any other kind of owed transmission owns its own
-    // follow-up. A reply is one kind: WELCOME-vs-REPORT is not recorded on the
-    // entry at all, because a fresh probe can change it after the entry is
-    // queued, so armReplyAck reads replyPurpose for the truth.
-    if (entry.kind !== 'reply') return;
-    this.armReplyAck(entry.targetId, entry.attempts);
-    this.forgetReplyPurpose(entry.targetId);
+    // A reply is one kind: WELCOME-vs-REPORT is not recorded on the entry at
+    // all, because a fresh probe can change it after the entry is queued, so
+    // armReplyAck reads replyPurpose for the truth.
+    if (entry.kind === 'reply') {
+      this.armReplyAck(entry.targetId, entry.attempts);
+      this.forgetReplyPurpose(entry.targetId);
+      return;
+    }
+    // An ACK is fire-and-forget — the room has no ack-for-an-ack, so nothing
+    // here tracks its delivery.
+    if (entry.kind === 'text') this.armTextAck(entry);
   }
 
   /**
@@ -891,6 +979,59 @@ export class RoomProtocol {
       });
       this.outbox.drain();
     });
+  }
+
+  // ---- TEXT retry policy: same "one retry, then give up" discipline as a
+  //      reply, but keyed on a real ACK frame rather than any-traffic-at-all,
+  //      and with a broadcast rule a DM doesn't need — see checkTextAck.
+
+  /** Arm the ACK-window timer for a TEXT that just went out. */
+  private armTextAck(entry: OutboxEntry): void {
+    const msgId = textMsgIdFromDedupKey(entry.dedupKey);
+    if (msgId === undefined) return; // not a dedupKey this class produced
+    const rec = this.sentText.get(msgId);
+    if (!rec) return; // stop() cleared it mid-flight
+    rec.attempts = entry.attempts;
+    this.timer(ROOM_TIMING.ackWindowMs, () => this.checkTextAck(msgId));
+  }
+
+  /**
+   * The ACK window for one send expired. Retry, or give up, per the rule the
+   * brief exists to enforce:
+   *
+   * - DM: retry unless the addressee specifically acked.
+   * - Broadcast: retry only if NOBODY acked. Retrying because one of several
+   *   peers missed it would spend seconds of air punishing the ones that
+   *   heard it — in a half-duplex room, one device talking blocks everyone,
+   *   including the peers who already have the message.
+   *
+   * Either way, bounded by MAX_TEXT_ATTEMPTS, matching MAX_REPLY_ATTEMPTS's
+   * discipline for the same reason: a genuinely deaf peer must not make this
+   * device transmit forever.
+   */
+  private checkTextAck(msgId: number): void {
+    const rec = this.sentText.get(msgId);
+    if (!rec) return; // resolved or cleared already
+
+    const acked = rec.targetId === 0 ? rec.ackedBy.length > 0 : rec.ackedBy.includes(rec.targetId);
+    if (acked) return; // handleAck already reported 'delivered'
+
+    if (rec.attempts >= MAX_TEXT_ATTEMPTS) {
+      this.deps.onTextStateChange?.(msgId, 'failed', [...rec.ackedBy]);
+      return;
+    }
+
+    const { targetId, payload } = rec;
+    this.outbox.enqueue({
+      kind: 'text',
+      targetId,
+      dedupKey: `text:${msgId}`,
+      build: () => ({
+        type: ControlType.Text, senderId: this.deps.deviceId, targetId, payload,
+      }),
+      attempts: rec.attempts,
+    });
+    this.outbox.drain();
   }
 
   // ---- shared plumbing ----

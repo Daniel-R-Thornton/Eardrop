@@ -256,7 +256,31 @@ export interface AppState {
   chatterPackets: ChatterPacket[];
   /** performance.now() of this device's last own transmission (for the "talking" pulse); null until the first one. */
   chatterLastTx: number | null;
+  /** Bounded ring of chat messages, newest last, for the room-mode text UI.
+   *  Not wired up yet — the controller that pushes into this lives in a
+   *  follow-up task. */
+  chatterMessages: ChatMessage[];
 }
+
+/** One chat message, newest LAST. Capped at CHATTER_MESSAGE_LOG_MAX.
+ *  Display-only — never read by a protocol decision. */
+export interface ChatMessage {
+  /** Monotonic counter, unique per session — React key. */
+  seq: number;
+  /** Sender-assigned id, wraps at 256. Unique only per senderId. */
+  msgId: number;
+  senderId: number;
+  /** 0 = the whole room. */
+  targetId: number;
+  text: string;
+  tMs: number;
+  dir: 'tx' | 'rx';
+  /** Device ids that acknowledged this message. Meaningful for dir 'tx'. */
+  ackedBy: number[];
+  state: 'sending' | 'delivered' | 'failed';
+}
+
+export const CHATTER_MESSAGE_LOG_MAX = 100;
 
 /** One observed control-plane event. Newest LAST. Capped at CHATTER_PACKET_LOG_MAX. */
 export interface ChatterPacket {
@@ -361,6 +385,7 @@ const defaultState: AppState = {
   chatterError: null,
   chatterPackets: [],
   chatterLastTx: null,
+  chatterMessages: [],
 };
 
 // ─── Store ────────────────────────────────────────────
