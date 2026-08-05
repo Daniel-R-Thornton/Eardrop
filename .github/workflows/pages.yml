@@ -3,6 +3,8 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -26,6 +28,7 @@ jobs:
       # eslint-config-airbnb pins eslint ^7/^8 while the repo is on eslint 10;
       # local installs resolve with legacy peer handling, match that here.
       - run: npm ci --legacy-peer-deps
+      - run: npm run typecheck
       - run: npm run build
         env:
           VITE_BASE: /Eardrop/
@@ -34,6 +37,10 @@ jobs:
           path: dist
 
   deploy:
+    # PR runs only need the build/typecheck signal above — deploying a PR's
+    # build to production Pages would be wrong (and the github-pages
+    # environment isn't set up to authorize it for arbitrary branches).
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     environment:

@@ -106,7 +106,7 @@ export class RxEngine {
   private ofdmDemod: OFDMQPSKDemodulator | null = null;
   private ofdmSyncFrames = 0;
   /** Energy threshold for OFDM sync detection — based on total tone energy, not pilot-only */
-  private ofdmSyncMinFrames = OFDM_TUNING.syncMinFrames;
+  private ofdmSyncMinFrames: number = OFDM_TUNING.syncMinFrames;
   private ofdmSyncThreshold = 0.06;
   /** Count of OFDM sync symbols processed for channel training */
   private ofdmTrainingSymbols = 0;

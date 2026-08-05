@@ -547,7 +547,40 @@ describe('ChatterController', () => {
     );
 
     expect(worker.calls).toContain('startFileStream');
-    expect(worker.calls).not.toContain('encodeFile');
+    // encodeFile pushes `encodeFile:${fileName}` (a prefixed marker, unlike
+    // startFileStream's bare string) — toContain('encodeFile') would never
+    // match that element and pass unconditionally, missing the worst case
+    // here: both paths firing and the file going out twice.
+    expect(worker.calls.some((c) => c.startsWith('encodeFile'))).toBe(false);
     expect(player.calls).toContain('playStream');
+  });
+
+  it('cancels the worker-side stream generator when playStream fails, and surfaces the error', async () => {
+    // doPlayStreamAndMute's cancel() call is the leak-prevention path: without
+    // it, a failed transfer leaves the worker holding the whole encode until
+    // the next stream replaces it. Force playStream to throw and confirm both
+    // the cancel marker and chatterError land.
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
+    player.playStream = async () => { throw new Error('playback failed'); };
+
+    await controller.joinRoom();
+    await clock.tick(
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS
+      + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
+    );
+    await controller.broadcastFile('a.txt', new Uint8Array(40));
+    await clock.tick(ROOM_TIMING.listenMs + MUTE_TAIL_MS + 100);
+    worker.emit('controlMessage', {
+      msg: { type: ControlType.Report, senderId: 5, targetId: getState().chatterDeviceId, payload: packReport(flatGrid).buffer },
+    });
+    await clock.tick(
+      ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200,
+    );
+
+    expect(worker.calls).toContain('startFileStream:cancel');
+    expect(getState().chatterError).toMatch(/playback failed/);
   });
 });
