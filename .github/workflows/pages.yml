@@ -13,7 +13,14 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
+  # Scoped per event+ref, not a single shared "pages" group: with pull_request
+  # now also triggering this workflow, a shared group would let opening/
+  # updating a PR cancel an in-progress production deploy of main (and let
+  # two PRs cancel each other's checks) via cancel-in-progress, before the
+  # deploy job's own `if: github.event_name != 'pull_request'` gate ever runs
+  # — that gate only stops the PR run from deploying, not from cancelling
+  # someone else's run. Keep this scoped if another trigger is added later.
+  group: pages-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
