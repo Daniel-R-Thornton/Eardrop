@@ -235,10 +235,17 @@ export const OFDM_DEFAULTS = {
  * gapSymbols: silence between the handshake segment and the target-band
  * transmission. The post-hop engine must meet the target chirp the way a
  * cold receiver does — quiet first. Bench 2026-08-03: without the gap, the
- * chirp correlator fired on the card symbols' pilot at norm ~0.15, the CP
- * probe then VALIDATED the false detect because cards are real OFDM with real
- * cyclic prefixes, and the engine trained during the actual chirp — target
- * tones measured ~1e-4 and the transfer was dead before it started.
+ * chirp correlator fired on the card symbols' pilot at norm ~0.15 (the
+ * template sweeps through 1850, and the old pilot sat exactly on that
+ * centre), the CP probe then VALIDATED the false detect because cards are
+ * real OFDM with real cyclic prefixes, and the engine trained during the
+ * actual chirp — target tones measured ~1e-4 and the transfer was dead
+ * before it started. Moving the pilot to 2000 does not retire this: the
+ * global template still spans 1750-1950 (chirpCenterHz 1850 +/- the 100 Hz
+ * half-span), so 2000 clears the swept edge by only 50 Hz — a partial return
+ * toward the same mechanism, not an escape from it. The gap and
+ * HandshakeReceiver's sample discard are what actually prevent it; see
+ * tuning.test.ts's guard on this exact clearance.
  */
 export const OFDM_HANDSHAKE = {
   pilotFreqHz: 2000,
@@ -254,16 +261,17 @@ export const OFDM_HANDSHAKE = {
    * compresses them and then releases across the frame — measured as the
    * received pilot going 0.367 during training to 2.67 during data, a 17 dB
    * swing, with no frame decoding (see OFDM_TUNING.chirpCenterHz). The global
-   * value is parked at 1850 Hz for exactly that reason, well below the data
-   * band this band used to occupy (6900-7250, see pilotFreqHz/toneStartHz
-   * above). This band's tones have since moved DOWN to 2600-2950 Hz, at which
-   * point 1850 stopped being "well below" and became "adjacent" — this field
-   * exists so that move didn't also drag the chirp into the band it precedes.
+   * value is parked at 1850 Hz for exactly that reason, well below any data
+   * band — historically this band's own 6900-7250 Hz tones too. This band's
+   * tones have since moved DOWN to 2600-2950 Hz, at which point 1850 stopped
+   * being "well below" and became "adjacent" — this field exists so that move
+   * didn't also drag the chirp into the band it precedes.
    *
    * 4400 Hz: the probe burst's own down-chirp already sweeps through here and
    * is decoded reliably on this hardware. It clears the handshake tones
-   * (2600-2950) by ~1.35 kHz — comfortably more than the 500 Hz separation
-   * that failed when the chirp sat close to the old 6900-7250 band.
+   * (2600-2950) by ~1.35 kHz — comfortably more than the ~500 Hz separation
+   * that failed for the TARGET band: pilot 6300 dragged its chirp to
+   * 6200-6400 under its own tones at 6900+ (see OFDM_TUNING.chirpCenterHz).
    *
    * The chirp only provides coarse timing, so its frequency is unconstrained
    * by anything else. TX and RX must agree: both derive it from

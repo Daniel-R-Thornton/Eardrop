@@ -178,7 +178,11 @@ describe('band handshake: TX', () => {
 
     // Pilot phase is extrapolated to each tone by toneFreq/pilotFreq, so any
     // error in the pilot measurement is multiplied by this. 3.9 shipped
-    // broken; 1.15 was fine.
+    // broken; 1.15 was fine. Same invariant as tuning.test.ts's "handshake
+    // pilot sits directly below its tones" — 1.6 is the live 1.475 ratio plus
+    // headroom, not a measured safety threshold, so if either assertion ever
+    // needs raising, raise both together and re-check the margin is still
+    // meaningful (headroom over 1.475 is already only ~8%).
     expect(lastTone / OFDM_HANDSHAKE.pilotFreqHz).toBeLessThan(1.6);
 
     // The chirp must stay far from the tones it precedes — 500 Hz was not

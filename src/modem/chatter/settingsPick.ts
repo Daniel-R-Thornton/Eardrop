@@ -64,9 +64,13 @@ export interface PickedSettings {
   floor: boolean;
 }
 
-/** Worst-case floor: QPSK, 4 tones, right where the handshake band already
- *  proved itself — tones at 6900-7050 Hz, same first-tone frequency as
- *  OFDM_HANDSHAKE (pilot 1850 + start 5050 = 6900). */
+/** Worst-case floor: QPSK, 4 tones at 6900-7050 Hz. This no longer has
+ *  anything to do with OFDM_HANDSHAKE — that band moved to 2600-2950 Hz
+ *  precisely because 6900-7250 was found to be the worst part of a phone's
+ *  speaker/mic response. This floor's rationale ("proved itself") is now
+ *  stale: the room's last-resort fallback sits exactly where the control
+ *  plane was evacuated from. Left as-is because changing it is a design
+ *  decision needing its own measurement, tracked separately. */
 export const FLOOR_SETTINGS: PickedSettings = {
   pilotFreqHz: 6700,
   toneStartHz: 200,

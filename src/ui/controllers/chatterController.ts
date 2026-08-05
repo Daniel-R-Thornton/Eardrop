@@ -147,7 +147,10 @@ function computeLinkInfo(rawGrid: number[]): { linkDb: number; grid: number[] } 
 function handshakeBandDb(grid: number[]): number | null {
   const freqs = reportGridFreqs();
   const lo = OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz;
-  const hi = lo + OFDM_HANDSHAKE.toneCount * OFDM_TONE_SPACING_HZ;
+  // toneCount - 1: N tones spaced toneSpacingHz apart span (N-1) * spacing,
+  // not N * spacing (8 tones 50 Hz apart cover 350 Hz, not 400) — this was
+  // an off-by-one that made the logged/measured window run 50 Hz high.
+  const hi = lo + (OFDM_HANDSHAKE.toneCount - 1) * OFDM_TONE_SPACING_HZ;
   const peak = Math.max(...grid);
   if (!(peak > 0)) return null;
   const inBand = grid.filter((_m, i) => freqs[i] >= lo - 100 && freqs[i] <= hi + 100);
@@ -288,8 +291,10 @@ export class ChatterController {
         probeFrom: ev.deviceId,
         meanDb: info ? info.linkDb.toFixed(1) : 'n/a',
         handshakeBandDb: hsDb === null ? 'n/a' : hsDb.toFixed(1),
+        // toneCount - 1, not toneCount: see handshakeBandDb's identical fix.
         band: `${OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz}-${
-          OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz + OFDM_HANDSHAKE.toneCount * OFDM_TONE_SPACING_HZ}Hz`,
+          OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz
+            + (OFDM_HANDSHAKE.toneCount - 1) * OFDM_TONE_SPACING_HZ}Hz`,
       }, { level: 'warn' });
       this.recordPacket({
         dir: 'rx',
