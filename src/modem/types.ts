@@ -290,9 +290,18 @@ export const OFDM_HANDSHAKE = {
    * 1500-7800 Hz and tries 32 tones (a 1550 Hz span) first, so ANY 32-tone
    * window starting between 2850 and 4400 Hz contains 4400 Hz — and 2-4 kHz is
    * exactly where phone hardware scores best, which is this branch's premise
-   * for moving the control plane there. So the 800 ms, 0.6-amplitude handshake
-   * chirp frequently lands INSIDE the target band, shortly before that band's
-   * own preamble: the 17 dB-swing geometry, on the target band this time.
+   * for moving the control plane there. So the 800 ms handshake chirp
+   * (OFDM_TUNING.chirpSymbols) frequently lands INSIDE the target band, shortly
+   * before that band's own preamble: the 17 dB-swing geometry, on the target
+   * band this time.
+   *
+   * Its amplitude is 0.12 (OFDM_TUNING.chirpAmplitude), NOT the 0.6 an earlier
+   * draft of this note claimed — 0.6 was replaced precisely because it detected
+   * worse and compressed the chain. At 0.12 the chirp is well below the
+   * preamble's own ~0.63 peak, so what drives the mechanism here is a sustained
+   * narrow sweep concentrating energy in one band, not raw loudness. The hazard
+   * is real and unguarded, but an order less severe than 0.6 would suggest, and
+   * the measurement below has to be sized against 0.12.
    *
    * NOT guarded here, deliberately. Excluding a band around this centre from
    * settingsPick would delete most candidate windows in the best part of the

@@ -141,13 +141,23 @@ interface Window {
  * NOTE, UNGUARDED HAZARD — the search range includes the handshake band's sync
  * chirp. OFDM_HANDSHAKE.chirpCenterHz is 4400 Hz with a 200 Hz span, and this
  * search runs 1500-7800 Hz, so any 32-tone window starting between 2850 and
- * 4400 Hz contains it. The handshake chirp is 800 ms at amplitude 0.6 and it
- * precedes the band card that announces the very window chosen here, so a
- * window containing 4400 Hz is one whose band gets compressed by that chirp
- * and released across the frames that follow — the documented 17 dB-swing
- * geometry (see OFDM_TUNING.chirpCenterHz for the measurement, and
+ * 4400 Hz contains it. It precedes the band card that announces the very window
+ * chosen here, so a window containing 4400 Hz is one whose band gets compressed
+ * by that chirp and released across the frames that follow — the documented
+ * 17 dB-swing geometry (see OFDM_TUNING.chirpCenterHz for the measurement, and
  * OFDM_HANDSHAKE.chirpCenterHz for why this is not excluded here rather than
  * simply not noticed).
+ *
+ * How big the hazard is, honestly: the chirp is 800 ms
+ * (OFDM_TUNING.chirpSymbols) at amplitude 0.12 (OFDM_TUNING.chirpAmplitude —
+ * 0.6 was tried and detected WORSE, partly because it compressed the chain), so
+ * it is NOT the loudest thing in the transmission by peak; the preamble symbols
+ * reach ~0.63. What drives the mechanism is concentration, not peak: the chain
+ * compresses per band, and a sustained narrow sweep is the shape it adapts to,
+ * where a multi-tone grid of the same total power was measured untouched. So the
+ * risk is real but far smaller than the 0.6 figure this note first carried
+ * would imply — which matters for sizing the measurement below, not just for
+ * accuracy.
  *
  * Left unexcluded on purpose: carving 4300-4500 out of the search would
  * disqualify most candidate windows in the 2-4 kHz region phone hardware

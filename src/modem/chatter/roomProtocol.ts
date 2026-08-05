@@ -577,8 +577,9 @@ export class RoomProtocol {
         });
       });
     } catch (err) {
-      // sendMessage rejected (e.g. audio glitch mid-broadcast) — this is a
-      // roll call in progress, so the existing zero-report deadline
+      // isAirBusy/sendMessage rejected (e.g. audio glitch mid-broadcast, or the
+      // air check itself failing now that this path carrier-senses first) —
+      // this is a roll call in progress, so the existing zero-report deadline
       // destination (idle) is the right fallback, not a stuck 'collecting'.
       this.handleDepsError(err, 'idle');
     }

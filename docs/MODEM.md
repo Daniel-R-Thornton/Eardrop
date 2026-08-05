@@ -190,6 +190,15 @@ membership is advisory and re-measured fresh at every send.
 tones it precedes). This band's over-the-air margin is unmeasured as of this
 writing — see the design doc's Verification section.
 
+That 4400 Hz centre clears the handshake tones and the global chirp template,
+but **not** the negotiated target band: `settingsPick` searches 1500–7800 Hz, so
+any 32-tone window starting between 2850 and 4400 Hz contains it, putting the
+handshake chirp inside the band whose preamble follows it. Unguarded and flagged
+for the pending hardware measurement — see the notes at
+`OFDM_HANDSHAKE.chirpCenterHz` (`src/modem/types.ts`) and `bestWindow`
+(`src/modem/chatter/settingsPick.ts`) for the mechanism and why it is a note
+rather than an exclusion.
+
 ### Probe burst
 
 `src/modem/protocol/probeBurst.ts` builds the one wire object every device
@@ -297,8 +306,17 @@ of TX settings every responding peer can survive:
    by the largest one, so the weakest tone pins at gain 1 and stronger tones
    are attenuated down from there (TX headroom is capped at unity — weak
    tones can't be boosted).
-6. `qamMap`: each tone's margin relative to the window's own strongest tone
-   sets bit density — 6 bits/symbol at ≥ -6 dB, 4 at ≥ -12 dB, else 2.
+6. `qamMap`: **QPSK (2 bits/symbol) on every tone**, deliberately. This used to
+   set bit density from each tone's margin relative to the window's strongest
+   tone (6 bits at ≥ -6 dB, 4 at ≥ -12 dB, else 2), but that is a measure of
+   *flatness*, and flatness says nothing about signal-to-noise — a channel can
+   be ruler-flat and still sit well below the ~26 dB MER 64-QAM wants. Hardware
+   showed exactly that: a room measured -0.7 dB across the band, nearly every
+   tone was assigned 6 bits, the receiver hopped correctly and locked with a
+   handoff score of 0.985, and decoded not one frame. The probe grid is
+   peak-relative by construction (step 1), so it cannot justify anything
+   denser. The map stays per-tone so restoring bit loading is local to that
+   function once a real MER measurement exists to drive it.
 
 `FLOOR_SETTINGS` (used when no reports arrive, or no band clears the
 threshold): QPSK, 4 tones, `pilotFreqHz` 6700, `toneStartHz` 200 (tones at

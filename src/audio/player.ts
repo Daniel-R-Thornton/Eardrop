@@ -158,14 +158,21 @@ export class AudioPlayer {
    *
    * Samples are NOT pre-normalized to any particular peak — this comment used
    * to claim "≈0.95 peak", which is not what the producer emits.
-   * `TxEngine.frameSegments` guarantees only that every segment sits at ONE
-   * fixed deterministic scale whose |sample| is bounded BY 0.95; the actual
-   * peak of a real transmission lands wherever the modulator's level maths
-   * puts it (measured 0.69-0.74 for chatter-shaped configs, and the
-   * sync/training burst lower still). What matters here is the guaranteed
-   * bound and the constant relative level, not a normalised peak: that is what
-   * makes a single whole-transmission scale safe and per-chunk rescaling
-   * forbidden (see `schedule()`).
+   * `TxEngine.frameSegments` emits every segment at ONE fixed deterministic
+   * scale, sized so that |sample| stays under 0.95 for a PAPR budget of
+   * PAPR_CREST standard deviations. That is a measured property, not a proof —
+   * OFDMQPSKModulator's own scale doc says so in as many words, and accepts
+   * occasional tail clipping as the price of not paying a permanent ~9 dB level
+   * penalty. So 0.95 is the level the transmitter AIMS under, not a bound
+   * anything downstream may rely on. The actual peak of a real transmission
+   * lands wherever that maths puts it (measured 0.69-0.74 for chatter-shaped
+   * configs, and the sync/training burst lower still).
+   *
+   * What matters here is the CONSTANT RELATIVE level across chunks, which is a
+   * structural property of emitting one fixed scale and does not depend on the
+   * PAPR budget holding. That is what makes a single whole-transmission scale
+   * safe and per-chunk rescaling forbidden (see `schedule()`), and it is why the
+   * clip guard clamps rather than rescales when the budget is exceeded.
    *
    * By default the UI `volume` control is applied via a gain node, clamped to
    * unity. `fixedGain` overrides it with a caller-supplied constant, for paths
@@ -195,16 +202,23 @@ export class AudioPlayer {
     }
 
     const gain = ctx.createGain();
-    // Streamed chunks arrive bounded by 0.95 (see the doc above), with no
-    // whole-signal analysis to cancel `this.volume` the way batch play()'s
-    // auto-norm does (`scale = targetPeak/(peak*volume)`). Above unity,
-    // `this.volume` (default 2.0×) would push a 0.95-peak chunk to ≈1.9
-    // post-gain and hard-clip at the DAC. Cap the applied gain at 1.0 —
+    // Streamed chunks arrive at the transmitter's own level, aimed under 0.95
+    // (see the doc above), with no whole-signal analysis to cancel `this.volume`
+    // the way batch play()'s auto-norm does (`scale = targetPeak/(peak*volume)`).
+    // Above unity, `this.volume` (default 2.0×) would push a 0.95-peak chunk to
+    // ≈1.9 post-gain and hard-clip at the DAC. Cap the applied gain at 1.0 —
     // volume < 1 (backing the speaker OUT of its compressor's range) still
     // works; > 1 on this path can only clip, so it's clamped rather than
     // honored. `fixedGain` bypasses the slider entirely; it is clamped the same
     // way, because the clipping argument does not care where the number came
     // from.
+    //
+    // NOTE the ORDER, which is what makes >1 unsafe rather than merely loud:
+    // `schedule()`'s clip guard inspects and clamps the RAW chunk, before it
+    // ever reaches this gain node. Anything this node adds on top is applied
+    // after the only guard in the path, so a gain above unity clips at the
+    // destination silently — no clamp, no `clipClamped` dlog, nothing in the
+    // log to explain a wrecked transfer. Hence the clamp here rather than trust.
     gain.gain.value = Math.min(fixedGain ?? this.volume, 1.0);
     gain.connect(ctx.destination);
 

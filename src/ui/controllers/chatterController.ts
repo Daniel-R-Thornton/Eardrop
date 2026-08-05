@@ -43,14 +43,20 @@ const OFDM_TONE_SPACING_HZ = OFDM_DEFAULTS.toneSpacingHz;
 const MUTE_TAIL_MS = 150;
 
 /**
- * Peak `TxEngine.frameSegments` guarantees no sample of a transmission will
- * exceed. Every segment it yields — handshake preamble, band card, target-band
- * preamble, data frames — is emitted at ONE fixed deterministic scale, set as
- * `0.95 / budget` by the modulator's own level maths (see OFDMQPSKModulator's
- * qamScale doc), so this is a wire-level property of the transmitter, not a
- * measurement of any particular waveform.
+ * Peak the transmitter AIMS under, not a peak it guarantees.
+ *
+ * Every segment `TxEngine.frameSegments` yields — handshake preamble, band
+ * card, target-band preamble, data frames — is emitted at ONE fixed
+ * deterministic scale, set as `0.95 / budget` by the modulator's own level
+ * maths. But that budget is a measured PAPR budget: OFDMQPSKModulator's scale
+ * doc states outright that it "IS NO LONGER A PROOF" and holds only up to
+ * PAPR_CREST standard deviations, accepting occasional tail clipping in
+ * exchange for not paying a permanent ~9 dB level penalty. So 0.95 is a design
+ * target with a measured (and deliberately non-zero) exceedance probability,
+ * and this constant is the transmitter's aim point — not a licence to assume
+ * any particular sample is below it.
  */
-const FRAME_SEGMENT_PEAK_BOUND = 0.95;
+const FRAME_SEGMENT_PEAK_AIM = 0.95;
 
 /**
  * Fixed playback gain for the streamed file transmission.
@@ -65,23 +71,35 @@ const FRAME_SEGMENT_PEAK_BOUND = 0.95;
  * slider meant the negotiation and the transfer it negotiates for went out at
  * different levels, quieter by 20·log10(volume) dB for any volume < 1.
  *
- * Derived from the transmitter's guaranteed peak, NOT from measuring chunks:
+ * Derived from the transmitter's own aim point, NOT from measuring chunks:
  * per-chunk normalisation is banned outright (see AudioPlayer.playStream's
  * `schedule()` — it was measured stepping the level between chunks and
  * wrecking every channel estimate downstream), and buffering the whole
  * waveform to measure its true peak would give back the memory saving the
  * streaming path exists for.
  *
- * Residual, recorded honestly: this maps the transmitter's BOUND onto the
- * batch path's target peak, so it reproduces the batch level exactly only for
- * a transmission that actually reaches that bound. A real chatter waveform
- * peaks lower (0.69-0.74 measured across 4/8/16/32-tone configs, flat and
- * tilted gains), where batch `play()`'s peak-normalisation amplified it by
- * 1/peak into 0.95 — so the streamed file still goes out ~2.2-2.8 dB below the
- * batch path. Closing that last gap needs the waveform's real peak, which
- * cannot be had without measuring it.
+ * Residual, recorded honestly: this maps the transmitter's AIM POINT onto the
+ * batch path's target peak, so it reproduces the batch level exactly only for a
+ * transmission that actually reaches that aim. A real chatter waveform peaks
+ * lower (0.69-0.74 measured across 4/8/16/32-tone configs, flat and tilted
+ * gains), where batch `play()`'s peak-normalisation amplified it by 1/peak into
+ * 0.95 — so the streamed file still goes out ~2.2-2.8 dB below the batch path.
+ * Closing that last gap needs the waveform's real peak, which cannot be had
+ * without measuring it.
+ *
+ * DO NOT RAISE THIS ABOVE 1.0 to chase that 2.2-2.8 dB. The only clip guard on
+ * this path is in `playStream`'s `schedule()`, and it inspects the RAW chunk
+ * BEFORE the gain node applies this number — so a gain above unity clips at the
+ * destination with no clamp and no `clipClamped` log line, leaving a wrecked
+ * transfer with nothing in the log to explain it. `playStream` clamps
+ * `fixedGain` to 1.0 for exactly this reason, so raising it here would silently
+ * do nothing rather than fail loudly. The transmitter's peak is also only a
+ * measured PAPR aim (see FRAME_SEGMENT_PEAK_AIM), so headroom above it is not
+ * actually free even in principle. The legitimate route is a TX-side
+ * deterministic peak for the transmission about to be emitted, computed from
+ * the configuration and plumbed through to here.
  */
-const FILE_STREAM_GAIN = PLAYBACK_TARGET_PEAK / FRAME_SEGMENT_PEAK_BOUND;
+const FILE_STREAM_GAIN = PLAYBACK_TARGET_PEAK / FRAME_SEGMENT_PEAK_AIM;
 
 /** Fudge factor + floor over a floor-settings bit-rate estimate for the
  *  FILE_COMING durationMs field. The real settings aren't picked until AFTER
