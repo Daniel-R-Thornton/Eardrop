@@ -8,7 +8,9 @@
  * EMA against real RMS levels.
  */
 import { describe, expect, it } from 'vitest';
-import { ProbeDetector, AirNoiseTracker, rmsOf } from '../../workers/modemService';
+import { ProbeDetector, AirNoiseTracker, ModemService, rmsOf } from '../../workers/modemService';
+import { DEFAULT_CONFIG } from '../types';
+import { dlogRecords, dlogReset } from '../../lib/debug/dlog';
 import { buildProbeBurst } from '../protocol/probeBurst';
 import { generateChirp } from '../protocol/chirp';
 import { TxEngine } from '../protocol/txEngine';
@@ -215,6 +217,79 @@ describe('control frames on the handshake band', () => {
     },
     TIMEOUT,
   );
+
+  it(
+    'a probe sweep does not leave the chatter listener deaf to the message after it',
+    () => {
+      // The energy-sync fallback exists for transmissions whose chirp was
+      // missed. The chatter control listener has no such case: every control
+      // message is built by buildHandshakeSegment, which always opens with a
+      // chirp. So on that listener the fallback can only ever fire on
+      // something that is NOT a control message — and firing puts it in
+      // FRAMES, where chirp detection never runs, until the 5 s watchdog.
+      //
+      // A probe burst's coarse sweep is the loudest such thing in the room:
+      // 2.9 s crossing the handshake band, transmitted on every join and
+      // every roll call. Re-arming when the probe DECODES (what the worker
+      // does) does not cover this — the sweep trips the fallback ~3 s before
+      // the burst finishes, and a probe that fails CRC never re-arms at all.
+      //
+      // Hardware logs show the consequence directly: repeated `!ES` (energy
+      // sync) followed by `!WD 201` (deaf for the watchdog), and a roll call
+      // whose REPORT was never decoded.
+      const msg: ControlMessage = {
+        type: ControlType.Bye, senderId: 5, targetId: 6, payload: new Uint8Array([1]),
+      };
+      const tx = new TxEngine({
+        useOFDM: true, sampleRate: SR, bandHandshake: true,
+        pilotFreqHz: 6300, toneStartHz: 600, toneCount: 32,
+      } as ConstructorParameters<typeof TxEngine>[0]);
+      const audio = tx.buildHandshakeSegment(encodeControlMessage(msg));
+      // A message whose head we missed: the reply to a roll call starts while
+      // the prober is still muted for its own probe, so what reaches the
+      // demodulator is a chirpless body. This is the shape the hardware logs
+      // show — `!ES` (energy sync, "the boundary is unanchored") followed by
+      // `!WD 201`, five seconds deaf, over and over.
+      const headless = audio.slice(Math.round(SR * 1.2));
+
+      const listen = (chirpOnlySync: boolean) => {
+        dlogReset();
+        const rx = new RxEngine({
+          useOFDM: true, sampleRate: SR, bandHandshake: true,
+          pilotFreqHz: 999, toneStartHz: 12345, toneCount: 16,
+          chirpOnlySync,
+        } as ConstructorParameters<typeof RxEngine>[0]);
+        let received: ControlMessage | null = null;
+        rx.onControlMessage = (m) => { received = m; };
+        // No re-arm between the two: that is the whole point.
+        rx.feedChunk(headless);
+        const energySynced = dlogRecords().some(
+          (r) => r.tag === 'OFDM-SYNC' && (r.fields as { detected?: boolean }).detected === true,
+        );
+        rx.feedChunk(audio);
+        rx.feedChunk(new Float32Array(4096));
+        return { received, energySynced };
+      };
+
+      const withFallback = listen(false);
+      expect(withFallback.energySynced, 'energy fallback syncs on the headless body').toBe(true);
+      expect(withFallback.received, 'and is then deaf to the message that follows').toBeNull();
+
+      const chirpOnly = listen(true);
+      expect(chirpOnly.energySynced, 'chirp-only: nothing to sync on, stays in WAITING').toBe(false);
+      expect(chirpOnly.received, 'chirp-only: the next message decodes').not.toBeNull();
+    },
+    TIMEOUT,
+  );
+
+  it('the chatter control listener is built chirp-only', () => {
+    // Wiring, not behaviour: the fix above is only real if chatterStart
+    // actually passes the flag through to the engine it creates.
+    const svc = new ModemService(() => {});
+    svc.handle({ type: 'configure', config: { ...DEFAULT_CONFIG, sampleRate: SR, useOFDM: true } as never });
+    svc.handle({ type: 'chatterStart', deviceId: 21 });
+    expect((svc as unknown as { chatterRx: { chirpOnlySync: boolean } }).chatterRx.chirpOnlySync).toBe(true);
+  });
 
   it('encodeControl audio does not falsely decode as a band card', () => {
     // decodeBandCard must reject a control header's magic byte, exercised

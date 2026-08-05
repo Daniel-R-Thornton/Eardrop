@@ -83,6 +83,11 @@ console log if a specific symbol needs inspecting.
 | `CFG` | `restart` | OFDM settings changed, RX restarted |
 | `SNAP` | note from`->`to | pilot or tone start snapped to the FFT bin grid |
 | `X` | `r` `t` `bch` `rs` `smer` | frame failure: reason, type, per-block BCH/RS error counts, staged MER |
+| `RRC` | `from` `n` | roll call counted a REPORT; `n` = total collected so far |
+| `!ROC` | `from` `st` | a REPORT arrived while the prober was NOT in `collecting` — discarded. `st=rollCall` means our own probe playback had not resolved yet |
+| `!STALL` | what `st` | a dep (probe playback, air check, FILE_COMING send) never settled; the room gave up on it and fell back |
+| `!PRB-CRC` | — | a probe burst was captured and failed its 4-bit ID CRC |
+| `!PRB-SWEEP` | `from` | probe ID decoded, but its sweep would not measure — probe discarded |
 | `PL` | `pk` `vol` | playback peak and volume mode |
 | `!PLNORM` | factor `pk` | **playback rescaled a chunk** — defeats the fixed TX scale |
 | `!PLCLIP` | `n` | playback clipped n samples |

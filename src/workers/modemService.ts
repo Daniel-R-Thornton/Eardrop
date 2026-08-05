@@ -174,9 +174,20 @@ export class ProbeDetector {
     const samples = new Float32Array(this.pending!.buf);
     this.pending = null;
     const decoded = decodeProbeId(samples, 0, this.sampleRate);
-    if (decoded === null || decoded.deviceId === this.ownDeviceId) return; // CRC fail or our own probe
+    // Our own probe is expected and uninteresting. The other two outcomes are
+    // not: a burst got as far as a chirp correlation and was then thrown away,
+    // and both used to be bare returns — so a device that hears every probe
+    // and discards every one looked identical to a device out of range.
+    if (decoded === null) {
+      dlog('CHATTER-RX', { probeCrcFail: true }, { level: 'warn' });
+      return;
+    }
+    if (decoded.deviceId === this.ownDeviceId) return;
     const grid = measureProbeSweep(samples, 0, this.sampleRate);
-    if (!grid) return;
+    if (!grid) {
+      dlog('CHATTER-RX', { probeSweepFail: true, from: decoded.deviceId }, { level: 'warn' });
+      return;
+    }
     this.onProbe(decoded.deviceId, grid, decoded.purpose);
   }
 }
@@ -387,7 +398,26 @@ export class ModemService {
       }
       case 'chatterStart': {
         if (!this.config) { this.emit({ type: 'error', error: 'chatterStart before configure' }); return; }
-        const cfg = { ...this.config, bandHandshake: true } as ConstructorParameters<typeof RxEngine>[0];
+        // chirpOnlySync: the energy fallback is actively harmful HERE, however
+        // useful it is on the file path.
+        //
+        // Every control message is built by buildHandshakeSegment, which always
+        // opens with a chirp — so on this listener the fallback can only ever
+        // fire on something that is NOT a decodable message: the body of one
+        // whose head we missed (a reply that starts while we are still muted
+        // for our own probe), an echo of our own transmission, room noise. And
+        // firing puts the engine in FRAMES, where chirp detection never runs,
+        // until the 5 s watchdog — so it trades a message it could not have
+        // decoded anyway for the NEXT one, which it could have.
+        //
+        // That is the dominant pattern in the hardware logs: `!ES` (synced on
+        // energy, boundary unanchored) followed by `!WD 201` (five seconds
+        // deaf), repeatedly, on both devices — a room that decodes its first
+        // couple of messages and then falls off a cliff, and a roll call whose
+        // REPORT is audibly sent and never decoded.
+        const cfg = {
+          ...this.config, bandHandshake: true, chirpOnlySync: true,
+        } as ConstructorParameters<typeof RxEngine>[0];
         const engine = new RxEngine(cfg);
         engine.onControlMessage = (msg: ControlMessage) => {
           dlog('CHATTER-RX', {

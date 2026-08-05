@@ -433,8 +433,17 @@ function compressOne(rec: DlogRecord): string | null {
 
     // A control message that decoded end to end — the success case the whole
     // ladder builds toward, and the one that says who is actually reachable.
-    case 'CHATTER-RX':
+    case 'CHATTER-RX': {
+      // A probe that was heard and then thrown away is invisible without
+      // these. Both drop paths used to be silent returns, so "no probe was
+      // audible" and "a probe arrived and failed its 4-bit CRC" and "a probe
+      // arrived clean but its sweep would not measure" all rendered as an
+      // absence of PRB rows — and the first is a range problem while the
+      // other two are not.
+      if (has('probeCrcFail')) return '!PRB-CRC';
+      if (has('probeSweepFail')) return `!PRB-SWEEP ${asNum(f.from)}`;
       return `CRX ${asString(f.decoded)} from=${asNum(f.from)} to=${asNum(f.to)} ${asNum(f.bytes)}B`;
+    }
 
     // What the operator did, and when. Without it a dump shows the radio
     // reacting to nothing, and a protocol that never started is
@@ -472,6 +481,12 @@ function compressOne(rec: DlogRecord): string | null {
       if (has('probeFrom')) {
         return `PRB ${asNum(f.probeFrom)} mean=${asString(f.meanDb)} hs=${asString(f.handshakeBandDb)}`;
       }
+      // A reply that arrived while the prober was one state short of
+      // 'collecting' is discarded, and produces the same "nobody home" as a
+      // reply that never came. These two say which happened.
+      if (has('reportCollected')) return `RRC from=${asNum(f.from)} n=${asNum(f.total)}`;
+      if (has('reportOutsideCollect')) return `!ROC from=${asNum(f.from)} st=${asString(f.state)}`;
+      if (has('stalled')) return `!STALL ${asString(f.stalled)} st=${asString(f.state)}`;
       if (has('droppedWelcome')) return `!DW from=${asNum(f.from)} to=${asNum(f.to)} us=${asNum(f.us)}`;
       if (has('droppedReport')) return `!DR from=${asNum(f.from)} to=${asNum(f.to)} us=${asNum(f.us)}`;
       if (has('fileComingForOther')) return `FC-OTHER to=${asNum(f.to)} us=${asNum(f.us)}`;
