@@ -273,10 +273,41 @@ export const OFDM_HANDSHAKE = {
    * that failed for the TARGET band: pilot 6300 dragged its chirp to
    * 6200-6400 under its own tones at 6900+ (see OFDM_TUNING.chirpCenterHz).
    *
-   * The chirp only provides coarse timing, so its frequency is unconstrained
-   * by anything else. TX and RX must agree: both derive it from
-   * `bandHandshake` mode rather than passing it around, so there is no
-   * configuration in which one side reads this and the other does not.
+   * WHAT CONSTRAINS THIS VALUE — it is emphatically not unconstrained, which
+   * is what this comment used to claim. The chirp carries no information (it
+   * only provides coarse timing, see rxEngine's chirpCorrelate), but its
+   * FREQUENCY is constrained by the same mechanism as the global centre:
+   * anything the chirp sits next to gets compressed and then released across
+   * the frame. Three separate clearances have to hold, and only the first two
+   * were checked when 4400 was chosen:
+   *
+   *   1. this band's own tones (2600-2950) — cleared by ~1.35 kHz;
+   *   2. the global chirp/pilot template (1750-1950) — cleared by 2.35 kHz, so
+   *      the two correlation templates cannot be confused;
+   *   3. the NEGOTIATED TARGET band, which is not a constant and was missed.
+   *
+   * HAZARD, UNRESOLVED (3): settingsPick.bestWindow slides its window across
+   * 1500-7800 Hz and tries 32 tones (a 1550 Hz span) first, so ANY 32-tone
+   * window starting between 2850 and 4400 Hz contains 4400 Hz — and 2-4 kHz is
+   * exactly where phone hardware scores best, which is this branch's premise
+   * for moving the control plane there. So the 800 ms, 0.6-amplitude handshake
+   * chirp frequently lands INSIDE the target band, shortly before that band's
+   * own preamble: the 17 dB-swing geometry, on the target band this time.
+   *
+   * NOT guarded here, deliberately. Excluding a band around this centre from
+   * settingsPick would delete most candidate windows in the best part of the
+   * spectrum on a hypothesis, and the target band's position is already
+   * pending an over-the-air measurement it has never had. What mitigates it
+   * today is distance in TIME rather than frequency — the card x3, gapSymbols
+   * of silence, and the target band's own trainingSettleSymbols, which exists
+   * precisely to discard the symbols a loud chirp compressed. Whether that is
+   * enough is a measurement, not an argument: it is recorded as a required
+   * item for the pending hardware run (see the plan ledger), and settingsPick
+   * carries the matching note at its window search.
+   *
+   * TX and RX must agree: both derive it from `bandHandshake` mode rather than
+   * passing it around, so there is no configuration in which one side reads
+   * this and the other does not.
    */
   chirpCenterHz: 4400,
 } as const;

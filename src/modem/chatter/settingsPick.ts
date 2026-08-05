@@ -134,8 +134,27 @@ interface Window {
   score: number;
 }
 
-/** Best-scoring (widest-tolerant) window for a given toneCount, or null if
- *  no window fits in the sweep band at all. */
+/**
+ * Best-scoring (widest-tolerant) window for a given toneCount, or null if no
+ * window fits in the sweep band at all.
+ *
+ * NOTE, UNGUARDED HAZARD — the search range includes the handshake band's sync
+ * chirp. OFDM_HANDSHAKE.chirpCenterHz is 4400 Hz with a 200 Hz span, and this
+ * search runs 1500-7800 Hz, so any 32-tone window starting between 2850 and
+ * 4400 Hz contains it. The handshake chirp is 800 ms at amplitude 0.6 and it
+ * precedes the band card that announces the very window chosen here, so a
+ * window containing 4400 Hz is one whose band gets compressed by that chirp
+ * and released across the frames that follow — the documented 17 dB-swing
+ * geometry (see OFDM_TUNING.chirpCenterHz for the measurement, and
+ * OFDM_HANDSHAKE.chirpCenterHz for why this is not excluded here rather than
+ * simply not noticed).
+ *
+ * Left unexcluded on purpose: carving 4300-4500 out of the search would
+ * disqualify most candidate windows in the 2-4 kHz region phone hardware
+ * scores best in, on a hypothesis, while the band position itself is still
+ * awaiting its first over-the-air measurement. Flagged for that measurement
+ * instead.
+ */
 function bestWindow(worst: number[], toneCount: number): Window | null {
   // Span from the first tone to the last is (toneCount-1) spacings, not
   // toneCount*50 — a toneCount-tone comb has toneCount-1 gaps between tones.
