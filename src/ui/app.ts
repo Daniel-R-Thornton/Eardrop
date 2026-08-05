@@ -24,6 +24,7 @@ import { DEFAULT_CONFIG, OFDM_TUNING, ofdmSamples } from '../modem/types';
 import { enumerateDevices, resolveInputDevice, MIC_FALLBACK_EVENT } from '../audio/devices';
 import { TxEngine } from '../modem/protocol/txEngine';
 import { encodeFrame, PAYLOAD_DATA_SIZE } from '../modem/protocol/atomicFrame';
+import { textByteLength } from '../modem/protocol/controlFrame';
 import { tryParsePreamble, verifyPayload } from '../protocol';
 import { mountReactDebug } from './react';
 import { runSelfTest } from './controllers/selfTest';
@@ -176,6 +177,19 @@ window.addEventListener('eardrop-chatter-join', (() => {
 window.addEventListener('eardrop-chatter-leave', (() => {
   dlog('UI', { action: 'leaveRoom' }, { level: 'warn' });
   void chatter.leaveRoom();
+}) as EventListener);
+
+// Chat text — RoomMode holds no protocol logic, so it dispatches and app.ts
+// routes, same as join/leave and file selection above. The log records the
+// byte length, never the text: a session log is meant to be shareable, and a
+// chat message is the operator's content, not diagnostics.
+window.addEventListener('eardrop-chatter-text', ((e: CustomEvent) => {
+  const { text, targetId } = e.detail as { text: string; targetId?: number };
+  dlog('UI', {
+    textSend: textByteLength(text),
+    to: targetId || 'broadcast',
+  }, { level: 'warn' });
+  chatter.sendText(text, targetId ?? 0);
 }) as EventListener);
 
 /**

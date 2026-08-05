@@ -8,7 +8,7 @@
 import { describe, expect, it, beforeEach } from 'vitest';
 import { ChatterController, type ModemWorkerHandle, type AudioPlayerLike } from '../../ui/controllers/chatterController';
 import { ROOM_TIMING } from '../chatter/roomProtocol';
-import { ControlType, packFileComing, packReport, CONTROL_HEADER_WIRE, controlPayloadWireSize } from '../protocol/controlFrame';
+import { ControlType, packFileComing, packReport, packText, CONTROL_HEADER_WIRE, controlPayloadWireSize } from '../protocol/controlFrame';
 import { getState, setState, CHATTER_PACKET_LOG_MAX } from '../../ui/Store';
 import { PROBE_PURPOSE, type ProbePurpose } from '../protocol/probeBurst';
 
@@ -153,6 +153,7 @@ describe('ChatterController', () => {
       chatterError: null,
       chatterPackets: [],
       chatterLastTx: null,
+      chatterMessages: [],
     });
   });
 
@@ -601,5 +602,61 @@ describe('ChatterController', () => {
 
     expect(worker.calls).toContain('startFileStream:cancel');
     expect(getState().chatterError).toMatch(/playback failed/);
+  });
+
+  it('sends text through the control path and records it in the store', async () => {
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const rng = () => 0; // deviceId = 1, slot 0
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng });
+
+    await controller.joinRoom();
+    await clock.tick(
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS
+      + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
+    );
+
+    controller.sendText('hello room');
+    await clock.tick(ROOM_TIMING.replySlotMs + MUTE_TAIL_MS + 200);
+
+    // ControlType.Text is 5 — the fake records `encodeControl:<type>`.
+    expect(worker.calls).toContain(`encodeControl:${ControlType.Text}`);
+    const msgs = getState().chatterMessages;
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]).toMatchObject({ text: 'hello room', dir: 'tx', targetId: 0, state: 'sending' });
+  });
+
+  it('records a received message and its own ack in the store', async () => {
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const rng = () => 0;
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng });
+
+    await controller.joinRoom();
+    await clock.tick(
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS
+      + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
+    );
+
+    const payload = packText(2, 'incoming');
+    worker.emit('controlMessage', {
+      msg: {
+        type: ControlType.Text,
+        senderId: 9,
+        targetId: 0,
+        // The worker transfers payloads as ArrayBuffer, not Uint8Array —
+        // ChatterController wraps them back into a Uint8Array.
+        payload: payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength),
+      },
+    });
+    await clock.tick(ROOM_TIMING.replySlotMs + MUTE_TAIL_MS + 200);
+
+    const msgs = getState().chatterMessages;
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]).toMatchObject({ text: 'incoming', dir: 'rx', senderId: 9 });
+    expect(worker.calls).toContain(`encodeControl:${ControlType.Ack}`);
+    expect(getState().chatterPackets.some((p) => p.kind === 'ack')).toBe(true);
   });
 });

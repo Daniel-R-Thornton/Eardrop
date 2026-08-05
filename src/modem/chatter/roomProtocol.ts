@@ -34,14 +34,15 @@
  *
  * Every state reached via a timer carries its OWN deadline back to idle (or
  * cold, for the pre-join chain) so nothing can get stuck; `stop()` cancels
- * every outstanding timer via a single `pendingTimers` set. Most timer
+ * every outstanding timer via a single `pendingTimers` set (the outbox's own
+ * slot timers are cancelled by `outbox.clear()` alongside it). Most timer
  * callbacks re-check `this.state` before acting (and again after every
  * await) so a stale timer firing after a later transition is a no-op, never
  * a regression to an earlier state. `armReplyAck`'s retry timer is the
  * exception: it isn't state-shaped (a reply can be owed in either 'idle' or
  * 'joinWait'), so it gates on membership in `awaitingAck` instead — cleared
  * by any contact from the prober, and by `stop()`/the cold error path
- * alongside `replyQueue.clear()` — which is the same "stale timer is a
+ * alongside `outbox.clear()` — which is the same "stale timer is a
  * no-op" property, just keyed on the map rather than on `this.state`. Only
  * 'joining'-purpose replies ever arm that timer at all — see armReplyAck for
  * why a roll-call reply must never be retried.
@@ -50,24 +51,35 @@
  * carrier sense is carrier sense regardless of what comes after it.
  *
  * Replies to probes are QUEUED, not state-gated: `onProbeHeard` records what
- * is owed and `drainReplyQueue` sends it whenever the local transmitter is
- * free (`canTransmitReply`). Gating the send on a single state meant two
- * devices joining at once were both in `joinWait` when the other's probe
- * arrived and neither ever replied.
+ * is owed and the Outbox sends it whenever the local transmitter is free
+ * (`canTransmitReply`). Gating the send on a single state meant two devices
+ * joining at once were both in `joinWait` when the other's probe arrived and
+ * neither ever replied. The queue itself — slot selection, carrier sense,
+ * re-roll on busy, hold-don't-drop — now lives in `outbox.ts`, because an ACK
+ * and a TEXT want exactly the same collision avoidance a reply does. What
+ * stays here is the POLICY: which states may transmit, and which replies earn
+ * a retry.
  */
 import {
   ControlType,
   packWelcome,
   packReport,
   packFileComing,
+  packText,
+  packAck,
   parseWelcome,
   parseReport,
   parseFileComing,
+  parseText,
+  parseAck,
+  textByteLength,
+  TEXT_MAX_BYTES,
   type ControlMessage,
   type BestRangeClaim,
   type FileComingPayload,
 } from '../protocol/controlFrame';
 import { pickSettings, type PeerReport, type PickedSettings } from './settingsPick';
+import { Outbox, type OutboxEntry } from './outbox';
 import { PROBE_PURPOSE, type ProbePurpose } from '../protocol/probeBurst';
 import { OFDM_TUNING } from '../types';
 import { dlog } from '../../lib/debug/dlog';
@@ -104,21 +116,44 @@ export interface RoomDeps {
   /** Arm the receive path (HandshakeReceiver) for an incoming transfer. */
   armFileRx(info: FileComingPayload): void;
   onStateChange?(state: RoomState, members: Member[]): void;
+  /** Display-only: a TEXT was delivered to the UI. Never read by a protocol
+   *  decision — the ACK is sent regardless of whether this is wired up. */
+  onTextReceived?(msg: { msgId: number; senderId: number; targetId: number; text: string }): void;
+  /** Display-only: an ACK for a message this device sent came back. Never
+   *  read by a protocol decision — the retry/delivery-state tracking that
+   *  reacts to an ACK lives in `handleAck` itself, not in the UI. */
+  onTextAcked?(msgId: number, byDeviceId: number): void;
+  /** Display-only: a sent TEXT's delivery state changed. `ackedBy` is every
+   *  device that has acked so far (deduped), meaningful mainly for a
+   *  broadcast that may collect more than one. */
+  onTextStateChange?(msgId: number, state: 'sending' | 'delivered' | 'failed', ackedBy: number[]): void;
 }
+
+// Hoisted above ROOM_TIMING because that object is an `as const` literal and
+// cannot reference its own fields during construction — ackWindowMs below
+// needs replySlots/replySlotMs, so all three live here and ROOM_TIMING's
+// fields are themselves derived from them (never the other way around).
+
+/** JOIN_WAIT and COLLECT both.
+ *
+ *  300 ms, not the 1 s this shipped with. Slots exist so two peers do not
+ *  start talking at the same instant, but listen-before-talk is what
+ *  actually prevents the collision — the slot only has to be long enough
+ *  that a peer who started in the previous one is visible to the next
+ *  device's carrier sense. That check averages the last 250 ms of audio, so
+ *  300 ms clears it with margin. A full second bought nothing and cost up to
+ *  five seconds of the join, which is most of the time a two-device room
+ *  spends waiting. */
+const REPLY_SLOTS = 6;
+const REPLY_SLOT_MS = 300;
+
+/** Measured air time of a 1-byte control payload: 35 wire bytes over 8 QPSK
+ *  tones plus the fixed ~1.5 s preamble. Used below to size the ACK window. */
+const ACK_AIR_MS = 2000;
 
 export const ROOM_TIMING = {
   listenMs: 1000, listenCapMs: 10000,
-  // JOIN_WAIT and COLLECT both.
-  //
-  // 300 ms, not the 1 s this shipped with. Slots exist so two peers do not
-  // start talking at the same instant, but listen-before-talk is what
-  // actually prevents the collision — the slot only has to be long enough
-  // that a peer who started in the previous one is visible to the next
-  // device's carrier sense. That check averages the last 250 ms of audio, so
-  // 300 ms clears it with margin. A full second bought nothing and cost up to
-  // five seconds of the join, which is most of the time a two-device room
-  // spends waiting.
-  replySlots: 6, replySlotMs: 300,
+  replySlots: REPLY_SLOTS, replySlotMs: REPLY_SLOT_MS,
   // Grace after the last reply slot opens.
   //
   // Must exceed one whole control message, because a peer that draws the
@@ -128,6 +163,18 @@ export const ROOM_TIMING = {
   // answer lands just after everyone stopped listening for it.
   collectExtraMs: 4000,
   fileComingLeadMs: 700,
+  /**
+   * How long a sent TEXT waits for an ACK before its one retry.
+   *
+   * DERIVED, never hardcoded: the slot span every ACK is drawn from, plus one
+   * whole ACK's airtime. `collectExtraMs` was a hardcoded window sized
+   * against an assumption a later change invalidated, and the result was a
+   * retried reply landing outside it and silently killing a file transfer —
+   * see this module's history. ACK_AIR_MS is the measured air time of a
+   * 1-byte control payload: 35 wire bytes over 8 QPSK tones plus the fixed
+   * ~1.5 s preamble.
+   */
+  ackWindowMs: REPLY_SLOTS * REPLY_SLOT_MS + ACK_AIR_MS,
 } as const;
 
 /** A device's real self-knowledge (measured passband/QAM ceiling) arrives in
@@ -152,6 +199,16 @@ const TRANSFER_TAIL_MARGIN_MS = 5000;
  *  ordinary two-device flow the second send therefore happens every time. */
 const MAX_REPLY_ATTEMPTS = 2;
 
+/** Total sends per text message, including the first — same discipline as
+ *  MAX_REPLY_ATTEMPTS. A failed 254-byte message already costs ~21 s of air
+ *  across two attempts. */
+const MAX_TEXT_ATTEMPTS = 2;
+
+/** Bound on the received-TEXT dedup set (see `seenText`), not an LRU cache.
+ *  msgId wraps at 256, so 128 also caps how far back a wrap could collide;
+ *  an unbounded set would otherwise grow for the whole session. */
+const SEEN_TEXT_MAX = 128;
+
 interface PendingFile {
   fileBytes: number;
   durationMs: number;
@@ -166,20 +223,50 @@ interface PendingFile {
   targetId: number;
 }
 
-interface PendingReply {
+interface PendingAck {
   proberId: number;
-  /** What the prober announced — decides WELCOME vs REPORT. Overwritten by a
-   *  fresh probe, because the newest announcement is the true one: a device
-   *  that ran a roll call and then refreshed and rejoined needs a WELCOME. */
-  purpose: ProbePurpose;
-  /** Sends attempted for this reply so far, including the first — read by
-   *  armReplyAck to decide whether a retry is still owed. Capped at
+  /** Sends already spent on this reply, including the first — read when the
+   *  retry deadline fires to decide whether another is still owed. Capped at
    *  MAX_REPLY_ATTEMPTS: once attempts reaches it, the prober is given up on
    *  rather than retried again. */
   attempts: number;
-  /** A slot chain is already in flight for this entry. */
-  scheduled: boolean;
 }
+
+/**
+ * A TEXT this device has sent, tracked from its first send until it is
+ * acked or gives up. Unlike `PendingAck` (which watches for ANY traffic
+ * proving a reply landed), a TEXT has an actual ACK frame to wait for, so
+ * this only needs the send count and who has acked so far.
+ */
+interface SentText {
+  msgId: number;
+  /** 0 = broadcast. */
+  targetId: number;
+  payload: Uint8Array;
+  /** Sends spent, including the first — capped at MAX_TEXT_ATTEMPTS. */
+  attempts: number;
+  /** Devices that have acked this message so far, deduped, in arrival order. */
+  ackedBy: number[];
+}
+
+/** The outbox dedup key for a reply owed to `proberId`.
+ *
+ *  The outbox keys entries on a monotonic id, because a TEXT broadcast is not
+ *  keyed by a peer at all. This string restores exactly what the old
+ *  prober-keyed map gave for free: at most one reply chain in flight per peer,
+ *  so a repeat probe — or a setState that re-drains — cannot start a second. */
+const replyKey = (proberId: number): string => `reply:${proberId}`;
+
+/** Recover the msgId from a `text:<msgId>` dedupKey — the inverse of the
+ *  literal built in sendText/checkTextAck. `onOutboxSent` only gets the
+ *  entry, not the SentText record, and the entry itself carries no msgId
+ *  field (a text broadcast has no peer to key on the way a reply does), so
+ *  this is the one place that needs to parse it back out. */
+const textMsgIdFromDedupKey = (dedupKey: string): number | undefined => {
+  if (!dedupKey.startsWith('text:')) return undefined;
+  const n = Number(dedupKey.slice('text:'.length));
+  return Number.isFinite(n) ? n : undefined;
+};
 
 export class RoomProtocol {
   private _state: RoomState = 'cold';
@@ -192,7 +279,7 @@ export class RoomProtocol {
   private activeFileParams: PendingFile | null = null;
   private readonly collectedReports = new Map<number, PeerReport>();
   /**
-   * Replies owed to probers, keyed by prober id.
+   * Everything this device owes the air, replies included (see outbox.ts).
    *
    * A queue rather than a state-gated side effect. Reply duty used to exist
    * only in 'idle', so a probe heard in any other state updated the member
@@ -200,14 +287,21 @@ export class RoomProtocol {
    * each other are BOTH in joinWait when the other's probe arrives, so
    * neither ever welcomed and both declared an empty room. Now the reply is
    * recorded when the probe is heard and sent when our own transmitter is
-   * next free (see canTransmitReply).
-   *
-   * `scheduled` is the dedupe that `pendingReplyTo` used to be: it marks an
-   * entry whose slot chain is already in flight, so a repeat probe from the
-   * same device — or a setState that re-drains the queue — cannot start a
-   * second chain for it.
+   * next free (see canTransmitReply, which the outbox calls as `canTransmit`).
    */
-  private readonly replyQueue = new Map<number, PendingReply>();
+  private readonly outbox: Outbox;
+  /**
+   * What each prober last announced — decides WELCOME vs REPORT.
+   *
+   * Kept here rather than baked into the queued entry because a fresh probe
+   * overwrites it: the newest announcement is the true one, so a device that
+   * ran a roll call and then refreshed and rejoined gets a WELCOME even if the
+   * REPORT it originally earned is still sitting unsent. The reply's `build`
+   * closure reads this at send time for the same reason it reads `heardGrid`
+   * there — what goes out should reflect the last thing we heard, not the
+   * first.
+   */
+  private readonly replyPurpose = new Map<number, ProbePurpose>();
   /**
    * Replies transmitted but not yet known to have landed, keyed by prober id.
    *
@@ -222,9 +316,55 @@ export class RoomProtocol {
    * "the prober happened to stay quiet", not "the reply was lost". See
    * MAX_REPLY_ATTEMPTS.
    */
-  private readonly awaitingAck = new Map<number, PendingReply>();
+  private readonly awaitingAck = new Map<number, PendingAck>();
+  /** Next msgId this device will assign to an outgoing TEXT. Wraps at 256 —
+   *  see packText's doc comment for why the receiver dedupes on
+   *  (senderId, msgId) rather than treating it as globally unique. */
+  private nextMsgId = 0;
+  /** Recently delivered (senderId:msgId) keys, newest last, bounded so a long
+   *  session cannot grow it without limit. msgId wraps at 256, so the bound
+   *  also caps how far back a wrap could collide. */
+  private readonly seenText: Set<string> = new Set();
+  /** TEXTs sent by this device, awaiting ACK or already resolved, keyed by
+   *  msgId. Cleared in `stop()` alongside the other retry state. */
+  private readonly sentText = new Map<number, SentText>();
 
-  constructor(private readonly deps: RoomDeps) {}
+  constructor(private readonly deps: RoomDeps) {
+    this.outbox = new Outbox({
+      now: () => deps.now(),
+      rng: () => deps.rng(),
+      schedule: (fn, delayMs) => deps.schedule(fn, delayMs),
+      isAirBusy: () => deps.isAirBusy(),
+      sendMessage: (msg) => deps.sendMessage(msg),
+      canTransmit: () => this.canTransmitReply(),
+      replySlots: ROOM_TIMING.replySlots,
+      replySlotMs: ROOM_TIMING.replySlotMs,
+      onSent: (entry) => this.onOutboxSent(entry),
+      onFailed: (entry, err) => {
+        // Exhausting every slot is not an error the operator can act on — the
+        // air was busy for a whole slot window and the reply is simply given
+        // up on. A rejected isAirBusy/sendMessage is: that is an audio fault,
+        // and it surfaces in the UI exactly as it did before the extraction.
+        if (err !== undefined) this._lastError = err instanceof Error ? err.message : String(err);
+        if (entry.kind === 'reply') this.forgetReplyPurpose(entry.targetId);
+        // A TEXT that never made it onto the air at all — every slot in the
+        // window found the air busy, or sendMessage itself threw — is a
+        // DIFFERENT failure than an ACK timeout, and must not be handled by
+        // armTextAck: nothing was sent, so no ackWindowMs timer is ever armed
+        // for it, and without this branch the SentText record just sits in
+        // `sentText` at attempts:0 forever — stuck on 'sending' in the UI for
+        // the rest of the session, the exact silent-failure shape this whole
+        // task exists to eliminate, just relocated here from the ACK path.
+        // No automatic retry: slot exhaustion means the air was demonstrably
+        // busy across the WHOLE ~1.8 s carrier-sense window, so an automatic
+        // second attempt would add traffic to a room that just proved itself
+        // congested — same reasoning as broadcast-retries-only-on-zero-acks,
+        // just applied before the first send rather than after it. Report
+        // 'failed' and let the operator resend deliberately.
+        if (entry.kind === 'text') this.failSentText(entry.dedupKey);
+      },
+    });
+  }
 
   get state(): RoomState {
     return this._state;
@@ -259,8 +399,11 @@ export class RoomProtocol {
     this.pendingSendFile = null;
     this.activeFileParams = null;
     this.collectedReports.clear();
-    this.replyQueue.clear();
+    this.outbox.clear();
+    this.replyPurpose.clear();
     this.awaitingAck.clear();
+    this.seenText.clear();
+    this.sentText.clear();
     this.setState('cold');
   }
 
@@ -272,6 +415,42 @@ export class RoomProtocol {
       return;
     }
     this.beginRollCall({ fileBytes, durationMs, targetId });
+  }
+
+  /**
+   * Queue a text message. `targetId` 0 broadcasts to the room; anything else
+   * addresses one device — the air carries it either way, so this only
+   * decides who ACTS on it, exactly as an addressed file transfer does.
+   *
+   * Returns the assigned msgId so the caller can track delivery. Throws on
+   * over-long text rather than truncating: cutting UTF-8 at a byte boundary
+   * can split a codepoint, and encodeControlMessage would reject the
+   * oversized payload anyway. Callers check `textByteLength` first.
+   */
+  sendText(text: string, targetId = 0): number {
+    if (textByteLength(text) > TEXT_MAX_BYTES) {
+      throw new Error(`room: text ${textByteLength(text)} B exceeds ${TEXT_MAX_BYTES} B cap`);
+    }
+    const msgId = this.nextMsgId;
+    this.nextMsgId = (this.nextMsgId + 1) & 0xff;
+    const payload = packText(msgId, text);
+    // Recorded before the first send so armTextAck (fired from the outbox's
+    // onSent) has somewhere to write attempts, and so a retry rebuilds from
+    // the same payload rather than needing the original string kept alive.
+    this.sentText.set(msgId, {
+      msgId, targetId, payload, attempts: 0, ackedBy: [],
+    });
+    this.outbox.enqueue({
+      kind: 'text',
+      targetId,
+      dedupKey: `text:${msgId}`,
+      build: () => ({
+        type: ControlType.Text, senderId: this.deps.deviceId, targetId, payload,
+      }),
+    });
+    this.outbox.drain();
+    this.deps.onTextStateChange?.(msgId, 'sending', []);
+    return msgId;
   }
 
   /** worker heard a probe: id + measured grid + what it announced */
@@ -294,12 +473,19 @@ export class RoomProtocol {
     // older build degrades rather than breaks.
     //
     // A fresh probe overwrites a queued entry's purpose: the newest
-    // announcement is the true one.
-    const queued = this.replyQueue.get(deviceId);
-    if (queued) queued.purpose = purpose;
-    else this.replyQueue.set(deviceId, { proberId: deviceId, purpose, attempts: 0, scheduled: false });
+    // announcement is the true one. Recorded outside the queue entry so it can
+    // still change after the reply is enqueued (see replyPurpose) — the entry
+    // itself is deduped on `reply:<id>`, so a repeat probe adds nothing and
+    // must not restart a chain that is already in flight.
+    this.replyPurpose.set(deviceId, purpose);
+    this.outbox.enqueue({
+      kind: 'reply',
+      targetId: deviceId,
+      dedupKey: replyKey(deviceId),
+      build: () => this.buildReply(deviceId),
+    });
 
-    this.drainReplyQueue();
+    this.outbox.drain();
   }
 
   /** worker decoded a control message */
@@ -313,6 +499,12 @@ export class RoomProtocol {
         break;
       case ControlType.FileComing:
         this.handleFileComing(msg);
+        break;
+      case ControlType.Text:
+        this.handleText(msg);
+        break;
+      case ControlType.Ack:
+        this.handleAck(msg);
         break;
       case ControlType.Bye:
         // Member aging is the UI's problem — protocol never evicts.
@@ -433,6 +625,76 @@ export class RoomProtocol {
     });
   }
 
+  /** Received text: deliver once, then owe the sender an ACK. */
+  private handleText(msg: ControlMessage): void {
+    // Everyone in earshot demodulates a DM; only the addressee acts on it.
+    // 0 is the broadcast address, same convention as FILE_COMING.
+    if (msg.targetId !== 0 && msg.targetId !== this.deps.deviceId) return;
+    const parsed = parseText(msg.payload);
+    if (!parsed) return;
+
+    // Contact from this peer, so any reply we were waiting to see acked is
+    // acked (see awaitingAck).
+    this.awaitingAck.delete(msg.senderId);
+
+    const key = `${msg.senderId}:${parsed.msgId}`;
+    const fresh = !this.seenText.has(key);
+    if (fresh) {
+      this.rememberText(key);
+      this.deps.onTextReceived?.({
+        msgId: parsed.msgId, senderId: msg.senderId, targetId: msg.targetId, text: parsed.text,
+      });
+    }
+
+    // ACK even a duplicate: a repeat means the sender heard no ACK, so
+    // staying silent guarantees it retries again. Only the UI delivery is
+    // deduped. dedupKey collapses two ACKs for the same message into one.
+    this.outbox.enqueue({
+      kind: 'ack',
+      targetId: msg.senderId,
+      dedupKey: `ack:${msg.senderId}:${parsed.msgId}`,
+      build: () => ({
+        type: ControlType.Ack,
+        senderId: this.deps.deviceId,
+        targetId: msg.senderId,
+        payload: packAck(parsed.msgId),
+      }),
+    });
+    this.outbox.drain();
+  }
+
+  private handleAck(msg: ControlMessage): void {
+    if (msg.targetId !== this.deps.deviceId) return;
+    const parsed = parseAck(msg.payload);
+    if (!parsed) return;
+    this.awaitingAck.delete(msg.senderId);
+    this.deps.onTextAcked?.(parsed.msgId, msg.senderId);
+
+    const rec = this.sentText.get(parsed.msgId);
+    if (!rec) return; // not one of ours, or already cleared by stop()
+    // A repeat ACK from a device already recorded is not news — the sender
+    // side already reported this ack; re-reporting would just replay the
+    // same delivered state with the same ackedBy list.
+    if (rec.ackedBy.includes(msg.senderId)) return;
+    rec.ackedBy.push(msg.senderId);
+    // Any ack at all makes this message delivered, DM or broadcast — the
+    // retry timer (see checkTextAck) is what still decides whether a
+    // broadcast needed MORE than one before it stops chasing.
+    this.deps.onTextStateChange?.(rec.msgId, 'delivered', [...rec.ackedBy]);
+  }
+
+  /** Record a delivered (senderId:msgId) key, evicting the oldest insertion
+   *  once the bound is exceeded. Not an LRU: re-adding an existing key does
+   *  not refresh its position — the goal is bounding memory and the msgId-wrap
+   *  collision window, not tracking recency. */
+  private rememberText(key: string): void {
+    this.seenText.add(key);
+    if (this.seenText.size > SEEN_TEXT_MAX) {
+      const oldest = this.seenText.values().next().value as string | undefined;
+      if (oldest !== undefined) this.seenText.delete(oldest);
+    }
+  }
+
   // ---- join / roll-call carrier-sense (shared 'listening' state) ----
 
   private beginListening(purpose: 'join' | 'rollCall'): void {
@@ -527,7 +789,7 @@ export class RoomProtocol {
 
     try {
       // Carrier-sense before the announcement — the same deps.isAirBusy()
-      // idiom every reply uses (see scheduleReply). This was the only transmit
+      // idiom every reply uses (see outbox.ts). This was the only transmit
       // path in the machine without it, and it is the path that can least
       // afford a collision: FILE_COMING is what arms every receiver, so a peer
       // still transmitting over it hears nothing, arms nothing, and stays out
@@ -585,7 +847,8 @@ export class RoomProtocol {
     }
   }
 
-  // ---- reply-to-probe: slotted, carrier-sensed, re-rolling among later slots ----
+  // ---- reply-to-probe policy: WHAT is owed, and whether it earns a retry.
+  //      WHEN it goes out — slot, carrier sense, re-roll, hold — is outbox.ts.
 
   /**
    * Whether a reply may be transmitted right now.
@@ -607,101 +870,82 @@ export class RoomProtocol {
     return this._state === 'idle' || this._state === 'joinWait';
   }
 
-  /** Start a slot chain for every queued reply that does not already have one. */
-  private drainReplyQueue(): void {
-    if (!this.canTransmitReply()) return;
-    for (const entry of Array.from(this.replyQueue.values())) {
-      if (entry.scheduled) continue;
-      entry.scheduled = true;
-      this.scheduleReply(
-        this.deps.now(),
-        Array.from({ length: ROOM_TIMING.replySlots }, (_unused, i) => i),
-        entry,
-      );
-    }
-  }
-
-  private scheduleReply(baseTimeMs: number, candidateSlots: number[], entry: PendingReply): void {
-    if (candidateSlots.length === 0) {
-      // Give up — no slot left to try. Narrower exposure than the two delete
-      // sites below (nothing has awaited across this one), but the identity
-      // check is here anyway for consistency of the invariant.
-      if (this.replyQueue.get(entry.proberId) === entry) this.replyQueue.delete(entry.proberId);
-      return;
-    }
-    const idx = Math.floor(this.deps.rng() * candidateSlots.length);
-    const slot = candidateSlots[idx];
-    const laterSlots = candidateSlots.filter((s) => s > slot);
-    const delay = Math.max(0, baseTimeMs + slot * ROOM_TIMING.replySlotMs - this.deps.now());
-
-    this.timer(delay, async () => {
-      // Not eligible any more (a transfer started, a roll call began): HOLD
-      // the entry and clear `scheduled` so the next setState into an eligible
-      // state re-drains it. Dropping it here is the old bug.
-      if (!this.canTransmitReply()) {
-        entry.scheduled = false;
-        return;
-      }
-      try {
-        const busy = await this.deps.isAirBusy();
-        if (!this.canTransmitReply()) {
-          entry.scheduled = false;
-          return;
+  /**
+   * The reply message itself, built at SEND time by the outbox.
+   *
+   * Both the purpose and the measured grid are read here rather than captured
+   * when the probe was heard: a reply can sit queued for seconds (held through
+   * a transfer, re-rolled past a busy slot), and what finally goes out should
+   * carry the freshest thing we know about that peer.
+   */
+  private buildReply(proberId: number): ControlMessage {
+    // The `??` is unreachable in practice: forgetReplyPurpose only drops a
+    // peer's purpose once nothing is queued or awaiting ack for it, so an entry
+    // being built always has one. Defaulting to a WELCOME rather than a REPORT
+    // is still the right way to be wrong — a lost WELCOME leaves a joiner
+    // believing the room is empty, whereas a REPORT costs one negotiation.
+    const purpose = this.replyPurpose.get(proberId) ?? PROBE_PURPOSE.joining;
+    const heardGrid = this._members.get(proberId)?.heardGrid ?? [];
+    return purpose === PROBE_PURPOSE.rollCall
+      ? {
+          type: ControlType.Report,
+          senderId: this.deps.deviceId,
+          targetId: proberId,
+          payload: packReport(heardGrid),
         }
-
-        if (busy) {
-          this.scheduleReply(baseTimeMs, laterSlots, entry); // still pending — chain continues
-          return;
-        }
-        const heardGrid = this._members.get(entry.proberId)?.heardGrid ?? [];
-        await this.deps.sendMessage(
-          entry.purpose === PROBE_PURPOSE.rollCall
-            ? {
-                type: ControlType.Report,
-                senderId: this.deps.deviceId,
-                targetId: entry.proberId,
-                payload: packReport(heardGrid),
-              }
-            : {
-                type: ControlType.Welcome,
-                senderId: this.deps.deviceId,
-                targetId: entry.proberId,
-                payload: packWelcome({ claim: DEFAULT_CLAIM, grid: heardGrid }),
-              },
-        );
-        // sendMessage is ~3s of audio; a `stop()`/cold-error/re-probe can
-        // replace the queue entry at this key while we were awaiting it (a
-        // cleared queue plus a fresh probe from the same prober creates a
-        // brand-new, not-yet-sent entry under the same id). Delete only if
-        // the entry still at this key is the one we just sent — a plain
-        // delete-by-key would discard that newer, unsent entry. armReplyAck
-        // must stay INSIDE this guard too: if it ran unconditionally, a send
-        // that resolves after stop()/a cold error torn down this room would
-        // arm a retry into a room that no longer exists (or one we've since
-        // rejoined under a fresh id table).
-        if (this.replyQueue.get(entry.proberId) === entry) {
-          this.replyQueue.delete(entry.proberId);
-          this.armReplyAck(entry);
-        }
-      } catch (err) {
-        // isAirBusy/sendMessage rejected — surface the error and stop blocking
-        // this prober. Same identity check as the success path above.
-        if (this.replyQueue.get(entry.proberId) === entry) this.replyQueue.delete(entry.proberId);
-        this._lastError = err instanceof Error ? err.message : String(err);
-      }
-    });
+      : {
+          type: ControlType.Welcome,
+          senderId: this.deps.deviceId,
+          targetId: proberId,
+          payload: packWelcome({ claim: DEFAULT_CLAIM, grid: heardGrid }),
+        };
   }
 
   /**
-   * Watch for traffic from `entry.proberId`; re-queue the reply once if none
-   * arrives within a slot window. Only 'joining'-purpose replies (WELCOMEs)
-   * are ever watched — see below.
+   * Drop a peer's recorded reply purpose once nothing is owed to it.
+   *
+   * The purpose describes an owed reply, so it must not outlive the entry it
+   * describes — otherwise it accumulates one stale entry per peer ever heard and
+   * buildReply's fallback becomes load-bearing instead of belt-and-braces. Both
+   * conditions have to be checked: a reply may be queued again (a fresh probe
+   * arriving while a retry was pending) or still awaiting ack, and either one
+   * still needs the purpose.
+   */
+  private forgetReplyPurpose(proberId: number): void {
+    if (this.outbox.has(replyKey(proberId))) return;
+    if (this.awaitingAck.has(proberId)) return;
+    this.replyPurpose.delete(proberId);
+  }
+
+  /** A queued transmission made it onto the air. The outbox is done with it;
+   *  everything from here is this room's own policy. */
+  private onOutboxSent(entry: OutboxEntry): void {
+    // A reply is one kind: WELCOME-vs-REPORT is not recorded on the entry at
+    // all, because a fresh probe can change it after the entry is queued, so
+    // armReplyAck reads replyPurpose for the truth.
+    if (entry.kind === 'reply') {
+      this.armReplyAck(entry.targetId, entry.attempts);
+      this.forgetReplyPurpose(entry.targetId);
+      return;
+    }
+    // An ACK is fire-and-forget — the room has no ack-for-an-ack, so nothing
+    // here tracks its delivery.
+    if (entry.kind === 'text') this.armTextAck(entry);
+  }
+
+  /**
+   * Watch for traffic from `proberId`; re-queue the reply once if none arrives
+   * within a slot window. Only 'joining'-purpose replies (WELCOMEs) are ever
+   * watched — see below.
    *
    * Note this is not a retry-on-loss: nothing here transmits in response to a
    * WELCOME, so a prober that heard us perfectly is silent and the second send
    * happens anyway. See MAX_REPLY_ATTEMPTS and awaitingAck.
+   *
+   * `attemptsSpent` comes off the outbox entry the send belonged to, so a
+   * re-queued retry carries its predecessor's count and the cap still bites.
    */
-  private armReplyAck(entry: PendingReply): void {
+  private armReplyAck(proberId: number, attemptsSpent: number): void {
     // NEVER retry a roll-call reply. This is structural, not a tuning choice.
     //
     // ROOM_TIMING.collectExtraMs (4000) is sized so that one reply drawing the
@@ -722,23 +966,113 @@ export class RoomProtocol {
     // retry has nothing to win there and an entire transfer to lose. A lost
     // WELCOME is the opposite: it leaves the joiner believing the room is
     // empty, with nothing about to reveal otherwise.
-    if (entry.purpose === PROBE_PURPOSE.rollCall) return;
+    if (this.replyPurpose.get(proberId) === PROBE_PURPOSE.rollCall) return;
 
-    const attempts = entry.attempts + 1;
-    if (attempts >= MAX_REPLY_ATTEMPTS) return;
+    if (attemptsSpent >= MAX_REPLY_ATTEMPTS) return;
 
-    const retry: PendingReply = { ...entry, attempts, scheduled: false };
-    this.awaitingAck.set(entry.proberId, retry);
+    const retry: PendingAck = { proberId, attempts: attemptsSpent };
+    this.awaitingAck.set(proberId, retry);
     this.timer(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs, () => {
-      const pending = this.awaitingAck.get(entry.proberId);
-      if (!pending) return; // acknowledged — nothing to do
-      this.awaitingAck.delete(entry.proberId);
+      const pending = this.awaitingAck.get(proberId);
+      if (!pending) {
+        // Acknowledged — nothing more is owed, so the purpose can go too
+        // (unless a fresh probe queued a new reply, which forgetReplyPurpose
+        // checks for).
+        this.forgetReplyPurpose(proberId);
+        return;
+      }
+      this.awaitingAck.delete(proberId);
       // A newer probe already queued a fresh reply; that one supersedes this
       // retry (and carries the newer purpose).
-      if (this.replyQueue.has(entry.proberId)) return;
-      this.replyQueue.set(entry.proberId, pending);
-      this.drainReplyQueue();
+      if (this.outbox.has(replyKey(proberId))) return;
+      this.outbox.enqueue({
+        kind: 'reply',
+        targetId: proberId,
+        dedupKey: replyKey(proberId),
+        build: () => this.buildReply(proberId),
+        attempts: pending.attempts,
+      });
+      this.outbox.drain();
     });
+  }
+
+  // ---- TEXT retry policy: same "one retry, then give up" discipline as a
+  //      reply, but keyed on a real ACK frame rather than any-traffic-at-all,
+  //      and with a broadcast rule a DM doesn't need — see checkTextAck.
+
+  /**
+   * A TEXT never made it onto the air at all — the outbox exhausted every
+   * slot with the air busy, or `sendMessage` itself threw. Unlike a
+   * checkTextAck failure (which follows an ACK window that only exists
+   * because a send DID go out), nothing here armed any timer, so nothing
+   * would otherwise ever resolve this record — it would sit in `sentText`
+   * at attempts:0, reported 'sending' forever. Report 'failed' and remove
+   * the record now rather than leaving a message the operator believes is
+   * still in flight.
+   *
+   * No retry: slot exhaustion means the air was busy across the WHOLE
+   * ~1.8 s carrier-sense window, not just one check, so the room has just
+   * demonstrated it is congested. Spending more airtime on a second attempt
+   * would punish everyone in a half-duplex room the same way an unconditional
+   * broadcast retry would — see checkTextAck's broadcast rule for the same
+   * reasoning applied one step earlier.
+   */
+  private failSentText(dedupKey: string): void {
+    const msgId = textMsgIdFromDedupKey(dedupKey);
+    if (msgId === undefined) return; // not a dedupKey this class produced
+    const rec = this.sentText.get(msgId);
+    if (!rec) return; // stop() cleared it already
+    this.sentText.delete(msgId);
+    this.deps.onTextStateChange?.(msgId, 'failed', [...rec.ackedBy]);
+  }
+
+  /** Arm the ACK-window timer for a TEXT that just went out. */
+  private armTextAck(entry: OutboxEntry): void {
+    const msgId = textMsgIdFromDedupKey(entry.dedupKey);
+    if (msgId === undefined) return; // not a dedupKey this class produced
+    const rec = this.sentText.get(msgId);
+    if (!rec) return; // stop() cleared it mid-flight
+    rec.attempts = entry.attempts;
+    this.timer(ROOM_TIMING.ackWindowMs, () => this.checkTextAck(msgId));
+  }
+
+  /**
+   * The ACK window for one send expired. Retry, or give up, per the rule the
+   * brief exists to enforce:
+   *
+   * - DM: retry unless the addressee specifically acked.
+   * - Broadcast: retry only if NOBODY acked. Retrying because one of several
+   *   peers missed it would spend seconds of air punishing the ones that
+   *   heard it — in a half-duplex room, one device talking blocks everyone,
+   *   including the peers who already have the message.
+   *
+   * Either way, bounded by MAX_TEXT_ATTEMPTS, matching MAX_REPLY_ATTEMPTS's
+   * discipline for the same reason: a genuinely deaf peer must not make this
+   * device transmit forever.
+   */
+  private checkTextAck(msgId: number): void {
+    const rec = this.sentText.get(msgId);
+    if (!rec) return; // resolved or cleared already
+
+    const acked = rec.targetId === 0 ? rec.ackedBy.length > 0 : rec.ackedBy.includes(rec.targetId);
+    if (acked) return; // handleAck already reported 'delivered'
+
+    if (rec.attempts >= MAX_TEXT_ATTEMPTS) {
+      this.deps.onTextStateChange?.(msgId, 'failed', [...rec.ackedBy]);
+      return;
+    }
+
+    const { targetId, payload } = rec;
+    this.outbox.enqueue({
+      kind: 'text',
+      targetId,
+      dedupKey: `text:${msgId}`,
+      build: () => ({
+        type: ControlType.Text, senderId: this.deps.deviceId, targetId, payload,
+      }),
+      attempts: rec.attempts,
+    });
+    this.outbox.drain();
   }
 
   // ---- shared plumbing ----
@@ -761,7 +1095,8 @@ export class RoomProtocol {
     if (fallback === 'cold') {
       this.pendingSendFile = null;
       this.activeFileParams = null;
-      this.replyQueue.clear();
+      this.outbox.clear();
+      this.replyPurpose.clear();
       this.awaitingAck.clear();
       this.setState('cold');
     } else {
@@ -776,7 +1111,7 @@ export class RoomProtocol {
     // Entering an eligible state is the moment a held reply can go out. Every
     // transition routes through here, so this is the single re-arm point —
     // there is no state whose entry can forget to check the queue.
-    if (next === 'idle' || next === 'joinWait') this.drainReplyQueue();
+    if (next === 'idle' || next === 'joinWait') this.outbox.drain();
   }
 
   /** Register a cancelable timer, tracked in `pendingTimers` so `stop()` can

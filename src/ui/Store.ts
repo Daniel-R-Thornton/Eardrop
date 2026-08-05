@@ -256,7 +256,31 @@ export interface AppState {
   chatterPackets: ChatterPacket[];
   /** performance.now() of this device's last own transmission (for the "talking" pulse); null until the first one. */
   chatterLastTx: number | null;
+  /** Bounded ring of chat messages, newest last, for the room-mode text UI.
+   *  Pushed into by ChatterController.sendText/recordMessage and the
+   *  onTextReceived/onTextAcked/onTextStateChange RoomDeps callbacks. */
+  chatterMessages: ChatMessage[];
 }
+
+/** One chat message, newest LAST. Capped at CHATTER_MESSAGE_LOG_MAX.
+ *  Display-only — never read by a protocol decision. */
+export interface ChatMessage {
+  /** Monotonic counter, unique per session — React key. */
+  seq: number;
+  /** Sender-assigned id, wraps at 256. Unique only per senderId. */
+  msgId: number;
+  senderId: number;
+  /** 0 = the whole room. */
+  targetId: number;
+  text: string;
+  tMs: number;
+  dir: 'tx' | 'rx';
+  /** Device ids that acknowledged this message. Meaningful for dir 'tx'. */
+  ackedBy: number[];
+  state: 'sending' | 'delivered' | 'failed';
+}
+
+export const CHATTER_MESSAGE_LOG_MAX = 100;
 
 /** One observed control-plane event. Newest LAST. Capped at CHATTER_PACKET_LOG_MAX. */
 export interface ChatterPacket {
@@ -265,7 +289,7 @@ export interface ChatterPacket {
   /** performance.now() at observation. */
   tMs: number;
   dir: 'tx' | 'rx';
-  kind: 'probe' | 'welcome' | 'report' | 'fileComing' | 'bye' | 'file';
+  kind: 'probe' | 'welcome' | 'report' | 'fileComing' | 'bye' | 'file' | 'text' | 'ack';
   /** Sender for rx, target for tx. 0 = broadcast, undefined = unknown. */
   peerId?: number;
   /** Wire bytes on the air for this event (probe = burst samples ÷ sampleRate → use 0). */
@@ -361,6 +385,7 @@ const defaultState: AppState = {
   chatterError: null,
   chatterPackets: [],
   chatterLastTx: null,
+  chatterMessages: [],
 };
 
 // ─── Store ────────────────────────────────────────────

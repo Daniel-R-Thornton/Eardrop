@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { RoomProtocol, ROOM_TIMING } from '../chatter/roomProtocol';
-import { ControlType, packReport, packWelcome, packFileComing } from '../protocol/controlFrame';
+import {
+  ControlType, packReport, packWelcome, packFileComing,
+  packText, packAck, parseText, parseAck, TEXT_MAX_BYTES,
+} from '../protocol/controlFrame';
 import { PROBE_PURPOSE } from '../protocol/probeBurst';
 
 /** Manual clock + timer wheel so every test is deterministic. */
@@ -18,6 +21,9 @@ function makeHarness(
   const timers: { at: number; fn: () => void; dead: boolean }[] = [];
   const sent: any[] = [];
   const calls: string[] = [];
+  const textReceived: any[] = [];
+  const textAcked: any[] = [];
+  const textStates: any[] = [];
   const deps = {
     deviceId,
     now: () => t,
@@ -32,6 +38,9 @@ function makeHarness(
     isAirBusy: opts.isAirBusy ?? (async () => opts.busy?.() ?? false),
     startFileTx: () => calls.push('fileTx'),
     armFileRx: () => calls.push('fileRx'),
+    onTextReceived: (msg: any) => textReceived.push(msg),
+    onTextAcked: (msgId: number, byDeviceId: number) => textAcked.push({ msgId, by: byDeviceId }),
+    onTextStateChange: (msgId: number, state: string, ackedBy: number[]) => textStates.push({ msgId, state, ackedBy }),
   };
   const room = new RoomProtocol(deps as any);
   /** advance the clock, firing due timers in order */
@@ -51,10 +60,22 @@ function makeHarness(
     }
     t = end;
   };
-  return { room, tick, sent, calls };
+  return {
+    room, tick, sent, calls, textReceived, textAcked, textStates,
+  };
 }
 
 const flatGrid = Array.from({ length: 64 }, () => 1);
+
+/**
+ * The reply queue lives in the Outbox now (see outbox.ts), keyed on a
+ * monotonic entry id rather than on the prober — a TEXT broadcast is not keyed
+ * by a peer. `reply:<proberId>` is the dedup key that restores the old
+ * one-chain-per-peer rule, so these two stand in for what used to be
+ * `(room as any).replyQueue.get(id)` and `.size`.
+ */
+const queuedReply = (room: any, proberId: number): any => room.outbox.peek(`reply:${proberId}`);
+const replyQueueSize = (room: any): number => room.outbox.size;
 
 describe('room protocol', () => {
   it('joins an empty room: listen → announce → joinWait → idle', async () => {
@@ -401,7 +422,7 @@ describe('room protocol', () => {
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
     // Entry is scheduled and mid-slot-wait; nothing sent yet.
-    expect((h.room as any).replyQueue.get(9)?.scheduled).toBe(true);
+    expect(queuedReply(h.room, 9)?.scheduled).toBe(true);
 
     // Steal the transmitter: a FILE_COMING lands while we're still waiting
     // out the slot, and joinWait accepts it (handleFileComing allows
@@ -419,7 +440,7 @@ describe('room protocol', () => {
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
     // HELD, not dropped: the entry is still queued, and `scheduled` was
     // cleared so a later setState re-drains it.
-    const held = (h.room as any).replyQueue.get(9);
+    const held = queuedReply(h.room, 9);
     expect(held).toBeDefined();
     expect(held.scheduled).toBe(false);
 
@@ -459,7 +480,7 @@ describe('room protocol', () => {
     await h.tick(ROOM_TIMING.replySlotMs + 100); // slot 0 fires, isAirBusy steals the transmitter mid-await
     expect(h.room.state).toBe('receiving');
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
-    const held = (h.room as any).replyQueue.get(9);
+    const held = queuedReply(h.room, 9);
     expect(held).toBeDefined();
     expect(held.scheduled).toBe(false);
 
@@ -475,11 +496,11 @@ describe('room protocol', () => {
     expect(h.room.state).toBe('idle');
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
-    expect((h.room as any).replyQueue.size).toBe(1);
+    expect(replyQueueSize(h.room)).toBe(1);
 
     h.room.stop(); // cancels the pending slot timer before it fires
     expect(h.room.state).toBe('cold');
-    expect((h.room as any).replyQueue.size).toBe(0);
+    expect(replyQueueSize(h.room)).toBe(0);
 
     await h.tick(60000); // nothing left to fire
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
@@ -635,13 +656,18 @@ describe('room protocol', () => {
   });
 
   it('does not let a stale in-flight send discard a fresh reply queued under the same prober id', async () => {
-    // Regression pin for the identity check on the three replyQueue.delete
-    // sites in scheduleReply: a plain delete-by-key would discard a newer,
-    // not-yet-sent entry that reoccupies the same key while an earlier send
-    // is still in flight (sendMessage is ~3s of audio, and stop()/start()/a
-    // fresh probe can all happen inside that window). Reverting the guards
-    // to a plain delete keeps every OTHER test green, so this is the only
-    // thing that would catch that regression.
+    // A fresh reply queued while an earlier send is still in flight must
+    // survive that send completing (sendMessage is ~3s of audio, and
+    // stop()/start()/a fresh probe can all happen inside that window).
+    //
+    // This test no longer pins the identity check it was written for. When the
+    // queue was keyed by proberId, a plain delete-by-key here would have
+    // discarded the fresh entry; now that the outbox keys on a monotonic id
+    // that survives clear(), the stale closure's id is simply absent and a
+    // plain delete would be a harmless no-op. So this passes either way — it
+    // pins the OUTCOME (the fresh reply is not lost and does go out), not the
+    // mechanism. The half of the guard that is still load-bearing is the one
+    // around onSent, pinned in outbox.test.ts.
     let resolveSend: () => void = () => {};
     const sendGate = new Promise<void>((resolve) => { resolveSend = resolve; });
     const h = makeHarness(2, {
@@ -671,18 +697,16 @@ describe('room protocol', () => {
     expect(h.room.state).toBe('idle');
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
-    expect((h.room as any).replyQueue.get(9)).toBeDefined();
-    const freshEntry = (h.room as any).replyQueue.get(9);
+    expect(queuedReply(h.room, 9)).toBeDefined();
+    const freshEntry = queuedReply(h.room, 9);
 
-    // Now let the original, stale sendMessage resolve. Its timer callback
-    // will check `replyQueue.get(9) === <original entry>` — false, since a
-    // new entry occupies that key — and must NOT delete the fresh entry. A
-    // plain delete-by-key would discard it here, and it would never be sent
-    // or re-added.
+    // Now let the original, stale sendMessage resolve. Its closure holds the
+    // first entry, which is no longer in the queue, so it must not touch the
+    // fresh one — and must not arm an ack for a send this room never made.
     resolveSend();
     await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
 
-    expect((h.room as any).replyQueue.get(9)).toBe(freshEntry);
+    expect(queuedReply(h.room, 9)).toBe(freshEntry);
 
     // And it does eventually go out.
     await h.tick(ROOM_TIMING.replySlotMs + 100);
@@ -799,5 +823,191 @@ describe('room protocol', () => {
     busy = false;
     await h.tick(2000);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+  });
+
+  it('sends a broadcast TEXT from idle', async () => {
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    const msgId = h.room.sendText('hello room');
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    const sent = h.sent.find((m) => m.type === ControlType.Text);
+    expect(sent).toBeDefined();
+    expect(sent.targetId).toBe(0);
+    expect(parseText(sent.payload)).toEqual({ msgId, text: 'hello room' });
+  });
+
+  it('addresses a DM to one device', async () => {
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.sendText('just you', 7);
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    expect(h.sent.find((m) => m.type === ControlType.Text).targetId).toBe(7);
+  });
+
+  it('rejects text over the byte cap', () => {
+    const h = makeHarness(1);
+    expect(() => h.room.sendText('x'.repeat(TEXT_MAX_BYTES + 1))).toThrow(/cap|exceeds/i);
+  });
+
+  it('a received broadcast TEXT is delivered and ACKed exactly once', async () => {
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.onMessage({
+      type: ControlType.Text, senderId: 9, targetId: 0, payload: packText(3, 'hi all'),
+    });
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+
+    expect(h.textReceived).toEqual([{ msgId: 3, senderId: 9, targetId: 0, text: 'hi all' }]);
+    const acks = h.sent.filter((m) => m.type === ControlType.Ack);
+    expect(acks).toHaveLength(1);
+    expect(acks[0].targetId).toBe(9);
+    expect(parseAck(acks[0].payload)).toEqual({ msgId: 3 });
+  });
+
+  it('a duplicate (senderId, msgId) is neither re-delivered nor re-ACKed', async () => {
+    // A retried TEXT arrives twice. The receiver must show it once and must
+    // still ACK it once — the sender is retrying because it heard no ACK, so
+    // a second ACK is not wrong, but a second delivery to the UI is.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    const dup = { type: ControlType.Text, senderId: 9, targetId: 0, payload: packText(3, 'hi all') };
+    h.room.onMessage(dup);
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    h.room.onMessage(dup);
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+
+    expect(h.textReceived).toHaveLength(1);
+  });
+
+  it('ignores a DM addressed to someone else', async () => {
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.onMessage({
+      type: ControlType.Text, senderId: 9, targetId: 5, payload: packText(4, 'not for you'),
+    });
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    expect(h.textReceived).toHaveLength(0);
+    expect(h.sent.filter((m) => m.type === ControlType.Ack)).toHaveLength(0);
+  });
+
+  it('a received ACK reports the acking device', async () => {
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    const msgId = h.room.sendText('hello');
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    h.room.onMessage({ type: ControlType.Ack, senderId: 8, targetId: 1, payload: packAck(msgId) });
+    expect(h.textAcked).toEqual([{ msgId, by: 8 }]);
+  });
+
+  it('a DM with no ACK retries once, then fails', async () => {
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.sendText('you there?', 7);
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(1);
+
+    await h.tick(ROOM_TIMING.ackWindowMs + ROOM_TIMING.replySlotMs + 200);
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(2);
+
+    await h.tick(ROOM_TIMING.ackWindowMs + ROOM_TIMING.replySlotMs + 200);
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(2); // capped
+    expect(h.textStates[h.textStates.length - 1]).toMatchObject({ state: 'failed' });
+  });
+
+  it('a DM that is ACKed does not retry', async () => {
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    const msgId = h.room.sendText('you there?', 7);
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    h.room.onMessage({ type: ControlType.Ack, senderId: 7, targetId: 1, payload: packAck(msgId) });
+
+    await h.tick(60000);
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(1);
+    expect(h.textStates[h.textStates.length - 1]).toMatchObject({ state: 'delivered', ackedBy: [7] });
+  });
+
+  it('a broadcast with one ACK does not retry', async () => {
+    // Retrying because one of several peers missed it would spend seconds of
+    // air punishing the ones that heard it.
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    const msgId = h.room.sendText('hello room');
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    h.room.onMessage({ type: ControlType.Ack, senderId: 5, targetId: 1, payload: packAck(msgId) });
+
+    await h.tick(60000);
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(1);
+    expect(h.textStates[h.textStates.length - 1]).toMatchObject({ state: 'delivered', ackedBy: [5] });
+  });
+
+  it('a broadcast with zero ACKs retries once', async () => {
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.sendText('anyone?');
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(ROOM_TIMING.ackWindowMs + ROOM_TIMING.replySlotMs + 200);
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(2);
+  });
+
+  it('records every acking device on a broadcast', async () => {
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    const msgId = h.room.sendText('roll up');
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    h.room.onMessage({ type: ControlType.Ack, senderId: 5, targetId: 1, payload: packAck(msgId) });
+    h.room.onMessage({ type: ControlType.Ack, senderId: 6, targetId: 1, payload: packAck(msgId) });
+    h.room.onMessage({ type: ControlType.Ack, senderId: 5, targetId: 1, payload: packAck(msgId) }); // dup
+    expect(h.textStates[h.textStates.length - 1]).toMatchObject({ state: 'delivered', ackedBy: [5, 6] });
+  });
+
+  it('a TEXT that exhausts every slot with the air busy reports failed and does not strand', async () => {
+    // Slot exhaustion is a DIFFERENT failure than an ACK timeout: nothing was
+    // ever transmitted, so armTextAck never got a chance to arm anything.
+    // Without a dedicated onFailed branch the SentText record would sit in
+    // `sentText` forever, reported 'sending' for the rest of the session —
+    // the same silent-failure shape this whole task exists to eliminate, just
+    // moved earlier in the pipeline.
+    let busy = false;
+    const h = makeHarness(1, { busy: () => busy });
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+
+    busy = true; // every slot in the window will find the air busy
+    const msgId = h.room.sendText('anyone?');
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 500);
+
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(0);
+    expect(h.textStates[h.textStates.length - 1]).toMatchObject({ state: 'failed' });
+    expect((h.room as any).sentText.has(msgId)).toBe(false);
+  });
+
+  it('a TEXT queued while receiving is held, then sent on return to idle', async () => {
+    const h = makeHarness(3);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.onMessage({
+      type: ControlType.FileComing, senderId: 8, targetId: 0,
+      payload: packFileComing({ pilotFreqHz: 6300, toneStartHz: 600, toneCount: 32, settleSymbols: 16, fileBytes: 100, durationMs: 2000 }),
+    });
+    expect(h.room.state).toBe('receiving');
+
+    h.room.sendText('during a transfer');
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(0);
+
+    await h.tick(2000 + 5000 + ROOM_TIMING.replySlotMs + 300);
+    expect(h.room.state).toBe('idle');
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(1);
   });
 });
