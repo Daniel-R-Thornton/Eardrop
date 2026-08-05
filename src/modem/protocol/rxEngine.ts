@@ -562,6 +562,13 @@ export class RxEngine {
     this.ofdmDemod.resetTraining();
     this.buf = [];
     this.ofdmAlignBuf = [];
+    // This is the one path that can abort a payload run mid-flight (e.g. a
+    // probe burst interrupting a long TEXT message's header-earned grace —
+    // see ofdmWatchdogGraceWindows). onExtraFrame never fires for that
+    // aborted run, so nothing else would clear it; left set, it inflates the
+    // deadline for the NEXT sync — quite possibly a false one on that same
+    // interrupting signal, which is exactly the case the watchdog exists for.
+    this.ofdmWatchdogGraceWindows = 0;
   }
 
   /**

@@ -62,27 +62,55 @@ describe('long control messages survive the sync watchdog', () => {
     expect(parseText(got!.payload)).toEqual({ msgId: 1, text: 'hi' });
   });
 
-  it('a sync with no valid control header earns no grace', () => {
-    // A false sync must still reset on the plain 5 s watchdog, which is the
-    // whole reason the watchdog exists. Feed noise long enough that any
-    // extended deadline would be visible, then a real short message: if the
-    // engine were stuck holding a grace it never earned, this would fail.
+  it('rearmForNextControlMessage clears a grace earned but not yet spent', () => {
+    // rearmForNextControlMessage() is the one path that can abort a payload
+    // run mid-flight — the host calls it on a probe burst, an unpaused
+    // chatter scan, or un-mute after our own TX (see modemService.ts). If it
+    // doesn't clear ofdmWatchdogGraceWindows, a grace earned by a long
+    // message's header survives into the NEXT sync — quite possibly a false
+    // one on whatever interrupted us, which is exactly the case the plain
+    // 5 s watchdog exists to bound: a leaked ~344-window grace would turn
+    // that false sync's deadline into ~544 windows (~13.6 s) instead of the
+    // plain ~200 (~5 s), which is within reach of the 601-window incident
+    // this watchdog was written to prevent.
+    //
+    // This drives the REAL abort sequence — decode a maximum-length TEXT's
+    // header via processCard (earning the grace) without letting the payload
+    // run finish, then call the real rearmForNextControlMessage() — and
+    // checks the field directly, which pins the mechanism rather than only
+    // an indirect consequence.
+    //
+    // NOT extended to "and a following message still decodes": rearm also
+    // leaves chirpDetected/chirpEndSample and the SentinelScanner's
+    // mid-collection state untouched (the same leftover-state category as
+    // pendingControlHeader, already flagged pre-existing and out of scope).
+    // Feeding more audio after this abort exercises THOSE gaps, not the one
+    // this task fixes, and produced a stale chirp handoff using the aborted
+    // message's own leftover anchor rather than a clean resync — unreliable
+    // for pinning this specific fix. See the report's Important-1 follow-up
+    // for detail.
+    const text = 'x'.repeat(TEXT_MAX_BYTES);
+    const longAudio = buildControlAudio({
+      type: ControlType.Text, senderId: 4, targetId: 0, payload: packText(11, text),
+    });
+
     const rx = new RxEngine({
       useOFDM: true, bandHandshake: true, sampleRate: SR,
     } as ConstructorParameters<typeof RxEngine>[0]);
     let got: ControlMessage | null = null;
     rx.onControlMessage = (m) => { got = m; };
 
-    let seed = 7;
-    const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
-    const noise = new Float32Array(SR * 12);
-    for (let i = 0; i < noise.length; i++) noise[i] = (rnd() - 0.5) * 0.2;
-    rx.feedChunk(noise);
+    // Feed only the front of the long message — enough for the preamble and
+    // control header to decode (short messages fully round-trip in ~2 s, so
+    // the header itself is well within the first 3 s), but stop long before
+    // the ~10.4 s payload run completes.
+    rx.feedChunk(longAudio.slice(0, SR * 3));
+    expect(got).toBeNull(); // payload run not yet complete
+    expect((rx as unknown as { ofdmWatchdogGraceWindows: number }).ofdmWatchdogGraceWindows)
+      .toBeGreaterThan(0); // the header WAS decoded and DID earn a grace
 
-    rx.feedChunk(buildControlAudio({
-      type: ControlType.Text, senderId: 4, targetId: 0, payload: packText(2, 'after noise'),
-    }));
-    rx.feedChunk(new Float32Array(SR));
-    expect(parseText(got!.payload)).toEqual({ msgId: 2, text: 'after noise' });
+    rx.rearmForNextControlMessage();
+    expect((rx as unknown as { ofdmWatchdogGraceWindows: number }).ofdmWatchdogGraceWindows)
+      .toBe(0); // the abort must clear it, not just re-arm sync
   });
 });
