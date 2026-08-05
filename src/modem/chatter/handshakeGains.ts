@@ -4,9 +4,8 @@
  * The control plane has a bootstrap problem the file path does not: its band
  * is fixed and must work before anything has been negotiated, so TxEngine
  * deliberately sends it with flat gains. That is fine on a flat channel and
- * bad on a real one — the handshake tones sit at 6900-7250 Hz, where laptop
- * speakers and mics are already rolling off, and a control frame that dies
- * there takes the whole exchange with it.
+ * bad on a real one — the handshake tones sit at 2600-2950 Hz, and a control
+ * frame that dies there takes the whole exchange with it.
  *
  * But the curve is not actually unknown. A peer's WELCOME/REPORT carries the
  * response IT measured from OUR probe sweep (`theirViewOfUs`), which is

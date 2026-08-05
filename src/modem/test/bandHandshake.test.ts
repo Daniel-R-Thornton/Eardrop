@@ -21,7 +21,7 @@ import { TxEngine } from '../protocol/txEngine';
 import { RxEngine } from '../protocol/rxEngine';
 import { HandshakeReceiver } from '../protocol/handshakeReceiver';
 import { OFDMEngine } from '../protocol/ofdmEngine';
-import { OFDM_HANDSHAKE, OFDM_TUNING, ofdmSamples } from '../types';
+import { OFDM_DEFAULTS, OFDM_HANDSHAKE, OFDM_TUNING, ofdmSamples } from '../types';
 
 const SAMPLE_RATE = 48000;
 const { symSamples: SYM_LEN } = ofdmSamples(SAMPLE_RATE);
@@ -165,6 +165,27 @@ describe('band handshake: TX', () => {
     },
     TIMEOUT,
   );
+
+  it('keeps the handshake band inside the hardware sweet spot and clear of its chirp', () => {
+    // This band carries every control message. At 6900-7250 Hz it sat where
+    // phone speakers and mics are both worst, which is a single point of
+    // failure for the whole control plane.
+    const firstTone = OFDM_HANDSHAKE.pilotFreqHz + OFDM_HANDSHAKE.toneStartHz;
+    const lastTone = firstTone + (OFDM_HANDSHAKE.toneCount - 1) * OFDM_DEFAULTS.toneSpacingHz;
+
+    expect(firstTone).toBe(2600);
+    expect(lastTone).toBe(2950);
+
+    // Pilot phase is extrapolated to each tone by toneFreq/pilotFreq, so any
+    // error in the pilot measurement is multiplied by this. 3.9 shipped
+    // broken; 1.15 was fine.
+    expect(lastTone / OFDM_HANDSHAKE.pilotFreqHz).toBeLessThan(1.6);
+
+    // The chirp must stay far from the tones it precedes — 500 Hz was not
+    // enough (types.ts documents the 17 dB swing).
+    const halfSpan = 100; // OFDMEngine's default chirpSpanHz is 200
+    expect(OFDM_HANDSHAKE.chirpCenterHz - halfSpan - lastTone).toBeGreaterThan(1000);
+  });
 });
 
 describe('band handshake: RX end-to-end (the oracle)', () => {

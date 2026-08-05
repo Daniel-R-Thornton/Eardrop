@@ -184,6 +184,12 @@ present and WHAT settings to use before that handshake fires. Half duplex,
 strict turn-taking, no clock sync, no persistent identity, no heartbeats:
 membership is advisory and re-measured fresh at every send.
 
+`OFDM_HANDSHAKE` (`src/modem/types.ts`) fixes that band at 8 QPSK tones from
+2600-2950 Hz, pilot 2000 Hz, with its own sync-chirp centred at 4400 Hz
+(decoupled from `OFDM_TUNING.chirpCenterHz` so it doesn't sit next to the
+tones it precedes). This band's over-the-air margin is unmeasured as of this
+writing — see the design doc's Verification section.
+
 ### Probe burst
 
 `src/modem/protocol/probeBurst.ts` builds the one wire object every device
@@ -287,7 +293,8 @@ of TX settings every responding peer can survive:
 
 `FLOOR_SETTINGS` (used when no reports arrive, or no band clears the
 threshold): QPSK, 4 tones, `pilotFreqHz` 6700, `toneStartHz` 200 (tones at
-6900–7050 Hz — the same first-tone frequency as `OFDM_HANDSHAKE`).
+6900–7050 Hz — a target-band fallback, unrelated to `OFDM_HANDSHAKE`'s own
+band, which now sits at 2600–2950 Hz).
 
 ### State machine
 
