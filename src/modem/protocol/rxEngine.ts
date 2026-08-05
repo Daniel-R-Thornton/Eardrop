@@ -238,17 +238,36 @@ export class RxEngine {
    */
   private ofdmWindowsSinceDetect = 0;
   /**
-   * Watchdog: reset to WAITING if no frame within this many windows.
+   * One-shot extension to the sync watchdog, in windows, earned by decoding a
+   * valid control header.
+   *
+   * A control message can now be ~10.4 s of audio (see
+   * CONTROL_PAYLOAD_MAX) while the chatter watchdog is 5 s, so without this a
+   * long message resets the receiver mid-payload and is lost. The header
+   * declares `payloadLen`, so the exact number of symbols still to come is
+   * known — this holds that count, and nothing more.
+   *
+   * Deliberately earned rather than granted: raising OFDM_WATCHDOG_WINDOWS
+   * would weaken the false-sync case the watchdog exists for, for every
+   * message. A false sync never decodes a valid header, so it never gets here.
+   */
+  private ofdmWatchdogGraceWindows = 0;
+  /**
+   * Watchdog: reset to WAITING if no frame within this many windows (plus
+   * ofdmWatchdogGraceWindows, earned only after a valid control header — see
+   * that field).
    *
    * ~15 s for a file transfer, where frames are long and a spurious reset
    * would abandon a live decode. The chatter control listener is the opposite
-   * case: a whole control message is about 3.5 s (preamble + at most a
-   * 48-byte payload), it is one persistent engine for the entire session, and
-   * anything that syncs it without completing makes it deaf until the
-   * watchdog fires. At 15 s that is most of a room exchange — hardware showed
-   * a listener burning 601 windows and missing the FILE_COMING that followed.
-   * 5 s is comfortably longer than any real message and short enough that a
-   * false sync costs one reply rather than the whole transfer.
+   * case: a control message ranges from ~2 s up to ~10.4 s at the maximum
+   * TEXT payload (see CONTROL_PAYLOAD_MAX), it is one persistent engine for
+   * the entire session, and anything that syncs it without completing makes
+   * it deaf until the watchdog fires. At 15 s that is most of a room
+   * exchange — hardware showed a listener burning 601 windows and missing the
+   * FILE_COMING that followed. 5 s still bounds a FALSE sync (one that never
+   * decodes a valid header, and so never earns a grace) — short enough that a
+   * false sync costs one reply rather than the whole transfer. Long but
+   * genuine messages are covered separately, by ofdmWatchdogGraceWindows.
    */
   private get OFDM_WATCHDOG_WINDOWS() {
     const ms = this.onControlMessage ? 5000 : 15000;
@@ -489,6 +508,10 @@ export class RxEngine {
     this.scanner.onExtraFrame = (payloadWire: Uint8Array) => {
       const header = this.pendingControlHeader;
       this.pendingControlHeader = null;
+      // The payload run this grace covered is done (decoded or not) — clear
+      // it so a completed message doesn't leave an extension armed for
+      // whatever control message arrives next.
+      this.ofdmWatchdogGraceWindows = 0;
       if (header) {
         const payload = decodeControlPayload(payloadWire, header.payloadLen);
         if (!payload) {
@@ -581,7 +604,13 @@ export class RxEngine {
     const header = decodeControlHeader(body);
     if (header) {
       this.pendingControlHeader = header;
-      this.scanner.continueCollecting(controlPayloadWireSize(header.payloadLen));
+      const payloadWire = controlPayloadWireSize(header.payloadLen);
+      // Extend the sync watchdog by exactly this payload's duration — see
+      // ofdmWatchdogGraceWindows. bytesPerSymbol mirrors the card-sizing
+      // idiom used elsewhere in this file.
+      const bytesPerSymbol = Math.max(1, Math.floor(OFDM_HANDSHAKE.toneCount / 4));
+      this.ofdmWatchdogGraceWindows = Math.ceil(payloadWire / bytesPerSymbol);
+      this.scanner.continueCollecting(payloadWire);
       return;
     }
     dlog('RX-OFDM', { cardInvalid: true }, { level: 'warn' });
@@ -1156,8 +1185,13 @@ export class RxEngine {
       // CRC-valid decode in processFrame(), which is the only thing that
       // should keep this watchdog quiet.
       this.ofdmWindowsSinceDetect++;
-      if (this.ofdmWindowsSinceDetect > this.OFDM_WATCHDOG_WINDOWS) {
-        dlog('OFDM-SYNC', { watchdogReset: true, windows: this.ofdmWindowsSinceDetect }, { level: 'warn' });
+      if (this.ofdmWindowsSinceDetect > this.OFDM_WATCHDOG_WINDOWS + this.ofdmWatchdogGraceWindows) {
+        dlog('OFDM-SYNC', {
+          watchdogReset: true,
+          windows: this.ofdmWindowsSinceDetect,
+          grace: this.ofdmWatchdogGraceWindows,
+        }, { level: 'warn' });
+        this.ofdmWatchdogGraceWindows = 0;
         this.state = RxState.WAITING;
         this.ofdmSyncFrames = 0;
         this.ofdmNoiseEma = this.OFDM_EMA_SEED;
