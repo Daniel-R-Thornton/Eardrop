@@ -28,7 +28,7 @@ import {
   type FileComingPayload,
 } from '../../modem/protocol/controlFrame';
 import type { ModemEvent } from '../../workers/modemSchema';
-import { AudioPlayer } from '../../audio/player';
+import { AudioPlayer, PLAYBACK_TARGET_PEAK } from '../../audio/player';
 import { buildModemConfig } from './buildModemConfig';
 import { getState, setState, CHATTER_PACKET_LOG_MAX, type ChatterPacket } from '../Store';
 import { OFDM_DEFAULTS, OFDM_HANDSHAKE } from '../../modem/types';
@@ -41,6 +41,47 @@ const OFDM_TONE_SPACING_HZ = OFDM_DEFAULTS.toneSpacingHz;
 
 /** Echo tail after our own playback ends, before RX un-mutes (room echo settle). */
 const MUTE_TAIL_MS = 150;
+
+/**
+ * Peak `TxEngine.frameSegments` guarantees no sample of a transmission will
+ * exceed. Every segment it yields — handshake preamble, band card, target-band
+ * preamble, data frames — is emitted at ONE fixed deterministic scale, set as
+ * `0.95 / budget` by the modulator's own level maths (see OFDMQPSKModulator's
+ * qamScale doc), so this is a wire-level property of the transmitter, not a
+ * measurement of any particular waveform.
+ */
+const FRAME_SEGMENT_PEAK_BOUND = 0.95;
+
+/**
+ * Fixed playback gain for the streamed file transmission.
+ *
+ * Volume-INDEPENDENT on purpose. The batch `play()` path normalises every
+ * buffer to PLAYBACK_TARGET_PEAK regardless of `volume`, so probes and control
+ * messages — which still go out through it — leave this device at one fixed
+ * absolute level. The roll-call channel measurement and the -18 dB band pick
+ * are made from probes at that level, and the file's own handshake segment is
+ * the sync-critical head of the transmission on a band this branch documents
+ * as unmeasured over the air. Letting the file's level ride the UI volume
+ * slider meant the negotiation and the transfer it negotiates for went out at
+ * different levels, quieter by 20·log10(volume) dB for any volume < 1.
+ *
+ * Derived from the transmitter's guaranteed peak, NOT from measuring chunks:
+ * per-chunk normalisation is banned outright (see AudioPlayer.playStream's
+ * `schedule()` — it was measured stepping the level between chunks and
+ * wrecking every channel estimate downstream), and buffering the whole
+ * waveform to measure its true peak would give back the memory saving the
+ * streaming path exists for.
+ *
+ * Residual, recorded honestly: this maps the transmitter's BOUND onto the
+ * batch path's target peak, so it reproduces the batch level exactly only for
+ * a transmission that actually reaches that bound. A real chatter waveform
+ * peaks lower (0.69-0.74 measured across 4/8/16/32-tone configs, flat and
+ * tilted gains), where batch `play()`'s peak-normalisation amplified it by
+ * 1/peak into 0.95 — so the streamed file still goes out ~2.2-2.8 dB below the
+ * batch path. Closing that last gap needs the waveform's real peak, which
+ * cannot be had without measuring it.
+ */
+const FILE_STREAM_GAIN = PLAYBACK_TARGET_PEAK / FRAME_SEGMENT_PEAK_BOUND;
 
 /** Fudge factor + floor over a floor-settings bit-rate estimate for the
  *  FILE_COMING durationMs field. The real settings aren't picked until AFTER
@@ -89,6 +130,7 @@ export interface AudioPlayerLike {
     sampleRate: number,
     deviceId?: string,
     onProgress?: (scheduledSec: number) => void,
+    fixedGain?: number,
   ): Promise<void>;
 }
 
@@ -526,7 +568,13 @@ export class ChatterController {
     try {
       // Read the output device at play time, so a device change mid-session
       // takes effect on the next burst (same reason as doPlayAndMute).
-      await this.player.playStream(pull, sampleRate, getState().selectedOutputId);
+      //
+      // FILE_STREAM_GAIN, not the volume slider: the control plane this
+      // transfer was negotiated over goes out through batch play(), whose
+      // normalisation makes its level volume-independent. See the constant.
+      await this.player.playStream(
+        pull, sampleRate, getState().selectedOutputId, undefined, FILE_STREAM_GAIN,
+      );
     } catch (err) {
       // Cancel the worker-side generator, or a failed playback leaves it
       // holding the whole encode until the next stream replaces it.

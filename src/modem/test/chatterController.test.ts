@@ -105,14 +105,27 @@ function makeFakeWorker() {
 function makeFakePlayer() {
   const played: { samples: Float32Array; sampleRate: number }[] = [];
   const calls: string[] = [];
-  const player: AudioPlayerLike & { played: typeof played; calls: typeof calls } = {
+  /** fixedGain argument of every playStream call — the file path must pass an
+   *  explicit, volume-independent one (see FILE_STREAM_GAIN). */
+  const streamGains: (number | undefined)[] = [];
+  const player: AudioPlayerLike & {
+    played: typeof played; calls: typeof calls; streamGains: typeof streamGains;
+  } = {
     played,
     calls,
+    streamGains,
     play: async (samples: Float32Array, sampleRate: number) => {
       played.push({ samples, sampleRate });
     },
-    playStream: async (pull: () => Promise<Float32Array | null>) => {
+    playStream: async (
+      pull: () => Promise<Float32Array | null>,
+      _sampleRate: number,
+      _deviceId?: string,
+      _onProgress?: (scheduledSec: number) => void,
+      fixedGain?: number,
+    ) => {
       calls.push('playStream');
+      streamGains.push(fixedGain);
       // Drain like the real player does, so a generator bug surfaces here.
       for (;;) {
         const chunk = await pull();
@@ -553,6 +566,12 @@ describe('ChatterController', () => {
     // here: both paths firing and the file going out twice.
     expect(worker.calls.some((c) => c.startsWith('encodeFile'))).toBe(false);
     expect(player.calls).toContain('playStream');
+    // An explicit fixed gain, not the volume slider: the batch path this
+    // replaced normalised every buffer to a fixed peak regardless of volume,
+    // so probes/control messages and the file they negotiate must not go out
+    // at levels that move independently of each other. `undefined` here would
+    // mean the file's level rides the UI volume again.
+    expect(player.streamGains).toEqual([1]);
   });
 
   it('cancels the worker-side stream generator when playStream fails, and surfaces the error', async () => {

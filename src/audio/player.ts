@@ -5,6 +5,16 @@
 import { dlog } from '../lib/debug/dlog';
 
 /**
+ * Peak the batch path normalises every (non-clean) buffer to, regardless of
+ * `volume` — so a batch transmission's absolute acoustic level is fixed and
+ * volume-independent. Exported because the streaming path has no
+ * whole-signal analysis of its own and callers that need to MATCH this level
+ * have to derive their fixed scale from it (see `playStream`'s `fixedGain`
+ * and chatterController's file path).
+ */
+export const PLAYBACK_TARGET_PEAK = 0.95;
+
+/**
  * Apply playback volume and the auto-normalise/clamp policy, writing into
  * `out` rather than returning a new array — the caller already has a
  * destination (an AudioBuffer's channel data), and allocating a scratch copy
@@ -33,7 +43,7 @@ export function shapeForPlayback(
   }
   // Scale so that peak * volume * scale = 0.95 (no clipping). Capped at 5x so
   // a near-silent buffer is not amplified into noise.
-  const targetPeak = 0.95;
+  const targetPeak = PLAYBACK_TARGET_PEAK;
   const scale = peak > 0 ? Math.min(targetPeak / (peak * volume), 5.0) : 1.0;
 
   // Clamp, never rescale, the samples that still overshoot: the cap above
@@ -145,18 +155,35 @@ export class AudioPlayer {
    * Stream playback: schedule audio chunks back-to-back as they are pulled,
    * keeping ~2 s buffered ahead. `pull()` returns the next chunk or null at end.
    * Gapless — chunks are contiguous slices scheduled at contiguous times.
-   * Samples are expected pre-normalized (≈0.95 peak); the UI `volume` control
-   * (see batch `play()`) is applied here via a gain node — streaming can't do
-   * the whole-signal peak analysis `play()` does, so each chunk is additionally
-   * guarded against exceeding unity peak before scheduling (see `schedule()`).
+   *
+   * Samples are NOT pre-normalized to any particular peak — this comment used
+   * to claim "≈0.95 peak", which is not what the producer emits.
+   * `TxEngine.frameSegments` guarantees only that every segment sits at ONE
+   * fixed deterministic scale whose |sample| is bounded BY 0.95; the actual
+   * peak of a real transmission lands wherever the modulator's level maths
+   * puts it (measured 0.69-0.74 for chatter-shaped configs, and the
+   * sync/training burst lower still). What matters here is the guaranteed
+   * bound and the constant relative level, not a normalised peak: that is what
+   * makes a single whole-transmission scale safe and per-chunk rescaling
+   * forbidden (see `schedule()`).
+   *
+   * By default the UI `volume` control is applied via a gain node, clamped to
+   * unity. `fixedGain` overrides it with a caller-supplied constant, for paths
+   * that must transmit at a specific absolute level rather than at whatever
+   * the user's volume slider says — the batch `play()` path normalises volume
+   * out entirely, so a streamed transmission that has to match a batch one
+   * cannot be volume-dependent (see chatterController's file path).
+   *
    * Resolves when the last scheduled chunk finishes; rejects if pull() throws.
    * @param onProgress optional — called with seconds of audio scheduled so far.
+   * @param fixedGain optional — constant linear gain instead of the volume-derived one.
    */
   async playStream(
     pull: () => Promise<Float32Array | null>,
     sampleRate: number,
     deviceId?: string,
     onProgress?: (scheduledSec: number) => void,
+    fixedGain?: number,
   ): Promise<void> {
     const ctx = this.ensureCtx();
     if (deviceId && typeof (ctx as any).setSinkId === 'function') {
@@ -168,15 +195,17 @@ export class AudioPlayer {
     }
 
     const gain = ctx.createGain();
-    // Streamed chunks are pre-normalized to ≈0.95 peak (see class doc above),
-    // with no whole-signal analysis to cancel `this.volume` the way batch
-    // play()'s auto-norm does (`scale = targetPeak/(peak*volume)`). Above
-    // unity, `this.volume` (default 2.0×) would push ≈0.95 peak samples to
-    // ≈1.9 post-gain and hard-clip at the DAC on every chunk. Cap the applied
-    // gain at 1.0 — volume < 1 (backing the speaker OUT of its compressor's
-    // range, the actual use case here) still works; > 1 on this path can only
-    // clip, so it's clamped rather than honored.
-    gain.gain.value = Math.min(this.volume, 1.0);
+    // Streamed chunks arrive bounded by 0.95 (see the doc above), with no
+    // whole-signal analysis to cancel `this.volume` the way batch play()'s
+    // auto-norm does (`scale = targetPeak/(peak*volume)`). Above unity,
+    // `this.volume` (default 2.0×) would push a 0.95-peak chunk to ≈1.9
+    // post-gain and hard-clip at the DAC. Cap the applied gain at 1.0 —
+    // volume < 1 (backing the speaker OUT of its compressor's range) still
+    // works; > 1 on this path can only clip, so it's clamped rather than
+    // honored. `fixedGain` bypasses the slider entirely; it is clamped the same
+    // way, because the clipping argument does not care where the number came
+    // from.
+    gain.gain.value = Math.min(fixedGain ?? this.volume, 1.0);
     gain.connect(ctx.destination);
 
     const LOOKAHEAD_SEC = 2.0;
