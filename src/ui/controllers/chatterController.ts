@@ -640,11 +640,23 @@ export class ChatterController {
     // wire size isn't a simple formula here (depends on the negotiated
     // per-tone bit-loading in cfg.qamMap above), so this reports the file
     // size itself rather than approximating the wire size.
-    await this.playAndMute(() => this.worker.encodeFile(pending.fileName, pending.data), {
-      kind: 'file',
-      peerId: 0,
-      bytes: pending.data.byteLength,
-      note: pending.fileName,
-    });
+    // A rejection here used to vanish: startFileTx calls this with `void`, so
+    // an encode or playback failure became an unhandled rejection —
+    // chatterError stayed null and RoomProtocol sat in 'sending' until its own
+    // deadline, presenting a dead transfer as a live one. On a phone, where
+    // there is no console to check, that is the difference between a
+    // diagnosable failure and a silent one.
+    try {
+      await this.playAndMute(() => this.worker.encodeFile(pending.fileName, pending.data), {
+        kind: 'file',
+        peerId: 0,
+        bytes: pending.data.byteLength,
+        note: pending.fileName,
+      });
+    } catch (err) {
+      const reason = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      dlog('ROOM', { fileTxFailed: reason, name: pending.fileName, bytes: pending.data.byteLength }, { level: 'warn' });
+      setState({ chatterError: `send failed: ${reason}` });
+    }
   }
 }

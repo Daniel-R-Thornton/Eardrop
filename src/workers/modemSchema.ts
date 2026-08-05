@@ -94,7 +94,18 @@ export type ModemEvent =
   | { type: 'flushed'; id: number; fileReady: boolean }
   /** Either a formatted console line or the structured event behind it. */
   | { type: 'dlog'; line?: string; rec?: { tag: string; fields: Record<string, unknown> } }
-  | { type: 'error'; id?: number; error: string }
+  | {
+      type: 'error';
+      id?: number;
+      error: string;
+      /** Error constructor name — a browser allocation failure is a
+       *  RangeError on some engines and a bare Error on others, and the
+       *  message alone does not say which. */
+      errorName?: string;
+      /** The command that failed, so a log line points at a cause rather than
+       *  just an effect. */
+      command?: string;
+    }
   // ─── Chatter room (see chatterWorker.test.ts) ───
   | { type: 'probeHeard'; deviceId: number; grid: number[]; purpose: ProbePurpose }
   | { type: 'controlMessage'; msg: { type: number; senderId: number; targetId: number; payload: ArrayBuffer } }

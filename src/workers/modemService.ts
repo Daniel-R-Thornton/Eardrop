@@ -443,7 +443,9 @@ export class ModemService {
             [samples.buffer as ArrayBuffer],
           );
         } catch (err) {
-          this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
+          const e = err as Error;
+          dlog('TX-COMP', { encodeControlFailed: e.name, msg: e.message }, { level: 'warn' });
+          this.emit({ type: 'error', id: cmd.id, error: e.message, errorName: e.name, command: 'encodeControl' });
         }
         break;
       }
@@ -529,7 +531,9 @@ export class ModemService {
         [samples.buffer as ArrayBuffer],
       );
     } catch (err) {
-      this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
+      const e = err as Error;
+      dlog('TX-COMP', { encodeFileFailed: e.name, msg: e.message }, { level: 'warn' });
+      this.emit({ type: 'error', id: cmd.id, error: e.message, errorName: e.name, command: 'encodeFile' });
     }
   }
 
@@ -555,7 +559,9 @@ export class ModemService {
       this.emit({ type: 'streamStart', id: cmd.id, sampleRate: this.config.sampleRate, totalSamples });
     } catch (err) {
       this.stream = null;
-      this.emit({ type: 'error', id: cmd.id, error: (err as Error).message });
+      const e = err as Error;
+      dlog('TX-COMP', { encodeStreamStartFailed: e.name, msg: e.message }, { level: 'warn' });
+      this.emit({ type: 'error', id: cmd.id, error: e.message, errorName: e.name, command: 'encodeStreamStart' });
     }
   }
 

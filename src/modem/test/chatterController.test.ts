@@ -8,7 +8,7 @@
 import { describe, expect, it, beforeEach } from 'vitest';
 import { ChatterController, type ModemWorkerHandle, type AudioPlayerLike } from '../../ui/controllers/chatterController';
 import { ROOM_TIMING } from '../chatter/roomProtocol';
-import { ControlType, packFileComing, CONTROL_HEADER_WIRE, controlPayloadWireSize } from '../protocol/controlFrame';
+import { ControlType, packFileComing, packReport, CONTROL_HEADER_WIRE, controlPayloadWireSize } from '../protocol/controlFrame';
 import { getState, setState, CHATTER_PACKET_LOG_MAX } from '../../ui/Store';
 import { PROBE_PURPOSE, type ProbePurpose } from '../protocol/probeBurst';
 
@@ -464,5 +464,37 @@ describe('ChatterController', () => {
     expect(cfg.pilotFreqHz).toBe(6300);
     expect(cfg.toneCount).toBe(32);
     expect(worker.calls).toContain('startListening');
+  });
+
+  it('surfaces a failed file encode as chatterError instead of an unhandled rejection', async () => {
+    // startFileTx fires transmitFile with `void`, so a rejection inside it had
+    // nowhere to go: chatterError stayed null and the room sat in 'sending'
+    // until its deadline, showing a transfer that was already dead. This is
+    // the only signal a phone gets.
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, { player, schedule: clock.schedule, now: clock.now, rng: () => 0 });
+    worker.encodeFile = async () => { throw new Error('Out of memory'); };
+
+    await controller.joinRoom();
+    await clock.tick(
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS
+      + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
+    );
+    await controller.broadcastFile('a.txt', new Uint8Array(40));
+    // Reaching 'collecting' costs listenMs (carrier-sense wait) PLUS the roll
+    // call probe's own MUTE_TAIL_MS echo tail (see doPlayAndMute) — without
+    // the tail this fires while still 'rollCall', and the REPORT below lands
+    // outside the collecting window and gets silently dropped.
+    await clock.tick(ROOM_TIMING.listenMs + MUTE_TAIL_MS + 100);
+    worker.emit('controlMessage', {
+      msg: { type: ControlType.Report, senderId: 5, targetId: getState().chatterDeviceId, payload: packReport(flatGrid).buffer },
+    });
+    await clock.tick(
+      ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200,
+    );
+
+    expect(getState().chatterError).toMatch(/Out of memory/);
   });
 });
