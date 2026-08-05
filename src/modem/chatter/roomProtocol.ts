@@ -34,10 +34,15 @@
  *
  * Every state reached via a timer carries its OWN deadline back to idle (or
  * cold, for the pre-join chain) so nothing can get stuck; `stop()` cancels
- * every outstanding timer via a single `pendingTimers` set. Timer callbacks
- * re-check `this.state` before acting (and again after every await) so a
- * stale timer firing after a later transition is a no-op, never a
- * regression to an earlier state.
+ * every outstanding timer via a single `pendingTimers` set. Most timer
+ * callbacks re-check `this.state` before acting (and again after every
+ * await) so a stale timer firing after a later transition is a no-op, never
+ * a regression to an earlier state. `armReplyAck`'s retry timer is the
+ * exception: it isn't state-shaped (a reply can be owed in either 'idle' or
+ * 'joinWait'), so it gates on membership in `awaitingAck` instead — cleared
+ * by any contact from the prober, and by `stop()`/the cold error path
+ * alongside `replyQueue.clear()` — which is the same "stale timer is a
+ * no-op" property, just keyed on the map rather than on `this.state`.
  *
  * `listening` is shared by both carrier-sense phases (join and roll-call) —
  * carrier sense is carrier sense regardless of what comes after it.
@@ -158,7 +163,10 @@ interface PendingReply {
    *  fresh probe, because the newest announcement is the true one: a device
    *  that ran a roll call and then refreshed and rejoined needs a WELCOME. */
   purpose: ProbePurpose;
-  /** Sends attempted for this reply. Task-4 retry budget. */
+  /** Sends attempted for this reply so far, including the first — read by
+   *  armReplyAck to decide whether a retry is still owed. Capped at
+   *  MAX_REPLY_ATTEMPTS: once attempts reaches it, the prober is given up on
+   *  rather than retried again. */
   attempts: number;
   /** A slot chain is already in flight for this entry. */
   scheduled: boolean;
@@ -611,7 +619,11 @@ export class RoomProtocol {
         // cleared queue plus a fresh probe from the same prober creates a
         // brand-new, not-yet-sent entry under the same id). Delete only if
         // the entry still at this key is the one we just sent — a plain
-        // delete-by-key would discard that newer, unsent entry.
+        // delete-by-key would discard that newer, unsent entry. armReplyAck
+        // must stay INSIDE this guard too: if it ran unconditionally, a send
+        // that resolves after stop()/a cold error torn down this room would
+        // arm a retry into a room that no longer exists (or one we've since
+        // rejoined under a fresh id table).
         if (this.replyQueue.get(entry.proberId) === entry) {
           this.replyQueue.delete(entry.proberId);
           this.armReplyAck(entry);

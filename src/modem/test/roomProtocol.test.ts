@@ -362,14 +362,20 @@ describe('room protocol', () => {
     expect(h.room.state).toBe('receiving');
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    const elapsedSoFarMs = ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200;
+    await h.tick(elapsedSoFarMs);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
 
     // ...but once the transfer's deadline returns us to idle, it goes out.
-    // Window kept short of a full slot window past that send (subtract one)
-    // so the Task-4 retry, armed one slot window after it, does not also
-    // land inside this tick.
-    await h.tick(2000 + 5000 + 200 - ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs);
+    // The transfer arms its own deadline at durationMs (2000) +
+    // TRANSFER_TAIL_MARGIN_MS (5000) = 7000ms after the FILE_COMING above.
+    // Stop the clock just past that deadline — accounting for what the tick
+    // above already consumed — rather than well past it: that leaves a full
+    // slot window of headroom before the Task-4 retry (armed one slot window
+    // after the send this deadline triggers) would also land inside this
+    // tick and change what's being measured here.
+    const transferDeadlineMs = 2000 + 5000;
+    await h.tick(transferDeadlineMs - elapsedSoFarMs + 200);
     expect(h.room.state).toBe('idle');
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
@@ -601,5 +607,67 @@ describe('room protocol', () => {
     // And it does eventually go out.
     await h.tick(ROOM_TIMING.replySlotMs + 100);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(2);
+  });
+
+  it('does not retry once the prober is heard from via a WELCOME', async () => {
+    // Mirror of "does not retry once the prober is heard from" (which covers
+    // handleReport), for handleWelcome: a peer that answers our roll-call
+    // probe with a WELCOME instead of a REPORT (inference mismatch, older
+    // build — handleWelcome already tolerates this) is still proof the link
+    // works and must clear the pending ack.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.rollCall); // we owe a REPORT
+    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    expect(h.sent.filter((m) => m.type === ControlType.Report)).toHaveLength(1);
+
+    h.room.onMessage({
+      type: ControlType.Welcome,
+      senderId: 9,
+      targetId: 2,
+      payload: packWelcome({ claim: { lowHz: 1500, highHz: 7800, maxQamOrder: 6 }, grid: flatGrid }),
+    });
+    await h.tick(60000);
+    expect(h.sent.filter((m) => m.type === ControlType.Report)).toHaveLength(1);
+  });
+
+  it('a fresh probe clears the pending ack, so a stale retry timer does not fire a redundant send', async () => {
+    // Regression pin for the awaitingAck.delete in onProbeHeard. Unlike
+    // handleWelcome/handleReport (pure acks, no reply of their own), a fresh
+    // probe ALSO queues and drains its own reply — so to isolate the delete's
+    // effect from that second send's own (legitimate) re-arm, the air is held
+    // busy from the second probe onward: the second reply then exhausts every
+    // slot and gives up without ever sending, so nothing else touches
+    // awaitingAck before the FIRST send's retry timer (armed one slot window
+    // earlier) fires. Un-blocking the air afterward reveals whether that
+    // timer found a stale ack to redundantly re-send (bug) or nothing (fixed,
+    // because onProbeHeard already cleared it on contact).
+    let busy = false;
+    const h = makeHarness(2, { busy: () => busy });
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    await h.tick(10); // slot 0, rng fixed to 0 — sends almost immediately
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
+
+    // Fresh contact from 9, air busy from here: this reply will exhaust every
+    // slot and give up rather than send.
+    busy = true;
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+
+    // Past the first send's retry deadline (one slot window after it) — by
+    // now the busy-blocked second reply has already exhausted its own slots
+    // and given up, so a still-pending stale ack would find nothing left in
+    // replyQueue to defer to and would re-queue itself here.
+    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 100);
+
+    // Let the air clear: if the stale ack wrongly re-queued above, this is
+    // where it would actually transmit.
+    busy = false;
+    await h.tick(2000);
+    expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
 });
