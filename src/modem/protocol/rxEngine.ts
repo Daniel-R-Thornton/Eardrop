@@ -154,7 +154,7 @@ export class RxEngine {
   /** Chirp detection: centre Hz. Set from OFDM_HANDSHAKE in card-listening
    *  mode (see the constructor) — derived from the mode, not passed in, so it
    *  can never disagree with what TxEngine chose the same way. */
-  private chirpCenterHz = OFDM_TUNING.chirpCenterHz;
+  private chirpCenterHz: number = OFDM_TUNING.chirpCenterHz;
   /** Chirp correlation throttle — run once per sps samples (not every sample) */
   private chirpRan = false;
   private chirpTick = 0;
