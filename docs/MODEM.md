@@ -198,7 +198,7 @@ the chirp's own start (the "anchor"), preceded by a 100 ms silent lead-in
 (buffer padding only, not part of the timed layout):
 
 ```text
-[100 ms silence][down-chirp 150 ms][gap 50 ms][coarse sweep ~2.9 s][gap 50 ms][12 × 40 ms ID slots]
+[100 ms silence][down-chirp 150 ms][gap 50 ms][coarse sweep ~2.9 s][gap 50 ms][13 × 40 ms ID slots]
 ```
 
 | Constant | Value |
@@ -206,8 +206,8 @@ the chirp's own start (the "anchor"), preceded by a 100 ms silent lead-in
 | Anchor chirp | 4400 → 1200 Hz down-chirp, 150 ms |
 | `PROBE_LAYOUT.gapMs` | 50 ms (both gaps) |
 | `PROBE_LAYOUT.idSlotMs` | 40 ms per slot |
-| `PROBE_LAYOUT.idSlots` | 12 |
-| `CHATTER_SWEEP` | 1500–7800 Hz, 100 Hz steps, 45 ms/step (~2.9 s), amplitude 0.02 |
+| `PROBE_LAYOUT.idSlots` | 13 (8 id bits + 1 purpose bit + 4 CRC bits) |
+| `CHATTER_SWEEP` | 1500–7800 Hz, 100 Hz steps, 45 ms/step (~2.9 s), amplitude 0.15 |
 | ID pulse tone | 2500 Hz, 25 ms raised-cosine burst, amplitude 0.15 |
 | `REPORT_GRID` | 1500–7800 Hz, 64 points, 100 Hz spacing — the fixed grid every sweep report is resampled onto |
 
@@ -215,16 +215,25 @@ The chirp direction is deliberately reversed from the modem's own low→high
 sync chirp, so a probe listener correlating against it cannot false-trigger
 on ordinary data traffic.
 
-The 12 ID slots carry `V = (deviceId << 4) | crc4(deviceId)`, one bit per
-slot, **LSB-first** (slot 0 = the CRC's own LSB, slot 11 = the device ID's
-MSB) — deliberately not a MSB/first-split of the two fields, so decoding
-never depends on either field's own endpoint bit. Each slot is on/off keyed:
-tone present = 1, absent = 0, decided per-burst by a **largest-gap bimodal
-threshold** — the 12 slot magnitudes are sorted and split at whichever
-adjacent gap is largest, rather than compared to a fixed multiple of their
-median. That handles any on/off ratio from 1-in-12 to 11-in-12, where a
-fixed-threshold split breaks down once half or more of the bits are 1. CRC-4
-is poly `x^4+x+1`, MSB-first, non-reflected, over the 8 ID bits.
+The 13 ID slots carry `V = (word << 4) | crc4Bits(word, 9)`, where
+`word = (deviceId << 1) | purpose` — one bit per slot, **LSB-first** (slot 0 =
+the CRC's own LSB, slot 4 = the purpose bit, slot 12 = the device ID's MSB) —
+deliberately not a MSB/first-split of the fields, so decoding never depends on
+any field's own endpoint bit. `purpose` is `PROBE_PURPOSE`: 0 = joining (reply
+WELCOME), 1 = roll call (reply REPORT). Before that bit existed the reply type
+was inferred from whether the listener already knew the prober, which is
+one-sided and wrong in both directions.
+
+Each slot is on/off keyed: tone present = 1, absent = 0, decided per-burst by a
+**largest-gap bimodal threshold** — the 13 slot magnitudes are sorted and split
+at whichever adjacent gap is largest, rather than compared to a fixed multiple
+of their median. That handles any on/off ratio from 1-in-13 to 12-in-13, where
+a fixed-threshold split breaks down once half or more of the bits are 1. CRC-4
+is poly `x^4+x+1`, MSB-first, non-reflected, over all **9** bits of `word` —
+the purpose bit included, so a flipped purpose bit fails CRC and the burst is
+dropped rather than answered with the wrong reply type. Both ends must agree on
+the slot count: a mismatch fails CRC, so an old-build peer's probes are dropped
+rather than misread.
 
 ### Control message frame
 
@@ -304,10 +313,28 @@ AudioContext, no worker — every side effect goes through injected
 
 ```text
 cold --start()--> listening --(quiet)--> announcing --> joinWait --> idle
-idle --sendFile()--> listening --(quiet)--> rollCall --> collecting --> sending --> idle
+idle --sendFile()--> listening --(quiet)--> rollCall --> collecting --(air quiet)--> sending --> idle
+                                                        collecting --(air busy)--> idle, lastError
 idle/joinWait --onMessage(FILE_COMING)--> receiving --> idle
-idle --onProbeHeard()--> (reply in a random slot) --> idle
+any state --onProbeHeard()--> reply QUEUED
+  --> sent from idle or joinWait, in a random slot, carrier-sensed
+  --> a WELCOME (not a REPORT) is sent a second time unless something is
+      heard from that prober within one slot window
 ```
+
+Replies are **queued**, not gated on a single state: `onProbeHeard` records
+what is owed in any state and a drain routine sends it once the local
+transmitter is free (`idle` or `joinWait`). Gating the send on `idle` alone
+meant two devices joining within a few seconds of each other were both in
+`joinWait` when the other's probe arrived and neither ever replied. A
+roll-call reply is never re-sent: its retry would fire after the prober's
+collect window has closed, colliding with the `FILE_COMING` that prober is
+about to transmit.
+
+`FILE_COMING` is carrier-sensed like every other transmit path; busy air
+aborts the roll call to `idle` with `lastError` rather than announcing over
+someone else's burst (which would leave every receiver unarmed for the file
+that follows).
 
 `listening` is shared by both carrier-sense phases (join and roll-call).
 Every state reached via a timer carries its own deadline back to `idle` (or
@@ -323,8 +350,8 @@ stalling the machine.
 | `listenMs` | 1000 ms per carrier-sense poll |
 | `listenCapMs` | 10000 ms — cap before announcing/rolling-call anyway |
 | `replySlots` | 6 (shared by `joinWait` and `collecting`) |
-| `replySlotMs` | 1000 ms per slot |
-| `collectExtraMs` | 500 ms grace after the last reply slot |
+| `replySlotMs` | 300 ms per slot — long enough that a peer who started in the previous slot is visible to the next device's carrier sense (which averages the last 250 ms) |
+| `collectExtraMs` | 4000 ms grace after the last reply slot — must exceed one whole control message (~3.15 s of audio), since a peer drawing the final slot only STARTS transmitting then |
 | `fileComingLeadMs` | 700 ms between sending `FILE_COMING` and starting the file TX |
 
 A completed send or receive stays "occupied" for `durationMs + 5000 ms`
