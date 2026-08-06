@@ -3,7 +3,7 @@
  * sound" packet.
  *
  * A device joining (or polling) the chatter room emits this burst instead of
- * a full handshake: a down-chirp anchor, a coarse frequency sweep, and a
+ * a full handshake: a down-chirp anchor, a multitone channel probe, and a
  * pulse-keyed device ID. Every other device in earshot can pick it up
  * passively — no reply, no negotiation — and come away knowing WHO is present
  * and WHAT the acoustic path currently looks like.
@@ -12,7 +12,7 @@
  *
  *   [0, chirpMs)                              down-chirp  (4400→1200 Hz)
  *   [chirpMs, chirpMs+gapMs)                   gap (silence)
- *   [..., ...+sweep audio length)              coarse sweep (CHATTER_SWEEP)
+ *   [..., ...+multitone length)                multitone probe (CHATTER_MULTITONE)
  *   [..., ...+gapMs)                           gap (silence)
  *   [..., ...+idSlots*idSlotMs)                13 pulse-keyed bits (8 id + 1 purpose + 4 CRC)
  *
@@ -31,43 +31,83 @@
  * keying a single tone, gated by a threshold measured against the OTHER
  * slots in the same burst, needs no amplitude reference, no channel
  * estimate, and no clock recovery beyond the chirp's own anchor. That
- * self-referencing threshold is also why the sweep sits in the middle:
+ * self-referencing threshold is also why the multitone sits in the middle:
  * it exists to characterize the channel, not to help decode the ID.
  */
 
-import {
-  buildSweep, measureSweep, sampleResponseAt,
-  type SweepPlan, type SweepResult,
-} from '../diag/channelSweep';
 import { generateChirp } from './chirp';
 import { toneIQ } from '../pilot';
 
-/** The coarse sweep every probe burst carries — band-pick resolution, not
- *  notch-hunting resolution. 100 Hz steps over the full acoustic band the
- *  chatter room can use, at ~2.9 s total. */
-export const CHATTER_SWEEP = {
+/**
+ * The multitone burst every probe carries — the room's channel measurement.
+ *
+ * WHY NOT A STEPPED SWEEP (what this replaces): a sweep measures one frequency
+ * at a time, so its length is points x step time — 64 x 45 ms = 2.9 s, which
+ * was 78% of the entire probe burst. A multitone measures every frequency AT
+ * ONCE. All tones are integer multiples of `spacingHz`, so they are mutually
+ * orthogonal over any whole number of 1/spacingHz windows: one 20 ms window
+ * separates all 126 of them exactly, and the repeats below buy coherent
+ * processing gain rather than buying more frequencies.
+ *
+ * The probe drops from 3.84 s to ~0.93 s as a result, and that is not just a
+ * latency win. A roll-call reply is transmitted into the decaying reverb of
+ * the prober's own burst — hardware logs show those replies handing off at
+ * 0.68-0.83 where messages arriving into a quiet room score 0.93-0.97. Four
+ * times less energy pumped into the room is four times less tail sitting on
+ * top of the REPORT that has to be decoded through it.
+ *
+ * 50 Hz spacing, not the old grid's 100: the control tones sit 50 Hz apart, so
+ * a 100 Hz measurement could only ever see every OTHER one and a null on an
+ * odd tone was invisible (see handshakeToneMags). REPORT_GRID stays at 100 Hz
+ * — it is a wire format — and simply takes every second measured tone, so
+ * nothing downstream changes while the measurement itself gets twice the
+ * resolution.
+ */
+export const CHATTER_MULTITONE = {
   startHz: 1500,
   endHz: 7800,
-  stepHz: 100,
-  stepMs: 45,
+  /** Tone spacing. Sets both the resolution AND the minimum analysis window
+   *  (1/50 Hz = 20 ms), since orthogonality is what separates the tones. */
+  spacingHz: 50,
+  /** One orthogonality period. Every tone completes a whole number of cycles
+   *  in exactly this long, which is what makes a single window separate them. */
+  symbolMs: 20,
+  /** Repeats of that window. Coherent integration over all of them, so this is
+   *  pure SNR: 8 repeats is ~9 dB over one, for 160 ms of air.
+   *
+   *  This is the knob to turn if a room proves too noisy to measure — it costs
+   *  time linearly and buys SNR at 10log10(N), where the old sweep bought SNR
+   *  by spending time PER FREQUENCY (64x worse for the same gain). */
+  repeats: 8,
   /**
-   * Matched to the ID pulses, NOT inherited from SWEEP_DEFAULTS' 0.02.
+   * Peak the multitone is normalised to, before the player's own whole-burst
+   * normalisation.
    *
-   * That default is sized for the calibration tool, where the point is to
-   * probe at the same operating level a 32-40 tone grid uses per tone. A
-   * probe burst is a different animal: one tone at a time, sharing a burst
-   * with a 0.5 chirp, and the player normalises the WHOLE burst by its peak.
-   * At 0.02 the sweep therefore landed near -28 dBFS while the chirp sat at
-   * full scale — and the sweep is 2.9 of the burst's 3.7 seconds, so almost
-   * everything a listener hears, and everything the channel measurement
-   * rides on, was the quietest part of the transmission by a factor of 25.
+   * A multitone can be driven far harder than the sweep it replaces BECAUSE of
+   * the Schroeder phasing below: 126 tones summed in phase would crest at ~11x
+   * RMS and have to be attenuated to fit, which is exactly how the old sweep
+   * ended up ~28 dB below the chirp sharing its burst. Schroeder phases flatten
+   * the crest to under 3, so the energy goes into the channel instead of into
+   * headroom.
    *
-   * 0.15 is ~17 dB louder and still well under the 0.25 where a sustained
-   * single tone was measured compressing by 14 dB, which would flatten the
-   * very response this is here to measure.
+   * 0.22 measures out at RMS 0.1155 (crest 1.91). Compare that against the
+   * 0.25 at which a sustained tone was measured compressing by 14 dB: that
+   * tone's RMS is 0.177, so this sits ~3.7 dB BELOW the level known to
+   * compress, not just below its peak. Peak-vs-peak would be the wrong
+   * comparison — compression follows delivered power, and a crest-1.91
+   * waveform delivers far less of it at equal peak than a sine does.
+   *
+   * THE COST, recorded because it is real and the opposite of the win above:
+   * spreading the same peak across 127 tones puts ~15 dB less ENERGY into each
+   * frequency than the stepped sweep did (which spent 45 ms on one tone at a
+   * time at amplitude 0.15). The measurement is correspondingly noisier per
+   * point. Two knobs if a real room proves too noisy to measure: `repeats`
+   * (+3 dB per doubling, 20 ms each), or this — there is ~4 dB of level left
+   * before reaching the compression threshold above. Neither has been needed
+   * against a measured failure yet, so neither has been spent.
    */
-  amplitude: 0.15,
-} as const; // ~2.9 s, coarse by design (band pick, not notch hunting)
+  peak: 0.22,
+} as const;
 
 /** The frequency grid a decoded sweep is reported on — fixed, so reports from
  *  different devices (built from different SweepPlans if config ever drifts)
@@ -154,19 +194,64 @@ function ms(sampleRate: number, milliseconds: number): number {
   return Math.round((milliseconds / 1000) * sampleRate);
 }
 
-function sweepPlan(sampleRate: number): SweepPlan {
-  return buildSweep({ ...CHATTER_SWEEP, sampleRate });
+/** Every frequency the multitone carries: [1500, 1550, ..., 7800]. */
+export function multitoneFreqs(): number[] {
+  const { startHz, endHz, spacingHz } = CHATTER_MULTITONE;
+  const freqs: number[] = [];
+  for (let f = startHz; f <= endHz; f += spacingHz) freqs.push(f);
+  return freqs;
 }
 
-/** Sample count of the sweep audio, without synthesizing it. Mirrors the
- *  step count `buildSweep` computes internally before its per-sample cos()
- *  loop — needed by every length/offset calculation (`probeBurstSamplesAfterChirp`,
- *  `idSlotsStart`, called on every decode) that only wants a length, not the
- *  ~139k-sample waveform itself. */
-function sweepSampleCount(sampleRate: number): number {
-  const { startHz, endHz, stepHz, stepMs } = CHATTER_SWEEP;
-  const steps = Math.floor((endHz - startHz) / stepHz) + 1;
-  return steps * ms(sampleRate, stepMs);
+/** Sample count of the multitone audio, without synthesizing it — needed by
+ *  the length/offset maths (`probeBurstSamplesAfterChirp`, `idSlotsStart`)
+ *  that runs on every decode and only wants a length. */
+function multitoneSampleCount(sampleRate: number): number {
+  return CHATTER_MULTITONE.repeats * ms(sampleRate, CHATTER_MULTITONE.symbolMs);
+}
+
+/**
+ * Schroeder phase for tone `k` of `n`: phi_k = -pi k^2 / n.
+ *
+ * The reason a multitone is usable at all here. Summing n equal-amplitude
+ * tones at phase 0 produces a single impulse of amplitude n — crest factor
+ * ~sqrt(n) against RMS, ~11 for 126 tones — so the burst has to be scaled down
+ * by that factor to avoid clipping, and almost all the transmit headroom is
+ * spent on one sample. Schroeder's quadratic phase ramp spreads the energy
+ * evenly across the window (it is a discrete chirp in disguise), giving a
+ * crest under 3, which is what lets `peak` above sit at 0.22 instead of ~0.02.
+ */
+function schroederPhase(k: number, n: number): number {
+  return (-Math.PI * k * k) / n;
+}
+
+/**
+ * The multitone burst: every measured frequency at once, Schroeder-phased,
+ * repeated `repeats` times and normalised to `peak`.
+ *
+ * Exported for the PAPR test — the crest factor is the property the whole
+ * design rests on, and it is not visible from the burst as a whole (the chirp
+ * dominates that peak).
+ */
+export function buildProbeMultitone(sampleRate: number): Float32Array {
+  const freqs = multitoneFreqs();
+  const period = ms(sampleRate, CHATTER_MULTITONE.symbolMs);
+  const one = new Float32Array(period);
+  for (let k = 0; k < freqs.length; k++) {
+    const w = (2 * Math.PI * freqs[k]) / sampleRate;
+    const phase = schroederPhase(k, freqs.length);
+    for (let n = 0; n < period; n++) one[n] += Math.cos(w * n + phase);
+  }
+  // Normalise the single period, then repeat it. Repeating a normalised period
+  // (rather than normalising the whole run) keeps every repeat sample-identical,
+  // which is what makes the receiver's integration across them coherent.
+  let peak = 0;
+  for (let n = 0; n < period; n++) peak = Math.max(peak, Math.abs(one[n]));
+  const scale = peak > 0 ? CHATTER_MULTITONE.peak / peak : 0;
+  for (let n = 0; n < period; n++) one[n] *= scale;
+
+  const out = new Float32Array(period * CHATTER_MULTITONE.repeats);
+  for (let r = 0; r < CHATTER_MULTITONE.repeats; r++) out.set(one, r * period);
+  return out;
 }
 
 /** Slot k carries bit k of the 13-bit word
@@ -206,7 +291,7 @@ function buildIdSlot(bit: number, sampleRate: number): Float32Array {
   return slot;
 }
 
-/** silence(100ms) + downChirp + gap + sweep + gap + 13 pulse slots. */
+/** silence(100ms) + downChirp + gap + multitone + gap + 13 pulse slots. */
 export function buildProbeBurst(
   deviceId: number,
   sampleRate: number,
@@ -214,7 +299,7 @@ export function buildProbeBurst(
 ): Float32Array {
   const chirp = generateChirp({ ...DOWN_CHIRP, sampleRate, amplitude: 0.5 });
   const gap = new Float32Array(ms(sampleRate, PROBE_LAYOUT.gapMs));
-  const sweep = sweepPlan(sampleRate).audio;
+  const sweep = buildProbeMultitone(sampleRate);
   const bits = idBits(deviceId, purpose);
   const slots = bits.map((bit) => buildIdSlot(bit, sampleRate));
 
@@ -237,7 +322,7 @@ export function buildProbeBurst(
 export function probeBurstSamplesAfterChirp(sampleRate: number): number {
   const chirpSamples = ms(sampleRate, PROBE_LAYOUT.chirpMs);
   const gapSamples = ms(sampleRate, PROBE_LAYOUT.gapMs);
-  const sweepSamples = sweepSampleCount(sampleRate);
+  const sweepSamples = multitoneSampleCount(sampleRate);
   const idSamples = PROBE_LAYOUT.idSlots * ms(sampleRate, PROBE_LAYOUT.idSlotMs);
   return chirpSamples + gapSamples + sweepSamples + gapSamples + idSamples;
 }
@@ -246,7 +331,7 @@ export function probeBurstSamplesAfterChirp(sampleRate: number): number {
 function idSlotsStart(sampleRate: number): number {
   const chirpSamples = ms(sampleRate, PROBE_LAYOUT.chirpMs);
   const gapSamples = ms(sampleRate, PROBE_LAYOUT.gapMs);
-  const sweepSamples = sweepSampleCount(sampleRate);
+  const sweepSamples = multitoneSampleCount(sampleRate);
   return chirpSamples + gapSamples + sweepSamples + gapSamples;
 }
 
@@ -300,18 +385,42 @@ export function decodeProbeId(
   return { deviceId: (word >> 1) & 0xff, purpose: (word & 1) as ProbePurpose };
 }
 
-/** Measure the burst's sweep, sampled onto REPORT_GRID (linear mags). */
+/**
+ * Measure the burst's multitone, reported on REPORT_GRID (linear mags).
+ *
+ * Integrates each tone over the WHOLE multitone segment rather than per
+ * repeat. Every tone is an integer multiple of `spacingHz` and the segment is
+ * a whole number of 1/spacingHz periods, so the integration is exactly
+ * coherent: the wanted tone adds in phase across all 8 repeats while every
+ * other tone — and any noise not sitting precisely on the grid — averages
+ * toward zero. That is where the SNR comes from, and it is why the repeats
+ * cost 20 ms each instead of a full pass over every frequency.
+ *
+ * `null` (rather than a floor-valued curve) when the segment is silence, so a
+ * caller can tell "measured a dead channel" from "heard nothing at all" —
+ * see the !PRB-SWEEP log in modemService.
+ */
 export function measureProbeSweep(samples: Float32Array, anchor: number, sampleRate: number): number[] | null {
   if (anchor < 0) return null;
   const chirpSamples = ms(sampleRate, PROBE_LAYOUT.chirpMs);
   const gapSamples = ms(sampleRate, PROBE_LAYOUT.gapMs);
-  const plan = sweepPlan(sampleRate);
   const start = anchor + chirpSamples + gapSamples;
-  const slice = samples.subarray(start, start + plan.audio.length);
+  const slice = samples.subarray(start, start + multitoneSampleCount(sampleRate));
+  // A partial capture cannot be integrated coherently — the tail of the window
+  // would be zeros, which is not the same signal the phases were built for.
+  if (slice.length < multitoneSampleCount(sampleRate)) return null;
 
-  const result: SweepResult = measureSweep(slice, plan);
-  if (result.failed) return null;
-  return sampleResponseAt(result, reportGridFreqs());
+  const measured = new Map<number, number>();
+  for (const hz of multitoneFreqs()) {
+    const { i, q } = toneIQ(slice, hz, sampleRate);
+    measured.set(hz, Math.hypot(i, q));
+  }
+
+  const grid = reportGridFreqs().map((hz) => measured.get(hz) ?? 0);
+  // Silence in, nothing out. Every tone reading zero means no signal, not a
+  // channel with no response.
+  if (!(Math.max(...grid) > 0)) return null;
+  return grid;
 }
 
 /** CRC-4 (poly x^4+x+1, MSB-first, non-reflected) over the low `bitCount`

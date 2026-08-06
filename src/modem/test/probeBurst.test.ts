@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest';
 import {
   buildProbeBurst, decodeProbeId, measureProbeSweep,
   probeChirpTemplate, crc4, reportGridFreqs, REPORT_GRID,
-  PROBE_LAYOUT, PROBE_PURPOSE,
+  PROBE_LAYOUT, PROBE_PURPOSE, buildProbeMultitone, multitoneFreqs,
 } from '../protocol/probeBurst';
 import { chirpCorrelate } from '../protocol/chirp';
+import { handshakeToneHz } from '../chatter/handshakeGains';
+import { OFDM_HANDSHAKE } from '../types';
 
 const SR = 48000;
 
@@ -129,3 +131,101 @@ describe('probe burst', () => {
     for (let bit = 0; bit < 8; bit++) expect(crc4(0x5a ^ (1 << bit))).not.toBe(crc4(0x5a));
   });
 });
+
+/**
+ * The probe's channel measurement: a multitone burst, not a stepped sweep.
+ *
+ * A stepped sweep measures one frequency at a time, so its duration is
+ * (points x step time) — 64 x 45 ms = 2.9 s, which was 78% of the whole probe
+ * burst. A multitone measures every frequency AT ONCE: all tones are integer
+ * multiples of the grid spacing, so one analysis window of 1/spacing seconds
+ * separates them exactly, and repeating that window buys coherent processing
+ * gain instead of buying more frequencies.
+ *
+ * This matters beyond probe length. The reply to a roll call is transmitted
+ * into the decaying reverb of the prober's own burst, and hardware logs show
+ * exactly that reply handing off at 0.68-0.83 where a message arriving into a
+ * quiet room scores 0.93-0.97. Less energy pumped into the room means less
+ * tail sitting on top of the REPORT.
+ */
+describe('probe multitone', () => {
+  it('measures every handshake tone directly, not by interpolation', () => {
+    // The 100 Hz REPORT_GRID could only ever measure every OTHER control tone
+    // (they sit 50 Hz apart), so a notch on an odd tone was invisible — the
+    // limitation recorded in handshakeToneMags. The multitone grid is 50 Hz,
+    // so every control tone lands on a measured frequency.
+    const freqs = multitoneFreqs();
+    for (let t = 0; t < OFDM_HANDSHAKE.toneCount; t++) {
+      expect(freqs).toContain(handshakeToneHz(t));
+    }
+  });
+
+  it('keeps its crest factor low enough to drive the output stage hard', () => {
+    // The whole point of Schroeder phasing. In phase, N tones stack to a crest
+    // of ~sqrt(N) or worse and the burst has to be attenuated to fit, which is
+    // how the OLD sweep ended up at -28 dBFS. This codebase already has the
+    // scars: CHATTER_SWEEP's amplitude doc records a sustained tone
+    // compressing by 14 dB at 0.25.
+    const tone = buildProbeMultitone(SR);
+    let peak = 0;
+    let sumSq = 0;
+    for (let i = 0; i < tone.length; i++) {
+      peak = Math.max(peak, Math.abs(tone[i]));
+      sumSq += tone[i] * tone[i];
+    }
+    const crest = peak / Math.sqrt(sumSq / tone.length);
+    expect(crest).toBeLessThan(3); // a coherent 126-tone sum would be ~11
+  });
+
+  it('cuts the probe burst to about a second', () => {
+    const burst = buildProbeBurst(1, SR);
+    const seconds = burst.length / SR;
+    expect(seconds).toBeLessThan(1.3); // was 3.84
+  });
+
+  it('recovers a notched channel on the report grid', () => {
+    // The measurement has to survive the thing it exists to find. Apply a
+    // one-bin null and check the grid actually reports it — a measurement that
+    // smears a notch into its neighbours is what makes a band pick land on a
+    // dead spot.
+    const burst = buildProbeBurst(1, SR);
+    const anchor = findAnchor(burst);
+    const notchHz = 3500;
+
+    const flat = measureProbeSweep(burst, anchor, SR)!;
+    const notched = measureProbeSweep(notchAt(burst, notchHz), anchor, SR)!;
+
+    const idx = reportGridFreqs().indexOf(notchHz);
+    expect(idx).toBeGreaterThanOrEqual(0);
+    // Deep at the notch...
+    expect(notched[idx] / flat[idx]).toBeLessThan(0.4);
+    // ...and largely intact clear of it. 500 Hz, not 200: a Q=8 notch at
+    // 3500 Hz is ~437 Hz wide, so 200 Hz off is still inside its own skirt
+    // (the filter's analytic response there is 0.67 — measuring 0.67 means the
+    // measurement is right and a tighter assertion would have been testing the
+    // biquad, not the probe). At 500 Hz the filter is back to ~0.91.
+    expect(notched[idx + 5] / flat[idx + 5]).toBeGreaterThan(0.8);
+  });
+
+  it('returns null on silence rather than inventing a curve', () => {
+    expect(measureProbeSweep(new Float32Array(SR), 0, SR)).toBeNull();
+  });
+});
+
+/** Narrow notch at `hz`, applied as an RBJ notch biquad — a stand-in for the
+ *  room/speaker null the probe exists to find. */
+function notchAt(x: Float32Array, hz: number): Float32Array {
+  const w0 = (2 * Math.PI * hz) / SR;
+  const alpha = Math.sin(w0) / (2 * 8); // Q = 8
+  const cw = Math.cos(w0);
+  const a0 = 1 + alpha;
+  const b0 = 1 / a0, b1 = (-2 * cw) / a0, b2 = 1 / a0;
+  const a1 = (-2 * cw) / a0, a2 = (1 - alpha) / a0;
+  const y = new Float32Array(x.length);
+  let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+  for (let i = 0; i < x.length; i++) {
+    const out = b0 * x[i] + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    x2 = x1; x1 = x[i]; y2 = y1; y1 = out; y[i] = out;
+  }
+  return y;
+}
