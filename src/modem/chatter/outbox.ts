@@ -71,6 +71,25 @@ export interface OutboxDeps {
   /** Slot count and slot length — passed in so ROOM_TIMING stays the single source. */
   replySlots: number;
   replySlotMs: number;
+  /**
+   * Dead time before slot 0, measured from the moment the entry was queued.
+   *
+   * Slots were drawn from zero, and an owed reply is queued the instant the
+   * transmission it answers finishes decoding — which is the instant that
+   * transmission ENDED. So slot 0 meant "start talking the moment they stop",
+   * and the peer we are answering is at that same moment still muted for its
+   * own playback (MUTE_TAIL_MS), about to re-arm its receiver, and sitting in
+   * the reverb tail of its own burst. Our 800 ms sync chirp landed in exactly
+   * that window.
+   *
+   * The hardware evidence is a clean split: every message type that works is
+   * human-initiated into a quiet room (TEXT), and every type that fails is
+   * machine-generated immediately after someone else's burst (WELCOME, REPORT,
+   * ACK). On the receiving side the same split shows up as correlation peak —
+   * one text arriving into silence measured 2.7e3 and decoded, while replies
+   * seconds later measured 236-727 and handed off at 0.86 instead of 0.97.
+   */
+  turnaroundMs: number;
   /** After a successful send. The owner arms any retry/ack tracking here. */
   onSent?(entry: OutboxEntry): void;
   /** Slots exhausted, or the send threw. */
@@ -177,7 +196,10 @@ export class Outbox {
     const idx = Math.floor(this.deps.rng() * candidateSlots.length);
     const slot = candidateSlots[idx];
     const laterSlots = candidateSlots.filter((s) => s > slot);
-    const delay = Math.max(0, baseTimeMs + slot * this.deps.replySlotMs - this.deps.now());
+    const delay = Math.max(
+      0,
+      baseTimeMs + this.deps.turnaroundMs + slot * this.deps.replySlotMs - this.deps.now(),
+    );
 
     this.timer(delay, async () => {
       // Not eligible any more (a transfer started, a roll call began): HOLD

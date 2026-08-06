@@ -2,14 +2,22 @@ import { describe, expect, it } from 'vitest';
 import { Outbox, type OutboxEntry } from '../chatter/outbox';
 import { ControlType, type ControlMessage } from '../protocol/controlFrame';
 
-function makeHarness(opts: { busy?: () => boolean; canTransmit?: () => boolean } = {}) {
+function makeHarness(opts: {
+  busy?: () => boolean;
+  canTransmit?: () => boolean;
+  /** Dead time before slot 0. Defaults to 0 so the tests below measure SLOT
+   *  behaviour on its own; the turnaround has its own test, and that the real
+   *  ROOM_TIMING value reaches this dep is asserted in roomProtocol.test.ts. */
+  turnaroundMs?: number;
+  rng?: () => number;
+} = {}) {
   let t = 0;
   const timers: { at: number; fn: () => void; dead: boolean }[] = [];
   const sent: ControlMessage[] = [];
   const events: string[] = [];
   const outbox = new Outbox({
     now: () => t,
-    rng: () => 0,
+    rng: opts.rng ?? (() => 0),
     schedule: (fn, d) => {
       const rec = { at: t + d, fn, dead: false };
       timers.push(rec);
@@ -20,6 +28,7 @@ function makeHarness(opts: { busy?: () => boolean; canTransmit?: () => boolean }
     canTransmit: () => opts.canTransmit?.() ?? true,
     replySlots: 6,
     replySlotMs: 300,
+    turnaroundMs: opts.turnaroundMs ?? 0,
     onSent: (e: OutboxEntry) => events.push(`sent:${e.kind}:${e.id}`),
     onFailed: (e: OutboxEntry) => events.push(`failed:${e.kind}:${e.id}`),
   });
@@ -41,6 +50,36 @@ const textMsg = (targetId: number): ControlMessage => ({
 });
 
 describe('outbox', () => {
+  it('holds every entry until the turnaround has passed', async () => {
+    // An owed reply is queued the instant the transmission it answers finishes
+    // decoding — which is the instant that transmission ENDED. Drawing slot 0
+    // from zero therefore meant "start talking the moment they stop", while
+    // the peer being answered is still muted for its own playback, about to
+    // re-arm, and sitting in its own reverb. Our sync chirp landed there.
+    const h = makeHarness({ turnaroundMs: 500 });
+    h.outbox.enqueue({ kind: 'reply', targetId: 3, dedupKey: 'reply:3', build: () => textMsg(3) });
+    h.outbox.drain();
+
+    await h.tick(450);
+    expect(h.sent, 'silent through the turnaround').toHaveLength(0);
+
+    await h.tick(200); // past 500 ms, into slot 0
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it('offsets every slot by the turnaround, not just the first', async () => {
+    // rng picks an index into the remaining slots; 0.99 lands on the last one,
+    // which must sit at turnaround + 5 * slotMs rather than 5 * slotMs.
+    const h = makeHarness({ turnaroundMs: 500, rng: () => 0.99 });
+    h.outbox.enqueue({ kind: 'reply', targetId: 3, dedupKey: 'reply:3', build: () => textMsg(3) });
+    h.outbox.drain();
+
+    await h.tick(500 + 5 * 300 - 50);
+    expect(h.sent).toHaveLength(0);
+    await h.tick(100);
+    expect(h.sent).toHaveLength(1);
+  });
+
   it('sends a queued entry on drain', async () => {
     const h = makeHarness();
     h.outbox.enqueue({ kind: 'text', targetId: 0, dedupKey: 'text:1', build: () => textMsg(0) });
@@ -134,6 +173,7 @@ describe('outbox', () => {
       canTransmit: () => true,
       replySlots: 6,
       replySlotMs: 300,
+      turnaroundMs: 0,
       onFailed: (e, err) => events.push(`failed:${e.kind}:${(err as Error).message}`),
     });
     outbox.enqueue({ kind: 'text', targetId: 0, dedupKey: 'text:1', build: () => textMsg(0) });
@@ -185,6 +225,7 @@ describe('outbox', () => {
       canTransmit: () => true,
       replySlots: 6,
       replySlotMs: 300,
+      turnaroundMs: 0,
     });
     outbox.enqueue({ kind: 'text', targetId: 0, dedupKey: 'text:1', build: () => textMsg(0) });
     outbox.drain();
@@ -236,6 +277,7 @@ describe('outbox', () => {
       canTransmit: () => true,
       replySlots: 6,
       replySlotMs: 300,
+      turnaroundMs: 0,
       onSent: (e: OutboxEntry) => events.push(`sent:${e.kind}:${e.id}`),
       onFailed: (e: OutboxEntry) => events.push(`failed:${e.kind}:${e.id}`),
     });

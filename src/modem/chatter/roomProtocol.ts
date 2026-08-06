@@ -150,6 +150,23 @@ export interface RoomDeps {
 const REPLY_SLOTS = 6;
 const REPLY_SLOT_MS = 300;
 
+/**
+ * Dead time before the first reply slot — see OutboxDeps.turnaroundMs for the
+ * failure this exists to stop.
+ *
+ * 500 ms covers three things that all land in the same window: the peer's own
+ * mute tail (MUTE_TAIL_MS, 150 ms after its playback ends), the re-arm that
+ * follows it, and the room's reverb decaying enough that an 800 ms sync chirp
+ * correlates against the transmission rather than against the tail of the one
+ * before it.
+ *
+ * The cost is 500 ms added to every reply and, because the last slot now opens
+ * later, the same 500 ms added to the collect window that has to contain it.
+ * That is the trade: half a second per exchange against replies that are
+ * transmitted, audibly, and never decoded.
+ */
+const REPLY_TURNAROUND_MS = 500;
+
 /** Measured air time of a 1-byte control payload: 35 wire bytes over 8 QPSK
  *  tones plus the fixed ~1.5 s preamble. Used below to size the ACK window. */
 const ACK_AIR_MS = 2000;
@@ -157,6 +174,7 @@ const ACK_AIR_MS = 2000;
 export const ROOM_TIMING = {
   listenMs: 1000, listenCapMs: 10000,
   replySlots: REPLY_SLOTS, replySlotMs: REPLY_SLOT_MS,
+  replyTurnaroundMs: REPLY_TURNAROUND_MS,
   // Grace after the last reply slot opens.
   //
   // Must exceed one whole control message, because a peer that draws the
@@ -164,7 +182,16 @@ export const ROOM_TIMING = {
   // of audio. Anything less and the window shuts mid-reply: the roll call
   // reports an empty room while a peer is still audibly answering, and the
   // answer lands just after everyone stopped listening for it.
-  collectExtraMs: 4000,
+  //
+  // 4500, not 4000: the turnaround pushes every slot back by
+  // REPLY_TURNAROUND_MS, so the last one now opens at 500 + 1500 = 2000 ms and
+  // a 3.15 s WELCOME finishes at 5150. Growing this by exactly the turnaround
+  // keeps the margin that was there before (window 6300, worst reply 5150,
+  // ~1.15 s spare for encode and output latency, which is NOT otherwise
+  // budgeted anywhere). See replyWindowFits in roomProtocol.test.ts — that
+  // arithmetic is asserted rather than left as a comment, because the last
+  // time it drifted the symptom was a silently-killed file transfer.
+  collectExtraMs: 4500,
   fileComingLeadMs: 700,
   /**
    * How long a sent TEXT waits for an ACK before its one retry.
@@ -407,6 +434,7 @@ export class RoomProtocol {
       canTransmit: () => this.canTransmitReply(),
       replySlots: ROOM_TIMING.replySlots,
       replySlotMs: ROOM_TIMING.replySlotMs,
+      turnaroundMs: ROOM_TIMING.replyTurnaroundMs,
       onSent: (entry) => this.onOutboxSent(entry),
       onFailed: (entry, err) => {
         // Exhausting every slot is not an error the operator can act on — the

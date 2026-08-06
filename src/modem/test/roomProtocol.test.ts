@@ -65,6 +65,14 @@ function makeHarness(
   };
 }
 
+/** How long until an owed reply has certainly gone out: the dead time before
+ *  slot 0 plus the whole slot span. Every `tick` that waits for a reply uses
+ *  this, so adding a turnaround does not mean editing sixty call sites. */
+const REPLY_SPAN = ROOM_TIMING.replyTurnaroundMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs;
+
+/** When the earliest slot actually fires: the turnaround, then slot 0. */
+const SLOT_0 = ROOM_TIMING.replyTurnaroundMs + ROOM_TIMING.replySlotMs;
+
 const flatGrid = Array.from({ length: 64 }, () => 1);
 
 /**
@@ -84,7 +92,7 @@ describe('room protocol', () => {
     expect(h.room.state).toBe('listening');
     await h.tick(ROOM_TIMING.listenMs + 50);
     expect(h.calls).toContain('probe');
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 100);
+    await h.tick(REPLY_SPAN + ROOM_TIMING.collectExtraMs + 100);
     expect(h.room.state).toBe('idle');
     expect(h.room.members.size).toBe(0);
   });
@@ -92,9 +100,9 @@ describe('room protocol', () => {
   it('member replies WELCOME when it hears a probe', async () => {
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.onProbeHeard(9, flatGrid);
-    await h.tick(ROOM_TIMING.replySlotMs + 100); // slot 0 fires
+    await h.tick(SLOT_0 + 100); // slot 0 fires
     const welcome = h.sent.find((m) => m.type === ControlType.Welcome);
     expect(welcome).toBeDefined();
     expect(welcome.targetId).toBe(9);
@@ -106,24 +114,24 @@ describe('room protocol', () => {
     const h = makeHarness(2, { busy: () => busy });
     h.room.start();
     // air busy: listening extends, then cap forces announce
-    await h.tick(ROOM_TIMING.listenCapMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 500);
+    await h.tick(ROOM_TIMING.listenCapMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 500);
     expect(h.room.state).toBe('idle');
     h.room.onProbeHeard(9, flatGrid);
-    await h.tick(ROOM_TIMING.replySlotMs + 50); // slot 0 blocked
+    await h.tick(SLOT_0 + 50); // slot 0 blocked
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
     busy = false;
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs);
+    await h.tick(REPLY_SPAN);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
 
   it('roll call with one report → FILE_COMING + startFileTx', async () => {
     const h = makeHarness(1);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.sendFile(1000, 30000);
     await h.tick(ROOM_TIMING.listenMs + 100); // carrier-sense + probe
     h.room.onMessage({ type: ControlType.Report, senderId: 5, targetId: 1, payload: packReport(flatGrid) });
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200);
+    await h.tick(REPLY_SPAN + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200);
     expect(h.sent.some((m) => m.type === ControlType.FileComing)).toBe(true);
     expect(h.calls).toContain('fileTx');
     expect(h.room.state).toBe('sending');
@@ -137,7 +145,7 @@ describe('room protocol', () => {
     // "nobody home", which is what happened on hardware.
     const h = makeHarness(1);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.sendFile(1000, 30000);
     await h.tick(ROOM_TIMING.listenMs + 100); // carrier-sense + probe
     h.room.onMessage({
@@ -146,7 +154,7 @@ describe('room protocol', () => {
       targetId: 1,
       payload: packWelcome({ claim: { lowHz: 1500, highHz: 7800, maxQamOrder: 6 }, grid: flatGrid }),
     });
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200);
+    await h.tick(REPLY_SPAN + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200);
     expect(h.room.lastError).toBeNull();
     expect(h.sent.some((m) => m.type === ControlType.FileComing)).toBe(true);
     expect(h.calls).toContain('fileTx');
@@ -155,9 +163,9 @@ describe('room protocol', () => {
   it('roll call with zero reports aborts to idle with lastError', async () => {
     const h = makeHarness(1);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.sendFile(1000, 30000);
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 500);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 500);
     expect(h.calls).not.toContain('fileTx');
     expect(h.room.state).toBe('idle');
     expect(h.room.lastError).toMatch(/no.*report|nobody/i);
@@ -170,7 +178,7 @@ describe('room protocol', () => {
     // will never assemble.
     const h = makeHarness(3);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.onMessage({
       type: ControlType.FileComing, senderId: 8, targetId: 9, // not us (3)
       payload: packFileComing({ pilotFreqHz: 6300, toneStartHz: 600, toneCount: 32, settleSymbols: 16, fileBytes: 100, durationMs: 2000 }),
@@ -184,12 +192,12 @@ describe('room protocol', () => {
     // settings down — it is not receiving this transfer.
     const h = makeHarness(1);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.sendFile(1000, 30000, 5); // addressed to 5
     await h.tick(ROOM_TIMING.listenMs + 100);
     // Only a bystander answers.
     h.room.onMessage({ type: ControlType.Report, senderId: 7, targetId: 1, payload: packReport(flatGrid) });
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200);
+    await h.tick(REPLY_SPAN + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200);
     expect(h.calls).not.toContain('fileTx');
     expect(h.room.lastError).toMatch(/not reachable/);
   });
@@ -197,11 +205,11 @@ describe('room protocol', () => {
   it('an addressed FILE_COMING carries the target id', async () => {
     const h = makeHarness(1);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.sendFile(1000, 30000, 5);
     await h.tick(ROOM_TIMING.listenMs + 100);
     h.room.onMessage({ type: ControlType.Report, senderId: 5, targetId: 1, payload: packReport(flatGrid) });
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200);
+    await h.tick(REPLY_SPAN + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 200);
     const fc = h.sent.find((m) => m.type === ControlType.FileComing);
     expect(fc).toBeDefined();
     expect(fc.targetId).toBe(5);
@@ -211,7 +219,7 @@ describe('room protocol', () => {
   it('FILE_COMING while idle arms RX and times back out to idle', async () => {
     const h = makeHarness(3);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.onMessage({
       type: ControlType.FileComing, senderId: 8, targetId: 0,
       payload: packFileComing({ pilotFreqHz: 6300, toneStartHz: 600, toneCount: 32, settleSymbols: 16, fileBytes: 100, durationMs: 2000 }),
@@ -252,7 +260,7 @@ describe('room protocol', () => {
       },
     });
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     expect(h.room.state).toBe('idle');
 
     h.room.sendFile(1000, 30000);
@@ -277,14 +285,14 @@ describe('room protocol', () => {
     // that pickSettings later reads from.
     expect((h.room as any).collectedReports.size).toBe(0);
 
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 100);
+    await h.tick(REPLY_SPAN + ROOM_TIMING.collectExtraMs + 100);
     expect(h.room.state).toBe('idle');
   });
 
   it('onProbeHeard twice for the same prober while idle only schedules one WELCOME chain', async () => {
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.onProbeHeard(9, flatGrid);
     h.room.onProbeHeard(9, flatGrid); // duplicate, same prober, reply chain already pending
     // Measured over a window shorter than one slot window: the retry arms
@@ -292,7 +300,7 @@ describe('room protocol', () => {
     // "one chain per prober" from the retry behaviour covered separately
     // below (a window covering a full slot window would let a retry fire
     // too, which is correct but not what this test is checking).
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
 
@@ -307,7 +315,7 @@ describe('room protocol', () => {
     expect(h.room.state).toBe('joinWait');
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
 
     const welcome = h.sent.find((m) => m.type === ControlType.Welcome);
     expect(welcome).toBeDefined();
@@ -331,7 +339,7 @@ describe('room protocol', () => {
     // A window shorter than one slot window after the send: long enough to
     // catch listening finish through the (slot-0, rng fixed to 0) send, short
     // of the Task-4 retry that arms one slot window after it.
-    await h.tick(ROOM_TIMING.replySlotMs + 200);
+    await h.tick(SLOT_0 + 200);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
 
@@ -349,8 +357,8 @@ describe('room protocol', () => {
 
     a.room.onProbeHeard(2, flatGrid, PROBE_PURPOSE.joining);
     b.room.onProbeHeard(1, flatGrid, PROBE_PURPOSE.joining);
-    await a.tick(ROOM_TIMING.replySlotMs + 100);
-    await b.tick(ROOM_TIMING.replySlotMs + 100);
+    await a.tick(SLOT_0 + 100);
+    await b.tick(SLOT_0 + 100);
 
     expect(a.sent.find((m) => m.type === ControlType.Welcome)?.targetId).toBe(2);
     expect(b.sent.find((m) => m.type === ControlType.Welcome)?.targetId).toBe(1);
@@ -370,7 +378,7 @@ describe('room protocol', () => {
     // Shorter than one slot window after the send, for the same reason as
     // above: the Task-4 retry arms one slot window after this send and would
     // otherwise fire inside a longer window.
-    await h.tick(ROOM_TIMING.replySlotMs + 200);
+    await h.tick(SLOT_0 + 200);
 
     expect(h.sent.filter((m) => m.type === ControlType.Report)).toHaveLength(0);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
@@ -381,7 +389,7 @@ describe('room protocol', () => {
     // over it.
     const h = makeHarness(3);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.onMessage({
       type: ControlType.FileComing, senderId: 8, targetId: 0,
       payload: packFileComing({ pilotFreqHz: 6300, toneStartHz: 600, toneCount: 32, settleSymbols: 16, fileBytes: 100, durationMs: 2000 }),
@@ -389,7 +397,7 @@ describe('room protocol', () => {
     expect(h.room.state).toBe('receiving');
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
-    const elapsedSoFarMs = ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200;
+    const elapsedSoFarMs = REPLY_SPAN + 200;
     await h.tick(elapsedSoFarMs);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
 
@@ -401,8 +409,11 @@ describe('room protocol', () => {
     // slot window of headroom before the Task-4 retry (armed one slot window
     // after the send this deadline triggers) would also land inside this
     // tick and change what's being measured here.
+    // + SLOT_0: returning to idle re-drains the outbox, and the held reply is
+    // scheduled from THAT moment — so it goes out a turnaround plus a slot
+    // later, not the instant the state flips.
     const transferDeadlineMs = 2000 + 5000;
-    await h.tick(transferDeadlineMs - elapsedSoFarMs + 200);
+    await h.tick(transferDeadlineMs - elapsedSoFarMs + SLOT_0 + 200);
     expect(h.room.state).toBe('idle');
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
@@ -436,7 +447,7 @@ describe('room protocol', () => {
     // Let the slot timer (5 * replySlotMs after the probe) fire while we're
     // still 'receiving' — this is the in-timer canTransmitReply() check, not
     // the gate at the top of drainReplyQueue.
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 100);
+    await h.tick(REPLY_SPAN + 100);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
     // HELD, not dropped: the entry is still queued, and `scheduled` was
     // cleared so a later setState re-drains it.
@@ -446,7 +457,7 @@ describe('room protocol', () => {
 
     // The transfer's own deadline (durationMs + 5000) returns us to idle,
     // which re-drains the queue and finally sends the WELCOME.
-    await h.tick(2000 + 5000 + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    await h.tick(2000 + 5000 + REPLY_SPAN + 200);
     expect(h.room.state).toBe('idle');
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
@@ -477,14 +488,14 @@ describe('room protocol', () => {
     expect(h.room.state).toBe('joinWait');
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
-    await h.tick(ROOM_TIMING.replySlotMs + 100); // slot 0 fires, isAirBusy steals the transmitter mid-await
+    await h.tick(SLOT_0 + 100); // slot 0 fires, isAirBusy steals the transmitter mid-await
     expect(h.room.state).toBe('receiving');
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
     const held = queuedReply(h.room, 9);
     expect(held).toBeDefined();
     expect(held.scheduled).toBe(false);
 
-    await h.tick(2000 + 5000 + ROOM_TIMING.replySlotMs + 200);
+    await h.tick(2000 + 5000 + SLOT_0 + 200);
     expect(h.room.state).toBe('idle');
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
@@ -492,7 +503,7 @@ describe('room protocol', () => {
   it('stop() mid-chain clears the queue and sends nothing afterward', async () => {
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     expect(h.room.state).toBe('idle');
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
@@ -512,11 +523,11 @@ describe('room protocol', () => {
     // a channel measurement, not a welcome.
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     expect(h.room.state).toBe('idle');
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.rollCall);
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
 
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(0);
     const report = h.sent.find((m) => m.type === ControlType.Report);
@@ -530,14 +541,14 @@ describe('room protocol', () => {
     // joinWait — so it finished joining knowing nothing about this peer.
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.rollCall);
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    await h.tick(REPLY_SPAN + 200);
     expect(h.room.members.get(9)).toBeDefined();
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining); // 9 refreshed and rejoined
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
 
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
   });
@@ -551,14 +562,14 @@ describe('room protocol', () => {
     // as the behaviour it actually is, not as loss recovery.
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
 
     // Nothing heard back within one slot window → one more attempt.
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.replySlotMs + 200);
+    await h.tick(REPLY_SPAN + SLOT_0 + 200);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(2);
   });
 
@@ -575,10 +586,10 @@ describe('room protocol', () => {
     // — the two purposes are the only difference between them.
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.rollCall);
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     expect(h.sent.filter((m) => m.type === ControlType.Report)).toHaveLength(1);
 
     // Well past every retry deadline, and nothing was ever heard from 9.
@@ -593,10 +604,10 @@ describe('room protocol', () => {
     // than only for roll calls, fails here.
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
     expect((h.room as any).awaitingAck.get(9)).toBeDefined();
 
@@ -613,7 +624,7 @@ describe('room protocol', () => {
     let busy = false;
     const h = makeHarness(1, { busy: () => busy });
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
 
     h.room.sendFile(1000, 30000);
     await h.tick(ROOM_TIMING.listenMs + 100); // carrier-sense (still quiet) + probe
@@ -622,7 +633,7 @@ describe('room protocol', () => {
     // Someone starts talking during the collect window — e.g. a peer that drew
     // a late reply slot, or another device's own roll call.
     busy = true;
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 500);
+    await h.tick(REPLY_SPAN + ROOM_TIMING.collectExtraMs + ROOM_TIMING.fileComingLeadMs + 500);
 
     expect(h.sent.some((m) => m.type === ControlType.FileComing)).toBe(false);
     expect(h.calls).not.toContain('fileTx');
@@ -633,7 +644,7 @@ describe('room protocol', () => {
   it('stops after two attempts', async () => {
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
     await h.tick(60000);
@@ -643,10 +654,10 @@ describe('room protocol', () => {
   it('does not retry once the prober is heard from', async () => {
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
 
     // 9 answers — a REPORT addressed to us proves it heard the welcome.
@@ -677,7 +688,7 @@ describe('room protocol', () => {
       },
     });
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     expect(h.room.state).toBe('idle');
 
     // First probe: slot 0 fires, scheduleReply's timer calls sendMessage,
@@ -685,7 +696,7 @@ describe('room protocol', () => {
     // is captured in that timer's closure but no longer sits in replyQueue —
     // it's "in flight".
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
 
     // Leave and rejoin while that send is still in flight, then hear a new
@@ -693,7 +704,7 @@ describe('room protocol', () => {
     // object under the same key, queued and drained fresh in the new room.
     h.room.stop();
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     expect(h.room.state).toBe('idle');
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
@@ -709,7 +720,7 @@ describe('room protocol', () => {
     expect(queuedReply(h.room, 9)).toBe(freshEntry);
 
     // And it does eventually go out.
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(2);
   });
 
@@ -723,10 +734,10 @@ describe('room protocol', () => {
     // works even though it is not a response to ours.
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining); // we owe a WELCOME
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
 
     h.room.onMessage({
@@ -746,10 +757,10 @@ describe('room protocol', () => {
     // aimed at a device that has announced it is gone.
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
 
     h.room.onMessage({ type: ControlType.Bye, senderId: 9, targetId: 0, payload: new Uint8Array(0) });
@@ -766,10 +777,10 @@ describe('room protocol', () => {
     // holds even for a transfer we are not the addressee of.
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
 
     // Addressed to a third device (7), so we neither arm RX nor leave idle.
@@ -801,10 +812,10 @@ describe('room protocol', () => {
     let busy = false;
     const h = makeHarness(2, { busy: () => busy });
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
 
     h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
-    await h.tick(10); // slot 0, rng fixed to 0 — sends almost immediately
+    await h.tick(SLOT_0); // slot 0, rng fixed to 0 — sends as soon as the turnaround is up
     expect(h.sent.filter((m) => m.type === ControlType.Welcome)).toHaveLength(1);
 
     // Fresh contact from 9, air busy from here: this reply will exhaust every
@@ -816,7 +827,7 @@ describe('room protocol', () => {
     // now the busy-blocked second reply has already exhausted its own slots
     // and given up, so a still-pending stale ack would find nothing left in
     // replyQueue to defer to and would re-queue itself here.
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 100);
+    await h.tick(REPLY_SPAN + 100);
 
     // Let the air clear: if the stale ack wrongly re-queued above, this is
     // where it would actually transmit.
@@ -828,9 +839,9 @@ describe('room protocol', () => {
   it('sends a broadcast TEXT from idle', async () => {
     const h = makeHarness(1);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     const msgId = h.room.sendText('hello room');
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     const sent = h.sent.find((m) => m.type === ControlType.Text);
     expect(sent).toBeDefined();
     expect(sent.targetId).toBe(0);
@@ -840,9 +851,9 @@ describe('room protocol', () => {
   it('addresses a DM to one device', async () => {
     const h = makeHarness(1);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.sendText('just you', 7);
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     expect(h.sent.find((m) => m.type === ControlType.Text).targetId).toBe(7);
   });
 
@@ -854,11 +865,11 @@ describe('room protocol', () => {
   it('a received broadcast TEXT is delivered and ACKed exactly once', async () => {
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.onMessage({
       type: ControlType.Text, senderId: 9, targetId: 0, payload: packText(3, 'hi all'),
     });
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
 
     expect(h.textReceived).toEqual([{ msgId: 3, senderId: 9, targetId: 0, text: 'hi all' }]);
     const acks = h.sent.filter((m) => m.type === ControlType.Ack);
@@ -873,12 +884,12 @@ describe('room protocol', () => {
     // a second ACK is not wrong, but a second delivery to the UI is.
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     const dup = { type: ControlType.Text, senderId: 9, targetId: 0, payload: packText(3, 'hi all') };
     h.room.onMessage(dup);
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    await h.tick(REPLY_SPAN + 200);
     h.room.onMessage(dup);
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    await h.tick(REPLY_SPAN + 200);
 
     expect(h.textReceived).toHaveLength(1);
   });
@@ -886,11 +897,11 @@ describe('room protocol', () => {
   it('ignores a DM addressed to someone else', async () => {
     const h = makeHarness(2);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.onMessage({
       type: ControlType.Text, senderId: 9, targetId: 5, payload: packText(4, 'not for you'),
     });
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    await h.tick(REPLY_SPAN + 200);
     expect(h.textReceived).toHaveLength(0);
     expect(h.sent.filter((m) => m.type === ControlType.Ack)).toHaveLength(0);
   });
@@ -898,9 +909,9 @@ describe('room protocol', () => {
   it('a received ACK reports the acking device', async () => {
     const h = makeHarness(1);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     const msgId = h.room.sendText('hello');
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     h.room.onMessage({ type: ControlType.Ack, senderId: 8, targetId: 1, payload: packAck(msgId) });
     expect(h.textAcked).toEqual([{ msgId, by: 8 }]);
   });
@@ -908,15 +919,15 @@ describe('room protocol', () => {
   it('a DM with no ACK retries once, then fails', async () => {
     const h = makeHarness(1);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.sendText('you there?', 7);
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(1);
 
-    await h.tick(ROOM_TIMING.ackWindowMs + ROOM_TIMING.replySlotMs + 200);
+    await h.tick(ROOM_TIMING.ackWindowMs + SLOT_0 + 200);
     expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(2);
 
-    await h.tick(ROOM_TIMING.ackWindowMs + ROOM_TIMING.replySlotMs + 200);
+    await h.tick(ROOM_TIMING.ackWindowMs + SLOT_0 + 200);
     expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(2); // capped
     expect(h.textStates[h.textStates.length - 1]).toMatchObject({ state: 'failed' });
   });
@@ -924,9 +935,9 @@ describe('room protocol', () => {
   it('a DM that is ACKed does not retry', async () => {
     const h = makeHarness(1);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     const msgId = h.room.sendText('you there?', 7);
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     h.room.onMessage({ type: ControlType.Ack, senderId: 7, targetId: 1, payload: packAck(msgId) });
 
     await h.tick(60000);
@@ -939,9 +950,9 @@ describe('room protocol', () => {
     // air punishing the ones that heard it.
     const h = makeHarness(1);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     const msgId = h.room.sendText('hello room');
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     h.room.onMessage({ type: ControlType.Ack, senderId: 5, targetId: 1, payload: packAck(msgId) });
 
     await h.tick(60000);
@@ -952,19 +963,19 @@ describe('room protocol', () => {
   it('a broadcast with zero ACKs retries once', async () => {
     const h = makeHarness(1);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.sendText('anyone?');
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
-    await h.tick(ROOM_TIMING.ackWindowMs + ROOM_TIMING.replySlotMs + 200);
+    await h.tick(SLOT_0 + 100);
+    await h.tick(ROOM_TIMING.ackWindowMs + SLOT_0 + 200);
     expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(2);
   });
 
   it('records every acking device on a broadcast', async () => {
     const h = makeHarness(1);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     const msgId = h.room.sendText('roll up');
-    await h.tick(ROOM_TIMING.replySlotMs + 100);
+    await h.tick(SLOT_0 + 100);
     h.room.onMessage({ type: ControlType.Ack, senderId: 5, targetId: 1, payload: packAck(msgId) });
     h.room.onMessage({ type: ControlType.Ack, senderId: 6, targetId: 1, payload: packAck(msgId) });
     h.room.onMessage({ type: ControlType.Ack, senderId: 5, targetId: 1, payload: packAck(msgId) }); // dup
@@ -981,11 +992,11 @@ describe('room protocol', () => {
     let busy = false;
     const h = makeHarness(1, { busy: () => busy });
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
 
     busy = true; // every slot in the window will find the air busy
     const msgId = h.room.sendText('anyone?');
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 500);
+    await h.tick(REPLY_SPAN + 500);
 
     expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(0);
     expect(h.textStates[h.textStates.length - 1]).toMatchObject({ state: 'failed' });
@@ -995,7 +1006,7 @@ describe('room protocol', () => {
   it('a TEXT queued while receiving is held, then sent on return to idle', async () => {
     const h = makeHarness(3);
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.onMessage({
       type: ControlType.FileComing, senderId: 8, targetId: 0,
       payload: packFileComing({ pilotFreqHz: 6300, toneStartHz: 600, toneCount: 32, settleSymbols: 16, fileBytes: 100, durationMs: 2000 }),
@@ -1003,10 +1014,10 @@ describe('room protocol', () => {
     expect(h.room.state).toBe('receiving');
 
     h.room.sendText('during a transfer');
-    await h.tick(ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + 200);
+    await h.tick(REPLY_SPAN + 200);
     expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(0);
 
-    await h.tick(2000 + 5000 + ROOM_TIMING.replySlotMs + 300);
+    await h.tick(2000 + 5000 + SLOT_0 + 300);
     expect(h.room.state).toBe('idle');
     expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(1);
   });
@@ -1059,6 +1070,44 @@ describe('room protocol', () => {
     expect(h.room.lastError).toMatch(/never completed/);
   });
 
+  // ---- reply turnaround ----
+
+  it('holds a reply through the turnaround before its first slot', async () => {
+    // Wiring plus behaviour: the real ROOM_TIMING value has to reach the
+    // outbox, not just exist. A reply queued the instant a peer's burst ends
+    // must not go out while that peer is still muted for its own playback and
+    // re-arming its receiver.
+    const h = makeHarness(1);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN
+      + ROOM_TIMING.collectExtraMs + 200);
+    const before = h.sent.length;
+
+    h.room.onProbeHeard(9, flatGrid, PROBE_PURPOSE.joining);
+    await h.tick(ROOM_TIMING.replyTurnaroundMs - 100);
+    expect(h.sent.length, 'silent through the turnaround').toBe(before);
+
+    await h.tick(REPLY_SPAN + 300);
+    expect(h.sent.length).toBeGreaterThan(before);
+  });
+
+  it('leaves room in the collect window for a reply drawn into the last slot', async () => {
+    // Asserted, not left in a comment. The last time this arithmetic drifted,
+    // the symptom was a reply landing just outside the window and silently
+    // killing a file transfer — see collectExtraMs. A WELCOME is the longest
+    // reply at ~3.15 s of air (measured).
+    const WELCOME_AIR_MS = 3150;
+    const lastSlotOpensAt = ROOM_TIMING.replyTurnaroundMs
+      + (ROOM_TIMING.replySlots - 1) * ROOM_TIMING.replySlotMs;
+    const worstReplyEndsAt = lastSlotOpensAt + WELCOME_AIR_MS;
+    const window = ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs;
+
+    expect(worstReplyEndsAt).toBeLessThan(window);
+    // ...with real margin left for encode and output latency, which nothing
+    // else budgets for.
+    expect(window - worstReplyEndsAt).toBeGreaterThan(1000);
+  });
+
   // ---- remembered band: skip the roll call when we already negotiated ----
   //
   // A roll call exists to learn which band a peer can hear. That answer does
@@ -1071,12 +1120,12 @@ describe('room protocol', () => {
   /** Drive a first addressed send all the way through, so a band is cached. */
   const negotiateOnce = async (h: ReturnType<typeof makeHarness>, peer: number) => {
     h.room.start();
-    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
     h.room.sendFile(64, 1000, peer);
     await h.tick(ROOM_TIMING.listenMs + 100);
     h.room.onMessage({ type: ControlType.Report, senderId: peer, targetId: 1, payload: packReport(flatGrid) });
     await h.tick(
-      ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs
+      REPLY_SPAN + ROOM_TIMING.collectExtraMs
       + ROOM_TIMING.fileComingLeadMs + 1000 + 5000 + 500,
     );
   };
