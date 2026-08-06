@@ -234,6 +234,48 @@ describe('band handshake: RX end-to-end (the oracle)', () => {
   );
 
   it(
+    'non-chirp energy before a transfer does not make the card listener deaf to it',
+    () => {
+      // The card listener is the thing that must hear the band card and hop.
+      // Everything it needs to hear opens with a chirp (frameSegments' own
+      // handshake preamble), so an energy-fallback sync on it can only ever be
+      // a FALSE one — and firing costs 15 s of deafness, because with no
+      // onControlMessage this engine takes the long watchdog. The card is sent
+      // three times precisely because losing it kills the whole transfer;
+      // being deaf for fifteen seconds loses all three copies at once.
+      //
+      // Observed on hardware as `!ES` then `!WD 601` on the receiving device,
+      // with no `HR` (card decoded) and no `HH` (hopped) row anywhere in the
+      // session — a roll call that completed, a FILE_COMING that went out, and
+      // a transfer that reached nobody.
+      const payload = new Uint8Array(96).map((_, i) => (i * 7 + 3) & 0xff);
+      const audio = transmit(makeTx({ bandHandshake: true }), payload);
+
+      // Strong in-band energy with no chirp in front of it: the tail of a
+      // transmission whose head we missed, an echo, a neighbour's burst.
+      const interference = audio.slice(Math.round(SAMPLE_RATE * 1.2), Math.round(SAMPLE_RATE * 1.8));
+
+      const rx = new HandshakeReceiver({
+        useOFDM: true,
+        sampleRate: SAMPLE_RATE,
+        pilotFreqHz: 999,
+        toneStartHz: 12345,
+        toneCount: 16,
+      } as ConstructorParameters<typeof HandshakeReceiver>[0]);
+
+      rx.feedChunk(interference);
+      rx.feedChunk(new Float32Array(SYM_LEN * 4));
+      rx.feedChunk(audio);
+      rx.feedChunk(new Float32Array(SYM_LEN * 8));
+
+      const file = rx.getFile();
+      expect(file).not.toBeNull();
+      expect(Array.from(file!.data.slice(0, payload.length))).toEqual(Array.from(payload));
+    },
+    TIMEOUT,
+  );
+
+  it(
     'decodes when the TX uses a non-default settle count (card carries it)',
     () => {
       const { file, payload } = roundtrip({ trainingSettleSymbols: 8 });

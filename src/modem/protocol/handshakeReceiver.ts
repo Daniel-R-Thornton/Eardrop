@@ -38,7 +38,21 @@ export class HandshakeReceiver {
   private discardRemaining = 0;
 
   constructor(private readonly cfg: RxConfig) {
-    this.listener = new RxEngine({ ...cfg, bandHandshake: true } as RxConfig);
+    // chirpOnlySync on the LISTENER too, not just the post-hop engine below.
+    //
+    // Everything this engine needs to hear opens with a chirp — it is the
+    // handshake preamble frameSegments emits ahead of the card. So an
+    // energy-fallback sync here can only ever be a FALSE one, and firing costs
+    // 15 s of deafness: with no onControlMessage this engine takes the long
+    // watchdog, three times the chatter listener's. The card is transmitted
+    // BAND_CARD_REPEATS times precisely because losing it kills the whole
+    // transfer, and fifteen seconds loses all three copies together.
+    //
+    // Observed on hardware as `!ES` followed by `!WD 601` on the receiving
+    // device, with no `HR` and no `HH` anywhere in the session: a roll call
+    // that completed, a FILE_COMING that went out, and a transfer that reached
+    // nobody. Same fix, same reasoning, as the chatter control listener.
+    this.listener = new RxEngine({ ...cfg, bandHandshake: true, chirpOnlySync: true } as RxConfig);
     this.listener.onBandCard = (card) => this.hop(card);
   }
 
