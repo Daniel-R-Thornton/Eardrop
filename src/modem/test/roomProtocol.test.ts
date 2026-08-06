@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { RoomProtocol, ROOM_TIMING, ROOM_STALL_MS } from '../chatter/roomProtocol';
+import { RoomProtocol, ROOM_TIMING, ROOM_STALL_MS, BAND_CACHE_TTL_MS } from '../chatter/roomProtocol';
 import {
   ControlType, packReport, packWelcome, packFileComing,
   packText, packAck, parseText, parseAck, TEXT_MAX_BYTES,
@@ -1057,6 +1057,101 @@ describe('room protocol', () => {
     await h.tick(ROOM_STALL_MS + 100);
     expect(h.room.state).toBe('cold');
     expect(h.room.lastError).toMatch(/never completed/);
+  });
+
+  // ---- remembered band: skip the roll call when we already negotiated ----
+  //
+  // A roll call exists to learn which band a peer can hear. That answer does
+  // not change between two sends thirty seconds apart, and re-deriving it
+  // costs a probe burst, a reply window, and — critically — a 12-chunk REPORT
+  // over the fixed control band, which is the single most failure-prone
+  // message the room sends. Remembering it per peer removes the whole
+  // negotiation from a repeat send.
+
+  /** Drive a first addressed send all the way through, so a band is cached. */
+  const negotiateOnce = async (h: ReturnType<typeof makeHarness>, peer: number) => {
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200);
+    h.room.sendFile(64, 1000, peer);
+    await h.tick(ROOM_TIMING.listenMs + 100);
+    h.room.onMessage({ type: ControlType.Report, senderId: peer, targetId: 1, payload: packReport(flatGrid) });
+    await h.tick(
+      ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs
+      + ROOM_TIMING.fileComingLeadMs + 1000 + 5000 + 500,
+    );
+  };
+
+  it('a repeat send to the same peer skips the roll call', async () => {
+    const h = makeHarness(1);
+    await negotiateOnce(h, 7);
+    expect(h.room.state).toBe('idle');
+    const probesAfterFirst = h.calls.filter((c) => c === 'probe').length;
+    const firstAnnounce = h.sent.filter((m) => m.type === ControlType.FileComing);
+    expect(firstAnnounce).toHaveLength(1);
+
+    h.room.sendFile(64, 1000, 7);
+    await h.tick(ROOM_TIMING.listenMs + ROOM_TIMING.fileComingLeadMs + 500);
+
+    // No second probe, and the announcement went out anyway.
+    expect(h.calls.filter((c) => c === 'probe')).toHaveLength(probesAfterFirst);
+    expect(h.sent.filter((m) => m.type === ControlType.FileComing)).toHaveLength(2);
+    expect(h.room.lastError).toBeNull();
+    expect(h.calls.filter((c) => c === 'fileTx')).toHaveLength(2);
+  });
+
+  it('still carrier-senses before announcing from a remembered band', async () => {
+    // Skipping the negotiation must not skip listen-before-talk: the whole
+    // point of the check is that FILE_COMING is what arms every receiver.
+    let busy = false;
+    const h = makeHarness(1, { busy: () => busy });
+    await negotiateOnce(h, 7);
+
+    busy = true;
+    h.room.sendFile(64, 1000, 7);
+    await h.tick(ROOM_TIMING.listenCapMs + ROOM_TIMING.fileComingLeadMs + 1000);
+    expect(h.room.lastError).toMatch(/channel busy/);
+  });
+
+  it('a peer that rejoins invalidates its remembered band', async () => {
+    // Device ids are re-rolled at random (1-255) on every join, so a
+    // 'joining' probe from an id we already hold is a NEW session behind a
+    // recycled number — possibly a different device entirely. Its old band is
+    // meaningless and must not be reused.
+    const h = makeHarness(1);
+    await negotiateOnce(h, 7);
+    const probesBefore = h.calls.filter((c) => c === 'probe').length;
+
+    h.room.onProbeHeard(7, flatGrid, PROBE_PURPOSE.joining);
+    h.room.sendFile(64, 1000, 7);
+    await h.tick(ROOM_TIMING.listenMs + 200);
+
+    expect(h.calls.filter((c) => c === 'probe').length).toBe(probesBefore + 1);
+  });
+
+  it('a remembered band goes stale rather than being trusted forever', async () => {
+    const h = makeHarness(1);
+    await negotiateOnce(h, 7);
+    const probesBefore = h.calls.filter((c) => c === 'probe').length;
+
+    await h.tick(BAND_CACHE_TTL_MS + 1000);
+    h.room.sendFile(64, 1000, 7);
+    await h.tick(ROOM_TIMING.listenMs + 200);
+
+    expect(h.calls.filter((c) => c === 'probe').length).toBe(probesBefore + 1);
+  });
+
+  it('a broadcast always rolls call, however recently we negotiated', async () => {
+    // A broadcast has no single peer to remember: the right settings are the
+    // room's collective worst case, and a member who joined since the last
+    // send has never been measured at all.
+    const h = makeHarness(1);
+    await negotiateOnce(h, 7);
+    const probesBefore = h.calls.filter((c) => c === 'probe').length;
+
+    h.room.sendFile(64, 1000, 0);
+    await h.tick(ROOM_TIMING.listenMs + 200);
+
+    expect(h.calls.filter((c) => c === 'probe').length).toBe(probesBefore + 1);
   });
 
   it('an isAirBusy that never settles does not wedge carrier sense', async () => {

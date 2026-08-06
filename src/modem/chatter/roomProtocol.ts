@@ -19,6 +19,9 @@
  *     +-------------------------- stop() -------------------------------+
  *
  *   idle --sendFile()--> listening --(quiet)--> rollCall --> collecting
+ *          (no band remembered for this peer — see BAND_CACHE_TTL_MS;
+ *           with one, the probe and the collect window are both skipped:
+ *           idle --sendFile()--> listening --(quiet)--> collecting)
  *     ^                                                          |
  *     |                                 reports==0 / air busy  |  reports>0,
  *     +---------------------- lastError set <--------------------+  air quiet
@@ -204,6 +207,37 @@ export const ROOM_TIMING = {
  */
 export const ROOM_STALL_MS = 20000;
 
+/**
+ * How long a negotiated band may be reused for a peer before it is re-derived.
+ *
+ * A roll call exists to learn which band a peer can hear, and that answer does
+ * not change between two sends a minute apart. Re-deriving it costs a probe
+ * burst, a reply window, and a 12-chunk REPORT over the fixed control band —
+ * the single most failure-prone message the room sends, and the one observed
+ * failing on hardware. So the answer is remembered per peer and the whole
+ * negotiation is skipped on a repeat send.
+ *
+ * A TTL rather than trust-forever, because the thing being remembered is a
+ * property of the ROOM, not of the peer: a phone that moves from a desk to a
+ * hand has a different response, and a stale band fails SILENTLY (we transmit
+ * a whole file into a band the receiver can no longer hear) where a fresh
+ * negotiation fails loudly. Five minutes is long enough to cover a burst of
+ * sends and short enough that a room rearranged between them re-measures.
+ *
+ * NOT a substitute for a real staleness check. The honest signal is the
+ * ordinary probe's own grid: compare what we hear of a peer now against what
+ * we heard when the band was picked, and drop the entry when it moves
+ * materially. That needs the fine-sweep work to be worth wiring up, so for now
+ * the TTL and the rejoin invalidation below carry it.
+ */
+export const BAND_CACHE_TTL_MS = 5 * 60 * 1000;
+
+/** A band negotiated with one peer, and when. */
+interface CachedBand {
+  settings: PickedSettings;
+  atMs: number;
+}
+
 /** A device's real self-knowledge (measured passband/QAM ceiling) arrives in
  *  a later iteration; v1 claims this fixed, sensible default for every WELCOME. */
 const DEFAULT_CLAIM: BestRangeClaim = { lowHz: 1500, highHz: 7800, maxQamOrder: 6 };
@@ -308,6 +342,10 @@ export class RoomProtocol {
   private pendingSendFile: PendingFile | null = null;
   private activeFileParams: PendingFile | null = null;
   private readonly collectedReports = new Map<number, PeerReport>();
+  /** Bands already negotiated, per peer — see BAND_CACHE_TTL_MS. Session
+   *  scoped and never persisted: device ids are re-rolled at random on every
+   *  join, so an id means nothing across sessions. */
+  private readonly bandCache = new Map<number, CachedBand>();
   /**
    * Everything this device owes the air, replies included (see outbox.ts).
    *
@@ -434,6 +472,7 @@ export class RoomProtocol {
     this.awaitingAck.clear();
     this.seenText.clear();
     this.sentText.clear();
+    this.bandCache.clear();
     this.setState('cold');
   }
 
@@ -444,7 +483,48 @@ export class RoomProtocol {
       this.pendingSendFile = { fileBytes, durationMs, targetId };
       return;
     }
-    this.beginRollCall({ fileBytes, durationMs, targetId });
+    this.beginSend({ fileBytes, durationMs, targetId });
+  }
+
+  /**
+   * Start a send: reuse the band we already negotiated with this peer if we
+   * have a fresh one, otherwise roll call for it.
+   *
+   * Broadcasts never reuse. The right settings for a broadcast are the room's
+   * collective worst case, and a member who joined since the last send has
+   * never been measured at all — so there is no single peer whose answer could
+   * stand in for the room's.
+   */
+  private beginSend(fileParams: PendingFile): void {
+    const cached = fileParams.targetId !== 0 ? this.freshBandFor(fileParams.targetId) : undefined;
+    if (!cached) {
+      this.beginRollCall(fileParams);
+      return;
+    }
+    dlog('ROOM', {
+      bandReused: true, peer: fileParams.targetId, us: this.deps.deviceId,
+      ageMs: Math.round(this.deps.now() - (this.bandCache.get(fileParams.targetId)?.atMs ?? 0)),
+    }, { level: 'warn' });
+    this._lastError = null;
+    this.collectedReports.clear();
+    this.activeFileParams = fileParams;
+    this.listenElapsedMs = 0;
+    // Carrier sense still runs. Skipping the NEGOTIATION must not skip
+    // listen-before-talk: FILE_COMING is what arms every receiver, so a peer
+    // transmitting over it leaves us broadcasting a whole file to a room that
+    // never armed (see sendFileComingAndTransmit).
+    this.beginListening('cachedSend');
+  }
+
+  /** The band remembered for `peerId`, if it has not aged out. */
+  private freshBandFor(peerId: number): PickedSettings | undefined {
+    const entry = this.bandCache.get(peerId);
+    if (!entry) return undefined;
+    if (this.deps.now() - entry.atMs > BAND_CACHE_TTL_MS) {
+      this.bandCache.delete(peerId);
+      return undefined;
+    }
+    return entry.settings;
   }
 
   /**
@@ -507,6 +587,14 @@ export class RoomProtocol {
     // still change after the reply is enqueued (see replyPurpose) — the entry
     // itself is deduped on `reply:<id>`, so a repeat probe adds nothing and
     // must not restart a chain that is already in flight.
+    // A 'joining' probe from an id we already hold a band for is a NEW session
+    // behind a recycled number: ids are re-rolled at random (1-255) on every
+    // join, so this may not even be the same device, and its old band means
+    // nothing. Reusing it would transmit a file into a band nobody picked.
+    if (purpose === PROBE_PURPOSE.joining && this.bandCache.delete(deviceId)) {
+      dlog('ROOM', { bandForgotten: 'rejoin', peer: deviceId, us: this.deps.deviceId }, { level: 'warn' });
+    }
+
     this.replyPurpose.set(deviceId, purpose);
     this.outbox.enqueue({
       kind: 'reply',
@@ -742,7 +830,7 @@ export class RoomProtocol {
 
   // ---- join / roll-call carrier-sense (shared 'listening' state) ----
 
-  private beginListening(purpose: 'join' | 'rollCall'): void {
+  private beginListening(purpose: 'join' | 'rollCall' | 'cachedSend'): void {
     this.setState('listening');
     this.guardStall('listening', purpose === 'join' ? 'cold' : 'idle', 'air check');
     this.timer(ROOM_TIMING.listenMs, async () => {
@@ -757,6 +845,7 @@ export class RoomProtocol {
           return;
         }
         if (purpose === 'join') await this.beginAnnounceJoin();
+        else if (purpose === 'cachedSend') await this.announceRememberedBand();
         else await this.beginAnnounceRollCall();
       } catch (err) {
         // A rejected dep (playProbe/isAirBusy/sendMessage) must not stall the
@@ -797,6 +886,31 @@ export class RoomProtocol {
     });
   }
 
+  /**
+   * Announce a file on a band we negotiated earlier, with no probe and no
+   * collect window.
+   *
+   * Enters 'collecting' because that is precisely the state
+   * `sendFileComingAndTransmit` runs in on the normal path — by the time
+   * finishRollCall calls it the collect window has already expired, so
+   * 'collecting' there means "negotiation done, announcement pending", which
+   * is exactly where we are. Sharing the state keeps one set of stale guards
+   * and one stall guard rather than a parallel pair that could drift.
+   */
+  private async announceRememberedBand(): Promise<void> {
+    const target = this.activeFileParams?.targetId ?? 0;
+    const settings = this.freshBandFor(target);
+    if (!settings) {
+      // Aged out between beginSend and here (a busy air check can burn
+      // listenCapMs). Fall back to deriving it properly rather than
+      // transmitting on a band we just decided we no longer trust.
+      if (this.activeFileParams) this.beginRollCall(this.activeFileParams);
+      return;
+    }
+    this.setState('collecting');
+    await this.sendFileComingAndTransmit(settings);
+  }
+
   private beginRollCall(fileParams: PendingFile): void {
     this._lastError = null;
     this.collectedReports.clear();
@@ -828,7 +942,14 @@ export class RoomProtocol {
       this.finishToIdle();
       return;
     }
-    void this.sendFileComingAndTransmit(pickSettings(reports));
+    const settings = pickSettings(reports);
+    // Remember it, so the next send to this peer needs none of this. Only for
+    // an addressed transfer: a broadcast's settings are the room's collective
+    // answer and belong to no single peer (see beginSend).
+    if (target !== 0 && !settings.floor) {
+      this.bandCache.set(target, { settings, atMs: this.deps.now() });
+    }
+    void this.sendFileComingAndTransmit(settings);
   }
 
   private async sendFileComingAndTransmit(settings: PickedSettings): Promise<void> {
@@ -1135,7 +1256,7 @@ export class RoomProtocol {
     if (this.pendingSendFile) {
       const queued = this.pendingSendFile;
       this.pendingSendFile = null;
-      this.beginRollCall(queued);
+      this.beginSend(queued);
     }
   }
 
