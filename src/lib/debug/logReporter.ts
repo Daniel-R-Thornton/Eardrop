@@ -30,37 +30,87 @@ interface ReporterState {
   intervalMs: number;
   backoffMs: number;
   timer: ReturnType<typeof setTimeout> | null;
+  /**
+   * The in-flight push, if any. Both the periodic tick and flushLogReporter
+   * route through runOnce, which joins this promise instead of starting a
+   * second concurrent push — that is what keeps "at most one in-flight push,
+   * at most one live timer" true when a flush lands mid-tick (or two flushes
+   * land back to back). Without it, two pushes read dlogSince at the same
+   * unmoved cursor and the server gets the same rows twice.
+   */
+  pushing: Promise<void> | null;
 }
 let st: ReporterState | null = null;
 const listeners = new Set<() => void>();
-const notify = () => { for (const cb of listeners) cb(); };
+/**
+ * A subscriber that throws must not be able to take the reporter down: from
+ * `arm`'s chain it would surface as an unhandled rejection AND skip the
+ * following `arm(s)` re-schedule (silently killing the reporter forever);
+ * from `flushLogReporter` it would propagate into the caller's click handler.
+ * Either violates "never throws into app code".
+ */
+const notify = () => {
+  for (const cb of listeners) {
+    try {
+      cb();
+    } catch {
+      /* a bad subscriber must not kill the reporter or its caller */
+    }
+  }
+};
 
 const randomId = () => Math.random().toString(36).slice(2, 8);
 
 async function push(s: ReporterState): Promise<void> {
-  const { next, lines } = dlogSince(s.cursor);
-  if (lines.length > 0) {
-    try {
-      const res = await s.fetchFn('/api/log', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ device: s.device, session: s.session, rows: lines }),
-      });
-      if (!res.ok) throw new Error(`status ${res.status}`);
-      s.cursor = next;
-      s.failures = 0;
-    } catch {
-      s.failures += 1; // cursor unmoved: these lines go again next tick
+  try {
+    const { next, lines } = dlogSince(s.cursor);
+    if (lines.length > 0) {
+      try {
+        const res = await s.fetchFn('/api/log', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ device: s.device, session: s.session, rows: lines }),
+        });
+        if (!res.ok) throw new Error(`status ${res.status}`);
+        s.cursor = next;
+        s.failures = 0;
+      } catch {
+        s.failures += 1; // cursor unmoved: these lines go again next tick
+      }
+    } else {
+      s.cursor = next; // adopt even when empty — survives a dlogReset
     }
-  } else {
-    s.cursor = next; // adopt even when empty — survives a dlogReset
+  } catch {
+    /* defensive: dlogSince is not expected to throw, but it must not be able
+     * to take the reporter down either if it somehow did */
+  } finally {
+    notify();
   }
-  notify();
+}
+
+/**
+ * Run exactly one push for `s`, joining an already-in-flight one instead of
+ * starting a second. Callers (the tick timer and flushLogReporter) both go
+ * through this so at most one push is ever outstanding per reporter state.
+ */
+function runOnce(s: ReporterState): Promise<void> {
+  if (s.pushing) return s.pushing;
+  const p = push(s).finally(() => {
+    if (s.pushing === p) s.pushing = null;
+  });
+  s.pushing = p;
+  return p;
 }
 
 function arm(s: ReporterState): void {
   const delay = s.failures >= BACKOFF_AFTER ? s.backoffMs : s.intervalMs;
-  s.timer = setTimeout(() => { void push(s).then(() => { if (st === s) arm(s); }); }, delay);
+  s.timer = setTimeout(() => {
+    // Null out first: by the time this fires the id is spent, and leaving it
+    // set would make a concurrent flushLogReporter's clearTimeout a no-op on
+    // a stale id instead of the no-op-because-already-null it should be.
+    s.timer = null;
+    void runOnce(s).then(() => { if (st === s) arm(s); });
+  }, delay);
 }
 
 export function startLogReporter(opts: {
@@ -77,6 +127,7 @@ export function startLogReporter(opts: {
     intervalMs: opts.intervalMs ?? INTERVAL_MS,
     backoffMs: opts.backoffMs ?? BACKOFF_MS,
     timer: null,
+    pushing: null,
   };
   st = s;
   void (async () => {
@@ -96,9 +147,16 @@ export function startLogReporter(opts: {
 export async function flushLogReporter(): Promise<void> {
   const s = st;
   if (!s || !s.enabled) return;
-  if (s.timer) clearTimeout(s.timer);
-  await push(s);
-  if (st === s) arm(s);
+  if (s.timer) {
+    clearTimeout(s.timer);
+    s.timer = null;
+  }
+  // Joins an in-flight tick's push via runOnce rather than starting a second
+  // one (same cursor, same rows — would duplicate them on the server).
+  await runOnce(s);
+  // If a joined tick already re-armed while we were awaiting, don't do it
+  // again — that is exactly the double-arm this function used to cause.
+  if (st === s && !s.timer) arm(s);
 }
 
 export function logReporterEnabled(): boolean {

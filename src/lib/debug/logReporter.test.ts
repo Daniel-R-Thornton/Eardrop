@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { dlog, dlogReset } from './dlog';
 import {
-  flushLogReporter, logReporterEnabled, startLogReporter, stopLogReporter,
+  flushLogReporter, logReporterEnabled, onLogReporterChange, startLogReporter, stopLogReporter,
 } from './logReporter';
 
 /** fetch stub: GET probe → probeStatus; POST → shift the next scripted status. */
@@ -80,6 +80,65 @@ describe('logReporter', () => {
     await settle();
     dlog('T', { x: 1 });
     await flushLogReporter();
+    expect(posts).toHaveLength(1);
+  });
+
+  it('a flush that arrives while a tick push is still in flight does not double the timer or duplicate rows', async () => {
+    const posts: { rows: string[] }[] = [];
+    let resolvePost: ((res: Response) => void) | undefined;
+    const fetchFn = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      if (!init || init.method !== 'POST') return new Response(null, { status: 204 });
+      posts.push(JSON.parse(String(init.body)));
+      // Never resolves on its own — the test controls exactly when the
+      // in-flight POST completes, so it can land a flush mid-request.
+      return new Promise<Response>((resolve) => { resolvePost = resolve; });
+    });
+    startLogReporter({ device: 'd', fetchFn: fetchFn as unknown as typeof fetch });
+    await settle();
+
+    dlog('T', { x: 1 });
+    await vi.advanceTimersByTimeAsync(5000); // tick fires; POST is now pending
+    expect(posts).toHaveLength(1);
+
+    // Flush arrives while that POST is still in flight (e.g. a double-tap of
+    // the panel button, or the panel button during a live tick).
+    const flushPromise = flushLogReporter();
+    await Promise.resolve(); // let flushLogReporter's synchronous prefix run
+    expect(posts).toHaveLength(1); // must join the in-flight push, not start a second
+
+    if (resolvePost) resolvePost(new Response(null, { status: 204 }));
+    await flushPromise;
+    await settle();
+
+    expect(posts).toHaveLength(1); // the same row never went out twice
+    expect(vi.getTimerCount()).toBe(1); // exactly one live timer remains armed
+  });
+
+  it('a throwing subscriber does not kill the reporter or propagate out of flushLogReporter', async () => {
+    const { fetchFn, posts } = makeFetch(204, []);
+    startLogReporter({ device: 'd', fetchFn });
+    await settle();
+    onLogReporterChange(() => { throw new Error('boom'); });
+
+    dlog('T', { x: 1 });
+    await expect(flushLogReporter()).resolves.toBeUndefined();
+    expect(posts).toHaveLength(1);
+    expect(logReporterEnabled()).toBe(true);
+
+    dlog('T', { x: 2 });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(posts).toHaveLength(2);
+  });
+
+  it('a throwing subscriber registered before the probe resolves does not leave the reporter enabled-but-unarmed', async () => {
+    const { fetchFn, posts } = makeFetch(204, []);
+    onLogReporterChange(() => { throw new Error('boom'); });
+    startLogReporter({ device: 'd', fetchFn });
+    await settle();
+    expect(logReporterEnabled()).toBe(true);
+
+    dlog('T', { x: 1 });
+    await vi.advanceTimersByTimeAsync(5000);
     expect(posts).toHaveLength(1);
   });
 });
