@@ -17,6 +17,11 @@ const MAX_LINE_LEN = 100; // tight lines: max data, min context
 const ring: string[] = [];
 const rateCounters = new Map<string, number>();
 
+/** Lines ever pushed to the ring, including evicted ones — the sequence space
+ *  dlogSince cursors live in. Reset with the ring (dlogReset), which dlogSince
+ *  callers survive by always adopting the returned cursor. */
+let totalEmitted = 0;
+
 /**
  * Structured mirror of the ring: the same events, but as {tag, fields} rather
  * than formatted text.
@@ -122,6 +127,7 @@ export function dlogInjectRecord(rec: DlogRecord): void {
 /** Push to ring, evicting oldest when full. Adjusts redrawEmitted so
  *  incremental flushes stay aligned after ring shifts. */
 function ringPush(line: string): void {
+  totalEmitted++;
   ring.push(line);
   if (ring.length > RING_MAX) {
     ring.shift();
@@ -303,6 +309,25 @@ export function dlogDump(count = 200): string {
   return ring.slice(-count).join('\n');
 }
 
+/**
+ * Incremental read of the ring for the LAN log reporter: everything emitted
+ * after cursor `seq`, plus the cursor to resume from. Clamped on both sides —
+ * a cursor older than the ring's tail yields what survives (eviction loses
+ * lines, it must not fabricate them), and a cursor from before a dlogReset
+ * (now larger than totalEmitted) yields the current head rather than an
+ * empty result forever. Callers always adopt `next`.
+ */
+export function dlogSince(seq: number): { next: number; lines: string[] } {
+  const floor = totalEmitted - ring.length;
+  // A cursor beyond totalEmitted can only mean a dlogReset happened underneath
+  // the caller (the counter restarted at 0). Clamping it down to totalEmitted
+  // (as if "already caught up") would silently swallow every line emitted
+  // between the reset and this call. Snapping to floor instead hands back
+  // everything currently in the ring, so the caller converges in one step.
+  const start = seq > totalEmitted ? floor : Math.max(seq, floor);
+  return { next: totalEmitted, lines: ring.slice(ring.length - (totalEmitted - start)) };
+}
+
 /** Structured records, for aggregation (see DlogRecord). */
 export function dlogRecords(count = RING_MAX): DlogRecord[] {
   return records.slice(-count);
@@ -328,4 +353,5 @@ export function dlogReset(): void {
   rateCounters.clear();
   dupState.clear();
   redrawEmitted = 0;
+  totalEmitted = 0;
 }
