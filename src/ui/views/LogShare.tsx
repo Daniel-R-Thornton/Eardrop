@@ -11,9 +11,10 @@
  * Everything is local — the text goes to the OS share sheet or a file the
  * user chooses to send. Nothing is uploaded anywhere.
  */
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState, useSyncExternalStore } from 'react';
 import { dlogDump, dlogRecords, DLOG_RING_MAX } from '../../lib/debug/dlog';
 import { compressRecords } from '../../lib/debug/llmDump';
+import { flushLogReporter, logReporterEnabled, onLogReporterChange } from '../../lib/debug/logReporter';
 import { T } from '../theme/labaccent/tokens';
 
 const btn = (accent = false): React.CSSProperties => ({
@@ -26,6 +27,11 @@ const btn = (accent = false): React.CSSProperties => ({
 export function LogShare({ onClose }: { onClose: () => void }) {
   const [compact, setCompact] = useState(true);
   const [note, setNote] = useState<string | null>(null);
+
+  // onLogReporterChange is a stable module-level function (not a fresh lambda
+  // per render), so passing it directly here doesn't resubscribe every
+  // render. No getServerSnapshot: this view is never server-rendered.
+  const pcConnected = useSyncExternalStore(onLogReporterChange, logReporterEnabled);
 
   // Snapshot per view/toggle rather than per render: the log keeps growing
   // while this panel is open, and text shifting under a finger mid-select is
@@ -85,6 +91,28 @@ export function LogShare({ onClose }: { onClose: () => void }) {
         <button style={btn()} onClick={download}>download</button>
         <button style={btn()} onClick={copy}>copy</button>
         <button style={btn()} onClick={onClose}>close</button>
+        {pcConnected && (
+          <>
+            {/* Only rendered once startLogReporter's startup probe has
+             *  succeeded — absent on GitHub Pages, where no LAN server
+             *  exists to send to. */}
+            <span style={{ fontFamily: T.mono, fontSize: 11, color: T.phosphor }}>
+              PC: connected
+            </span>
+            <button
+              type="button"
+              style={btn(true)}
+              onClick={() => {
+                void flushLogReporter().then(
+                  () => flash('sent to PC'),
+                  () => flash('send failed'),
+                );
+              }}
+            >
+              send to PC
+            </button>
+          </>
+        )}
       </div>
       {note && (
         <div style={{ fontFamily: T.mono, fontSize: 11, color: T.amber }}>{note}</div>
