@@ -3,7 +3,7 @@
  * hero and the RX view. Owns the pipeline playhead and mirrors its state + the
  * chosen speed into the Store.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type CSSProperties } from 'react';
 import { dlogDump, dlogRecords, DLOG_RING_MAX } from '../lib/debug/dlog';
 import { LogShare } from './views/LogShare';
 import { compressRecords } from '../lib/debug/llmDump';
@@ -97,6 +97,24 @@ export function BenchApp() {
 
   const dispatch = (type: string) => window.dispatchEvent(new CustomEvent(type));
 
+  /**
+   * The header's action buttons. Extracted because all five repeated the same
+   * base declaration, and the one thing they all got wrong had to be fixed five
+   * times: `padding: '5px 12px'` at fontSize 12 rendered them 28px tall, well
+   * under the 44px touch floor the room page honours throughout. This header is
+   * on screen in room mode too — the surface that is actually driven from a
+   * phone — so `◎ room mode` and `▤ log` were thumb targets all along.
+   *
+   * `active` drives the highlighted state the toggles and the copy buttons share.
+   */
+  const headerBtn = (active: boolean): CSSProperties => ({
+    fontFamily: T.mono, fontSize: 12, minHeight: 44, padding: '0 12px',
+    borderRadius: T.radius, cursor: 'pointer', whiteSpace: 'nowrap',
+    border: `1px solid ${active ? T.phosphor : T.panelEdge}`,
+    background: active ? T.phosphorDim : 'rgba(0,0,0,0.04)',
+    color: active ? T.phosphor : T.panelInk,
+  });
+
   return (
     <div
       style={{
@@ -106,7 +124,14 @@ export function BenchApp() {
         // packet/roster panels handle their own internal scrolling instead
         // of the whole page growing taller. Every other mode keeps the
         // original "grow with content" page scroll unchanged.
-        height: inRoom ? '100vh' : undefined,
+        //
+        // dvh, not vh. On mobile 100vh is the LARGE viewport — the height the
+        // page would have with the URL bar retracted — so with overflow hidden
+        // the bottom of the room column sat off-screen with no page scroll left
+        // to reach it. dvh tracks the height actually visible. Where it is
+        // unsupported the declaration is dropped and behaviour falls back to
+        // minHeight: 100vh above, i.e. exactly what this did before.
+        height: inRoom ? '100dvh' : undefined,
         overflow: inRoom ? 'hidden' : undefined,
         display: 'flex',
         flexDirection: 'column',
@@ -117,13 +142,22 @@ export function BenchApp() {
         boxSizing: 'border-box',
       }}
     >
-      {/* header */}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+      {/* header — WRAPS. Unwrapped, the five action buttons plus the wordmark
+          ran 215px off the right edge of a 390px phone, and `space-between`
+          cannot recover from that: with no room to distribute, the last buttons
+          simply leave the screen. The room page reaches its own log and back
+          controls from its own header, but this bar is what is on screen
+          everywhere else. flexWrap plus `marginLeft: auto` on the button group
+          keeps one row on a desktop and stacks on a phone. */}
+      <div style={{
+        display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10, rowGap: 8,
+        marginBottom: 12,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
           <h1 style={{ margin: 0, fontSize: 22, letterSpacing: 2, fontWeight: 800 }}>◢◤ EARDROP</h1>
           <span style={{ fontSize: 11, opacity: 0.7 }}>signal bench · sound ↔ data</span>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginLeft: 'auto' }}>
           {/* Session export. Lives in the main header rather than the
               Ctrl+Shift+D debug overlay, because that overlay is not where the
               work happens and a diagnostic nobody can find is a diagnostic
@@ -131,57 +165,33 @@ export function BenchApp() {
           <button
             onClick={copyLlmDump}
             title="Compressed session digest for an LLM — per-tone arrays reduced to stats (docs/dump-format.md)"
-            style={{
-              fontFamily: T.mono, fontSize: 12, padding: '5px 12px', borderRadius: T.radius,
-              cursor: 'pointer', border: `1px solid ${copiedLlm ? T.phosphor : T.panelEdge}`,
-              background: copiedLlm ? T.phosphorDim : 'rgba(0,0,0,0.04)',
-              color: copiedLlm ? T.phosphor : T.panelInk,
-            }}
+            style={headerBtn(copiedLlm)}
           >
             {copiedLlm ? '✓ copied' : '⧉ LLM dump'}
           </button>
           <button
             onClick={copyRawLog}
             title="Copy the raw human-readable session log"
-            style={{
-              fontFamily: T.mono, fontSize: 12, padding: '5px 12px', borderRadius: T.radius,
-              cursor: 'pointer', border: `1px solid ${copiedRaw ? T.phosphor : T.panelEdge}`,
-              background: copiedRaw ? T.phosphorDim : 'rgba(0,0,0,0.04)',
-              color: copiedRaw ? T.phosphor : T.panelInk,
-            }}
+            style={headerBtn(copiedRaw)}
           >
             {copiedRaw ? '✓ copied' : '⧉ raw log'}
           </button>
           <button
             onClick={() => setShowLog(true)}
             title="Read, share or download the session log — the only way to see it on a phone"
-            style={{
-              fontFamily: T.mono, fontSize: 12, padding: '5px 12px', borderRadius: T.radius,
-              cursor: 'pointer', border: `1px solid ${T.panelEdge}`,
-              background: 'rgba(0,0,0,0.04)', color: T.panelInk,
-            }}
+            style={headerBtn(false)}
           >
             ▤ log
           </button>
           <button
             onClick={() => { setPresenting((p) => !p); setInRoom(false); }}
-            style={{
-              fontFamily: T.mono, fontSize: 12, padding: '5px 12px', borderRadius: T.radius, cursor: 'pointer',
-              border: `1px solid ${presenting ? T.phosphor : T.panelEdge}`,
-              background: presenting ? T.phosphorDim : 'rgba(0,0,0,0.04)',
-              color: presenting ? T.phosphor : T.panelInk,
-            }}
+            style={headerBtn(presenting)}
           >
             {presenting ? '◱ bench' : '▶ presentation'}
           </button>
           <button
             onClick={() => { setInRoom((r) => !r); setPresenting(false); }}
-            style={{
-              fontFamily: T.mono, fontSize: 12, padding: '5px 12px', borderRadius: T.radius, cursor: 'pointer',
-              border: `1px solid ${inRoom ? T.phosphor : T.panelEdge}`,
-              background: inRoom ? T.phosphorDim : 'rgba(0,0,0,0.04)',
-              color: inRoom ? T.phosphor : T.panelInk,
-            }}
+            style={headerBtn(inRoom)}
           >
             {inRoom ? '◱ bench' : '◎ room mode'}
           </button>

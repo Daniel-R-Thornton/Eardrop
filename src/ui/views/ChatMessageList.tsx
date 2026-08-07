@@ -12,7 +12,7 @@ import { type CSSProperties } from 'react';
 import { type ChatMessage } from '../Store';
 import { T } from '../theme/labaccent/tokens';
 import { textAirSeconds } from './chatAirTime';
-import { hex } from './roomModeFormat';
+import { fileSize, hex } from './roomModeFormat';
 
 /**
  * States in which the outbox can actually transmit. Anywhere else a queued
@@ -47,7 +47,11 @@ export function ChatMessageList({
 
   if (messages.length === 0) {
     return (
-      <div style={{ ...row, opacity: 0.6, padding: 8 }}>
+      // Same flex contract as the populated branch below: shrinkable, with
+      // minHeight 0. At the default `0 1 auto` this placeholder refused to give
+      // any height back, so on a phone the chat panel could not fit its own
+      // composer and clipped the send button away.
+      <div style={{ ...row, opacity: 0.6, padding: 8, overflowY: 'auto', minHeight: 0, flex: '1 1 auto' }}>
         no messages yet — say something to the room
       </div>
     );
@@ -66,9 +70,23 @@ export function ChatMessageList({
             {m.targetId !== 0 && (
               <span style={meta}>{mine ? `→ ${hex(m.targetId)}` : 'to you'}</span>
             )}
-            <div style={{ color: T.panelInk, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-              {m.text}
-            </div>
+            {m.file ? (
+              <div style={{ color: T.panelInk }}>
+                <span style={{ opacity: 0.7 }}>shared a file </span>
+                <a
+                  href={m.file.url}
+                  download={m.file.name}
+                  style={{ color: T.amber, wordBreak: 'break-all' }}
+                >
+                  {m.file.name}
+                </a>
+                <span style={meta}>{fileSize(m.file.size)}</span>
+              </div>
+            ) : (
+              <div style={{ color: T.panelInk, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                {m.text}
+              </div>
+            )}
             {status && (
               <div style={{ ...meta, marginLeft: 0 }}>
                 {status}

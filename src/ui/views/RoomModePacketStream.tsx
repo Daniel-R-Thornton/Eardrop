@@ -34,7 +34,7 @@ export function PacketStream({ packets, now }: { packets: ChatterPacket[]; now: 
   }
   const rows = [...packets].reverse();
   return (
-    <div style={{ height: '100%', overflowY: 'auto', fontFamily: T.mono, fontSize: 11 }}>
+    <div style={{ height: '100%', overflowY: 'auto', overflowX: 'hidden', fontFamily: T.mono, fontSize: 11 }}>
       {rows.map((p) => (
         <div
           key={p.seq}
@@ -48,7 +48,14 @@ export function PacketStream({ packets, now }: { packets: ChatterPacket[]; now: 
           <span style={{ opacity: 0.75, minWidth: 30 }}>{p.peerId !== undefined ? hex(p.peerId) : '--'}</span>
           <span style={{ opacity: 0.6, minWidth: 46, textAlign: 'right' }}>{p.bytes}B</span>
           <span style={{ opacity: 0.5, minWidth: 34, textAlign: 'right' }}>{formatAgoShort(now - p.tMs)}</span>
-          {p.note && <span style={{ opacity: 0.55, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.note}</span>}
+          {/* minWidth 0 is what makes the ellipsis above actually work. A flex
+              item defaults to `min-width: auto`, i.e. it refuses to shrink
+              below its own content width — so this span grew to fit the whole
+              note, textOverflow never engaged, and the row burst sideways out
+              of the panel. The fixed columns to the left already cost ~214px of
+              a phone's ~338px of panel width, so any note of normal length
+              overflowed. */}
+          {p.note && <span style={{ opacity: 0.55, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.note}</span>}
         </div>
       ))}
     </div>

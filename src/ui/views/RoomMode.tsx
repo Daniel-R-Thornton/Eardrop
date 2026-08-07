@@ -110,12 +110,53 @@ function hashAngle(deviceId: number): number {
   return ((h >>> 0) % 10000 / 10000) * Math.PI * 2;
 }
 
+/**
+ * Floor for the chat panel, in px. Measured from the rendered page at 390px
+ * wide, not chosen: 10px of panel padding top and bottom, a 17px CHAT title,
+ * the 117px composer at its tallest (recipient picker + byte counter + disabled
+ * notice + input row), and ~20px for one line of transcript. Anything less and
+ * the panel cannot fit the send button.
+ */
+const CHAT_MIN_HEIGHT = 184;
+
+/** Side of the invisible square hit-target laid over each node on the canvas.
+ *  44px is the smallest comfortable touch target and a node is selected with a
+ *  thumb. Shared with graphMetrics below, which has to reserve room for it. */
+const NODE_TARGET_PX = 44;
+/** Range of `radius` a node is given (see the nodes map in RoomMode): the
+ *  strongest link sits closest in, the weakest/unmeasured furthest out.
+ *  graphMetrics needs the maximum to know where the outermost node will
+ *  actually land, so both ends live here rather than as literals at the site. */
+const MIN_NODE_RADIUS = 0.22;
+const MAX_NODE_RADIUS = 0.92;
+
 /** Shared centre/radius geometry — used by both the canvas draw and the
- *  overlay hit-targets so they can never desync. */
+ *  overlay hit-targets so they can never desync.
+ *
+ * R reserves room for a WHOLE hit-target inside the box, which is the load-
+ * bearing part. At the bare `min(w,h) * 0.44` this used to return, the
+ * outermost node (radius 0.92) lands 0.405 * min(w,h) from the centre — in the
+ * 120px-tall box the graph floors at on a phone, that is y ~= 108.6, and its
+ * 44px circle reaches ~130.6, about 11px BELOW the box. Those circles are
+ * positioned elements, so CSS paints them above the later, non-positioned
+ * action-button row whatever the DOM order, and they carry pointerEvents:auto
+ * — so they overlaid `send file` and `JOIN ROOM` and swallowed the taps meant
+ * for them. The two controls that put anything on the air were unreachable on
+ * the device this page exists to be driven from.
+ *
+ * The clamp belongs HERE and nowhere else: the canvas draw and the overlay both
+ * read their geometry from this function, so neither can drift from the other.
+ * The graph box also clips its overflow now, but that is the safety net for a
+ * stale measurement — not a substitute for placing nodes where they fit.
+ */
 function graphMetrics(w: number, h: number) {
   const cx = w / 2;
   const cy = h / 2;
-  const R = Math.min(w, h) * 0.44;
+  const half = Math.min(w, h) / 2;
+  const R = Math.max(0, Math.min(
+    half * 0.88,
+    (half - NODE_TARGET_PX / 2) / MAX_NODE_RADIUS,
+  ));
   return { cx, cy, R };
 }
 function nodeXY(w: number, h: number, angle: number, radius: number) {
@@ -314,8 +355,10 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
   const nodes = members.map((m) => {
     const angle = hashAngle(m.deviceId);
     const strength = linkStrength(m.linkDb);
-    // radius: 0.22 (strong link, close) .. 0.92 (weak/unmeasured, far)
-    const radius = 0.22 + (1 - strength) * 0.70;
+    // radius: 0.22 (strong link, close) .. MAX_NODE_RADIUS (weak/unmeasured,
+    // far). Derived from the constant rather than a second literal 0.92, so
+    // graphMetrics's room-for-a-hit-target clamp stays true to what this emits.
+    const radius = MIN_NODE_RADIUS + (1 - strength) * (MAX_NODE_RADIUS - MIN_NODE_RADIUS);
     const ageMs = now - m.lastHeardMs;
     const agedOut = ageMs > AGE_OUT_MS;
     return { m, angle, radius, strength, ageMs, agedOut };
@@ -442,14 +485,16 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
     ctx.stroke();
   };
 
-  const btn = (active: boolean, tone: 'phosphor' | 'amber' = 'phosphor'): CSSProperties => {
-    const color = tone === 'amber' ? T.amber : T.phosphor;
-    return {
-      fontFamily: T.mono, fontSize: 11, padding: '3px 9px', borderRadius: 4, cursor: 'pointer',
-      border: `1px solid ${active ? color : T.panelEdge}`,
-      background: active ? (tone === 'amber' ? 'rgba(255,176,58,0.18)' : T.phosphorDim) : 'transparent',
-      color: active ? color : T.panelInk,
-    };
+  /** The two header navigation buttons (log, back to bench). minHeight 44 for
+   *  the same reason CollapsibleSection, ChatComposer and actionBtn use it —
+   *  this page is driven with a thumb. This replaced a `btn(active, tone)`
+   *  factory whose padding of '3px 9px' at fontSize 11 rendered about 19px
+   *  tall; its active/amber branches were dead, since both call sites only ever
+   *  passed `false`. */
+  const navBtn: CSSProperties = {
+    fontFamily: T.mono, fontSize: 12, minHeight: 44, padding: '0 12px',
+    borderRadius: 4, cursor: 'pointer', whiteSpace: 'nowrap',
+    border: `1px solid ${T.panelEdge}`, background: 'transparent', color: T.panelInk,
   };
   /** The two primary actions. `flex: 1 1 0` so they split the width evenly
    *  whatever their labels say, and minHeight 44 because this page is driven
@@ -461,11 +506,31 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
     border: `1px solid ${T.panelEdge}`, borderRadius: T.radius,
     background: T.panel, color: T.panelInk,
   };
+  /**
+   * A section's box. Every consumer is a child of the one scrolling column, and
+   * a panel that does not contain its own contents overflows onto whatever
+   * follows it rather than growing the column.
+   *
+   * `overflow: hidden` + `minWidth: 0` are the containment half of that, and
+   * both are needed. minWidth 0 because a flex child defaults to
+   * `min-width: auto` and so refuses to shrink below its content — mono text
+   * and canvases both happily demand more width than a 390px phone has.
+   * overflow hidden because absolutely-positioned children (the spectrum
+   * canvas) and unshrinkable rows (the packet stream) otherwise paint outside
+   * the border, and being positioned they land ON their siblings.
+   *
+   * Callers that scroll re-declare the axis they need AFTER spreading this —
+   * `overflowY: 'auto'` on the roster, for instance. A longhand after the
+   * shorthand wins on that axis and leaves overflowX clipped, which is exactly
+   * the wanted pairing: scroll vertically, never sideways.
+   */
   const panel = (highlight = false): CSSProperties => ({
     background: T.panel,
     border: `1px solid ${highlight ? T.phosphor : T.panelEdge}`,
     borderRadius: T.radius,
     padding: 10,
+    minWidth: 0,
+    overflow: 'hidden',
     boxShadow: highlight ? `0 0 0 1px ${T.phosphorDim}` : undefined,
   });
   const title: CSSProperties = { fontFamily: T.mono, fontSize: 11, letterSpacing: 1, color: T.panelInk, opacity: 0.8, marginBottom: 6 };
@@ -492,6 +557,17 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
     if (s.chatterState !== 'idle') {
       dlog('UI', { fileRejected: 'busy', state: s.chatterState, name: f.name }, { level: 'warn' });
       setLocalNotice(`Busy (${s.chatterState}) — wait until the room is idle, then drop again.`);
+      return;
+    }
+    // An empty file is not a cheap send, it is a full-price one that delivers
+    // nothing: splitDataIntoFrames floors at one frame, so the room pays a roll
+    // call, a FILE_COMING and the whole transfer's airtime to put a padded
+    // empty payload on the air. On a hardware run that produced a receiver log
+    // identical in shape to a real transfer that failed to decode — a band card,
+    // a clean hop, then silence — and cost a session to tell the two apart.
+    if (f.size === 0) {
+      dlog('UI', { fileRejected: 'empty', name: f.name }, { level: 'warn' });
+      setLocalNotice(`"${f.name}" is empty — nothing to send.`);
       return;
     }
     setLocalNotice(null);
@@ -523,7 +599,14 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
       onDragOver={(e) => { e.preventDefault(); if (!dragging) setDragging(true); }}
       onDragLeave={(e) => { if (e.currentTarget === e.target) setDragging(false); }}
       onDrop={(e) => { e.preventDefault(); offerFile(e.dataTransfer.files?.[0], 0); }}
-      style={{ display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0, position: 'relative' }}
+      // paddingBottom clears the home indicator on a notched phone. BenchApp
+      // pins this mode to the viewport with overflow hidden, so without it the
+      // last thing in the column — the chat composer — sits under the system
+      // gesture area, where a tap belongs to the OS rather than to us.
+      style={{
+        display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0,
+        position: 'relative', paddingBottom: 'env(safe-area-inset-bottom)',
+      }}
     >
       <input
         id="roommode-file"
@@ -542,9 +625,20 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
         </div>
       )}
       {showLog && <LogShare onClose={() => setShowLog(false)} />}
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10, flex: '0 0 auto' }}>
+      {/* WRAPS rather than switching layout at a breakpoint. Unwrapped, this
+       *  row carried ~430px of content — a 15px-mono title, the state pill and
+       *  two nav buttons — into a 390px phone viewport, and `space-between`
+       *  simply overflowed it. flexWrap plus `marginLeft: auto` on the button
+       *  group gives one space-between row at desktop width and two stacked
+       *  rows on a phone, from a single declaration. A media query would mean a
+       *  second layout tree to keep in step, which is exactly what this file's
+       *  one-column-at-every-width rule exists to avoid. */}
+      <div style={{
+        display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8, rowGap: 8,
+        marginBottom: 10, flex: '0 0 auto',
+      }}>
         <span style={{ fontFamily: T.mono, fontSize: 15, letterSpacing: 1, color: T.panelInk }}>ROOM MODE — nodes &amp; packets</span>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginLeft: 'auto' }}>
           <span style={{
             fontFamily: T.mono, fontSize: 11, padding: '3px 10px', borderRadius: 4,
             border: `1px solid ${s.chatterOn ? T.phosphor : T.panelEdge}`,
@@ -558,8 +652,8 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
               it is one of the two things that put something on the air, and it
               belongs at a thumb-sized target next to "send file" rather than
               squeezed into a header beside two navigation buttons. */}
-          <button onClick={() => setShowLog(true)} style={btn(false)}>▤ log</button>
-          <button onClick={onExit} style={btn(false)}>← back to bench</button>
+          <button onClick={() => setShowLog(true)} style={navBtn}>▤ log</button>
+          <button onClick={onExit} style={navBtn}>← back to bench</button>
         </div>
       </div>
 
@@ -567,8 +661,14 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
        *  half duplex over real speakers and mics: if it plays out of the wrong
        *  output the room never hears it, so the devices in use belong on
        *  screen next to the phase rather than buried in the bench settings. */}
+      {/* Wraps for the same reason as the header row: at phone width the phase
+       *  sentence and the mic/out line together overrun a single row, and
+       *  `space-between` crushed the phase text — the one line that says
+       *  whether the radio is working. Wrapped, the device line drops beneath
+       *  it instead. */}
       <div style={{
-        display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12,
+        display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between',
+        alignItems: 'baseline', gap: 12, rowGap: 4,
         marginBottom: 10, flex: '0 0 auto', fontFamily: T.mono, fontSize: 11,
       }}>
         <span style={{ color: s.chatterOn ? T.phosphor : T.panelInk, opacity: s.chatterOn ? 1 : 0.7 }}>
@@ -614,7 +714,16 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
            *  viewport, and a 220px floor here plus the other hard minimums
            *  pushed the chat composer past the clip line on a phone. 120px
            *  still gives the graph a ~53px radius, enough for the node labels. */}
-          <div ref={graphBoxRef} style={{ position: 'relative', flex: '1 1 0', minHeight: 120 }}>
+          {/* overflow hidden is the safety net under graphMetrics's clamp, and
+           *  it is not redundant with it. Every child here is absolutely
+           *  positioned, so a measurement that lags a shrink — the canvas is
+           *  sized in fixed px from the last measured box — leaves a child
+           *  larger than the box it sits in. Positioned elements paint above
+           *  the later, non-positioned action-button row whatever the DOM
+           *  order says, so anything that escapes lands ON the two buttons
+           *  that put something on the air. Clip once, here, and no
+           *  measurement race can reach them. */}
+          <div ref={graphBoxRef} style={{ position: 'relative', flex: '1 1 0', minHeight: 120, overflow: 'hidden' }}>
             {graphSize.w > 0 && graphSize.h > 0 && (
               <>
                 {/* Absolutely positioned so the canvas contributes NOTHING to
@@ -635,13 +744,18 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
                         onMouseEnter={() => setHoveredId(n.m.deviceId)}
                         onMouseLeave={() => setHoveredId((h2) => (h2 === n.m.deviceId ? null : h2))}
                         onClick={() => setSelectedId((sel) => (sel === n.m.deviceId ? null : n.m.deviceId))}
-                        // 44px, not the 24px this started as: a node is
-                        // selected with a thumb on a phone, and 24px is well
-                        // under a comfortable touch target. The offsets are
-                        // half the size so the circle stays centred on the
-                        // node the canvas drew at the same (x, y).
+                        // NODE_TARGET_PX (44), not the 24px this started as: a
+                        // node is selected with a thumb on a phone, and 24px is
+                        // well under a comfortable touch target. The offsets are
+                        // half the size so the circle stays centred on the node
+                        // the canvas drew at the same (x, y). The constant is
+                        // shared with graphMetrics, which reserves exactly this
+                        // much room at the edge — read from one place so the two
+                        // cannot drift and start spilling onto the buttons.
                         style={{
-                          position: 'absolute', left: x - 22, top: y - 22, width: 44, height: 44,
+                          position: 'absolute',
+                          left: x - NODE_TARGET_PX / 2, top: y - NODE_TARGET_PX / 2,
+                          width: NODE_TARGET_PX, height: NODE_TARGET_PX,
                           borderRadius: '50%', pointerEvents: 'auto', cursor: 'pointer',
                         }}
                         title={`${hex(n.m.deviceId)} · ${formatAgo(n.ageMs)}${n.m.linkDb !== undefined ? ` · ${n.m.linkDb.toFixed(0)}dB` : ''}`}
@@ -737,7 +851,12 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
             {/* 90px basis, but shrinkable: the column lives inside a pinned
              *  viewport, so every box that CAN give height back should. The
              *  minHeight floors it at 60 either way. */}
-            <div ref={spectrumBoxRef} style={{ position: 'relative', flex: '1 1 90px', minHeight: 60 }}>
+            {/* overflow hidden for the same reason as the graph box: the canvas
+             *  inside is absolutely positioned at a fixed px size taken from the
+             *  last measurement, so any lag behind a shrink leaves it larger
+             *  than this box — and a positioned child paints above the
+             *  non-positioned siblings that follow. */}
+            <div ref={spectrumBoxRef} style={{ position: 'relative', flex: '1 1 90px', minHeight: 60, overflow: 'hidden' }}>
               {spectrumSize.w > 0 && spectrumSize.h > 0 && (
                 // Out of flow for the same reason as the graph canvas above.
                 <div style={{ position: 'absolute', inset: 0 }}>
@@ -762,10 +881,19 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
         </CollapsibleSection>
 
         {/* Chat — flexes so it takes the space the collapsed panels give back.
-         *  The floor is 120, down from 160, for the same budget reason as the
-         *  graph box: the composer plus one line of transcript is what has to
-         *  survive on a phone, and anything above that is slack it can claim. */}
-        <div style={{ ...panel(false), display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 120 }}>
+         *  The composer plus one line of transcript is what has to survive on a
+         *  phone, and anything above that is slack it can claim.
+         *
+         *  The floor is CHAT_MIN_HEIGHT, measured rather than guessed. At the
+         *  120 it was, this panel could not fit its own contents: the composer
+         *  alone renders 117px (recipient picker, byte counter, the disabled
+         *  notice, then the input row), and with the title above it the panel
+         *  needed 203. It was flexed down to 120 anyway and the send button was
+         *  simply gone — clipped, once panel() started containing its overflow;
+         *  painted over the section below, before that. Where the whole column
+         *  no longer fits, the column scrolls; that is what its overflowY is
+         *  for, and it is the right trade against an unreachable send button. */}
+        <div style={{ ...panel(false), display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: CHAT_MIN_HEIGHT }}>
           <div style={title}>CHAT</div>
           <ChatMessageList
             messages={s.chatterMessages}

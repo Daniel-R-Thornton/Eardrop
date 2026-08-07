@@ -54,9 +54,32 @@ export function CollapsibleSection({
   };
   return (
     <div style={{
-      display: 'flex', flexDirection: 'column', minHeight: 0,
-      // Only when open: a shut section is a strip, whatever `grow` says.
-      flex: grow && open ? '1 1 auto' : undefined,
+      display: 'flex', flexDirection: 'column',
+      // `0 0 auto` for a non-growing section — it must NOT shrink. This was
+      // `undefined` (i.e. the default `0 1 auto`) alongside an unconditional
+      // `minHeight: 0`, which together said "you may be squashed to nothing".
+      // In RoomMode's height-constrained column that is exactly what happened
+      // on a phone: every section was compressed below its own content height,
+      // and since the root does not clip, its contents painted straight over
+      // the section beneath. The roster's text landed under the SPECTRUM
+      // header, the spectrum's under its canvas, the packet list's under CHAT.
+      //
+      // Refusing to shrink is right because the column that holds these
+      // sections is `overflowY: auto`. Excess height is meant to become scroll,
+      // not overlap. Only the growing section keeps minHeight 0, because it is
+      // the one that is supposed to absorb and give back the surplus.
+      // The growing section keeps no `minHeight: 0`, so its automatic minimum
+      // size (min-height: auto) is content-based. It may still absorb surplus
+      // height, but it can no longer be squashed below what it holds. With
+      // minHeight 0 here, a tight column compressed this wrapper to ~42px while
+      // the graph box inside kept its own 120px floor — and the 78px difference
+      // painted over the send-file / join-room buttons directly beneath. That
+      // was the "radar covers the buttons" report, one level up from the
+      // per-node hit-targets. Excess now becomes scroll on the column, which is
+      // what its overflowY is for.
+      ...(grow && open
+        ? { flex: '1 1 auto' }
+        : { flex: '0 0 auto' }),
     }}>
       <button type="button" style={header} onClick={onToggle} aria-expanded={open}>
         {/* Caret and title live in separate spans rather than one
