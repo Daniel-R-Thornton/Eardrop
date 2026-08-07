@@ -416,7 +416,7 @@ export class ModemService {
         // couple of messages and then falls off a cliff, and a roll call whose
         // REPORT is audibly sent and never decoded.
         const cfg = {
-          ...this.config, bandHandshake: true, chirpOnlySync: true,
+          ...this.config, bandHandshake: true, chirpOnlySync: true, role: 'chatter',
         } as ConstructorParameters<typeof RxEngine>[0];
         const engine = new RxEngine(cfg);
         engine.onControlMessage = (msg: ControlMessage) => {

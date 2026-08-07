@@ -333,15 +333,31 @@ export function dlogDump(count = 200): string {
  * restart their cursor at 0 when it moves — otherwise a longer new run reads
  * as "caught up" and is dropped entirely.
  */
-export function dlogSince(seq: number): { generation: number; next: number; lines: string[] } {
+export function dlogSince(seq: number): {
+  generation: number; next: number; lines: string[]; dropped: number;
+} {
   const floor = totalEmitted - ring.length;
   // A cursor beyond totalEmitted can only mean a dlogReset happened underneath
   // the caller (the counter restarted at 0). Clamping it down to totalEmitted
   // (as if "already caught up") would silently swallow every line emitted
   // between the reset and this call. Snapping to floor instead hands back
   // everything currently in the ring, so the caller converges in one step.
-  const start = seq > totalEmitted ? floor : Math.max(seq, floor);
-  return { generation, next: totalEmitted, lines: ring.slice(ring.length - (totalEmitted - start)) };
+  const reset = seq > totalEmitted;
+  const start = reset ? floor : Math.max(seq, floor);
+  return {
+    generation,
+    next: totalEmitted,
+    lines: ring.slice(ring.length - (totalEmitted - start)),
+    // How many lines existed between the caller's cursor and the oldest line
+    // still in the ring. They are gone, but a reader that is not told about
+    // them cannot tell a complete log from one with a hole in it — and the
+    // hole always lands mid-burst, which is exactly when something
+    // interesting was happening. Reported as 0 across a reset (`start` moves
+    // BACKWARD there, which is not an eviction): the generation stamp is
+    // what signals that case, and double-signalling it would cry wolf on
+    // every speed-test trial.
+    dropped: reset ? 0 : Math.max(0, start - seq),
+  };
 }
 
 /** Structured records, for aggregation (see DlogRecord). */

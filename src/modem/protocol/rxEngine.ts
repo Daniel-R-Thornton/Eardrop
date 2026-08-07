@@ -421,6 +421,23 @@ export class RxEngine {
    */
   private chirpOnlySync = false;
 
+  /**
+   * Which receiver this engine IS, stamped onto its sync/train/demod log lines
+   * as `eng=`.
+   *
+   * A session runs several RxEngines at once — the persistent chatter listener,
+   * the band-card listener, and the fresh post-hop file engine — and they all
+   * emit the same OFDM-SYNC/OFDM-TRAIN/OFDM-DEMOD tags. Without a
+   * discriminator a hardware log interleaves three engines' sync stories into
+   * one stream and the only way to attribute a line is to infer it from
+   * `samplesSeen` magnitudes and watchdog window counts. That inference has now
+   * been the blocking step in two separate investigations, and it is guesswork
+   * both times: a 5 s `watchdogReset windows=201` means the chatter listener
+   * and a 15 s `601` means a file engine, which is a fact about
+   * OFDM_WATCHDOG_WINDOWS that nothing in the log states.
+   */
+  private role: string;
+
   // Per-tone I/Q calibration references (from Gray code calibration)
   /** Reference vectors for bit=0 (ref0I/Q) and bit=1 (ref1I/Q) per tone */
   private ref0I: number[] = [1, 1, 1, 1];
@@ -454,6 +471,7 @@ export class RxEngine {
     this.useOFDM = (cfg as any).useOFDM === true;
     this.bandHandshake = (cfg as any).bandHandshake === true;
     this.chirpOnlySync = (cfg as any).chirpOnlySync === true;
+    this.role = typeof (cfg as any).role === 'string' ? (cfg as any).role : 'rx';
     if (this.bandHandshake) {
       // Band handshake: LISTEN on the fixed handshake band regardless of the
       // configured band — this engine's whole job is to decode a band card
@@ -562,6 +580,31 @@ export class RxEngine {
     this.ofdmDemod.resetTraining();
     this.buf = [];
     this.ofdmAlignBuf = [];
+    // Drop a half-finished chirp sync too, not just the buffers it was filling.
+    //
+    // Chirp sync is TWO stages: the correlator latches `chirpDetected` and
+    // records `chirpEndSample`, and a later CP-boundary probe completes the
+    // handoff and clears both (see the handoff in the sync path). A re-arm that
+    // clears the buffers but leaves the latch set returns an engine that is in
+    // WAITING and still convinced a chirp just landed — and chirp detection is
+    // gated off while the latch is set, so it cannot even re-detect. Worse,
+    // `chirpEndSample` is an ABSOLUTE index from before the interruption, so
+    // `samplesSeen - chirpEndSample >= sps*2` is already true and the boundary
+    // probe fires on the first refilled buffer, i.e. on whatever the room
+    // happens to be doing afterwards.
+    //
+    // The unmute path calls this the moment our own transmission ends, when the
+    // room is still ringing with it. Hardware showed the result: settle and
+    // training ran straight off that ring-out, `pilotAmp=1.6e-4` against a
+    // healthy ~0.68, then `watchdogReset windows=201` — five seconds deaf,
+    // which is the whole ACK window (ROOM_TIMING.ackWindowMs ≈ 5.3 s). A phone
+    // broadcast one TEXT and never decoded the ACK the PC audibly sent.
+    this.chirpDetected = false;
+    this.chirpEndSample = -1;
+    this.chirpBufClear();
+    this.chirpTick = 0;
+    this.chirpRan = false;
+    this.chirpProbeTick = 0;
     // This is the one path that can abort a payload run mid-flight (e.g. a
     // probe burst interrupting a long TEXT message's header-earned grace —
     // see ofdmWatchdogGraceWindows). onExtraFrame never fires for that
@@ -719,7 +762,7 @@ export class RxEngine {
           );
           const samplesAfterChirp = bufLen - chirpEndInBuffer;
           this.chirpEndSample = this.samplesSeen - samplesAfterChirp;
-          dlog('OFDM-SYNC', { chirp: true, norm: normScore, peak: peakValue, idx: peakIndex });
+          dlog('OFDM-SYNC', { eng: this.role, chirp: true, norm: normScore, peak: peakValue, idx: peakIndex });
           // Flag chirp detected — let the existing CP correlation path
           // (running on ofdmAlignBuf which fills with training OFDM symbols)
           // handle boundary alignment. This reuses the proven ±1-sample
@@ -846,6 +889,7 @@ export class RxEngine {
             // Phase 4: new sync detected — reset to the base link profile.
             this.resetLinkProfile();
             dlog('OFDM-SYNC', {
+              eng: this.role,
               chirpHandoff: true,
               boundary: signedBoundary,
               trainingSamples,
@@ -1194,10 +1238,24 @@ export class RxEngine {
       this.ofdmWindowsSinceDetect++;
       if (this.ofdmWindowsSinceDetect > this.OFDM_WATCHDOG_WINDOWS + this.ofdmWatchdogGraceWindows) {
         dlog('OFDM-SYNC', {
+          eng: this.role,
           watchdogReset: true,
           windows: this.ofdmWindowsSinceDetect,
           grace: this.ofdmWatchdogGraceWindows,
         }, { level: 'warn' });
+        // Clear the counter that fired this reset. Left at limit+1 it is
+        // already over the line, so the next window this engine processes
+        // increments to limit+2 and trips the watchdog again — a ratchet, not a
+        // one-off. Only a CRC-valid decode in processFrame() zeroes it
+        // otherwise, and an engine that is being reset every window never gets
+        // far enough into a message to produce one, so nothing breaks the loop.
+        // Hardware: logs/2026-08-07/dev-o8m2a7-d5dc7l.log has the handshake
+        // listener emitting windows=601..610 on consecutive windows with no
+        // other line between them, and the chatter listener ratcheting 201..205
+        // in the same session. This reset IS the "stop trusting the current
+        // sync and start looking again" event, which is exactly when
+        // windows-since-detect should go back to zero.
+        this.ofdmWindowsSinceDetect = 0;
         this.ofdmWatchdogGraceWindows = 0;
         this.state = RxState.WAITING;
         this.ofdmSyncFrames = 0;
@@ -1222,7 +1280,7 @@ export class RxEngine {
       if (this.ofdmSettleSymbols < this.OFDM_SETTLE_SYMBOLS) {
         this.ofdmSettleSymbols++;
         if (this.ofdmSettleSymbols >= this.OFDM_SETTLE_SYMBOLS) {
-          dlog('OFDM-TRAIN', { settled: this.ofdmSettleSymbols });
+          dlog('OFDM-TRAIN', { eng: this.role, settled: this.ofdmSettleSymbols });
         }
         return; // Not training yet, and definitely not data.
       }
@@ -1233,6 +1291,7 @@ export class RxEngine {
         this.ofdmTrainingSymbols++;
         if (this.ofdmTrainingSymbols >= this.OFDM_TRAINING_SYMBOLS) {
           dlog('OFDM-TRAIN', { 
+            eng: this.role,
             done: true, 
             symbols: this.ofdmTrainingSymbols,
             bufLenRemaining: this.buf.length,
@@ -1244,7 +1303,7 @@ export class RxEngine {
 
       // Log transition from training → data (once)
       if (this.ofdmDataSymbolCounter === 0) {
-        dlog('OFDM-DEMOD', { enteringDataPhase: true, bufLenAtEntry: this.buf.length, samplesSeen: this.samplesSeen }, { level: 'info' });
+        dlog('OFDM-DEMOD', { eng: this.role, enteringDataPhase: true, bufLenAtEntry: this.buf.length, samplesSeen: this.samplesSeen }, { level: 'info' });
       }
 
       // Count how many data symbols we're processing — helps debug why only

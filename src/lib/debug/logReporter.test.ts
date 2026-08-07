@@ -1,6 +1,6 @@
 // src/lib/debug/logReporter.test.ts
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { dlog, dlogReset } from './dlog';
+import { dlog, dlogReset, DLOG_RING_MAX } from './dlog';
 import {
   flushLogReporter, logReporterEnabled, onLogReporterChange, startLogReporter, stopLogReporter,
 } from './logReporter';
@@ -49,6 +49,36 @@ describe('logReporter', () => {
     expect(posts).toHaveLength(2);
     expect(posts[0].rows.join()).toContain('x=1');
     expect(posts[1].rows).toHaveLength(2);
+  });
+
+  it('marks the gap when a burst outran the ring between two ticks', async () => {
+    // A phone mid-transfer emits far more than DLOG_RING_MAX lines in one 5 s
+    // window. Those lines are unrecoverable, but delivering the survivors with
+    // no marker hands back a log that READS complete — which is how an absent
+    // [TX-COMP] was taken as proof the sender never transmitted.
+    const { fetchFn, posts } = makeFetch(204, []);
+    startLogReporter({ device: 'd', fetchFn });
+    await settle();
+    dlog('T', { first: 1 });
+    await vi.advanceTimersByTimeAsync(5000);
+
+    for (let i = 0; i < DLOG_RING_MAX + 20; i++) dlog('T', { i });
+    await vi.advanceTimersByTimeAsync(5000);
+
+    const { rows } = posts[1];
+    // 1 line already delivered + 520 new = 521 emitted; the ring keeps the last
+    // 500, so lines 2..21 (20 of them) were evicted before this tick read them.
+    expect(rows[0]).toContain('linesDropped=20');
+    expect(rows).toHaveLength(DLOG_RING_MAX + 1); // marker + everything that survived
+  });
+
+  it('does not mark a gap on an ordinary tick', async () => {
+    const { fetchFn, posts } = makeFetch(204, []);
+    startLogReporter({ device: 'd', fetchFn });
+    await settle();
+    dlog('T', { x: 1 });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(posts[0].rows.join()).not.toContain('linesDropped');
   });
 
   it('keeps the cursor on a failed POST and re-sends those lines next tick', async () => {

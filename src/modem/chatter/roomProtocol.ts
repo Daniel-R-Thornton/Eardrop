@@ -116,8 +116,10 @@ export interface RoomDeps {
   isAirBusy(): Promise<boolean>;
   /** Begin the file transmission with negotiated settings. */
   startFileTx(settings: PickedSettings): void;
-  /** Arm the receive path (HandshakeReceiver) for an incoming transfer. */
-  armFileRx(info: FileComingPayload): void;
+  /** Arm the receive path (HandshakeReceiver) for an incoming transfer.
+   *  `senderId` is display-only — the transfer itself carries no author, so
+   *  this announcement is the only place the receiver learns who is sending. */
+  armFileRx(info: FileComingPayload, senderId: number): void;
   onStateChange?(state: RoomState, members: Member[]): void;
   /** Display-only: a TEXT was delivered to the UI. Never read by a protocol
    *  decision — the ACK is sent regardless of whether this is wired up. */
@@ -655,8 +657,39 @@ export class RoomProtocol {
     this.outbox.drain();
   }
 
+  /**
+   * Any decoded frame proves its sender exists and is in earshot, so record
+   * it as a member. Merges rather than replaces, so this can only add a
+   * member or refresh `lastHeardMs` — never drop a `claim` or `heardGrid`
+   * a richer handler already stored.
+   *
+   * Membership used to come only from a probe, a WELCOME or a REPORT. Lose
+   * the WELCOME — one collision on a half-duplex acoustic link — and the gap
+   * was permanent in one direction: the member heard the join probe so it
+   * knew the joiner, while the joiner held an empty roster and had no reason
+   * to probe again.
+   *
+   * Deliberately ignores targetId. handleText and handleFileComing drop
+   * frames aimed at a third party, but overhearing one still proves the
+   * sender is there, which is all this records.
+   *
+   * No notification: `onStateChange` is the only members callback and it
+   * fires on state transitions alone, so a peer learned here reaches the UI
+   * with the next transition rather than immediately.
+   */
+  private noteHeard(deviceId: number): void {
+    const existing = this._members.get(deviceId);
+    this._members.set(deviceId, { ...existing, deviceId, lastHeardMs: this.deps.now() });
+  }
+
   /** worker decoded a control message */
   onMessage(msg: ControlMessage): void {
+    // Before the switch, so the richer handlers below still win on the fields
+    // they own (WELCOME's claim, REPORT's grid) — see noteHeard's merge.
+    // BYE is excluded: it is proof the sender existed, but it is announcing
+    // that it is leaving, so recording it adds a member that can only age out.
+    if (msg.type !== ControlType.Bye) this.noteHeard(msg.senderId);
+
     switch (msg.type) {
       case ControlType.Welcome:
         this.handleWelcome(msg);
@@ -799,7 +832,7 @@ export class RoomProtocol {
     }
     const parsed = parseFileComing(msg.payload);
     if (!parsed) return;
-    this.deps.armFileRx(parsed);
+    this.deps.armFileRx(parsed, msg.senderId);
     this.setState('receiving');
     this.timer(parsed.durationMs + TRANSFER_TAIL_MARGIN_MS, () => {
       if (this._state !== 'receiving') return;
@@ -1001,6 +1034,23 @@ export class RoomProtocol {
     void this.sendFileComingAndTransmit(settings);
   }
 
+  /**
+   * A send that is being dropped because the state moved out from under it.
+   *
+   * Dropping it is correct — the transmitter is no longer ours to use. Dropping
+   * it in SILENCE is not: three separate exits between "FILE_COMING is on the
+   * air" and "the file is on the air" each returned bare, so a sender log that
+   * stops after FILE_COMING is consistent with all three AND with a send that
+   * proceeded normally. `where` names the exit, so the absence of these lines
+   * becomes real evidence that the send did start.
+   */
+  private abandonSend(where: string): void {
+    this._lastError = `file send abandoned at ${where}: state became ${this._state}`;
+    dlog('ROOM', {
+      fileSendAbandoned: where, state: this._state, us: this.deps.deviceId,
+    }, { level: 'warn' });
+  }
+
   private async sendFileComingAndTransmit(settings: PickedSettings): Promise<void> {
     const fileParams = this.activeFileParams;
     if (!fileParams) return; // stop() cleared it mid-flight
@@ -1034,7 +1084,7 @@ export class RoomProtocol {
         this.finishToIdle();
         return;
       }
-      if (this._state !== 'collecting') return; // stale guard (e.g. stop() mid-await)
+      if (this._state !== 'collecting') return this.abandonSend('beforeFileComing');
 
       await this.deps.sendMessage({
         type: ControlType.FileComing,
@@ -1049,10 +1099,15 @@ export class RoomProtocol {
           durationMs: fileParams.durationMs,
         }),
       });
-      if (this._state !== 'collecting') return; // stale guard (e.g. stop() mid-await)
+      if (this._state !== 'collecting') return this.abandonSend('afterFileComing');
 
       this.timer(ROOM_TIMING.fileComingLeadMs, () => {
-        if (this._state !== 'collecting') return;
+        // Dropping the send when the state moved is right; doing it in silence
+        // is not. This is one of three exits between "FILE_COMING sent" and
+        // "audio on the air" that used to leave NO trace, and a hardware log
+        // showing rollCallDone reports=1, FILE_COMING, then nothing at all
+        // could not be pinned on any of them. Say which one it was.
+        if (this._state !== 'collecting') return this.abandonSend('leadWindow');
         this.deps.startFileTx(settings);
         this.setState('sending');
         this.timer(fileParams.durationMs + TRANSFER_TAIL_MARGIN_MS, () => {

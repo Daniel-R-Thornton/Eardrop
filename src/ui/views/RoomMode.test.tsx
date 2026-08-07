@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, fireEvent } from '@testing-library/react';
 import { RoomMode } from './RoomMode';
+import { setState } from '../Store';
 
 /**
  * jsdom implements neither ResizeObserver nor layout, so the two inputs
@@ -72,6 +73,28 @@ describe('RoomMode', () => {
     fireEvent.click(getByText('SPECTRUM'));
 
     expect(canvasCount()).toBe(2);
+  });
+
+  it('refuses an empty file instead of broadcasting a transfer with no payload', () => {
+    // A 0-byte file is a fully-formed transmission that carries nothing:
+    // splitDataIntoFrames floors at one frame, so the room spends a roll call,
+    // a FILE_COMING and an entire transfer's airtime delivering a padded empty
+    // frame. Observed on a hardware run, where the resulting log was
+    // indistinguishable from a real transfer that failed to decode and cost a
+    // whole test session to tell apart.
+    setState({ chatterOn: true, chatterState: 'idle' });
+    const sent = vi.fn();
+    window.addEventListener('eardrop-file', sent);
+
+    const { container, getByText } = render(<RoomMode onExit={() => {}} />);
+    const input = container.querySelector('#roommode-file') as HTMLInputElement;
+    const empty = new File([], 'empty.txt', { type: 'text/plain' });
+    Object.defineProperty(input, 'files', { value: [empty], configurable: true });
+    fireEvent.change(input);
+
+    expect(sent).not.toHaveBeenCalled();
+    expect(getByText(/empty/i)).toBeTruthy();
+    window.removeEventListener('eardrop-file', sent);
   });
 
   it('keeps the composer mounted with the debug sections collapsed', () => {

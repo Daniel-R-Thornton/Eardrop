@@ -211,7 +211,24 @@ export class AudioRecorder {
         AudioRecorder.workletLoadedFor.add(this.ctx);
         dlog('REC', { workletLoaded: true });
       } catch (err: any) {
-        dlog('REC-ERR', { workletAddModuleFailed: true, error: err.message }, { level: 'warn' });
+        // "reading 'addModule' of undefined" says only that SOMETHING on the
+        // left was undefined — it does not say which. Capture the shape of the
+        // context at the moment of failure so the next occurrence names the
+        // culprit instead of leaving it to inference.
+        dlog(
+          'REC-ERR',
+          {
+            workletAddModuleFailed: true,
+            error: err.message,
+            ctxType: this.ctx?.constructor?.name ?? String(this.ctx),
+            ctxState: this.ctx?.state,
+            hasWorklet: Boolean(this.ctx?.audioWorklet),
+            workletInProto: this.ctx ? 'audioWorklet' in this.ctx : false,
+            secure: window.isSecureContext,
+            urlKind: WORKLET_URL.slice(0, 5),
+          },
+          { level: 'warn' },
+        );
         throw new Error(`AudioWorklet init failed: ${err.message}`);
       }
     } else {

@@ -273,6 +273,11 @@ export interface ChatMessage {
   /** 0 = the whole room. */
   targetId: number;
   text: string;
+  /** Set instead of `text` when this row is a received file rather than chat.
+   *  `url` is an object URL owned by this page — it dies with the tab, so the
+   *  link is the only chance to save the blob. Room mode renders no other
+   *  file UI, which is why a transfer lands in the transcript at all. */
+  file?: { name: string; url: string; size: number };
   tMs: number;
   dir: 'tx' | 'rx';
   /** Device ids that acknowledged this message. Meaningful for dir 'tx'. */

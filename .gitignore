@@ -4,3 +4,7 @@ dist/
 .pi-subagents/
 .pi-progress.txt
 logs/
+
+# Locally-generated TLS material for the LAN log server (mkcert). Never commit
+# a private key.
+certs/

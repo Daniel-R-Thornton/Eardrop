@@ -857,6 +857,75 @@ describe('room protocol', () => {
     expect(h.sent.find((m) => m.type === ControlType.Text).targetId).toBe(7);
   });
 
+  /**
+   * Membership from ordinary traffic.
+   *
+   * A joiner probes, every existing member replies WELCOME, and the joiner
+   * learns the room from those replies. Lose the WELCOME — one collision, one
+   * bad moment on a half-duplex acoustic link — and the gap is permanent in
+   * one direction: the member heard the join probe so it knows the joiner,
+   * but the joiner has an empty roster and no reason to probe again. Any
+   * frame that decodes from that peer is proof it exists and is in earshot,
+   * so it is enough to close the gap without spending airtime.
+   */
+  it('registers an unknown sender on a received TEXT', async () => {
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
+    expect(h.room.members.get(9)).toBeUndefined();
+
+    h.room.onMessage({
+      type: ControlType.Text, senderId: 9, targetId: 0, payload: packText(3, 'hi all'),
+    });
+
+    expect(h.room.members.get(9)).toBeDefined();
+  });
+
+  it('registers an unknown sender on a TEXT addressed to someone else', async () => {
+    // handleText drops a DM aimed at a third party, but the frame still
+    // decoded — that device is real and in earshot regardless of who it was
+    // talking to.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
+
+    h.room.onMessage({
+      type: ControlType.Text, senderId: 9, targetId: 7, payload: packText(3, 'psst'),
+    });
+
+    expect(h.room.members.get(9)).toBeDefined();
+  });
+
+  it('does not register an unknown sender on a BYE', async () => {
+    // A BYE is proof the device existed, but it is leaving — recording it
+    // adds a member that can only ever age out.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
+
+    h.room.onMessage({ type: ControlType.Bye, senderId: 9, targetId: 0, payload: new Uint8Array(0) });
+
+    expect(h.room.members.get(9)).toBeUndefined();
+  });
+
+  it('a TEXT from a known member keeps the grid already measured for them', async () => {
+    // noteHeard merges rather than replaces. Without that, every message from
+    // an established peer would silently wipe the probe grid the room needs
+    // to negotiate a band with them — turning a roster fix into a
+    // settings-negotiation bug.
+    const h = makeHarness(2);
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + REPLY_SPAN + ROOM_TIMING.collectExtraMs + 200);
+    h.room.onProbeHeard(9, flatGrid);
+    expect(h.room.members.get(9)?.heardGrid).toBeDefined();
+
+    h.room.onMessage({
+      type: ControlType.Text, senderId: 9, targetId: 0, payload: packText(3, 'hi'),
+    });
+
+    expect(h.room.members.get(9)?.heardGrid).toBeDefined();
+  });
+
   it('rejects text over the byte cap', () => {
     const h = makeHarness(1);
     expect(() => h.room.sendText('x'.repeat(TEXT_MAX_BYTES + 1))).toThrow(/cap|exceeds/i);

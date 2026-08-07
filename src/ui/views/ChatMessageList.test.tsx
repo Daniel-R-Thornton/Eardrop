@@ -61,6 +61,24 @@ describe('ChatMessageList', () => {
     expect(queryByText(/delivered to/i)).toBeNull();
   });
 
+  it('renders a received file as a download link instead of message text', () => {
+    // A file arrives with no text of its own — the row IS the link, or the
+    // blob is unreachable (room mode renders no other file UI).
+    const withFile: ChatMessage = {
+      ...base, dir: 'rx', senderId: 9, text: '',
+      file: { name: 'notes.txt', url: 'blob:fake', size: 54 },
+    };
+    const { getByRole, getByText } = render(
+      <ChatMessageList messages={[withFile]} {...props} />,
+    );
+    expect(getByText(/shared a file/i)).toBeTruthy();
+    const link = getByRole('link', { name: /notes\.txt/i }) as HTMLAnchorElement;
+    expect(link.getAttribute('href')).toBe('blob:fake');
+    // Without `download` the browser navigates to the blob instead of saving,
+    // which on a phone is a dead end for anything not natively viewable.
+    expect(link.getAttribute('download')).toBe('notes.txt');
+  });
+
   it('labels a DM with its addressee', () => {
     const dm: ChatMessage = { ...base, targetId: 0xa7 };
     const { getByText } = render(<ChatMessageList messages={[dm]} {...props} />);

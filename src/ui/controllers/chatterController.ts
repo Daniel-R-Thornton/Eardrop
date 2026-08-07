@@ -323,6 +323,10 @@ export class ChatterController {
   private deviceId = 0;
   private rxArmed = false;
   private pendingFile: { fileName: string; data: Uint8Array } | null = null;
+  /** Sender of the transfer currently being received, learned from its
+   *  FILE_COMING (see `armFileRx`). Display-only, and only meaningful between
+   *  that announcement and the matching `recordReceivedFile`. */
+  private incomingFileFrom: number | null = null;
   /** Re-entry guard: `chatterOn` in the Store only flips true at the END of
    *  `joinRoom`'s async chain, so a second click/call arriving mid-await sees
    *  `chatterOn === false` and would otherwise re-enter — re-rolling the
@@ -374,7 +378,7 @@ export class ChatterController {
       ),
       isAirBusy: async () => (await this.worker.airCheck()).busy,
       startFileTx: (settings: PickedSettings) => { void this.transmitFile(settings); },
-      armFileRx: (info: FileComingPayload) => this.armFileRx(info),
+      armFileRx: (info: FileComingPayload, senderId: number) => this.armFileRx(info, senderId),
       onStateChange: (state: RoomState, members: Member[]) => {
         // While a file is in the air the room's scanners have nothing useful
         // to hear: the probe correlator and the control listener would only
@@ -700,6 +704,33 @@ export class ChatterController {
     setState({ chatterMessages: [...getState().chatterMessages, message].slice(-CHATTER_MESSAGE_LOG_MAX) });
   }
 
+  /** Put a completed inbound transfer into the room transcript, so room mode
+   *  has somewhere to show it. Without this the blob `fileComplete` builds is
+   *  reachable from nothing: `receivedFiles` is rendered only by RxView and
+   *  RxPipeline, and room mode replaces both (see BenchApp).
+   *
+   *  Called from app.ts's `fileComplete` handler rather than fired from here
+   *  because the object URL is the page's to own and revoke, not the
+   *  controller's. A no-op outside a room — the transcript is room-scoped, and
+   *  on the bench the file already has its own UI. */
+  recordReceivedFile(file: { name: string; url: string; size: number }): void {
+    if (!getState().chatterOn) return;
+    this.recordMessage({
+      // msgId 0: files are not TEXT frames and carry no sender-assigned id.
+      // Nothing looks a file row up by id — patchSentMessage only ever
+      // matches dir 'tx' — so there is no collision to avoid here.
+      msgId: 0,
+      senderId: this.incomingFileFrom ?? 0,
+      targetId: 0,
+      text: '',
+      file,
+      dir: 'rx',
+      ackedBy: [],
+      state: 'delivered',
+    });
+    this.incomingFileFrom = null;
+  }
+
   /** Patch the fields a delivery-state update touches on the outbound
    *  message matching `msgId` (only ever `dir: 'tx'` — an inbound message has
    *  no delivery state of its own to track). A no-op if the message has
@@ -774,7 +805,13 @@ export class ChatterController {
    *  card arrives — the transmission's own card does the tuning (see
    *  HandshakeReceiver); `info` carries nothing else this adapter needs
    *  (the receive timeout is RoomProtocol's own timer). */
-  private armFileRx(info: FileComingPayload): void {
+  private armFileRx(info: FileComingPayload, senderId: number): void {
+    // The file's own transmission carries no author, and `fileComplete`
+    // surfaces only a name and bytes — so the announcement is the one chance
+    // to learn who to attribute the transcript row to. Overwritten per
+    // transfer, like the config below: transfers do not overlap.
+    this.incomingFileFrom = senderId;
+
     // bytes is the raw file payload size by design here (unlike control
     // messages' bytes, which is the true encoded wire size) — fileBytes is
     // what FILE_COMING actually advertises; the modulated wire size depends
@@ -823,7 +860,26 @@ export class ChatterController {
   private async transmitFile(settings: PickedSettings): Promise<void> {
     const pending = this.pendingFile;
     this.pendingFile = null;
-    if (!pending) return;
+    // The third of three silent exits between "FILE_COMING sent" and "audio on
+    // the air" (the others are RoomProtocol's lead-window guard and its stale
+    // guards). Reaching here with nothing pending should be impossible —
+    // broadcastFile sets it immediately before room.sendFile — so if a hardware
+    // log ever shows this line, that assumption is wrong and this is where the
+    // transfer died. The fileTxStart line below is the positive counterpart:
+    // without it, a sender log simply stops after FILE_COMING whether the
+    // transfer began or not, and the negotiated band is nowhere on record.
+    if (!pending) {
+      dlog('ROOM', { fileTxSkipped: 'noPendingFile' }, { level: 'warn' });
+      setState({ chatterError: 'send failed: no pending file at transmit time' });
+      return;
+    }
+    dlog('ROOM', {
+      fileTxStart: pending.fileName,
+      bytes: pending.data.byteLength,
+      pilot: settings.pilotFreqHz,
+      toneStart: settings.toneStartHz,
+      tones: settings.toneCount,
+    }, { level: 'warn' });
 
     const s = getState();
     const cfg = buildModemConfig({

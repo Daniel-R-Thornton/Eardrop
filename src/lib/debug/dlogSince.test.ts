@@ -23,6 +23,33 @@ describe('dlogSince', () => {
     expect(lines).toHaveLength(DLOG_RING_MAX); // the 20 evicted lines are gone, not re-invented
   });
 
+  it('reports how many lines the ring evicted before the cursor could read them', () => {
+    // The evicted lines are unrecoverable, but a reader that is not TOLD they
+    // existed reads a log with a hole in it as a complete one. That is how an
+    // absent [TX-COMP] became "the sender never transmitted" — the tail of a
+    // burst had simply been dropped between two 5 s pushes, and nothing in the
+    // delivered rows said so.
+    for (let i = 0; i < DLOG_RING_MAX + 20; i++) dlog('T1', { i });
+    expect(dlogSince(0).dropped).toBe(20);
+  });
+
+  it('reports no drop when the cursor is still inside the ring', () => {
+    for (let i = 0; i < 5; i++) dlog('T1', { i });
+    expect(dlogSince(0).dropped).toBe(0);
+    expect(dlogSince(dlogSince(0).next).dropped).toBe(0);
+  });
+
+  it('reports no drop for a cursor stranded past a dlogReset', () => {
+    // Snapping a beyond-the-end cursor back to floor is a reset, not an
+    // eviction — the generation stamp already tells that story, and a bogus
+    // negative-turned-positive drop count here would cry wolf on every reset.
+    for (let i = 0; i < 5; i++) dlog('T1', { i });
+    const { next } = dlogSince(0);
+    dlogReset();
+    dlog('T1', { fresh: true });
+    expect(dlogSince(next).dropped).toBe(0);
+  });
+
   it('clamps a cursor from before a dlogReset instead of stalling forever', () => {
     for (let i = 0; i < 5; i++) dlog('T1', { i });
     const { next } = dlogSince(0);

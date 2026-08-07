@@ -23,13 +23,19 @@
  *      normalization), using that toneCount's best-scoring window. If
  *      nothing clears -18 dB at any width, the room has no band everyone
  *      can hear well enough — fall back to FLOOR_SETTINGS.
- *   4. Let W = the chosen window's absolute first-tone frequency. pilotFreqHz
- *      = W - 200 Hz (clamped >= 200, always a multiple of 50 — same "pilot
- *      sits below the tones" convention as OFDM_DEFAULTS / OFDM_HANDSHAKE).
- *      toneStartHz is then W - pilotFreqHz: an OFFSET above the pilot, NOT an
- *      absolute frequency — same semantics as ofdmToneFrequencies() and
- *      BandCard.toneStartHz elsewhere in this codebase (first tone =
- *      pilotFreqHz + toneStartHz).
+ *   4. The pilot is part of a candidate, not derived after one wins (see
+ *      `pilotFor`). For a window whose first tone is W, pilotFreqHz =
+ *      W - MIN_TONE_START_HZ, and the window is admissible only if that
+ *      pilot lands inside the swept grid and within MAX_PILOT_RATIO of the
+ *      window's top tone. Inadmissible windows are skipped, so an unusable
+ *      band is never scored — and step 3's toneCount ladder falls back to a
+ *      narrower band rather than emitting one that cannot be demodulated.
+ *      toneStartHz is then W - pilotFreqHz = MIN_TONE_START_HZ: an OFFSET
+ *      above the pilot, NOT an absolute frequency — same semantics as
+ *      ofdmToneFrequencies() and BandCard.toneStartHz elsewhere (first tone
+ *      = pilotFreqHz + toneStartHz). Being exactly the global floor is what
+ *      makes ofdmToneFrequencies' clamp a no-op on both TX and RX, so the
+ *      band this module scores is the band that goes on the air.
  *   5. toneGains: TX headroom is capped at unity, so we can't boost weak
  *      tones — we attenuate strong ones instead. Each tone's raw gain is
  *      1/mag; dividing every raw gain by the largest one pins the WEAKEST
@@ -42,6 +48,7 @@
  */
 import { REPORT_GRID } from '../protocol/probeBurst';
 import { BAND_CARD_TONE_COUNTS } from '../protocol/bandCard';
+import { MIN_TONE_START_HZ } from '../types';
 
 export interface PeerReport {
   deviceId: number;
@@ -72,8 +79,12 @@ export interface PickedSettings {
  *  plane was evacuated from. Left as-is because changing it is a design
  *  decision needing its own measurement, tracked separately. */
 export const FLOOR_SETTINGS: PickedSettings = {
-  pilotFreqHz: 6700,
-  toneStartHz: 200,
+  // 6300 + 600, not 6700 + 200: the old pair carried the same defect the
+  // picked path did — an offset below MIN_TONE_START_HZ, clamped up by
+  // ofdmToneFrequencies, putting the tones at 7300-7450 rather than the
+  // 6900-7050 this comment claims. Same first tone, legal offset.
+  pilotFreqHz: 6300,
+  toneStartHz: MIN_TONE_START_HZ,
   toneCount: 4,
   qamMap: [2, 2, 2, 2],
   toneGains: [1, 1, 1, 1],
@@ -87,14 +98,27 @@ const BAND_HIGH_HZ = REPORT_GRID.startHz + (REPORT_GRID.points - 1) * REPORT_GRI
 const TONE_SPACING_HZ = 50;
 const THRESHOLD_DB = -18;
 const MIN_MAG = 1e-9;
-/** Pilot sits this far below the first tone (mirrors OFDM_DEFAULTS: pilot
- *  1900 Hz, first tone 2000 Hz — a 100 Hz gap; we use a slightly wider one
- *  here since the picked band can start as low as 1500 Hz). */
-const PILOT_OFFSET_HZ = 200;
-/** Floor for the clamp below — keeps toneStartHz >= 50 Hz even at the very
- *  bottom of the sweep band, so the offset never collapses to 0 (band-card
- *  bins must be >= 1). */
-const PILOT_MIN_HZ = 200;
+/**
+ * Ceiling on topTone / pilot.
+ *
+ * The pilot is the phase reference every tone is demodulated against, and
+ * the phase error it leaves scales with how far above it a tone sits — see
+ * OFDM_HANDSHAKE's comment in types.ts for the measurement. Known points:
+ * 1.48 (the handshake band, chosen deliberately, works over the air), 2.65
+ * (a 32-tone window this module picked at the bottom of the sweep band —
+ * receiver locked on at handoff score 0.904 and decoded nothing), and 3.9
+ * (the original control band, never demodulated a single frame over the
+ * air).
+ *
+ * Set at the only known-good point rather than somewhere between it and the
+ * first known-bad one: the two failures bracket nothing useful, and a bound
+ * guessed in the gap would be a third untested band. This is deliberately
+ * conservative and costs bandwidth — a wide window low in the band stops
+ * being admissible and the toneCount ladder drops to a narrower one. Widen
+ * it when a real over-the-air MER measurement justifies a specific number,
+ * the same discipline qamMap is held to below.
+ */
+export const MAX_PILOT_RATIO = 1.5;
 
 function dbToLinearRatio(db: number): number {
   return Math.pow(10, db / 20);
@@ -128,10 +152,38 @@ function toneMags(worst: number[], toneStartHz: number, toneCount: number): numb
 }
 
 interface Window {
-  /** Absolute frequency of the window's FIRST tone (not yet split into
-   *  pilot + offset — see step 4 in the header comment). */
+  /** Absolute frequency of the window's FIRST tone. */
   firstToneHz: number;
+  /** Absolute pilot frequency for this window. Part of the candidate, not
+   *  derived after the choice — see `pilotFor`. */
+  pilotFreqHz: number;
   score: number;
+}
+
+/**
+ * The pilot for a window starting at `firstToneHz`, or null if this window
+ * cannot carry a legal one — in which case it is not a candidate at all.
+ *
+ * The pilot used to be derived AFTER a window won, from a local 200 Hz
+ * offset constant. Two things then went wrong silently. The offset was below
+ * the modem's global MIN_TONE_START_HZ, so ofdmToneFrequencies raised it on
+ * both TX and RX and slid every tone 400 Hz up, off the window that was
+ * actually measured. And nothing checked the pilot at all: it could land
+ * below the swept grid (never measured — 1300 Hz was observed) or far enough
+ * under the top tone to make the constellation undecodable. Deriving it here,
+ * as part of the candidate, is what makes those states unreachable rather
+ * than merely unlikely.
+ */
+function pilotFor(firstToneHz: number, toneCount: number): number | null {
+  // Exactly the floor, never below it: a smaller offset gets clamped up (see
+  // above), a larger one buys nothing and only worsens the ratio.
+  const pilotFreqHz = firstToneHz - MIN_TONE_START_HZ;
+  // Below the sweep's low edge the pilot sits outside every report, so no
+  // peer has measured whether it can even hear its own phase reference.
+  if (pilotFreqHz < BAND_LOW_HZ) return null;
+  const topToneHz = firstToneHz + (toneCount - 1) * TONE_SPACING_HZ;
+  if (topToneHz / pilotFreqHz > MAX_PILOT_RATIO) return null;
+  return pilotFreqHz;
 }
 
 /**
@@ -174,8 +226,12 @@ function bestWindow(worst: number[], toneCount: number): Window | null {
 
   let best: Window | null = null;
   for (let start = BAND_LOW_HZ; start <= maxStart; start += SLIDE_STEP_HZ) {
+    // Admissibility before scoring: a window that cannot hold a legal pilot
+    // is not a worse candidate, it is not a candidate.
+    const pilotFreqHz = pilotFor(start, toneCount);
+    if (pilotFreqHz === null) continue;
     const score = Math.min(...toneMags(worst, start, toneCount));
-    if (!best || score > best.score) best = { firstToneHz: start, score };
+    if (!best || score > best.score) best = { firstToneHz: start, pilotFreqHz, score };
   }
   return best;
 }
@@ -203,11 +259,13 @@ export function pickSettings(reports: PeerReport[]): PickedSettings {
     const window = bestWindow(worst, toneCount);
     if (!window || window.score < threshold) continue;
 
-    const { firstToneHz } = window;
-    // pilotFreqHz/toneStartHz split: toneStartHz is an OFFSET above the
-    // pilot everywhere else in this codebase (ofdmToneFrequencies,
-    // OFDM_HANDSHAKE, BandCard), not an absolute frequency — see step 4.
-    const pilotFreqHz = Math.max(PILOT_MIN_HZ, firstToneHz - PILOT_OFFSET_HZ);
+    const { firstToneHz, pilotFreqHz } = window;
+    // toneStartHz is an OFFSET above the pilot everywhere in this codebase
+    // (ofdmToneFrequencies, OFDM_HANDSHAKE, BandCard), not an absolute
+    // frequency. It equals MIN_TONE_START_HZ by construction — pilotFor
+    // placed the pilot exactly that far below — which is what guarantees
+    // ofdmToneFrequencies' clamp is a no-op and the band scored below is the
+    // band transmitted.
     const toneStartHz = firstToneHz - pilotFreqHz;
     const mags = toneMags(worst, firstToneHz, toneCount).map((m) => Math.max(m, MIN_MAG));
     const windowMax = Math.max(...mags);

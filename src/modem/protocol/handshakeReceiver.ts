@@ -52,7 +52,9 @@ export class HandshakeReceiver {
     // device, with no `HR` and no `HH` anywhere in the session: a roll call
     // that completed, a FILE_COMING that went out, and a transfer that reached
     // nobody. Same fix, same reasoning, as the chatter control listener.
-    this.listener = new RxEngine({ ...cfg, bandHandshake: true, chirpOnlySync: true } as RxConfig);
+    this.listener = new RxEngine({
+      ...cfg, bandHandshake: true, chirpOnlySync: true, role: 'hsListener',
+    } as RxConfig);
     this.listener.onBandCard = (card) => this.hop(card);
   }
 
@@ -71,6 +73,7 @@ export class HandshakeReceiver {
       // card symbols are strong non-chirp energy, so only the target band's
       // own chirp may start this engine (no energy-fallback sync).
       chirpOnlySync: true,
+      role: 'fileTarget',
       pilotFreqHz: card.pilotFreqHz,
       toneStartHz: card.toneStartHz,
       toneCount: card.toneCount,

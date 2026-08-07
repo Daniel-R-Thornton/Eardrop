@@ -81,6 +81,68 @@ const notify = () => {
 
 const randomId = () => Math.random().toString(36).slice(2, 8);
 
+const CLIENT_SLUG_KEY = 'eardrop.clientSlug';
+
+/**
+ * A coarse, human-readable name for this browser/OS, e.g. `chrome-android`.
+ *
+ * Deliberately coarse. This is a filename token whose only job is to let
+ * someone reading `logs/` tell the phone's file from the PC's at a glance —
+ * precisely the thing `dev-ih9jof` could not do. Version numbers and exact
+ * engine identification would make it longer and less legible without making
+ * it more useful, and the log body already carries the details.
+ *
+ * Order matters: Edge and most Android browsers put "Chrome" in their UA too,
+ * so the more specific names have to be tested first, and Safari last because
+ * every WebKit-shell UA contains "Safari".
+ */
+function uaLabel(): string {
+  const ua = typeof navigator === 'undefined' ? '' : navigator.userAgent;
+  const os = /Android/i.test(ua) ? 'android'
+    : /iPhone|iPad|iPod/i.test(ua) ? 'ios'
+      : /Windows/i.test(ua) ? 'windows'
+        : /Mac OS X/i.test(ua) ? 'macos'
+          : /Linux/i.test(ua) ? 'linux'
+            : 'os';
+  const browser = /Edg\//.test(ua) ? 'edge'
+    : /OPR\//.test(ua) ? 'opera'
+      : /SamsungBrowser/i.test(ua) ? 'samsung'
+        : /Firefox\//.test(ua) ? 'firefox'
+          : /Chrome\//.test(ua) ? 'chrome'
+            : /Safari\//.test(ua) ? 'safari'
+              : 'browser';
+  return `${browser}-${os}`;
+}
+
+/**
+ * A stable per-device identity, e.g. `chrome-android-k3n8`.
+ *
+ * Persisted in localStorage because the previous scheme minted a fresh random
+ * id on every reload, so one phone across a debugging session scattered itself
+ * over a directory of unrelated-looking filenames with no way to tell which
+ * were the same device. The random suffix survives because two phones running
+ * the same browser and OS would otherwise collide into one file.
+ *
+ * localStorage is wrapped: it throws on access in a partitioned or
+ * storage-blocked context, and this module's contract is that it never throws
+ * into app code. Losing persistence degrades to the old per-reload behaviour,
+ * which is worse but not broken.
+ */
+function clientSlug(): string {
+  const fresh = () => `${uaLabel()}-${randomId().slice(0, 4)}`;
+  try {
+    const store = globalThis.localStorage;
+    if (!store) return fresh();
+    const saved = store.getItem(CLIENT_SLUG_KEY);
+    if (saved) return saved;
+    const made = fresh();
+    store.setItem(CLIENT_SLUG_KEY, made);
+    return made;
+  } catch {
+    return fresh();
+  }
+}
+
 /**
  * A request that never settles would block this reporter forever: pushes are
  * coalesced through one in-flight promise, so every later tick AND the manual
@@ -104,12 +166,24 @@ async function push(s: ReporterState): Promise<boolean> {
     // entire new run whenever it is at least as long as the old one, which is
     // precisely the per-trial speed-test case.
     if (read.generation !== s.generation) read = dlogSince(0);
-    if (read.lines.length > 0) {
+    // The ring evicted lines this cursor never got to read — a burst outran
+    // the 5 s tick. They are unrecoverable, but shipping the survivors
+    // unannounced yields a file that reads as a COMPLETE record of the run,
+    // and the hole always lands mid-burst: precisely where the interesting
+    // thing happened. Diagnosing an over-the-air transfer from such a log
+    // means reading "line absent" as "event did not occur", which is how a
+    // missing [TX-COMP] was taken as proof the sender never transmitted.
+    // Marker goes in-band, as the first row, so it survives to disk with the
+    // same path as everything else.
+    const rows = read.dropped > 0
+      ? [`! [DLOG] linesDropped=${read.dropped} reason=ringOverflow`, ...read.lines]
+      : read.lines;
+    if (rows.length > 0) {
       try {
         const res = await s.fetchFn('/api/log', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ device: s.device, session: s.session, rows: read.lines }),
+          body: JSON.stringify({ device: s.device, session: s.session, rows }),
           signal: timeoutSignal(s.timeoutMs),
         });
         if (!isEndpointReply(res)) throw new Error(`status ${res.status}`);
@@ -168,7 +242,10 @@ export function startLogReporter(opts: {
   if (st) return; // idempotent: main.tsx calls once, HMR may call again
   const s: ReporterState = {
     enabled: false,
-    device: opts.device ?? `dev-${randomId()}`,
+    // `dev-<random>` told you nothing and changed every reload. The slug is a
+    // persisted per-device identity; `session` stays random per load, so one
+    // device's runs sort together and are still separable.
+    device: opts.device ?? clientSlug(),
     session: randomId(),
     cursor: 0,
     generation: -1,

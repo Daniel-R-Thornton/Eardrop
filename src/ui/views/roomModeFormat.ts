@@ -17,6 +17,14 @@ export function formatAgo(ms: number): string {
   return `${min}m ${sec % 60}s ago`;
 }
 
+/** "54 B" / "1.2 kB" style — used on received-file rows in the transcript.
+ *  Transfers over this medium are small by nature, so kB is the last unit
+ *  worth spelling. */
+export function fileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  return `${(bytes / 1024).toFixed(1)} kB`;
+}
+
 /** "12s" / "3m" style — compact, used in the packet stream's timestamp column. */
 export function formatAgoShort(ms: number): string {
   const sec = Math.max(0, ms / 1000);

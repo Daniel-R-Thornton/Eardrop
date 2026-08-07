@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { pickSettings, FLOOR_SETTINGS } from '../chatter/settingsPick';
-import { reportGridFreqs } from '../protocol/probeBurst';
+import { pickSettings, FLOOR_SETTINGS, MAX_PILOT_RATIO } from '../chatter/settingsPick';
+import { reportGridFreqs, REPORT_GRID } from '../protocol/probeBurst';
+import { MIN_TONE_START_HZ, ofdmToneFrequencies } from '../types';
+import type { PickedSettings } from '../chatter/settingsPick';
 
 const freqs = reportGridFreqs();
 const gridWhere = (fn: (hz: number) => number) => freqs.map(fn);
@@ -33,6 +35,69 @@ describe('settingsPick', () => {
     expect(s.toneStartHz).toBeGreaterThanOrEqual(50);
     expect(s.pilotFreqHz % 50).toBe(0);
     expect(s.toneStartHz % 50).toBe(0);
+  });
+
+  /**
+   * The allocation invariants, asserted against what actually goes on the
+   * air rather than what the picker returns.
+   *
+   * These exist because of a real transfer that failed with every earlier
+   * assertion in this file passing. The picker emitted toneStartHz 200; the
+   * modem's global floor (MIN_TONE_START_HZ = 600, applied by
+   * ofdmToneFrequencies to TX and RX alike) silently raised it, so a window
+   * scored at 1500-3050 Hz was transmitted at 1900-3450 Hz with the pilot at
+   * 1300 — below the measured grid entirely, and 2.65x below its own top
+   * tone. The receiver hopped, locked on the chirp at handoff score 0.904,
+   * and decoded not one frame in 601 windows.
+   *
+   * A window is only admissible if the WHOLE allocation fits: pilot at the
+   * modem's floor spacing, every tone inside the measured grid, and a pilot
+   * close enough below the top tone to serve as its phase reference.
+   */
+  const allocations = (): Array<[string, PickedSettings]> => [
+    ['flat', pickSettings([{ deviceId: 1, grid: gridWhere(() => 1) }])],
+    ['bottom-heavy', pickSettings([{ deviceId: 1, grid: gridWhere((hz) => 1 / (1 + (hz - 1500) / 500)) }])],
+    ['deaf above 4k', pickSettings([{ deviceId: 1, grid: gridWhere((hz) => (hz < 4000 ? 1 : 0.001)) }])],
+    ['top-heavy', pickSettings([{ deviceId: 1, grid: gridWhere((hz) => (hz > 6000 ? 1 : 0.01)) }])],
+    ['floor', FLOOR_SETTINGS],
+  ];
+
+  it('emits a tone offset the modem will not clamp, so the band it scores is the band it sends', () => {
+    for (const [name, s] of allocations()) {
+      // Anything below MIN_TONE_START_HZ is raised by ofdmToneFrequencies,
+      // moving every tone without moving the pilot.
+      expect(`${name}: ${s.toneStartHz}`).toBe(`${name}: ${MIN_TONE_START_HZ}`);
+      const sent = ofdmToneFrequencies({
+        toneCount: s.toneCount, pilotFreqHz: s.pilotFreqHz, startHz: s.toneStartHz,
+      });
+      expect(`${name}: ${sent[0]}`).toBe(`${name}: ${s.pilotFreqHz + s.toneStartHz}`);
+    }
+  });
+
+  it('places the pilot inside the measured grid — it is never scored otherwise', () => {
+    for (const [name, s] of allocations()) {
+      expect(`${name}: ${s.pilotFreqHz >= REPORT_GRID.startHz}`).toBe(`${name}: true`);
+    }
+  });
+
+  it('keeps the pilot close enough below the top tone to demodulate it', () => {
+    for (const [name, s] of allocations()) {
+      const top = s.pilotFreqHz + s.toneStartHz + (s.toneCount - 1) * 50;
+      const ratio = top / s.pilotFreqHz;
+      expect(`${name}: ${ratio <= MAX_PILOT_RATIO} (${ratio.toFixed(2)})`)
+        .toBe(`${name}: true (${ratio.toFixed(2)})`);
+    }
+  });
+
+  it('drops to a narrower band rather than emit an undemodulable low-frequency one', () => {
+    // 32 tones (1550 Hz wide) low in the band cannot satisfy the ratio with
+    // the pilot 600 Hz under the first tone — the fallback down the toneCount
+    // ladder is what makes the constraint survivable instead of fatal.
+    const s = pickSettings([{ deviceId: 1, grid: gridWhere((hz) => (hz < 3200 ? 1 : 1e-4)) }]);
+    expect(s.floor).toBe(false);
+    expect(s.toneCount).toBeLessThan(32);
+    const top = s.pilotFreqHz + s.toneStartHz + (s.toneCount - 1) * 50;
+    expect(top / s.pilotFreqHz).toBeLessThanOrEqual(MAX_PILOT_RATIO);
   });
 
   it('disjoint peers → floor settings', () => {

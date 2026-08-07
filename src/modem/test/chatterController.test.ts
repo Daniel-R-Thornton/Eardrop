@@ -500,6 +500,58 @@ describe('ChatterController', () => {
     expect(worker.calls).toContain('startListening');
   });
 
+  it('puts a completed inbound file in the transcript, attributed to its announcer', async () => {
+    // Room mode renders neither RxView nor RxPipeline, so the transcript row
+    // is the ONLY reachable handle on a file received there. The transfer
+    // itself carries no author — the sender id has to survive from
+    // FILE_COMING through to completion.
+    const worker = makeFakeWorker();
+    const player = makeFakePlayer();
+    const clock = makeClock();
+    const controller = new ChatterController(worker, {
+      player, schedule: clock.schedule, now: clock.now, rng: () => 0,
+    });
+    await controller.joinRoom();
+    await clock.tick(
+      ROOM_TIMING.listenMs + MUTE_TAIL_MS
+      + ROOM_TIMING.replySlots * ROOM_TIMING.replySlotMs + ROOM_TIMING.collectExtraMs + 200,
+    );
+
+    worker.emit('controlMessage', {
+      msg: {
+        type: ControlType.FileComing,
+        senderId: 143,
+        targetId: 0,
+        payload: packFileComing({
+          pilotFreqHz: 6300, toneStartHz: 600, toneCount: 32,
+          settleSymbols: 16, fileBytes: 54, durationMs: 30000,
+        }).buffer,
+      },
+    });
+    await clock.tick(50);
+
+    controller.recordReceivedFile({ name: 'notes.txt', url: 'blob:fake', size: 54 });
+
+    const rows = getState().chatterMessages.filter((m) => m.file);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].file).toEqual({ name: 'notes.txt', url: 'blob:fake', size: 54 });
+    expect(rows[0].senderId).toBe(143);
+    expect(rows[0].dir).toBe('rx');
+  });
+
+  it('ignores a completed file outside a room — the bench has its own file UI', () => {
+    // recordReceivedFile is called unconditionally from app.ts's fileComplete
+    // handler, which also fires for bench transfers. Recording those would put
+    // rows in a transcript nothing is showing, and attribute them to id 0.
+    const worker = makeFakeWorker();
+    const controller = new ChatterController(worker, { player: makeFakePlayer() });
+    setState({ chatterOn: false, chatterMessages: [] });
+
+    controller.recordReceivedFile({ name: 'bench.txt', url: 'blob:fake', size: 12 });
+
+    expect(getState().chatterMessages).toHaveLength(0);
+  });
+
   it('surfaces a failed file encode as chatterError instead of an unhandled rejection', async () => {
     // startFileTx fires transmitFile with `void`, so a rejection inside it had
     // nowhere to go: chatterError stayed null and the room sat in 'sending'

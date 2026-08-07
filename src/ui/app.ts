@@ -34,6 +34,8 @@ import { scoreTrial } from './lib/speedTestScore';
 import { detectToneEnergy } from '../lib/scan/index';
 import { resample } from '../lib/math/index';
 import { dlog, dlogDump, dlogInject, dlogInjectRecord, dlogReset, dlogSetFocus, dlogSetMode, DLOG_RING_MAX, dlogRingLength } from '../lib/debug/dlog';
+import { buildStampFields } from '../lib/debug/buildInfo';
+import { ROOM_LOG_TAGS } from './roomLogTags';
 import { ModemController } from './controllers/modemController';
 import { buildModemConfig } from './controllers/buildModemConfig';
 import { ChatterController } from './controllers/chatterController';
@@ -192,27 +194,11 @@ window.addEventListener('eardrop-chatter-text', ((e: CustomEvent) => {
   chatter.sendText(text, targetId ?? 0);
 }) as EventListener);
 
-/**
- * Tags worth seeing while the room is on screen: what the room decided, what
- * control traffic was demodulated, and the audio devices behind both. The
- * modem's per-symbol OFDM/sync/frame logging is excluded — it is the bulk of
- * the output and it buries these.
- */
-const ROOM_LOG_TAGS = [
-  'ROOM', 'CHATTER-RX', 'REC', 'REC-CAP', 'REC-ERR', 'PLAY', 'APP', 'UI',
-  // The decode ladder for a control message, needed to tell "heard nothing"
-  // from "heard it and could not read it": OFDM-SYNC = the chirp was found,
-  // RX-OFDM cardInvalid = a sentinel arrived but its header would not decode.
-  // These are noisy during a file transfer but near-silent while a room idles,
-  // which is exactly when we need them.
-  'OFDM-SYNC', 'RX-OFDM',
-];
-
 // Room mode narrows debug output to the room's own story. Applied on BOTH
 // sides: the worker does most of the logging, the main thread the rest.
 window.addEventListener('eardrop-room-focus', ((e: CustomEvent) => {
   const { focused } = e.detail as { focused: boolean };
-  const tags = focused ? ROOM_LOG_TAGS : null;
+  const tags = focused ? [...ROOM_LOG_TAGS] : null;
   dlogSetFocus(tags);
   modem.setLogFocus(tags);
 }) as EventListener);
@@ -225,12 +211,21 @@ modem.on('fileComplete', (ev) => {
     return;
   }
   const data = new Uint8Array(ev.data);
+  // A completed receive used to write NOTHING to the log, so a transfer that
+  // worked and one that died mid-payload both ended as a band card, a hop, and
+  // then silence. Reading that silence as failure is how a working 16-tone
+  // transfer in the same session as a failed 32-tone one got missed entirely.
+  // Success needs a line as much as failure does.
+  dlog('RX-FILE', { fileComplete: ev.fileName, bytes: data.length }, { level: 'warn' });
   const blob = new Blob([data]);
   const url = URL.createObjectURL(blob);
   setState({ recvStatus: { type: 'success', msg: `✅ Received ${ev.fileName}` } });
-  setState({
-    receivedFiles: [...getState().receivedFiles, { name: ev.fileName, url, size: data.length }],
-  });
+  const received = { name: ev.fileName, url, size: data.length };
+  setState({ receivedFiles: [...getState().receivedFiles, received] });
+  // Room mode renders neither RxView nor RxPipeline, so `receivedFiles` alone
+  // leaves the blob with no UI at all — mirror it into the room transcript,
+  // where it is the only way to reach a file received on a phone.
+  chatter.recordReceivedFile(received);
 });
 modem.on('dlog', (ev) => {
   if (ev.line !== undefined) dlogInject(ev.line);
@@ -238,7 +233,29 @@ modem.on('dlog', (ev) => {
 });
 modem.on('telemetry', (ev) => setTelemetry(ev.telemetry));
 
+// FIRST line of every session's log, before anything that could fail: it names
+// the build the rest of the log came from. Without it a log cannot say whether
+// it predates a fix under test — which is exactly how one receiver
+// investigation lost a session to guesswork. `built=` is the field that exposes
+// a phone still running a cached LAN bundle from before the edit.
+dlog('APP', buildStampFields(), { level: 'warn' });
+
 dlog('APP', { hwRate: audioCtx.sampleRate });
+
+// Both `audioWorklet` and `navigator.mediaDevices` are [SecureContext] in the
+// spec: over plain http:// on a LAN IP they are simply absent, and the first
+// symptom is `addModule` of undefined deep inside the recorder. Log the gate
+// itself at startup so a phone's log names the cause instead of the symptom.
+dlog(
+  'APP',
+  {
+    origin: location.origin,
+    secureContext: window.isSecureContext,
+    audioWorklet: Boolean(audioCtx.audioWorklet),
+    mediaDevices: Boolean(navigator.mediaDevices),
+  },
+  { level: window.isSecureContext ? 'info' : 'warn' },
+);
 
 // ─── Device Enumeration ───────────────────────────────
 // The device dropdowns are rendered and populated by React (MainApp). Here we
