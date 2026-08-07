@@ -13,7 +13,8 @@
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\"",
     "lint": "eslint src/",
-    "lint:fix": "eslint src/ --fix"
+    "lint:fix": "eslint src/ --fix",
+    "logserver": "node scripts/log-server.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
