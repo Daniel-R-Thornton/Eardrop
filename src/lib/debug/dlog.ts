@@ -23,6 +23,17 @@ const rateCounters = new Map<string, number>();
 let totalEmitted = 0;
 
 /**
+ * Bumped by every dlogReset. The sequence space restarting at 0 is only
+ * *detectable* from a cursor when the new run is shorter than the old one
+ * (seq > totalEmitted); app.ts resets per speed-test trial, so a trial that
+ * emits at least as many lines as the previous cursor would look "already
+ * caught up" and its entire log would be dropped silently. This counter makes
+ * "different ring" unambiguous regardless of length, so a reader can restart
+ * its cursor at 0 rather than guess.
+ */
+let generation = 0;
+
+/**
  * Structured mirror of the ring: the same events, but as {tag, fields} rather
  * than formatted text.
  *
@@ -316,8 +327,13 @@ export function dlogDump(count = 200): string {
  * lines, it must not fabricate them), and a cursor from before a dlogReset
  * (now larger than totalEmitted) yields the current head rather than an
  * empty result forever. Callers always adopt `next`.
+ *
+ * `generation` changes on every dlogReset. Length-based detection above only
+ * catches the shrinking case, so callers must compare generations too and
+ * restart their cursor at 0 when it moves — otherwise a longer new run reads
+ * as "caught up" and is dropped entirely.
  */
-export function dlogSince(seq: number): { next: number; lines: string[] } {
+export function dlogSince(seq: number): { generation: number; next: number; lines: string[] } {
   const floor = totalEmitted - ring.length;
   // A cursor beyond totalEmitted can only mean a dlogReset happened underneath
   // the caller (the counter restarted at 0). Clamping it down to totalEmitted
@@ -325,7 +341,7 @@ export function dlogSince(seq: number): { next: number; lines: string[] } {
   // between the reset and this call. Snapping to floor instead hands back
   // everything currently in the ring, so the caller converges in one step.
   const start = seq > totalEmitted ? floor : Math.max(seq, floor);
-  return { next: totalEmitted, lines: ring.slice(ring.length - (totalEmitted - start)) };
+  return { generation, next: totalEmitted, lines: ring.slice(ring.length - (totalEmitted - start)) };
 }
 
 /** Structured records, for aggregation (see DlogRecord). */
@@ -354,4 +370,5 @@ export function dlogReset(): void {
   dupState.clear();
   redrawEmitted = 0;
   totalEmitted = 0;
+  generation++;
 }

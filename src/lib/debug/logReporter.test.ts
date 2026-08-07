@@ -30,6 +30,7 @@ describe('logReporter', () => {
     dlog('T', { x: 1 });
     await vi.advanceTimersByTimeAsync(60000);
     expect(posts).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0); // no tick was ever armed
   });
 
   it('pushes each new line exactly once across ticks', async () => {
@@ -114,6 +115,85 @@ describe('logReporter', () => {
     expect(vi.getTimerCount()).toBe(1); // exactly one live timer remains armed
   });
 
+  it('stays permanently off when the probe answers 200 with an SPA fallback page', async () => {
+    // `npm run preview` (and any static host with an index.html fallback)
+    // answers GET /api/log with 200 index.html. Accepting that would light the
+    // "PC: connected" chip and advance the cursor while nothing reaches disk —
+    // the worst outcome for a debug tool. Only the endpoint's own 204 counts.
+    const { fetchFn, posts } = makeFetch(200, []);
+    startLogReporter({ device: 'd', fetchFn });
+    await settle();
+    expect(logReporterEnabled()).toBe(false);
+    dlog('T', { x: 1 });
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(posts).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+    await expect(flushLogReporter()).resolves.toBe(false); // manual send stays inert too
+    expect(posts).toHaveLength(0);
+  });
+
+  it('treats a 200 POST reply as a failure and re-sends those lines', async () => {
+    const { fetchFn, posts } = makeFetch(204, [200, 204]);
+    startLogReporter({ device: 'd', fetchFn });
+    await settle();
+    dlog('T', { x: 1 });
+    await vi.advanceTimersByTimeAsync(5000); // 200 = not our endpoint: a failure
+    await vi.advanceTimersByTimeAsync(5000); // retry, 204
+    expect(posts).toHaveLength(2);
+    expect(posts[1].rows.join()).toContain('x=1');
+  });
+
+  it('re-sends a whole fresh ring after a mid-session dlogReset', async () => {
+    // app.ts calls dlogReset() per speed-test trial. If the new trial emits at
+    // least as many lines as the old cursor, the cursor is <= totalEmitted and
+    // looks "caught up" — the exact run being debugged would be dropped.
+    const { fetchFn, posts } = makeFetch(204, []);
+    startLogReporter({ device: 'd', fetchFn });
+    await settle();
+    for (let i = 0; i < 3; i++) dlog('T', { trial1: i });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(posts).toHaveLength(1);
+
+    dlogReset();
+    for (let i = 0; i < 3; i++) dlog('T', { trial2: i });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(posts).toHaveLength(2);
+    expect(posts[1].rows).toHaveLength(3);
+    expect(posts[1].rows.join()).toContain('trial2=2');
+  });
+
+  it('flushLogReporter reports whether the push actually landed', async () => {
+    const { fetchFn } = makeFetch(204, [500]);
+    startLogReporter({ device: 'd', fetchFn });
+    await settle();
+    dlog('T', { x: 1 });
+    await expect(flushLogReporter()).resolves.toBe(false); // POST 500
+    await expect(flushLogReporter()).resolves.toBe(true); // retry, 204
+  });
+
+  it('abandons a POST that never settles instead of wedging the reporter forever', async () => {
+    // Pushes are coalesced through one in-flight promise, so a fetch that
+    // never settles would block every later tick AND the manual button.
+    vi.useRealTimers();
+    const fetchFn = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      if (!init || init.method !== 'POST') return new Response(null, { status: 204 });
+      return new Promise<Response>((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+      });
+    });
+    startLogReporter({
+      device: 'd', fetchFn: fetchFn as unknown as typeof fetch, intervalMs: 60000, timeoutMs: 20,
+    });
+    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 10));
+    dlog('T', { x: 1 });
+    await expect(flushLogReporter()).resolves.toBe(false);
+    // Not wedged: a second flush runs rather than joining a dead promise.
+    await expect(flushLogReporter()).resolves.toBe(false);
+    expect(fetchFn.mock.calls.filter((c) => (c[1] as RequestInit | undefined)?.method === 'POST'))
+      .toHaveLength(2);
+  });
+
   it('a throwing subscriber does not kill the reporter or propagate out of flushLogReporter', async () => {
     const { fetchFn, posts } = makeFetch(204, []);
     startLogReporter({ device: 'd', fetchFn });
@@ -121,7 +201,7 @@ describe('logReporter', () => {
     onLogReporterChange(() => { throw new Error('boom'); });
 
     dlog('T', { x: 1 });
-    await expect(flushLogReporter()).resolves.toBeUndefined();
+    await expect(flushLogReporter()).resolves.toBe(true); // resolved, not thrown
     expect(posts).toHaveLength(1);
     expect(logReporterEnabled()).toBe(true);
 

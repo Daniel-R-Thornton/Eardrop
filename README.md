@@ -48,6 +48,19 @@ npm run test
 npm run lint
 ```
 
+## Collecting phone logs over the LAN
+
+A phone has no console, and its in-memory debug ring only holds 500 lines, so a long test overwrites the part you needed. The LAN log server collects those lines on the PC as they happen:
+
+```bash
+npm run build     # default base — do NOT set VITE_BASE here
+npm run logserver # port 8790; prints the http://<pc-ip>:8790 URLs to open
+```
+
+Browse to the printed URL on **both** devices (the phone and the PC), then run the test as usual. A "PC: connected" chip and a "send to PC" button appear in the ▤ log panel once the reporter has found the server; lines are pushed every 5 seconds regardless. They land in `logs/<date>/<device>-<session>.log`.
+
+The Pages build (`VITE_BASE=/Eardrop/`) will not load from this server — build with the default base. On GitHub Pages itself the reporter finds no endpoint and stays permanently off, so nothing is ever sent from the deployed site. The endpoint is unauthenticated: anyone on your LAN can append log lines, which is deliberate for a bench debugging tool.
+
 ## Documentation
 
 - `STATE.md` — current state, known issues, and follow-up notes

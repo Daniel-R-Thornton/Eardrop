@@ -34,4 +34,23 @@ describe('dlogSince', () => {
     const recovered = dlogSince(after.next);
     expect([...after.lines, ...recovered.lines].join('\n')).toContain('fresh=true');
   });
+
+  it('reports a new generation after dlogReset even when the new run is longer than the cursor', () => {
+    // The reset case the seq>totalEmitted clamp CANNOT see: app.ts resets per
+    // speed-test trial, and if the next trial emits at least as many lines as
+    // the last cursor, seq <= totalEmitted and the clamp reads it as "already
+    // caught up" — silently dropping the whole trial. Only a generation stamp
+    // distinguishes "caught up" from "different ring".
+    for (let i = 0; i < 10; i++) dlog('T1', { i });
+    const first = dlogSince(0);
+    expect(first.lines).toHaveLength(10);
+
+    dlogReset();
+    for (let i = 0; i < 10; i++) dlog('T2', { i });
+
+    const after = dlogSince(first.next);
+    expect(after.generation).not.toBe(first.generation);
+    // And a reader that restarts at 0 on a generation change sees the new run.
+    expect(dlogSince(0).lines.join('\n')).toContain('i=9');
+  });
 });

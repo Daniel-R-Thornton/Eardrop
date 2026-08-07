@@ -1,5 +1,12 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 import { handleLogRequest } from "./scripts/log-endpoint.mjs";
+
+// Derived from this file's own location, not process.cwd(): `vite` started
+// from anywhere but the repo root would otherwise scatter logs/ directories
+// wherever the shell happened to be. The standalone server derives its root
+// the same way, so both write to the same repo-root logs/.
+const repoRoot = fileURLToPath(new URL(".", import.meta.url));
 
 export default defineConfig({
   root: ".",
@@ -15,7 +22,7 @@ export default defineConfig({
       name: "eardrop-log-endpoint",
       configureServer(server) {
         server.middlewares.use((req, res, next) => {
-          void handleLogRequest(req, res, { rootDir: process.cwd() }).then(
+          void handleLogRequest(req, res, { rootDir: repoRoot }).then(
             (handled) => { if (!handled) next(); },
             next,
           );

@@ -5,8 +5,9 @@
  * Exists for the phone: its 500-record ring silently loses the start of any
  * long session, and exporting it means touching the phone mid-test. When the
  * app is served by scripts/log-server.mjs or the vite dev server, /api/log
- * answers the startup probe and this module pushes every NEW line (dlogSince
- * cursor — nothing sent twice) every 5 s. On GitHub Pages the probe fails and
+ * answers the startup probe with its 204 and this module pushes every NEW line
+ * (dlogSince cursor — nothing sent twice) every 5 s. Anywhere else — GitHub
+ * Pages' 404, an SPA fallback's 200 index.html — the probe does not match and
  * the reporter is permanently off: zero behavior change for the deployed site.
  *
  * Never throws into app code: every fetch path is caught. A failed push keeps
@@ -19,16 +20,35 @@ import { dlogSince } from './dlog';
 const INTERVAL_MS = 5000;
 const BACKOFF_MS = 30000;
 const BACKOFF_AFTER = 3;
+const TIMEOUT_MS = 10000;
+
+/**
+ * The endpoint answers 204 to both the probe and a stored POST, and nothing
+ * else does. "Any 2xx" is not good enough: every SPA-fallback host (including
+ * `npm run preview`) answers GET /api/log with 200 index.html, which would
+ * light the "PC: connected" chip and advance the cursor while not one line
+ * ever reaches disk — silent data loss in the tool you reach for when you
+ * suspect data loss.
+ */
+const isEndpointReply = (res: Response): boolean => res.status === 204;
 
 interface ReporterState {
   enabled: boolean;
   device: string;
   session: string;
   cursor: number;
+  /**
+   * The dlog generation `cursor` belongs to. -1 = "not yet observed"; the
+   * first push adopts whatever the ring reports. A change means dlogReset ran
+   * underneath us (app.ts does it per speed-test trial) and the cursor is
+   * meaningless — see push().
+   */
+  generation: number;
   failures: number;
   fetchFn: typeof fetch;
   intervalMs: number;
   backoffMs: number;
+  timeoutMs: number;
   timer: ReturnType<typeof setTimeout> | null;
   /**
    * The in-flight push, if any. Both the periodic tick and flushLogReporter
@@ -38,7 +58,7 @@ interface ReporterState {
    * land back to back). Without it, two pushes read dlogSince at the same
    * unmoved cursor and the server gets the same rows twice.
    */
-  pushing: Promise<void> | null;
+  pushing: Promise<boolean> | null;
 }
 let st: ReporterState | null = null;
 const listeners = new Set<() => void>();
@@ -61,28 +81,56 @@ const notify = () => {
 
 const randomId = () => Math.random().toString(36).slice(2, 8);
 
-async function push(s: ReporterState): Promise<void> {
+/**
+ * A request that never settles would block this reporter forever: pushes are
+ * coalesced through one in-flight promise, so every later tick AND the manual
+ * "send to PC" button would join a promise that can never resolve. A phone on
+ * a flaky LAN produces exactly that. AbortSignal.timeout is guarded because
+ * the module is also loaded under test/older runtimes; without it we simply
+ * lose the timeout, not the push.
+ */
+function timeoutSignal(ms: number): AbortSignal | undefined {
+  const ctor = globalThis.AbortSignal as (typeof AbortSignal | undefined);
+  return typeof ctor?.timeout === 'function' ? ctor.timeout(ms) : undefined;
+}
+
+/** Resolves true when the ring is fully delivered (including "nothing new"). */
+async function push(s: ReporterState): Promise<boolean> {
   try {
-    const { next, lines } = dlogSince(s.cursor);
-    if (lines.length > 0) {
+    let read = dlogSince(s.cursor);
+    // A generation change means the ring was reset underneath us, so `cursor`
+    // indexes a sequence space that no longer exists. Reading from 0 resends
+    // the whole fresh ring; the alternative (trusting the cursor) drops the
+    // entire new run whenever it is at least as long as the old one, which is
+    // precisely the per-trial speed-test case.
+    if (read.generation !== s.generation) read = dlogSince(0);
+    if (read.lines.length > 0) {
       try {
         const res = await s.fetchFn('/api/log', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ device: s.device, session: s.session, rows: lines }),
+          body: JSON.stringify({ device: s.device, session: s.session, rows: read.lines }),
+          signal: timeoutSignal(s.timeoutMs),
         });
-        if (!res.ok) throw new Error(`status ${res.status}`);
-        s.cursor = next;
+        if (!isEndpointReply(res)) throw new Error(`status ${res.status}`);
+        s.cursor = read.next;
+        s.generation = read.generation;
         s.failures = 0;
       } catch {
-        s.failures += 1; // cursor unmoved: these lines go again next tick
+        // Cursor AND generation unmoved: these lines go again next tick, and
+        // a still-unacknowledged reset is still seen as a reset.
+        s.failures += 1;
+        return false;
       }
     } else {
-      s.cursor = next; // adopt even when empty — survives a dlogReset
+      s.cursor = read.next; // adopt even when empty — survives a dlogReset
+      s.generation = read.generation;
     }
+    return true;
   } catch {
     /* defensive: dlogSince is not expected to throw, but it must not be able
      * to take the reporter down either if it somehow did */
+    return false;
   } finally {
     notify();
   }
@@ -93,7 +141,7 @@ async function push(s: ReporterState): Promise<void> {
  * starting a second. Callers (the tick timer and flushLogReporter) both go
  * through this so at most one push is ever outstanding per reporter state.
  */
-function runOnce(s: ReporterState): Promise<void> {
+function runOnce(s: ReporterState): Promise<boolean> {
   if (s.pushing) return s.pushing;
   const p = push(s).finally(() => {
     if (s.pushing === p) s.pushing = null;
@@ -114,7 +162,8 @@ function arm(s: ReporterState): void {
 }
 
 export function startLogReporter(opts: {
-  device?: string; fetchFn?: typeof fetch; intervalMs?: number; backoffMs?: number;
+  device?: string; fetchFn?: typeof fetch;
+  intervalMs?: number; backoffMs?: number; timeoutMs?: number;
 } = {}): void {
   if (st) return; // idempotent: main.tsx calls once, HMR may call again
   const s: ReporterState = {
@@ -122,10 +171,12 @@ export function startLogReporter(opts: {
     device: opts.device ?? `dev-${randomId()}`,
     session: randomId(),
     cursor: 0,
+    generation: -1,
     failures: 0,
     fetchFn: opts.fetchFn ?? fetch.bind(globalThis),
     intervalMs: opts.intervalMs ?? INTERVAL_MS,
     backoffMs: opts.backoffMs ?? BACKOFF_MS,
+    timeoutMs: opts.timeoutMs ?? TIMEOUT_MS,
     timer: null,
     pushing: null,
   };
@@ -133,7 +184,9 @@ export function startLogReporter(opts: {
   void (async () => {
     try {
       const res = await s.fetchFn('/api/log', { method: 'GET' });
-      if (!res.ok) return; // Pages (404) or anything else odd: stay off
+      // Pages (404), an SPA fallback's 200 index.html, anything but our own
+      // endpoint's 204: stay off, permanently and silently.
+      if (!isEndpointReply(res)) return;
       s.enabled = true;
       notify();
       arm(s);
@@ -143,20 +196,29 @@ export function startLogReporter(opts: {
   })();
 }
 
-/** Immediate push — the ▤ log panel's "send now". Safe when disabled. */
-export async function flushLogReporter(): Promise<void> {
+/**
+ * Immediate push — the ▤ log panel's "send now". Safe when disabled.
+ *
+ * Resolves true only when the rows actually reached the server (or there was
+ * nothing new to send), false otherwise. It deliberately never REJECTS —
+ * "never throws into app code" is the module's invariant — so the outcome has
+ * to come back as a value, or the caller's "send failed" branch is dead code
+ * and a 500 or a full disk still flashes "sent to PC".
+ */
+export async function flushLogReporter(): Promise<boolean> {
   const s = st;
-  if (!s || !s.enabled) return;
+  if (!s || !s.enabled) return false;
   if (s.timer) {
     clearTimeout(s.timer);
     s.timer = null;
   }
   // Joins an in-flight tick's push via runOnce rather than starting a second
   // one (same cursor, same rows — would duplicate them on the server).
-  await runOnce(s);
+  const ok = await runOnce(s);
   // If a joined tick already re-armed while we were awaiting, don't do it
   // again — that is exactly the double-arm this function used to cause.
   if (st === s && !s.timer) arm(s);
+  return ok;
 }
 
 export function logReporterEnabled(): boolean {

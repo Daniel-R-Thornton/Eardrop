@@ -8,8 +8,11 @@
  * copies, on screen, plus the ways a phone can actually get text off itself:
  * the native share sheet, a downloaded file, or the clipboard.
  *
- * Everything is local — the text goes to the OS share sheet or a file the
- * user chooses to send. Nothing is uploaded anywhere.
+ * The share/download/copy routes are all local — the text goes to the OS share
+ * sheet or a file the user chooses to send. The one exception is "send to PC",
+ * which appears only when the LAN log server answered logReporter's probe, and
+ * pushes to that server on your own network; on GitHub Pages the reporter is
+ * off and neither the chip nor the button exists.
  */
 import { useCallback, useMemo, useState, useSyncExternalStore } from 'react';
 import { dlogDump, dlogRecords, DLOG_RING_MAX } from '../../lib/debug/dlog';
@@ -103,10 +106,10 @@ export function LogShare({ onClose }: { onClose: () => void }) {
               type="button"
               style={btn(true)}
               onClick={() => {
-                void flushLogReporter().then(
-                  () => flash('sent to PC'),
-                  () => flash('send failed'),
-                );
+                // flushLogReporter never rejects by design, so the outcome
+                // arrives as its resolved value — a rejection handler here
+                // would be dead code and every failed POST would read as sent.
+                void flushLogReporter().then((ok) => flash(ok ? 'sent to PC' : 'send failed'));
               }}
             >
               send to PC
