@@ -1108,6 +1108,57 @@ describe('room protocol', () => {
     expect(window - worstReplyEndsAt).toBeGreaterThan(1000);
   });
 
+  it('leaves room in the ACK window for an ACK drawn into the last slot', () => {
+    // Same discipline as the collect-window assertion above, for the same
+    // reason: the peer's ACK rides the same Outbox as every reply, so it is
+    // scheduled at turnaround + slot*slotMs — a window that omits the
+    // turnaround shuts before an ACK drawn into a late slot has finished,
+    // and the sender retries (then reports 'failed') a message that was in
+    // fact delivered. An ACK is ~2 s of air (measured — see ACK_AIR_MS).
+    const ACK_AIR_MS = 2000;
+    const lastSlotOpensAt = ROOM_TIMING.replyTurnaroundMs
+      + (ROOM_TIMING.replySlots - 1) * ROOM_TIMING.replySlotMs;
+    const worstAckEndsAt = lastSlotOpensAt + ACK_AIR_MS;
+
+    expect(worstAckEndsAt).toBeLessThan(ROOM_TIMING.ackWindowMs);
+    // ...with real margin for the peer's decode of the TEXT, its encode of
+    // the ACK, and output latency — budgeted nowhere else.
+    expect(ROOM_TIMING.ackWindowMs - worstAckEndsAt).toBeGreaterThan(1000);
+  });
+
+  // ---- texts must not strand when the room cannot transmit ----
+
+  it('a TEXT sent while the room is cold fails immediately instead of stranding', async () => {
+    // The outbox only drains on entry to idle/joinWait, and a cold room never
+    // reaches either without a fresh start(). A text accepted in cold would
+    // otherwise sit reported 'sending' for the rest of the session.
+    const h = makeHarness(1);
+    const msgId = h.room.sendText('anyone?'); // never started — state is 'cold'
+    await h.tick(REPLY_SPAN + ROOM_TIMING.ackWindowMs + 500);
+
+    expect(h.sent.filter((m) => m.type === ControlType.Text)).toHaveLength(0);
+    expect(h.textStates[h.textStates.length - 1]).toMatchObject({ msgId, state: 'failed' });
+    expect((h.room as any).sentText.has(msgId)).toBe(false);
+    expect((h.room as any).outbox.size).toBe(0);
+  });
+
+  it('a deps error that drops the room to cold fails in-flight TEXTs rather than stranding them', async () => {
+    // handleDepsError('cold') clears the outbox, which cancels every slot
+    // chain — after that nothing can ever resolve a SentText record, so each
+    // one must be reported 'failed' rather than left on 'sending' forever.
+    const h = makeHarness(1, { playProbe: () => new Promise<void>(() => {}) });
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + 100);
+    expect(h.room.state).toBe('announcing'); // transmitter busy: text is held
+
+    const msgId = h.room.sendText('queued mid-join');
+    await h.tick(ROOM_STALL_MS + 100); // announce stalls → cold
+
+    expect(h.room.state).toBe('cold');
+    expect(h.textStates[h.textStates.length - 1]).toMatchObject({ msgId, state: 'failed' });
+    expect((h.room as any).sentText.has(msgId)).toBe(false);
+  });
+
   // ---- remembered band: skip the roll call when we already negotiated ----
   //
   // A roll call exists to learn which band a peer can hear. That answer does

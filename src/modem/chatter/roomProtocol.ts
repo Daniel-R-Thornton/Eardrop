@@ -171,6 +171,11 @@ const REPLY_TURNAROUND_MS = 500;
  *  tones plus the fixed ~1.5 s preamble. Used below to size the ACK window. */
 const ACK_AIR_MS = 2000;
 
+/** Margin past the worst-case ACK for the peer's decode of the TEXT, its
+ *  encode of the ACK, and output latency — the same ~1 s of slack the collect
+ *  window keeps (see collectExtraMs), budgeted nowhere else. */
+const ACK_GRACE_MS = 1000;
+
 export const ROOM_TIMING = {
   listenMs: 1000, listenCapMs: 10000,
   replySlots: REPLY_SLOTS, replySlotMs: REPLY_SLOT_MS,
@@ -196,15 +201,19 @@ export const ROOM_TIMING = {
   /**
    * How long a sent TEXT waits for an ACK before its one retry.
    *
-   * DERIVED, never hardcoded: the slot span every ACK is drawn from, plus one
-   * whole ACK's airtime. `collectExtraMs` was a hardcoded window sized
+   * DERIVED, never hardcoded: the turnaround plus the slot span every ACK is
+   * drawn from, plus one whole ACK's airtime, plus grace for the latencies
+   * nothing else budgets. `collectExtraMs` was a hardcoded window sized
    * against an assumption a later change invalidated, and the result was a
    * retried reply landing outside it and silently killing a file transfer —
-   * see this module's history. ACK_AIR_MS is the measured air time of a
-   * 1-byte control payload: 35 wire bytes over 8 QPSK tones plus the fixed
-   * ~1.5 s preamble.
+   * see this module's history. This window then repeated that history in
+   * miniature: when REPLY_TURNAROUND_MS was added it grew collectExtraMs but
+   * not this, so an ACK drawn into a late slot (opens at 2000 ms) plus its
+   * ~2 s of air landed past the 3800 ms window — and the sender retried,
+   * then reported 'failed', a message the peer had audibly acknowledged.
+   * Asserted in roomProtocol.test.ts alongside the collect-window arithmetic.
    */
-  ackWindowMs: REPLY_SLOTS * REPLY_SLOT_MS + ACK_AIR_MS,
+  ackWindowMs: REPLY_TURNAROUND_MS + REPLY_SLOTS * REPLY_SLOT_MS + ACK_AIR_MS + ACK_GRACE_MS,
 } as const;
 
 /**
@@ -578,6 +587,18 @@ export class RoomProtocol {
     this.sentText.set(msgId, {
       msgId, targetId, payload, attempts: 0, ackedBy: [],
     });
+    // No room to send into, and no way back: the outbox only drains on entry
+    // to idle/joinWait, and cold reaches neither without a fresh start() —
+    // which clears the queue anyway. Accepting the message here (the UI can
+    // still call this after a deps error dropped the room to cold) and
+    // queueing it would leave it reported 'sending' for the rest of the
+    // session. Fail it now, visibly, so the operator rejoins and resends.
+    if (this._state === 'cold') {
+      this._lastError = 'room: text sent while not joined';
+      this.deps.onTextStateChange?.(msgId, 'sending', []);
+      this.failSentText(`text:${msgId}`);
+      return msgId;
+    }
     this.outbox.enqueue({
       kind: 'text',
       targetId,
@@ -1219,6 +1240,20 @@ export class RoomProtocol {
    * broadcast retry would — see checkTextAck's broadcast rule for the same
    * reasoning applied one step earlier.
    */
+  /**
+   * Resolve every TEXT record still pending, for a room that has lost the
+   * machinery that would otherwise resolve them (see handleDepsError's cold
+   * branch). A record that already collected an ack was reported 'delivered'
+   * and is silently dropped; the rest are reported 'failed' — unlike stop(),
+   * where the operator chose to leave and the chat UI resets with the room.
+   */
+  private failAllSentTexts(): void {
+    for (const rec of Array.from(this.sentText.values())) {
+      this.sentText.delete(rec.msgId);
+      if (rec.ackedBy.length === 0) this.deps.onTextStateChange?.(rec.msgId, 'failed', []);
+    }
+  }
+
   private failSentText(dedupKey: string): void {
     const msgId = textMsgIdFromDedupKey(dedupKey);
     if (msgId === undefined) return; // not a dedupKey this class produced
@@ -1298,6 +1333,10 @@ export class RoomProtocol {
       this.pendingSendFile = null;
       this.activeFileParams = null;
       this.outbox.clear();
+      // clear() just cancelled every slot chain, so nothing after this point
+      // can resolve a SentText record — queued or mid-window, each one would
+      // sit reported 'sending' for the rest of the session. Sweep them now.
+      this.failAllSentTexts();
       this.replyPurpose.clear();
       this.awaitingAck.clear();
       this.setState('cold');
