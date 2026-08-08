@@ -37,16 +37,15 @@ import { useStore } from '../Store';
 import { T } from '../theme/labaccent/tokens';
 import { Screen } from '../components/instrument/Screen';
 import { PacketStream } from './RoomModePacketStream';
-import { hex, formatAgo } from './roomModeFormat';
+import { formatAgo } from './roomModeFormat';
 import { LogShare } from './LogShare';
 import { CollapsibleSection } from './CollapsibleSection';
 import { ChatMessageList } from './ChatMessageList';
 import { ChatComposer } from './ChatComposer';
 import { isWideViewport } from './viewport';
 import { dlog } from '../../lib/debug/dlog';
-import {
-  NICKNAME_MAX_BYTES, defaultNickname, getNickname, labelFor, setNickname,
-} from '../../lib/identity';
+import { getNickname, labelFor } from '../../lib/identity';
+import { NicknameField } from './NicknameField';
 
 const dispatch = (type: string) => window.dispatchEvent(new CustomEvent(type));
 
@@ -336,10 +335,6 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
 
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [hoveredId, setHoveredId] = useState<number | null>(null);
-  // Seeded from storage, then this state is the source of truth for the field.
-  // The nickname is not in the Store because nothing outside this input writes
-  // it, and RoomProtocol reads it live off `deps.nickname()` at send time.
-  const [nickname, setNicknameState] = useState(() => getNickname());
   const focusId = hoveredId ?? selectedId;
 
   const now = performance.now();
@@ -686,6 +681,11 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
         <span style={{ color: T.panelInk, opacity: 0.7 }}>
           mic {s.selectedInputLabel || 'default'} · out {s.selectedOutputId ? 'selected' : 'system default'}
         </span>
+        {/* Out here rather than inside the collapsible roster: the roster starts
+         *  CLOSED on a phone, and a control nobody can find is a control that
+         *  does not exist. This row already wraps, so the field drops onto its
+         *  own line at narrow widths instead of overrunning. */}
+        <NicknameField />
       </div>
 
       {notice && (
@@ -824,31 +824,6 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
               // recipient picker addresses files and text alike, so a second
               // way to choose a target would be a second source of truth.
               <ul style={{ margin: 0, padding: 0, listStyle: 'none', fontFamily: T.mono, fontSize: 11 }}>
-                {/* This device, and the only place its nickname can be set. The
-                 *  name goes out in every WELCOME, so peers see it too — which
-                 *  is the point: a room of hex ids cannot say which node is the
-                 *  phone in your hand. Sanitizing on change (not on blur) means
-                 *  the field always shows exactly what will go on the air,
-                 *  including the byte cap. */}
-                <li style={{ marginBottom: 8, minHeight: 44, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span style={{ opacity: 0.7, flex: '0 0 auto' }}>this device</span>
-                  <input
-                    aria-label="nickname for this device"
-                    value={nickname}
-                    placeholder={defaultNickname()}
-                    onChange={(e) => setNicknameState(setNickname(e.target.value))}
-                    style={{
-                      flex: '1 1 auto', minWidth: 0, minHeight: 32,
-                      fontFamily: T.mono, fontSize: 11,
-                      color: T.phosphor, background: 'rgba(0,0,0,0.35)',
-                      border: `1px solid ${T.phosphor}`, borderRadius: 3,
-                      padding: '4px 6px',
-                    }}
-                  />
-                  <span style={{ opacity: 0.5, flex: '0 0 auto' }}>
-                    {`${new TextEncoder().encode(nickname).length}/${NICKNAME_MAX_BYTES}B`}
-                  </span>
-                </li>
                 {nodes.map(({ m, ageMs, agedOut }) => (
                   <li
                     key={m.deviceId}

@@ -11,6 +11,8 @@ import { T } from '../theme/labaccent/tokens';
 import { Panel } from '../components/instrument/Panel';
 import { Button } from '../components/instrument/Button';
 import { LED } from '../components/instrument/LED';
+import { NicknameField } from './NicknameField';
+import { getNickname, labelFor } from '../../lib/identity';
 
 const dispatch = (type: string) => window.dispatchEvent(new CustomEvent(type));
 
@@ -31,10 +33,6 @@ function formatAgo(ms: number): string {
   if (sec < 60) return `${sec}s ago`;
   const min = Math.floor(sec / 60);
   return `${min}m ${sec % 60}s ago`;
-}
-
-function hex(id: number): string {
-  return id.toString(16).padStart(2, '0');
 }
 
 export function ChatterPanel() {
@@ -85,9 +83,16 @@ export function ChatterPanel() {
         <LED on={s.chatterOn} label={s.chatterOn ? s.chatterState.toUpperCase() : 'OFF'} />
         {s.chatterOn && (
           <span style={{ fontFamily: T.mono, fontSize: 11, color: T.panelInk, opacity: 0.7 }}>
-            id {hex(s.chatterDeviceId)}
+            id {labelFor(s.chatterDeviceId, getNickname())}
           </span>
         )}
+      </div>
+
+      {/* Always available, not gated on chatterOn: naming the device before
+       *  joining is the natural order, and the name has to be set BEFORE the
+       *  first WELCOME goes out to be any use to peers on that join. */}
+      <div style={{ marginBottom: 8, maxWidth: 320 }}>
+        <NicknameField />
       </div>
 
       {s.chatterError && (
@@ -122,7 +127,7 @@ export function ChatterPanel() {
                     textDecoration: agedOut ? 'line-through' : 'none',
                   }}
                 >
-                  <span style={{ color: T.phosphor }}>{hex(m.deviceId)}</span>
+                  <span style={{ color: T.phosphor }}>{labelFor(m.deviceId, m.nickname)}</span>
                   {` · last heard ${formatAgo(ageMs)}`}
                   {hasClaim && (
                     <span style={{ opacity: 0.7 }}>

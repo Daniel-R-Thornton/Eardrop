@@ -102,8 +102,11 @@ describe('RoomMode', () => {
     // hidden), so anything the column cannot fit is simply clipped away with no
     // page scroll to reach it. Chat is the whole point of the mode; assert its
     // controls are present in the default phone layout.
-    const { getByRole } = render(<RoomMode onExit={() => {}} />);
-    expect(getByRole('textbox')).toBeTruthy();
+    const { getByRole, getByPlaceholderText } = render(<RoomMode onExit={() => {}} />);
+    // By placeholder, not by role: the nickname field is a second textbox in
+    // this mode, so a bare getByRole('textbox') is ambiguous and would fail
+    // without saying anything about the composer either way.
+    expect(getByPlaceholderText(/type a message/i)).toBeTruthy();
     expect(getByRole('button', { name: /^send$/i })).toBeTruthy();
   });
 });
