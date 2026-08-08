@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { RoomProtocol, ROOM_TIMING, ROOM_STALL_MS, BAND_CACHE_TTL_MS } from '../chatter/roomProtocol';
 import {
   ControlType, packReport, packWelcome, packFileComing,
-  packText, packAck, parseText, parseAck, TEXT_MAX_BYTES,
+  packText, packAck, parseText, parseAck, parseWelcome, TEXT_MAX_BYTES,
 } from '../protocol/controlFrame';
 import { PROBE_PURPOSE } from '../protocol/probeBurst';
 
@@ -15,6 +15,7 @@ function makeHarness(
     rng?: () => number;
     isAirBusy?: () => Promise<boolean>;
     sendMessage?: (m: any) => Promise<void>;
+    nickname?: () => string;
   } = {},
 ) {
   let t = 0;
@@ -24,8 +25,11 @@ function makeHarness(
   const textReceived: any[] = [];
   const textAcked: any[] = [];
   const textStates: any[] = [];
+  const collisions: number[][] = [];
   const deps = {
     deviceId,
+    nickname: opts.nickname,
+    onIdCollision: (taken: number[]) => collisions.push(taken),
     now: () => t,
     rng: opts.rng ?? (() => 0), // slot 0 always — collisions forced by `busy`
     schedule: (fn: () => void, d: number) => {
@@ -61,7 +65,7 @@ function makeHarness(
     t = end;
   };
   return {
-    room, tick, sent, calls, textReceived, textAcked, textStates,
+    room, tick, sent, calls, textReceived, textAcked, textStates, collisions,
   };
 }
 
@@ -1332,5 +1336,104 @@ describe('room protocol', () => {
     await h.tick(ROOM_STALL_MS + 100);
     expect(h.room.state).toBe('cold');
     expect(h.room.lastError).toMatch(/never completed/);
+  });
+});
+
+describe('device id collisions', () => {
+  /**
+   * The cost of making the id persistent: two devices that independently
+   * persisted the same 8-bit value now collide for good, where the old
+   * re-roll-every-join scheme collided just as often but threw the dice again.
+   * The room reports it; the controller owns the re-roll (it holds the storage
+   * and the worker), so all that is asserted here is the report.
+   */
+  it('reports a peer heard using our own id', () => {
+    const h = makeHarness(0x42);
+
+    h.room.onMessage({
+      type: ControlType.Report, senderId: 0x42, targetId: 0,
+      payload: packReport(flatGrid),
+    } as any);
+
+    expect(h.collisions).toHaveLength(1);
+    // Our own id must be in `taken` — whatever we move to has to differ from
+    // the value the colliding peer is also using.
+    expect(h.collisions[0]).toContain(0x42);
+  });
+
+  it('does not add the colliding sender to the roster', () => {
+    // Recording it would put a member on the roster under OUR id, which then
+    // renders as a second copy of this device.
+    const h = makeHarness(0x42);
+
+    h.room.onMessage({
+      type: ControlType.Report, senderId: 0x42, targetId: 0,
+      payload: packReport(flatGrid),
+    } as any);
+
+    expect(h.room.members.has(0x42)).toBe(false);
+  });
+
+  it('leaves ordinary traffic from other ids alone', () => {
+    const h = makeHarness(0x42);
+
+    h.room.onMessage({
+      type: ControlType.Report, senderId: 0x07, targetId: 0,
+      payload: packReport(flatGrid),
+    } as any);
+
+    expect(h.collisions).toHaveLength(0);
+    expect(h.room.members.has(0x07)).toBe(true);
+  });
+});
+
+describe('nicknames', () => {
+  it('learns a peer name from its WELCOME', () => {
+    const h = makeHarness(0x42);
+
+    h.room.onMessage({
+      type: ControlType.Welcome, senderId: 0x07, targetId: 0x42,
+      payload: packWelcome({
+        claim: { lowHz: 2600, highHz: 2950, maxQamOrder: 4 },
+        grid: flatGrid,
+        nickname: 'pixel',
+      }),
+    } as any);
+
+    expect(h.room.members.get(0x07)?.nickname).toBe('pixel');
+  });
+
+  it('a later nameless WELCOME does not erase a name already learned', () => {
+    // A peer on a build without nicknames, or one whose name bytes failed to
+    // decode, must not blank out what an earlier WELCOME told us.
+    const h = makeHarness(0x42);
+    const welcome = (nickname?: string) => ({
+      type: ControlType.Welcome, senderId: 0x07, targetId: 0x42,
+      payload: packWelcome({
+        claim: { lowHz: 2600, highHz: 2950, maxQamOrder: 4 },
+        grid: flatGrid,
+        nickname,
+      }),
+    });
+
+    h.room.onMessage(welcome('pixel') as any);
+    h.room.onMessage(welcome(undefined) as any);
+
+    expect(h.room.members.get(0x07)?.nickname).toBe('pixel');
+  });
+
+  it('puts our own nickname on the air in a WELCOME', async () => {
+    const h = makeHarness(0x42, { nickname: () => 'desk-pc' });
+    // The room only answers probes once it is past its initial listen window.
+    h.room.start();
+    await h.tick(ROOM_TIMING.listenMs + 50);
+
+    // A stranger's probe earns a WELCOME (see PROBE_PURPOSE).
+    h.room.onProbeHeard(0x07, flatGrid, PROBE_PURPOSE.joining);
+    await h.tick(REPLY_SPAN);
+
+    const welcome = h.sent.find((m: any) => m.type === ControlType.Welcome);
+    expect(welcome, 'a WELCOME should have gone out').toBeDefined();
+    expect(parseWelcome(welcome.payload)?.nickname).toBe('desk-pc');
   });
 });

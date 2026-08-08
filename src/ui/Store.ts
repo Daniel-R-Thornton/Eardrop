@@ -240,6 +240,9 @@ export interface AppState {
   chatterMembers: {
     deviceId: number;
     lastHeardMs: number;
+    /** Name the member announced in its WELCOME. Undefined when it never sent
+     *  one (older build, or no nickname set), in which case the UI shows hex. */
+    nickname?: string;
     claimLowHz?: number;
     claimHighHz?: number;
     /** Mean of the member's heardGrid in dB relative to that grid's own peak.

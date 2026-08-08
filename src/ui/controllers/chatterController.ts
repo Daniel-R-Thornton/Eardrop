@@ -38,6 +38,7 @@ import { OFDM_DEFAULTS, OFDM_HANDSHAKE } from '../../modem/types';
 import { reportGridFreqs, type ProbePurpose } from '../../modem/protocol/probeBurst';
 import { dlog } from '../../lib/debug/dlog';
 import { handshakeToneGains, handshakeToneMags, handshakeToneHz } from '../../modem/chatter/handshakeGains';
+import { getDeviceId, getNickname, rerollDeviceId } from '../../lib/identity';
 
 /** OFDM tone spacing — the handshake band's tones sit on this grid. */
 const OFDM_TONE_SPACING_HZ = OFDM_DEFAULTS.toneSpacingHz;
@@ -295,6 +296,7 @@ function controlKindFromType(type: ControlType): ChatterPacket['kind'] {
 function toStoreMembers(members: Member[]): {
   deviceId: number;
   lastHeardMs: number;
+  nickname?: string;
   claimLowHz?: number;
   claimHighHz?: number;
   linkDb?: number;
@@ -305,6 +307,7 @@ function toStoreMembers(members: Member[]): {
     return {
       deviceId: m.deviceId,
       lastHeardMs: m.lastHeardMs,
+      nickname: m.nickname,
       claimLowHz: m.claim?.lowHz,
       claimHighHz: m.claim?.highHz,
       linkDb: info?.linkDb,
@@ -357,6 +360,10 @@ export class ChatterController {
       // Placeholder — joinRoom() overwrites this with the real picked id
       // before start() is called; RoomProtocol reads `deps.deviceId` live.
       deviceId: 0,
+      // Read live so renaming the device takes effect on the next WELCOME
+      // instead of waiting for a rejoin.
+      nickname: () => getNickname(),
+      onIdCollision: (taken) => this.onIdCollision(taken),
       now,
       rng: this.rng,
       schedule: this.schedule,
@@ -478,6 +485,29 @@ export class ChatterController {
    *  this guard a second call arriving mid-await would re-roll the device id
    *  and hand `ModemController.startListening` a second `AudioRecorder` on
    *  top of the first (leaked mic stream). */
+  /**
+   * Move to a fresh device id after hearing a peer use ours.
+   *
+   * The re-roll is persisted, so the swap survives the next reload rather than
+   * colliding again. The worker has to be told too: it stamps `senderId` on
+   * every frame it encodes, so leaving it on the old id would keep us
+   * transmitting as the peer we just collided with.
+   *
+   * Deliberately does NOT restart the room. A rejoin would cost a full
+   * announce/join-wait cycle — seconds of airtime on a half-duplex link — to fix
+   * something the next probe re-announces for free under the new id.
+   */
+  private onIdCollision(taken: number[]): void {
+    const previous = this.deviceId;
+    const next = rerollDeviceId(taken, this.rng);
+    if (next === previous) return; // nothing free to move to; keep going
+    this.deviceId = next;
+    this.deps.deviceId = next;
+    this.worker.chatterStart(next);
+    setState({ chatterDeviceId: next });
+    dlog('ROOM', { idRerolled: true, from: previous, to: next }, { level: 'warn' });
+  }
+
   async joinRoom(): Promise<void> {
     if (this.joining || getState().chatterOn) return;
     this.joining = true;
@@ -487,7 +517,11 @@ export class ChatterController {
     // running under a store that thinks the join never happened.
     let chatterStartSent = false;
     try {
-      const deviceId = 1 + Math.floor(this.rng() * 255); // 1-255
+      // Persisted, not re-rolled per join: a device that dropped and rejoined
+      // used to come back as a brand-new peer, so the roster grew a stranger
+      // while the old entry sat there until it aged out. Collisions are handled
+      // reactively instead — see onIdCollision.
+      const deviceId = getDeviceId(this.rng);
       this.deviceId = deviceId;
       this.deps.deviceId = deviceId;
 

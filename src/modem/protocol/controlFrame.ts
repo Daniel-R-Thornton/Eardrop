@@ -35,6 +35,7 @@ import { bch63Encode, bch63Decode } from '../ecc/bch63';
 import { SENTINEL_BYTES, SENTINEL_SIZE, BCH_HEADER_SIZE } from './atomicFrame';
 import { crc32 } from '../../lib/crc';
 import { BAND_CARD_TONE_COUNTS, BAND_CARD_BIN_HZ } from './bandCard';
+import { sanitizeNickname } from '../../lib/identity';
 
 /** First control-header byte — distinguishes a control frame from a band card. */
 export const CONTROL_MAGIC = 0xc7;
@@ -213,6 +214,13 @@ export interface BestRangeClaim {
 export interface WelcomePayload {
   claim: BestRangeClaim;
   grid: number[]; // 64 linear mags
+  /**
+   * Optional human-readable name for the sender, so peers can label each other
+   * with something better than an 8-bit hex id. Absent when the user has not
+   * set one — see packWelcome for why absence is a distinct wire case rather
+   * than an empty string.
+   */
+  nickname?: string;
 }
 
 export interface FileComingPayload {
@@ -305,19 +313,66 @@ function unpackClaim(bytes: Uint8Array): BestRangeClaim {
   };
 }
 
-/** WELCOME payload: 3-byte claim + 32-byte quantized grid = 35 B. */
+/** Bytes before the optional nickname: 3-byte claim + 32-byte grid. */
+const WELCOME_FIXED_BYTES = 3 + GRID_PACKED_BYTES;
+
+/**
+ * WELCOME payload: 3-byte claim + 32-byte quantized grid = 35 B, then — only
+ * when a nickname is set — a 1-byte length and that many UTF-8 bytes.
+ *
+ * APPENDED, and omitted entirely when there is no nickname, on purpose. This is
+ * a live acoustic protocol being changed while a sync/ACK investigation is open,
+ * so the extension is deliberately one an old build cannot notice:
+ *
+ *  - Old parser, new sender: `parseWelcome` has always tested `length <` its
+ *    fixed size and ignored anything past the grid, so trailing name bytes are
+ *    skipped rather than misread.
+ *  - New parser, old sender: a 35-byte payload simply has no name, which is
+ *    exactly how "no nickname" is already represented.
+ *  - No nickname set: the payload is byte-identical to the pre-nickname format,
+ *    so nobody pays airtime — or the extra BCH chunks' all-or-nothing loss risk
+ *    (see NICKNAME_MAX_BYTES) — for a feature they are not using.
+ *
+ * The name is sanitized and byte-truncated here rather than trusted from the
+ * caller, so an over-long or exotic nickname cannot silently push the payload
+ * past its declared length.
+ */
 export function packWelcome(p: WelcomePayload): Uint8Array {
-  const out = new Uint8Array(3 + GRID_PACKED_BYTES);
+  const nick = p.nickname ? sanitizeNickname(p.nickname) : '';
+  const nameBytes = nick ? new TextEncoder().encode(nick) : new Uint8Array(0);
+  const extra = nameBytes.length > 0 ? 1 + nameBytes.length : 0;
+
+  const out = new Uint8Array(WELCOME_FIXED_BYTES + extra);
   out.set(packClaim(p.claim), 0);
   out.set(packGrid(quantizeGrid(p.grid)), 3);
+  if (extra > 0) {
+    out[WELCOME_FIXED_BYTES] = nameBytes.length;
+    out.set(nameBytes, WELCOME_FIXED_BYTES + 1);
+  }
   return out;
 }
 
 export function parseWelcome(b: Uint8Array): WelcomePayload | null {
-  if (b.length < 3 + GRID_PACKED_BYTES) return null;
+  if (b.length < WELCOME_FIXED_BYTES) return null;
   const claim = unpackClaim(b.slice(0, 3));
-  const grid = dequantizeGrid(unpackGrid(b.slice(3, 3 + GRID_PACKED_BYTES)));
-  return { claim, grid };
+  const grid = dequantizeGrid(unpackGrid(b.slice(3, WELCOME_FIXED_BYTES)));
+
+  // Everything past the grid is optional. A declared length that overruns the
+  // payload means a corrupt or foreign frame: drop the NAME, keep the claim and
+  // grid, because those already passed the payload CRC and the room's band
+  // decisions depend on them. A cosmetic field must not cost a valid WELCOME.
+  let nickname: string | undefined;
+  if (b.length > WELCOME_FIXED_BYTES) {
+    const len = b[WELCOME_FIXED_BYTES];
+    const start = WELCOME_FIXED_BYTES + 1;
+    if (len > 0 && start + len <= b.length) {
+      const decoded = new TextDecoder().decode(b.slice(start, start + len));
+      const clean = sanitizeNickname(decoded);
+      if (clean) nickname = clean;
+    }
+  }
+
+  return nickname === undefined ? { claim, grid } : { claim, grid, nickname };
 }
 
 /** REPORT payload: 32-byte quantized grid. */

@@ -44,6 +44,9 @@ import { ChatMessageList } from './ChatMessageList';
 import { ChatComposer } from './ChatComposer';
 import { isWideViewport } from './viewport';
 import { dlog } from '../../lib/debug/dlog';
+import {
+  NICKNAME_MAX_BYTES, defaultNickname, getNickname, labelFor, setNickname,
+} from '../../lib/identity';
 
 const dispatch = (type: string) => window.dispatchEvent(new CustomEvent(type));
 
@@ -333,6 +336,10 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
 
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [hoveredId, setHoveredId] = useState<number | null>(null);
+  // Seeded from storage, then this state is the source of truth for the field.
+  // The nickname is not in the Store because nothing outside this input writes
+  // it, and RoomProtocol reads it live off `deps.nickname()` at send time.
+  const [nickname, setNicknameState] = useState(() => getNickname());
   const focusId = hoveredId ?? selectedId;
 
   const now = performance.now();
@@ -400,7 +407,7 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
     ctx.font = `bold 11px ${T.mono}`;
     ctx.fillStyle = T.phosphor;
     ctx.textAlign = 'center';
-    ctx.fillText(s.chatterOn ? hex(s.chatterDeviceId) : 'you', cx, cy + 26);
+    ctx.fillText(s.chatterOn ? labelFor(s.chatterDeviceId, getNickname()) : 'you', cx, cy + 26);
     ctx.textAlign = 'left';
 
     if (nodes.length === 0) {
@@ -455,7 +462,7 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
       ctx.font = `10px ${T.mono}`;
       ctx.fillStyle = n.agedOut ? 'rgba(210,210,200,0.4)' : 'rgba(230,230,220,0.85)';
       ctx.textAlign = 'center';
-      ctx.fillText(hex(n.m.deviceId), x, y - nodeR - 6);
+      ctx.fillText(labelFor(n.m.deviceId, n.m.nickname), x, y - nodeR - 6);
       if (n.m.linkDb !== undefined) {
         ctx.font = `9px ${T.mono}`;
         ctx.fillStyle = 'rgba(210,210,200,0.6)';
@@ -702,7 +709,7 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
          *  around it cannot push height through a default-basis flex item), and
          *  collapses to its header strip when shut. */}
         <CollapsibleSection
-          title={`NODE GRAPH — ${s.chatterOn ? `this device is ${hex(s.chatterDeviceId)}` : 'not joined'}`}
+          title={`NODE GRAPH — ${s.chatterOn ? `this device is ${labelFor(s.chatterDeviceId, getNickname())}` : 'not joined'}`}
           summary={`${members.length} node${members.length === 1 ? '' : 's'}`}
           open={graphOpen}
           onToggle={() => setGraphOpen((v) => !v)}
@@ -758,7 +765,7 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
                           width: NODE_TARGET_PX, height: NODE_TARGET_PX,
                           borderRadius: '50%', pointerEvents: 'auto', cursor: 'pointer',
                         }}
-                        title={`${hex(n.m.deviceId)} · ${formatAgo(n.ageMs)}${n.m.linkDb !== undefined ? ` · ${n.m.linkDb.toFixed(0)}dB` : ''}`}
+                        title={`${labelFor(n.m.deviceId, n.m.nickname)} · ${formatAgo(n.ageMs)}${n.m.linkDb !== undefined ? ` · ${n.m.linkDb.toFixed(0)}dB` : ''}`}
                       />
                     );
                   })}
@@ -817,6 +824,31 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
               // recipient picker addresses files and text alike, so a second
               // way to choose a target would be a second source of truth.
               <ul style={{ margin: 0, padding: 0, listStyle: 'none', fontFamily: T.mono, fontSize: 11 }}>
+                {/* This device, and the only place its nickname can be set. The
+                 *  name goes out in every WELCOME, so peers see it too — which
+                 *  is the point: a room of hex ids cannot say which node is the
+                 *  phone in your hand. Sanitizing on change (not on blur) means
+                 *  the field always shows exactly what will go on the air,
+                 *  including the byte cap. */}
+                <li style={{ marginBottom: 8, minHeight: 44, display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ opacity: 0.7, flex: '0 0 auto' }}>this device</span>
+                  <input
+                    aria-label="nickname for this device"
+                    value={nickname}
+                    placeholder={defaultNickname()}
+                    onChange={(e) => setNicknameState(setNickname(e.target.value))}
+                    style={{
+                      flex: '1 1 auto', minWidth: 0, minHeight: 32,
+                      fontFamily: T.mono, fontSize: 11,
+                      color: T.phosphor, background: 'rgba(0,0,0,0.35)',
+                      border: `1px solid ${T.phosphor}`, borderRadius: 3,
+                      padding: '4px 6px',
+                    }}
+                  />
+                  <span style={{ opacity: 0.5, flex: '0 0 auto' }}>
+                    {`${new TextEncoder().encode(nickname).length}/${NICKNAME_MAX_BYTES}B`}
+                  </span>
+                </li>
                 {nodes.map(({ m, ageMs, agedOut }) => (
                   <li
                     key={m.deviceId}
@@ -830,7 +862,7 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
                       color: selectedId === m.deviceId ? T.amber : undefined,
                     }}
                   >
-                    <span style={{ color: T.phosphor }}>{hex(m.deviceId)}</span>
+                    <span style={{ color: T.phosphor }}>{labelFor(m.deviceId, m.nickname)}</span>
                     {` · ${formatAgo(ageMs)}`}
                     {m.linkDb !== undefined && <span style={{ opacity: 0.7 }}>{` · ${m.linkDb.toFixed(0)}dB`}</span>}
                     {agedOut && <span style={{ opacity: 0.7 }}> · aged out</span>}
@@ -843,7 +875,7 @@ export function RoomMode({ onExit }: { onExit: () => void }) {
 
         <CollapsibleSection
           title="SPECTRUM"
-          summary={focusMember ? `node ${hex(focusMember.deviceId)}` : 'no node selected'}
+          summary={focusMember ? `node ${labelFor(focusMember.deviceId, focusMember.nickname)}` : 'no node selected'}
           open={spectrumOpen}
           onToggle={() => setSpectrumOpen((v) => !v)}
         >

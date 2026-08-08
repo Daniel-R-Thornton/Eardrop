@@ -94,6 +94,9 @@ export type RoomState =
 export interface Member {
   deviceId: number;
   lastHeardMs: number;
+  /** Name the member sent in its WELCOME, if any. Undefined means "never told
+   *  us", which the UI renders as the hex id — see `labelFor`. */
+  nickname?: string;
   claim?: BestRangeClaim;
   /** what THIS device heard of the member's last probe (REPORT_GRID mags) */
   heardGrid?: number[];
@@ -103,6 +106,22 @@ export interface Member {
 
 export interface RoomDeps {
   deviceId: number;
+  /**
+   * This device's nickname to put on the air, or '' / undefined for none.
+   *
+   * A function rather than a value, read at send time, for the same reason
+   * `deviceId` is read live off `deps`: the user can rename the device while the
+   * room is running, and a value captured at construction would keep announcing
+   * the old name until a rejoin.
+   */
+  nickname?(): string;
+  /**
+   * Called when a peer is heard using OUR device id, with the ids currently
+   * known to be in use. The room does not re-roll itself: the id is persisted
+   * and pushed to the worker by the controller, so the controller owns the
+   * change and the room just reports the observation.
+   */
+  onIdCollision?(taken: number[]): void;
   now(): number; // ms, monotonic
   rng(): number; // [0,1)
   schedule(fn: () => void, delayMs: number): () => void; // returns cancel
@@ -688,6 +707,25 @@ export class RoomProtocol {
     // they own (WELCOME's claim, REPORT's grid) — see noteHeard's merge.
     // BYE is excluded: it is proof the sender existed, but it is announcing
     // that it is leaving, so recording it adds a member that can only age out.
+    // A decoded message whose sender id is OUR id means two devices persisted
+    // the same 8-bit value. Worth acting on rather than tolerating: the id is
+    // the only thing addressing a targeted message, so a duplicate misroutes
+    // WELCOMEs and FILE_COMINGs to the wrong node for as long as it lasts.
+    //
+    // This cannot be our own transmission coming back: the recorder is muted for
+    // the whole of a local send (see playAndMute) and re-armed after, so a
+    // control frame that survives CRC here was demodulated off the air from
+    // somebody else.
+    if (msg.senderId === this.deps.deviceId) {
+      dlog('ROOM', {
+        idCollision: true, us: this.deps.deviceId, type: msg.type,
+      }, { level: 'warn' });
+      // Our own id is included in `taken`: whatever we move to must differ from
+      // the value the colliding peer is also using.
+      this.deps.onIdCollision?.([...this._members.keys(), this.deps.deviceId]);
+      return;
+    }
+
     if (msg.type !== ControlType.Bye) this.noteHeard(msg.senderId);
 
     switch (msg.type) {
@@ -739,6 +777,10 @@ export class RoomProtocol {
       lastHeardMs: this.deps.now(),
       claim: parsed.claim,
       theirViewOfUs: parsed.grid,
+      // Only overwrite when this WELCOME actually carried a name: a peer on a
+      // build without nicknames, or one whose name bytes failed to decode,
+      // must not erase a name we already learned from an earlier WELCOME.
+      ...(parsed.nickname ? { nickname: parsed.nickname } : {}),
     });
     // A WELCOME is traffic from the sender — it proves any reply we owed them
     // landed, whatever that reply was.
@@ -1164,19 +1206,20 @@ export class RoomProtocol {
     // believing the room is empty, whereas a REPORT costs one negotiation.
     const purpose = this.replyPurpose.get(proberId) ?? PROBE_PURPOSE.joining;
     const heardGrid = this._members.get(proberId)?.heardGrid ?? [];
-    return purpose === PROBE_PURPOSE.rollCall
-      ? {
-          type: ControlType.Report,
-          senderId: this.deps.deviceId,
-          targetId: proberId,
-          payload: packReport(heardGrid),
-        }
-      : {
-          type: ControlType.Welcome,
-          senderId: this.deps.deviceId,
-          targetId: proberId,
-          payload: packWelcome({ claim: DEFAULT_CLAIM, grid: heardGrid }),
-        };
+    const senderId = this.deps.deviceId;
+
+    // Two statements rather than one ternary: each branch packs only its own
+    // payload, so a roll-call REPORT does not also quantize a grid for a WELCOME
+    // it is not going to send.
+    if (purpose === PROBE_PURPOSE.rollCall) {
+      return { type: ControlType.Report, senderId, targetId: proberId, payload: packReport(heardGrid) };
+    }
+    return {
+      type: ControlType.Welcome,
+      senderId,
+      targetId: proberId,
+      payload: packWelcome({ claim: DEFAULT_CLAIM, grid: heardGrid, nickname: this.deps.nickname?.() }),
+    };
   }
 
   /**

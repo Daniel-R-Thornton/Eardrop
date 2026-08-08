@@ -16,6 +16,7 @@
  * it may come back.
  */
 import { dlogSince } from './dlog';
+import { getNickname, uaLabel } from '../identity';
 
 const INTERVAL_MS = 5000;
 const BACKOFF_MS = 30000;
@@ -84,38 +85,8 @@ const randomId = () => Math.random().toString(36).slice(2, 8);
 const CLIENT_SLUG_KEY = 'eardrop.clientSlug';
 
 /**
- * A coarse, human-readable name for this browser/OS, e.g. `chrome-android`.
- *
- * Deliberately coarse. This is a filename token whose only job is to let
- * someone reading `logs/` tell the phone's file from the PC's at a glance —
- * precisely the thing `dev-ih9jof` could not do. Version numbers and exact
- * engine identification would make it longer and less legible without making
- * it more useful, and the log body already carries the details.
- *
- * Order matters: Edge and most Android browsers put "Chrome" in their UA too,
- * so the more specific names have to be tested first, and Safari last because
- * every WebKit-shell UA contains "Safari".
- */
-function uaLabel(): string {
-  const ua = typeof navigator === 'undefined' ? '' : navigator.userAgent;
-  const os = /Android/i.test(ua) ? 'android'
-    : /iPhone|iPad|iPod/i.test(ua) ? 'ios'
-      : /Windows/i.test(ua) ? 'windows'
-        : /Mac OS X/i.test(ua) ? 'macos'
-          : /Linux/i.test(ua) ? 'linux'
-            : 'os';
-  const browser = /Edg\//.test(ua) ? 'edge'
-    : /OPR\//.test(ua) ? 'opera'
-      : /SamsungBrowser/i.test(ua) ? 'samsung'
-        : /Firefox\//.test(ua) ? 'firefox'
-          : /Chrome\//.test(ua) ? 'chrome'
-            : /Safari\//.test(ua) ? 'safari'
-              : 'browser';
-  return `${browser}-${os}`;
-}
-
-/**
- * A stable per-device identity, e.g. `chrome-android-k3n8`.
+ * A stable per-device identity, e.g. `chrome-android-k3n8`, or
+ * `desk-pc-k3n8` once a nickname is set.
  *
  * Persisted in localStorage because the previous scheme minted a fresh random
  * id on every reload, so one phone across a debugging session scattered itself
@@ -129,7 +100,9 @@ function uaLabel(): string {
  * which is worse but not broken.
  */
 function clientSlug(): string {
-  const fresh = () => `${uaLabel()}-${randomId().slice(0, 4)}`;
+  // The nickname when the user has set one — a log directory reading
+  // `desk-pc-…` / `pixel-…` beats two UA labels — else the UA label.
+  const fresh = () => `${getNickname() || uaLabel()}-${randomId().slice(0, 4)}`;
   try {
     const store = globalThis.localStorage;
     if (!store) return fresh();
